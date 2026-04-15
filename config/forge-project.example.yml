@@ -1,0 +1,59 @@
+# forge-project.yml — project-specific config for forge skills
+# Copy this to your project at .claude/forge-project.yml and customize.
+
+project:
+  name: "My Project"
+  description: "Brief description of the project"
+
+services:
+  backend:
+    command: "uvicorn src.app.main:app --reload --port 8000"
+    working_dir: "backend"
+    port: 8000
+    health_check: "http://localhost:8000/docs"
+    activate_venv: "source .venv/bin/activate"
+  frontend:
+    command: "npm run dev"
+    working_dir: "frontend"
+    port: 5173
+    health_check: "http://localhost:5173"
+
+testing:
+  backend:
+    command: "pytest"
+    working_dir: "backend"
+    activate_venv: "source .venv/bin/activate"
+  frontend:
+    unit_command: "npm run test:run"
+    e2e_command: "npm run test:e2e"
+    working_dir: "frontend"
+    playwright_install: "npx playwright install chromium"
+    playwright_config: "playwright.config.ts"
+    playwright_autostart: "frontend-only"
+    e2e_dir: "e2e"
+  screenshot:
+    full_page: "npx playwright screenshot --full-page {url} {output}"
+    viewport: "npx playwright screenshot --viewport-size={width},{height} {url} {output}"
+    working_dir: "frontend"
+
+auth:
+  test_email: "test@example.com"
+  test_password: "your-test-password"
+  login_endpoint: "/api/v1/auth/login"
+
+qa:
+  output_dir: ".dev/qa"
+  evidence_dir: "evidence"
+  smoke_pages:
+    - name: "Home"
+      path: "/"
+      requires_auth: false
+    - name: "Dashboard"
+      path: "/dashboard"
+      requires_auth: true
+  core_workflows:
+    - name: "Login and view dashboard"
+      description: "Login as test user, navigate to dashboard"
+  pixelmatch:
+    install_command: "npm install --save-dev pixelmatch pngjs"
+    working_dir: "frontend"

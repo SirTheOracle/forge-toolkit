@@ -1,0 +1,77 @@
+#!/bin/bash
+# ============================================================
+# forge-start — Launch a forge tmux session
+# ============================================================
+#
+# Layout:
+#   ┌──────────────────┬──────────────────┐
+#   │                  │  Pane 1          │
+#   │                  │  Claude          │
+#   │                  │  (orchestrator)  │
+#   │                  ├──────────────────┤
+#   │  Pane 0          │  Pane 2          │
+#   │  Claude          │  Codex A         │
+#   │  (inline)        │                  │
+#   │                  ├──────────────────┤
+#   │                  │  Pane 3          │
+#   │                  │  Codex B         │
+#   │                  │                  │
+#   └──────────────────┴──────────────────┘
+#
+# Usage:
+#   forge-start              — auto-names (forge-1, forge-2, etc.)
+#   forge-start myname       — names session "myname"
+# ============================================================
+
+set -e
+
+DIR="$(pwd)"
+
+if [ -n "$1" ]; then
+    SESSION="$1"
+else
+    COUNT=1
+    while tmux has-session -t "forge-$COUNT" 2>/dev/null; do
+        COUNT=$((COUNT + 1))
+    done
+    SESSION="forge-$COUNT"
+fi
+
+# Create session — pane 0 (left: claude inline)
+tmux new-session -d -s "$SESSION" -c "$DIR"
+
+# Split right — pane 1 (right side: orchestrator)
+tmux split-window -h -t "$SESSION:.0" -c "$DIR" -p 50
+
+# Split pane 1 down — pane 2 (codex A, middle-right)
+tmux split-window -v -t "$SESSION:.1" -c "$DIR" -p 66
+
+# Split pane 2 down — pane 3 (codex B, bottom-right)
+tmux split-window -v -t "$SESSION:.2" -c "$DIR" -p 50
+
+# Enable mouse
+tmux set -g mouse on
+
+# Launch CLIs in each pane
+tmux send-keys -t "$SESSION:.0" "claude" Enter
+tmux send-keys -t "$SESSION:.1" "claude" Enter
+tmux send-keys -t "$SESSION:.2" "codex" Enter
+tmux send-keys -t "$SESSION:.3" "codex" Enter
+
+# Focus on pane 0 (claude inline)
+tmux select-pane -t "$SESSION:.0"
+
+# Persist session name so forge-bridge works from any subprocess
+mkdir -p "$DIR/.dev"
+echo "$SESSION" > "$DIR/.dev/.forge-session"
+
+echo ""
+echo "Session '$SESSION' ready."
+echo ""
+echo "  Pane 0 (left):          Claude inline"
+echo "  Pane 1 (top-right):     Claude orchestrator"
+echo "  Pane 2 (middle-right):  Codex A"
+echo "  Pane 3 (bottom-right):  Codex B"
+echo ""
+echo "Attach with:  tmux attach -t $SESSION"
+echo ""

@@ -1,0 +1,780 @@
+#!/bin/bash
+# ============================================================
+# forge-bridge — cross-pane messaging with hooks and audit log
+# ============================================================
+#
+# Auto-detects which tmux session you're in.
+# Falls back to .dev/.forge-session file, then scans for forge sessions.
+#
+# Pane layout:
+#   0 = claude (inline)          LEFT SIDE
+#   1 = claude (orchestrator)    TOP-RIGHT
+#   2 = codex A                  MIDDLE-RIGHT
+#   3 = codex B                  BOTTOM-RIGHT
+#
+# Hooks (enforced by the script, not by skills):
+#   1. send refuses to dispatch unless a log entry exists (log-before-send)
+#   2. log-response auto-updates .dev/forge-context.yml on completion
+#   3. context command loads pipeline state for session start
+#
+# Commands:
+#   send <pane> <message>       — type into a pane (enforces log-before-send)
+#   send --force <pane> <msg>   — bypass log check (for non-pipeline messages)
+#   read <pane> [lines]         — read from a pane
+#   focus <pane>                — switch focus to a pane
+#   back                        — return focus to orchestrator
+#   signal <from> <message>     — file-based signal (no tmux needed)
+#   check-signals               — list pending signals
+#   clear-signals               — remove all signal files
+#   log --slug <s> --stage <s> --from <f> --to <t> --prompt <p>
+#   log-response --slug <s> --response <r> [--file <path:action>]...
+#   history [lines]             — project-wide summary
+#   pipeline-log <slug> [lines] — per-pipeline detail
+#   context                     — load current pipeline state (for session start)
+#   set-context --slug <s>      — manually set the active pipeline
+#
+# Pane names: inline/general (0), claude/orchestrator (1), codex/codex-a (2), codex-b (3)
+# ============================================================
+
+# --- Session Detection (3-tier fallback) ---
+
+SESSION="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+
+# Fallback 1: read session name from .dev/.forge-session (written by forge-start)
+if [ -z "$SESSION" ]; then
+    _dir="$(pwd)"
+    while [ "$_dir" != "/" ]; do
+        if [ -f "$_dir/.dev/.forge-session" ]; then
+            SESSION=$(cat "$_dir/.dev/.forge-session")
+            break
+        fi
+        _dir=$(dirname "$_dir")
+    done
+    unset _dir
+fi
+
+# Fallback 2: auto-detect the forge session with 4 panes
+if [ -z "$SESSION" ]; then
+    SESSION=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+        | grep '^forge' \
+        | while read -r s; do
+            panes=$(tmux list-panes -t "$s" 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$panes" -ge 4 ]; then echo "$s"; fi
+          done | tail -1)
+fi
+
+if [ -z "$SESSION" ]; then
+    echo "ERROR: No tmux forge session found. Run forge-start first."
+    exit 1
+fi
+
+WINDOW="0"
+DEV_DIR=".dev"
+SUMMARY_LOG="$DEV_DIR/forge-log.yml"
+CONTEXT_FILE="$DEV_DIR/forge-context.yml"
+
+# ---- Helpers ----
+
+pane_index() {
+    case "$1" in
+        inline|general|claude-general) echo "0" ;;
+        claude|orchestrator) echo "1" ;;
+        codex|codex-a)  echo "2" ;;
+        codex-b)        echo "3" ;;
+        *)              echo "$1" ;;
+    esac
+}
+
+pane_name() {
+    case "$1" in
+        0) echo "inline" ;;
+        1) echo "claude" ;;
+        2) echo "codex-a" ;;
+        3) echo "codex-b" ;;
+        *) echo "pane-$1" ;;
+    esac
+}
+
+timestamp() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+ensure_pipeline_log() {
+    local slug="$1"
+    local dir="$DEV_DIR/proposals/$slug"
+    local log="$dir/forge-log.yml"
+    mkdir -p "$dir"
+    if [ ! -f "$log" ]; then
+        cat > "$log" << EOF
+pipeline: $slug
+entries:
+EOF
+    fi
+}
+
+ensure_summary_log() {
+    mkdir -p "$DEV_DIR"
+    if [ ! -f "$SUMMARY_LOG" ]; then
+        cat > "$SUMMARY_LOG" << EOF
+entries:
+EOF
+    fi
+}
+
+yaml_escape() {
+    local text="$1"
+    if echo "$text" | grep -q $'\n'; then
+        echo "|"
+        echo "$text" | sed 's/^/      /'
+    else
+        local escaped
+        escaped=$(echo "$text" | sed 's/"/\\"/g')
+        echo "\"$escaped\""
+    fi
+}
+
+# ---- Hook: Check for pending log entry ----
+
+has_pending_log() {
+    # Returns 0 (true) if there's a log entry with response: null
+    if [ -f "$SUMMARY_LOG" ]; then
+        grep -q "response: null" "$SUMMARY_LOG" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
+# ---- Hook: Update forge-context.yml ----
+
+update_context() {
+    local slug="$1"
+    local stage="$2"
+    local status="$3"  # done, blocked, error
+    local worker="$4"
+    local ts
+    ts=$(timestamp)
+
+    mkdir -p "$DEV_DIR"
+
+    # Read existing notes if any
+    local existing_notes=""
+    if [ -f "$CONTEXT_FILE" ]; then
+        existing_notes=$(python3 -c "
+import yaml, sys
+try:
+    with open('$CONTEXT_FILE') as f:
+        data = yaml.safe_load(f) or {}
+    notes = data.get('notes', [])
+    for n in notes:
+        print(n)
+except:
+    pass
+" 2>/dev/null)
+    fi
+
+    # Determine next stage
+    local next_stage=""
+    if [ "$status" = "done" ]; then
+        case "$stage" in
+            proposal)       next_stage="review" ;;
+            review)         next_stage="incorporate" ;;
+            incorporate)    next_stage="implementation" ;;
+            implementation) next_stage="impl-review" ;;
+            impl-review)    next_stage="coding" ;;
+            coding)         next_stage="qa" ;;
+            qa)             next_stage="verify" ;;
+            verify)         next_stage="complete" ;;
+            commit-review)  next_stage="" ;;  # side-channel, not a pipeline stage
+            *)              next_stage="unknown" ;;
+        esac
+    fi
+
+    # Write context file
+    cat > "$CONTEXT_FILE" << EOF
+# Forge Context — auto-updated by forge-bridge hooks
+# Read this on session start to resume pipeline state
+active_pipeline: $slug
+last_stage_completed: $stage
+last_stage_status: $status
+last_worker: $worker
+next_stage: $next_stage
+updated_at: "$ts"
+EOF
+
+    # Append notes if they exist
+    if [ -n "$existing_notes" ]; then
+        echo "notes:" >> "$CONTEXT_FILE"
+        echo "$existing_notes" | while IFS= read -r line; do
+            echo "  - \"$line\"" >> "$CONTEXT_FILE"
+        done
+    else
+        echo "notes: []" >> "$CONTEXT_FILE"
+    fi
+}
+
+# ---- Signal (file-based, no tmux needed — works from sandboxed agents) ----
+
+SIGNAL_DIR=".dev/signals"
+
+cmd_signal() {
+    local from="$1"
+    shift
+    local msg="$*"
+    local ts
+    ts=$(timestamp)
+    mkdir -p "$SIGNAL_DIR"
+    local filename="${from}-$(date +%s).signal"
+    cat > "$SIGNAL_DIR/$filename" << EOF
+from: $from
+timestamp: $ts
+message: $msg
+EOF
+    echo "Signal sent: $from | $msg"
+}
+
+cmd_check_signals() {
+    local signal_dir="$SIGNAL_DIR"
+    if [ ! -d "$signal_dir" ] || [ -z "$(ls -A "$signal_dir"/*.signal 2>/dev/null)" ]; then
+        echo "(no pending signals)"
+        return 1
+    fi
+    for f in "$signal_dir"/*.signal; do
+        cat "$f"
+        echo "---"
+    done
+}
+
+cmd_clear_signals() {
+    rm -f "$SIGNAL_DIR"/*.signal 2>/dev/null
+    echo "Signals cleared"
+}
+
+# ---- Review Status ----
+
+REVIEWS_DIR=".dev/reviews"
+
+cmd_review_status() {
+    local pending_dir="$REVIEWS_DIR/pending"
+    local pending=0 pass=0 concerns=0 blocking=0 total_reviewed=0
+
+    # Count pending
+    if [ -d "$pending_dir" ]; then
+        pending=$(ls -1 "$pending_dir"/*.review 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
+    # Scan completed reviews (YAML frontmatter)
+    if [ -d "$REVIEWS_DIR" ]; then
+        for f in "$REVIEWS_DIR"/*.md; do
+            [ -f "$f" ] || continue
+            local verdict
+            verdict=$(sed -n 's/^verdict: *//p' "$f" 2>/dev/null | head -1 | tr -d ' ')
+            case "$verdict" in
+                PASS)     pass=$((pass + 1)) ;;
+                CONCERNS) concerns=$((concerns + 1)) ;;
+                BLOCKING) blocking=$((blocking + 1)) ;;
+            esac
+            total_reviewed=$((total_reviewed + 1))
+        done
+    fi
+
+    local total=$((pending + total_reviewed))
+
+    if [ "$total" -eq 0 ]; then
+        echo "(no reviews)"
+        return 0
+    fi
+
+    echo "Reviews: $total total"
+    echo "  pending:  $pending"
+    echo "  pass:     $pass"
+    echo "  concerns: $concerns"
+    echo "  blocking: $blocking"
+
+    if [ "$blocking" -gt 0 ]; then
+        echo ""
+        echo "BLOCKING reviews:"
+        for f in "$REVIEWS_DIR"/*.md; do
+            [ -f "$f" ] || continue
+            local v short subj
+            v=$(sed -n 's/^verdict: *//p' "$f" 2>/dev/null | head -1 | tr -d ' ')
+            if [ "$v" = "BLOCKING" ]; then
+                short=$(sed -n 's/^short: *//p' "$f" 2>/dev/null | head -1)
+                subj=$(sed -n 's/^subject: *"*\([^"]*\)"*/\1/p' "$f" 2>/dev/null | head -1)
+                echo "  $short — $subj"
+            fi
+        done
+    fi
+
+    if [ "$pending" -gt 0 ]; then
+        echo ""
+        echo "Pending reviews:"
+        for f in "$pending_dir"/*.review; do
+            [ -f "$f" ] || continue
+            local short subj
+            short=$(sed -n 's/^short: *//p' "$f" 2>/dev/null | head -1)
+            subj=$(sed -n 's/^subject: *"*\([^"]*\)"*/\1/p' "$f" 2>/dev/null | head -1)
+            echo "  $short — $subj"
+        done
+    fi
+
+    return 0
+}
+
+# ---- Commands ----
+
+cmd_send() {
+    local FORCE=false
+
+    # Check for --force flag
+    if [ "$1" = "--force" ]; then
+        FORCE=true
+        shift
+    fi
+
+    local PANE_NAME="$1"
+    local PANE
+    PANE=$(pane_index "$1")
+    shift
+    local MSG="$*"
+
+    # Hook 1: Enforce log-before-send (skip for --force or messages to non-worker panes)
+    if [ "$FORCE" = false ] && [ "$PANE_NAME" != "claude" ] && [ "$PANE_NAME" != "orchestrator" ] && [ "$PANE_NAME" != "inline" ] && [ "$PANE_NAME" != "general" ] && [ "$PANE_NAME" != "claude-general" ]; then
+        if ! has_pending_log; then
+            echo "HOOK BLOCKED: No pending log entry found."
+            echo "Run 'forge-bridge log' before sending to a worker."
+            echo "Or use 'forge-bridge send --force' to bypass for non-pipeline messages."
+            return 1
+        fi
+    fi
+
+    tmux select-pane -t "$SESSION:$WINDOW.$PANE"
+    sleep 0.3
+    tmux send-keys -t "$SESSION:$WINDOW.$PANE" "$MSG" Enter
+    sleep 0.2
+    tmux send-keys -t "$SESSION:$WINDOW.$PANE" "" Enter
+}
+
+cmd_read() {
+    local PANE
+    PANE=$(pane_index "$1")
+    local LINES="${2:-20}"
+    tmux capture-pane -t "$SESSION:$WINDOW.$PANE" -p -S "-$LINES"
+}
+
+cmd_focus() {
+    local PANE
+    PANE=$(pane_index "$1")
+    tmux select-pane -t "$SESSION:$WINDOW.$PANE"
+}
+
+cmd_back() {
+    tmux select-pane -t "$SESSION:$WINDOW.1"
+}
+
+cmd_log() {
+    local slug="" stage="" from="" to="" prompt=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)    slug="$2";    shift 2 ;;
+            --stage)   stage="$2";   shift 2 ;;
+            --from)    from="$2";    shift 2 ;;
+            --to)      to="$2";      shift 2 ;;
+            --prompt)  prompt="$2";  shift 2 ;;
+            *)         shift ;;
+        esac
+    done
+
+    if [ -z "$slug" ] || [ -z "$stage" ] || [ -z "$from" ] || [ -z "$to" ] || [ -z "$prompt" ]; then
+        echo "ERROR: Missing required flags."
+        echo "Usage: forge-bridge log --slug <s> --stage <s> --from <f> --to <t> --prompt <p>"
+        return 1
+    fi
+
+    local ts
+    ts=$(timestamp)
+    local escaped_prompt
+    escaped_prompt=$(yaml_escape "$prompt")
+
+    ensure_pipeline_log "$slug"
+    ensure_summary_log
+
+    local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
+
+    cat >> "$pipeline_log" << EOF
+
+  - timestamp: "$ts"
+    stage: $stage
+    from: $from
+    to: $to
+    prompt: $escaped_prompt
+    response: null
+    files: []
+EOF
+
+    cat >> "$SUMMARY_LOG" << EOF
+
+  - timestamp: "$ts"
+    pipeline: $slug
+    stage: $stage
+    from: $from
+    to: $to
+    response: null
+EOF
+
+    echo "Logged: $from → $to | $slug/$stage | $ts"
+}
+
+cmd_log_response() {
+    local slug="" response=""
+    local -a files=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)     slug="$2";     shift 2 ;;
+            --response) response="$2"; shift 2 ;;
+            --file)     files+=("$2"); shift 2 ;;
+            *)          shift ;;
+        esac
+    done
+
+    if [ -z "$slug" ] || [ -z "$response" ]; then
+        echo "ERROR: Missing required flags."
+        echo "Usage: forge-bridge log-response --slug <s> --response <r> [--file <path:action>]..."
+        return 1
+    fi
+
+    local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
+
+    if [ ! -f "$pipeline_log" ]; then
+        echo "ERROR: No log file for pipeline '$slug'"
+        return 1
+    fi
+
+    local files_yaml="[]"
+    if [ ${#files[@]} -gt 0 ]; then
+        files_yaml=""
+        for f in "${files[@]}"; do
+            local fpath="${f%%:*}"
+            local faction="${f##*:}"
+            files_yaml="$files_yaml
+      - path: $fpath
+        action: $faction"
+        done
+    fi
+
+    # Determine status and stage from response
+    local status="unknown"
+    local stage=""
+    local worker=""
+
+    if echo "$response" | grep -qi "FORGE_DONE"; then
+        status="done"
+    elif echo "$response" | grep -qi "FORGE_BLOCKED"; then
+        status="blocked"
+    elif echo "$response" | grep -qi "FORGE_ERROR"; then
+        status="error"
+    fi
+
+    # Extract stage and worker from the last pending log entry
+    if [ -f "$pipeline_log" ]; then
+        stage=$(python3 -c "
+import yaml
+with open('$pipeline_log') as f:
+    data = yaml.safe_load(f) or {}
+entries = data.get('entries', [])
+for e in reversed(entries):
+    if e.get('response') is None or e.get('response') == 'null':
+        print(e.get('stage', ''))
+        break
+" 2>/dev/null)
+        worker=$(python3 -c "
+import yaml
+with open('$pipeline_log') as f:
+    data = yaml.safe_load(f) or {}
+entries = data.get('entries', [])
+for e in reversed(entries):
+    if e.get('response') is None or e.get('response') == 'null':
+        print(e.get('to', ''))
+        break
+" 2>/dev/null)
+    fi
+
+    # Update the log files
+    python3 << PYEOF
+escaped_response = """$response""".replace('"', '\\"')
+
+with open("$pipeline_log", "r") as f:
+    content = f.read()
+
+parts = content.rsplit("response: null", 1)
+if len(parts) == 2:
+    content = parts[0] + 'response: "' + escaped_response + '"' + parts[1]
+
+files_data = """$files_yaml""".strip()
+if files_data and files_data != "[]":
+    parts = content.rsplit("files: []", 1)
+    if len(parts) == 2:
+        content = parts[0] + "files:" + files_data + parts[1]
+
+with open("$pipeline_log", "w") as f:
+    f.write(content)
+
+with open("$SUMMARY_LOG", "r") as f:
+    content = f.read()
+
+parts = content.rsplit("response: null", 1)
+if len(parts) == 2:
+    content = parts[0] + 'response: "' + escaped_response + '"' + parts[1]
+
+with open("$SUMMARY_LOG", "w") as f:
+    f.write(content)
+
+print("Updated: $slug | response: $response")
+PYEOF
+
+    # Hook 2: Auto-update forge-context.yml
+    if [ -n "$stage" ] && [ -n "$status" ]; then
+        update_context "$slug" "$stage" "$status" "$worker"
+    fi
+}
+
+cmd_history() {
+    local LINES="${1:-30}"
+    if [ -f "$SUMMARY_LOG" ]; then
+        tail -n "$LINES" "$SUMMARY_LOG"
+    else
+        echo "(no log entries yet)"
+    fi
+}
+
+cmd_pipeline_log() {
+    local slug="$1"
+    local LINES="${2:-50}"
+
+    if [ -z "$slug" ]; then
+        echo "Usage: forge-bridge pipeline-log <slug> [lines]"
+        return 1
+    fi
+
+    local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
+    if [ -f "$pipeline_log" ]; then
+        tail -n "$LINES" "$pipeline_log"
+    else
+        echo "(no log for pipeline '$slug')"
+    fi
+}
+
+# ---- Context (session start / recovery) ----
+
+cmd_context() {
+    if [ ! -f "$CONTEXT_FILE" ]; then
+        echo "(no forge context — no active pipeline)"
+        echo ""
+        echo "Start a new pipeline with forge-bridge log, or set one manually:"
+        echo "  forge-bridge set-context --slug <slug-name>"
+
+        # Still show reviews even without a pipeline
+        local has_reviews_noctx=false
+        if [ -d "$REVIEWS_DIR/pending" ] && [ -n "$(ls -A "$REVIEWS_DIR/pending/"*.review 2>/dev/null)" ]; then
+            has_reviews_noctx=true
+        fi
+        if [ -n "$(ls -A "$REVIEWS_DIR/"*.md 2>/dev/null)" ]; then
+            has_reviews_noctx=true
+        fi
+        if [ "$has_reviews_noctx" = true ]; then
+            echo ""
+            echo "=== Commit Reviews ==="
+            cmd_review_status
+        fi
+        return 0
+    fi
+
+    echo "=== Forge Context ==="
+    cat "$CONTEXT_FILE"
+    echo ""
+
+    # Show last few log entries for the active pipeline
+    local slug
+    slug=$(grep "active_pipeline:" "$CONTEXT_FILE" 2>/dev/null | awk '{print $2}')
+    if [ -n "$slug" ] && [ "$slug" != "null" ]; then
+        local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
+        if [ -f "$pipeline_log" ]; then
+            echo "=== Recent Activity ($slug) ==="
+            tail -20 "$pipeline_log"
+        fi
+
+        # Check for pending signals
+        if [ -d "$SIGNAL_DIR" ] && [ -n "$(ls -A "$SIGNAL_DIR"/*.signal 2>/dev/null)" ]; then
+            echo ""
+            echo "=== Pending Signals ==="
+            cmd_check_signals
+        fi
+    fi
+
+    # Show review status if any reviews exist
+    local has_reviews=false
+    if [ -d "$REVIEWS_DIR/pending" ] && [ -n "$(ls -A "$REVIEWS_DIR/pending/"*.review 2>/dev/null)" ]; then
+        has_reviews=true
+    fi
+    if [ -n "$(ls -A "$REVIEWS_DIR/"*.md 2>/dev/null)" ]; then
+        has_reviews=true
+    fi
+    if [ "$has_reviews" = true ]; then
+        echo ""
+        echo "=== Commit Reviews ==="
+        cmd_review_status
+    fi
+}
+
+cmd_set_context() {
+    local slug=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug) slug="$2"; shift 2 ;;
+            *)      shift ;;
+        esac
+    done
+
+    if [ -z "$slug" ]; then
+        echo "Usage: forge-bridge set-context --slug <slug-name>"
+        return 1
+    fi
+
+    mkdir -p "$DEV_DIR"
+
+    # If pipeline log exists, derive state from it
+    local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
+    local last_stage="none"
+    local last_status="none"
+    local last_worker="none"
+
+    if [ -f "$pipeline_log" ]; then
+        last_stage=$(python3 -c "
+import yaml
+with open('$pipeline_log') as f:
+    data = yaml.safe_load(f) or {}
+entries = data.get('entries', [])
+for e in reversed(entries):
+    r = e.get('response', '')
+    if r and 'FORGE_DONE' in str(r):
+        print(e.get('stage', 'none'))
+        break
+else:
+    print('none')
+" 2>/dev/null || echo "none")
+        last_worker=$(python3 -c "
+import yaml
+with open('$pipeline_log') as f:
+    data = yaml.safe_load(f) or {}
+entries = data.get('entries', [])
+for e in reversed(entries):
+    r = e.get('response', '')
+    if r and 'FORGE_DONE' in str(r):
+        print(e.get('to', 'none'))
+        break
+else:
+    print('none')
+" 2>/dev/null || echo "none")
+        if [ "$last_stage" != "none" ]; then
+            last_status="done"
+        fi
+    fi
+
+    update_context "$slug" "$last_stage" "$last_status" "$last_worker"
+    echo "Context set to pipeline: $slug"
+    cmd_context
+}
+
+cmd_add_note() {
+    local note="$*"
+
+    if [ -z "$note" ]; then
+        echo "Usage: forge-bridge add-note <your note>"
+        return 1
+    fi
+
+    if [ ! -f "$CONTEXT_FILE" ]; then
+        echo "ERROR: No active context. Run set-context first."
+        return 1
+    fi
+
+    python3 << PYEOF
+import yaml
+
+with open("$CONTEXT_FILE") as f:
+    data = yaml.safe_load(f) or {}
+
+notes = data.get("notes", [])
+if isinstance(notes, list):
+    notes.append("$note")
+else:
+    notes = ["$note"]
+data["notes"] = notes
+
+with open("$CONTEXT_FILE", "w") as f:
+    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+print("Note added.")
+PYEOF
+}
+
+# ---- Main ----
+
+case "${1:-help}" in
+    send)            shift; cmd_send "$@" ;;
+    read)            shift; cmd_read "$@" ;;
+    focus)           shift; cmd_focus "$@" ;;
+    back)            cmd_back ;;
+    signal)          shift; cmd_signal "$@" ;;
+    check-signals)   cmd_check_signals ;;
+    clear-signals)   cmd_clear_signals ;;
+    review-status)   cmd_review_status ;;
+    log)             shift; cmd_log "$@" ;;
+    log-response)    shift; cmd_log_response "$@" ;;
+    history)         shift; cmd_history "$@" ;;
+    pipeline-log)    shift; cmd_pipeline_log "$@" ;;
+    context)         cmd_context ;;
+    set-context)     shift; cmd_set_context "$@" ;;
+    add-note)        shift; cmd_add_note "$@" ;;
+    help|*)
+        echo "forge-bridge — cross-pane messaging with hooks and audit log"
+        echo "Session: ${SESSION:-none} (auto-detected)"
+        echo ""
+        echo "Messaging (requires tmux):"
+        echo "  send <pane> <message>         Send to a pane (enforces log-before-send)"
+        echo "  send --force <pane> <message>  Bypass log check (non-pipeline messages)"
+        echo "  read <pane> [lines]           Read last N lines from a pane"
+        echo "  focus <pane>                  Switch focus to a pane"
+        echo "  back                          Return focus to orchestrator"
+        echo ""
+        echo "Signals (file-based, no tmux needed — works from sandboxed agents):"
+        echo "  signal <from> <message>       Write a signal file to .dev/signals/"
+        echo "  check-signals                 List pending signals"
+        echo "  clear-signals                 Remove all signal files"
+        echo ""
+        echo "Reviews (commit-review pipeline):"
+        echo "  review-status                 Show pending/completed review counts and blocking items"
+        echo ""
+        echo "Logging:"
+        echo "  log --slug <s> --stage <s> --from <f> --to <t> --prompt <p>"
+        echo "                                Log a dispatch entry"
+        echo "  log-response --slug <s> --response <r> [--file <path:action>]..."
+        echo "                                Update last entry with response + files"
+        echo "  history [lines]               Show project-wide summary"
+        echo "  pipeline-log <slug> [lines]   Show per-pipeline detail"
+        echo ""
+        echo "Context (session start / recovery):"
+        echo "  context                       Show current pipeline state"
+        echo "  set-context --slug <s>        Set active pipeline (auto-derives state)"
+        echo "  add-note <text>               Add a note to context (persists across sessions)"
+        echo ""
+        echo "Panes: inline/general (0), claude/orchestrator (1), codex/codex-a (2), codex-b (3)"
+        echo ""
+        echo "Hooks (automatic):"
+        echo "  - send blocks unless log entry exists (use --force to bypass)"
+        echo "  - log-response auto-updates forge-context.yml"
+        echo "  - context reads pipeline state for session recovery"
+        ;;
+esac
