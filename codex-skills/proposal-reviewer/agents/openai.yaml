@@ -1,0 +1,4 @@
+interface:
+  display_name: "Proposal Reviewer"
+  short_description: "Independently review a proposal directory"
+  default_prompt: "Use $proposal-reviewer on this .dev/proposals/<issue-slug>/ directory or final-plan.md path and write review-codex.md after validating the plan against the code."

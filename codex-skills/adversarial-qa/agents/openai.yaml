@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adversarial QA"
+  short_description: "Run adversarial regression QA"
+  default_prompt: "Use $adversarial-qa to verify this branch or final-plan with independent QA passes, ranked issues, and a coverage test plan."

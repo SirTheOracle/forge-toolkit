@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adversarial Implementation"
+  short_description: "Turn a vetted plan into exact diffs"
+  default_prompt: "Use $adversarial-implementation to turn this final-plan.md into an implementation.md with exact diffs, tests, and a coverage matrix."

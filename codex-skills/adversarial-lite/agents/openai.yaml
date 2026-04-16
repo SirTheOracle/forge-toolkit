@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adversarial Lite"
+  short_description: "Fast isolated planning for low-risk tasks"
+  default_prompt: "Use $adversarial-lite to create a quick adversarial plan for this low-risk bug or feature request."

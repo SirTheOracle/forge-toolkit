@@ -1,6 +1,6 @@
 # Forge Toolkit
 
-A multi-agent orchestration system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Runs adversarial planning, implementation, QA, and automated code review using coordinated AI agents in tmux.
+A multi-agent orchestration system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://github.com/openai/codex). Runs adversarial planning, implementation, QA, and automated code review using coordinated AI agents in tmux. Skills are installed for both Claude Code and Codex so all panes in a forge session share the same capabilities.
 
 ## What It Does
 
@@ -17,6 +17,7 @@ Forge provides structured multi-agent workflows where independent agents investi
 | `adversarial-verify` | 1 agent | Re-run tests + pixel-diff to verify fixes |
 | `forge-coder` | 1 agent | Execute implementation.md diffs procedurally |
 | `docs-refresh` | 1 agent | Living documentation from code |
+| `proposal-reviewer` | 1 agent | Independent proposal review |
 
 **Infrastructure:**
 
@@ -35,7 +36,7 @@ Forge provides structured multi-agent workflows where independent agents investi
 - tmux (for forge sessions)
 - Git
 
-Optional:
+Optional but recommended:
 - [Codex](https://github.com/openai/codex) CLI (for the Codex A/B panes in forge sessions)
 - Playwright (for QA skills)
 
@@ -49,8 +50,9 @@ cd forge-toolkit
 
 The installer:
 1. Symlinks `bin/` scripts to `~/bin/`
-2. Copies `skills/` to `~/.claude/skills/`
-3. Prints instructions for hooks and per-project config
+2. Copies `skills/` to `~/.claude/skills/` (Claude Code)
+3. Copies `codex-skills/` to `~/.codex/skills/` (Codex)
+4. Prints instructions for hooks and per-project config
 
 To uninstall:
 ```bash
@@ -214,7 +216,7 @@ forge-toolkit/
 │   ├── forge-bridge            # Cross-pane messaging
 │   ├── forge-start             # Tmux session launcher
 │   └── forge-dispatch-review   # Auto-dispatch commit reviews
-├── skills/
+├── skills/                     # Claude Code skills (-> ~/.claude/skills/)
 │   ├── forge-orchestrator/     # Pipeline orchestration
 │   ├── forge-coder/            # Procedural code execution
 │   ├── adversarial-proposal/   # Full adversarial planning
@@ -222,14 +224,24 @@ forge-toolkit/
 │   ├── adversarial-implementation/ # Implementation from plan
 │   ├── adversarial-qa/         # Adversarial QA testing
 │   ├── adversarial-verify/     # QA verification
-│   └── docs-refresh/           # Documentation refresh
+│   ├── docs-refresh/           # Documentation refresh
+│   └── proposal-reviewer/      # Independent proposal review (Codex only)
+├── codex-skills/               # Codex skills (-> ~/.codex/skills/)
+│   ├── adversarial-proposal/   # Same skills, adapted for Codex
+│   ├── adversarial-lite/       # (includes openai.yaml agent configs)
+│   ├── adversarial-implementation/
+│   ├── adversarial-qa/
+│   ├── adversarial-verify/
+│   ├── docs-refresh/
+│   ├── forge-coder/
+│   └── proposal-reviewer/
 ├── hooks/
 │   ├── post-commit-review.sh   # Git post-commit hook
 │   └── install-hooks.sh        # Hook installer
 ├── config/
 │   ├── claude-hooks.json       # PostToolUse hook config snippet
 │   └── forge-project.example.yml  # Per-project config template
-├── install.sh                  # Installer
+├── install.sh                  # Installer (handles both Claude + Codex)
 └── README.md
 ```
 

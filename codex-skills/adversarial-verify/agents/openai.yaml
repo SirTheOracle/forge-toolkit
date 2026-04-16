@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adversarial Verify"
+  short_description: "Re-run a QA manifest and produce verification-report.yaml"
+  default_prompt: "Use $adversarial-verify on this .dev/qa/<slug> directory to re-run the manifest, compare screenshots, and write verification-report.yaml."

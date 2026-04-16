@@ -3,8 +3,9 @@
 #
 # What it does:
 #   1. Symlinks bin/ scripts to ~/bin/
-#   2. Copies skills/ to ~/.claude/skills/
-#   3. Prints instructions for hooks setup
+#   2. Copies skills/ to ~/.claude/skills/ (Claude Code)
+#   3. Copies codex-skills/ to ~/.codex/skills/ (Codex)
+#   4. Prints instructions for hooks setup
 #
 # Usage:
 #   ./install.sh              # install everything
@@ -14,8 +15,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$HOME/bin"
-SKILLS_DIR="$HOME/.claude/skills"
+CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
+CODEX_SKILLS_DIR="$HOME/.codex/skills"
 SETTINGS_FILE="$HOME/.claude/settings.json"
+
+SKILL_NAMES=(
+    forge-orchestrator forge-coder adversarial-proposal adversarial-lite
+    adversarial-implementation adversarial-qa adversarial-verify docs-refresh
+    proposal-reviewer
+)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -41,12 +49,19 @@ if [ "${1:-}" = "--uninstall" ]; then
         fi
     done
 
-    # Remove skill directories
-    for skill in forge-orchestrator forge-coder adversarial-proposal adversarial-lite \
-                 adversarial-implementation adversarial-qa adversarial-verify docs-refresh; do
-        if [ -d "$SKILLS_DIR/$skill" ]; then
-            rm -rf "$SKILLS_DIR/$skill"
+    # Remove Claude skill directories
+    for skill in "${SKILL_NAMES[@]}"; do
+        if [ -d "$CLAUDE_SKILLS_DIR/$skill" ]; then
+            rm -rf "$CLAUDE_SKILLS_DIR/$skill"
             ok "  Removed ~/.claude/skills/$skill"
+        fi
+    done
+
+    # Remove Codex skill directories
+    for skill in "${SKILL_NAMES[@]}"; do
+        if [ -d "$CODEX_SKILLS_DIR/$skill" ]; then
+            rm -rf "$CODEX_SKILLS_DIR/$skill"
+            ok "  Removed ~/.codex/skills/$skill"
         fi
     done
 
@@ -104,18 +119,17 @@ fi
 
 echo ""
 
-# ── Step 2: Skills ────────────────────────────────────────
+# ── Step 2: Claude Code Skills ───────────────────────────
 
-info "Step 2: Copying skills to ~/.claude/skills/"
+info "Step 2: Copying Claude Code skills to ~/.claude/skills/"
 
-mkdir -p "$SKILLS_DIR"
+mkdir -p "$CLAUDE_SKILLS_DIR"
 
 for skill_dir in "$SCRIPT_DIR"/skills/*/; do
     skill_name="$(basename "$skill_dir")"
-    dst="$SKILLS_DIR/$skill_name"
+    dst="$CLAUDE_SKILLS_DIR/$skill_name"
 
     if [ -d "$dst" ]; then
-        # Update existing
         rm -rf "$dst"
         cp -R "$skill_dir" "$dst"
         ok "  $skill_name — updated"
@@ -127,9 +141,37 @@ done
 
 echo ""
 
-# ── Step 3: Hooks config ─────────────────────────────────
+# ── Step 3: Codex Skills ─────────────────────────────────
 
-info "Step 3: Claude Code hooks setup"
+info "Step 3: Copying Codex skills to ~/.codex/skills/"
+
+if [ -d "$HOME/.codex" ]; then
+    mkdir -p "$CODEX_SKILLS_DIR"
+
+    for skill_dir in "$SCRIPT_DIR"/codex-skills/*/; do
+        [ -d "$skill_dir" ] || continue
+        skill_name="$(basename "$skill_dir")"
+        dst="$CODEX_SKILLS_DIR/$skill_name"
+
+        if [ -d "$dst" ]; then
+            rm -rf "$dst"
+            cp -R "$skill_dir" "$dst"
+            ok "  $skill_name — updated"
+        else
+            cp -R "$skill_dir" "$dst"
+            ok "  $skill_name — installed"
+        fi
+    done
+else
+    warn "  ~/.codex/ not found — skipping Codex skills"
+    warn "  Install Codex CLI first, then re-run ./install.sh"
+fi
+
+echo ""
+
+# ── Step 4: Hooks config ─────────────────────────────────
+
+info "Step 4: Claude Code hooks setup"
 echo ""
 
 if [ -f "$SETTINGS_FILE" ]; then
@@ -149,9 +191,9 @@ fi
 
 echo ""
 
-# ── Step 4: Per-project setup ─────────────────────────────
+# ── Step 5: Per-project setup ─────────────────────────────
 
-info "Step 4: Per-project setup (do this in each project)"
+info "Step 5: Per-project setup (do this in each project)"
 echo ""
 echo "  a) Copy the forge-project config template:"
 echo "     mkdir -p .claude"
@@ -176,11 +218,12 @@ echo "  forge-start              # Launch a forge tmux session"
 echo "  forge-bridge help        # See all forge-bridge commands"
 echo "  forge-bridge context     # Show current forge context"
 echo ""
-info "Skills available in Claude Code:"
+info "Skills available (Claude Code + Codex):"
 echo "  /adversarial-proposal    # 4-round adversarial planning (Opus)"
 echo "  /adversarial-lite        # 2-round lite planning (Sonnet + Opus)"
 echo "  /adversarial-implementation  # Implementation from plan"
 echo "  /adversarial-qa          # Adversarial QA testing"
 echo "  /adversarial-verify      # Verification of QA findings"
 echo "  /docs-refresh            # Living documentation refresh"
+echo "  /proposal-reviewer       # Independent proposal review"
 echo ""

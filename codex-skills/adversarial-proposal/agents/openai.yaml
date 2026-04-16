@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adversarial Proposal"
+  short_description: "Investigate and write a vetted final-plan.md"
+  default_prompt: "Use $adversarial-proposal on this bug or feature request, investigate it with isolated proposal passes, and write the outputs under the target .dev/proposals/<issue-slug>/ directory."
