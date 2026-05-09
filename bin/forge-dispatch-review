@@ -49,11 +49,17 @@ main() {
         short=$(sed -n 's/^short: *//p' "$f" 2>/dev/null | head -1)
         short_hashes="$short_hashes $short"
 
-        # Check committer — if Codex B made this commit, route to Codex A
+        # Check committer — route worker commits to a Codex reviewer.
         local ident
         ident=$(sed -n 's/^committer_ident: *"*\([^"]*\)"*/\1/p' "$f" 2>/dev/null | head -1)
         case "$ident" in
             *codex-b*|*codex_b*|*tmux-pane-%3*)
+                reviewer="codex-a"
+                ;;
+            *claude-opus*|*claude_opus*|*forge\ pane\ 0*)
+                reviewer="codex-a"
+                ;;
+            *claude-sonnet*|*claude_sonnet*|*forge\ pane\ 4*)
                 reviewer="codex-a"
                 ;;
         esac
@@ -62,6 +68,15 @@ main() {
     if [ "$count" -eq 0 ]; then
         return 0
     fi
+
+    # Defensive guard: commit-review side-channel must never consume worker panes 0 or 4.
+    case "$reviewer" in
+        codex-a|codex-b) ;;
+        *)
+            echo "forge-dispatch-review: ABORT — reviewer '$reviewer' is not codex-a or codex-b (§3 #5)" >&2
+            return 0
+            ;;
+    esac
 
     # Write the dispatch prompt
     mkdir -p "$forge_tmp"

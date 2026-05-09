@@ -7,90 +7,146 @@
 # Falls back to .dev/.forge-session file, then scans for forge sessions.
 #
 # Pane layout:
-#   0 = claude (inline)          LEFT SIDE
-#   1 = claude (orchestrator)    TOP-RIGHT
-#   2 = codex A                  MIDDLE-RIGHT
-#   3 = codex B                  BOTTOM-RIGHT
+#   0 = claude-opus worker      TOP-LEFT
+#   1 = claude orchestrator     BOTTOM-LEFT
+#   2 = codex A                 TOP-RIGHT
+#   3 = codex B                 MIDDLE-RIGHT
+#   4 = claude-sonnet worker    BOTTOM-RIGHT
 #
 # Hooks (enforced by the script, not by skills):
-#   1. send refuses to dispatch unless a log entry exists (log-before-send)
+#   1. send refuses to dispatch unless a pending log entry targets the same pane
+#      (per-target log-before-send; alias-normalized so historical `to: inline`
+#      entries resolve to the canonical `claude-opus` pane-0 worker name and
+#      historical `to: claude` entries match the canonical `claude` orchestrator name)
 #   2. log-response auto-updates .dev/forge-context.yml on completion
+#      (qa, qa-fix, qa-retry do NOT auto-advance — orchestrator decides)
 #   3. context command loads pipeline state for session start
+#   4. require_pane_count validates pane count at every tmux session entry point
 #
-# Commands:
-#   send <pane> <message>       — type into a pane (enforces log-before-send)
-#   send --force <pane> <msg>   — bypass log check (for non-pipeline messages)
+# Tmux-required commands (operate on panes):
+#   send <pane> <message>       — type into a pane (per-target log-before-send hook)
+#   send --force <pane> <msg>   — bypass log check (for non-pipeline messages / callbacks)
 #   read <pane> [lines]         — read from a pane
 #   focus <pane>                — switch focus to a pane
 #   back                        — return focus to orchestrator
-#   signal <from> <message>     — file-based signal (no tmux needed)
+#
+# No-tmux commands (file-based; work from any directory):
+#   preflight                   — kickoff snapshot: pwd, branch, merge state, halt code
+#   signal <from> <message>     — file-based signal
 #   check-signals               — list pending signals
 #   clear-signals               — remove all signal files
+#   review-status               — commit-review verdict counts
 #   log --slug <s> --stage <s> --from <f> --to <t> --prompt <p>
 #   log-response --slug <s> --response <r> [--file <path:action>]...
 #   history [lines]             — project-wide summary
 #   pipeline-log <slug> [lines] — per-pipeline detail
 #   context                     — load current pipeline state (for session start)
 #   set-context --slug <s>      — manually set the active pipeline
+#   add-note <text>             — annotate context (persists across sessions)
+#   alias-self-test [--strict]  — verify pane alias maps stay in lockstep
 #
-# Pane names: inline/general (0), claude/orchestrator (1), codex/codex-a (2), codex-b (3)
+# Pane names: inline/general/claude-opus/opus (0), claude/orchestrator/claude-orchestrator (1),
+#             codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)
 # ============================================================
 
-# --- Session Detection (3-tier fallback) ---
-
-SESSION="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
-
-# Fallback 1: read session name from .dev/.forge-session (written by forge-start)
-if [ -z "$SESSION" ]; then
-    _dir="$(pwd)"
-    while [ "$_dir" != "/" ]; do
-        if [ -f "$_dir/.dev/.forge-session" ]; then
-            SESSION=$(cat "$_dir/.dev/.forge-session")
-            break
-        fi
-        _dir=$(dirname "$_dir")
-    done
-    unset _dir
-fi
-
-# Fallback 2: auto-detect the forge session with 4 panes
-if [ -z "$SESSION" ]; then
-    SESSION=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-        | grep '^forge' \
-        | while read -r s; do
-            panes=$(tmux list-panes -t "$s" 2>/dev/null | wc -l | tr -d ' ')
-            if [ "$panes" -ge 4 ]; then echo "$s"; fi
-          done | tail -1)
-fi
-
-if [ -z "$SESSION" ]; then
-    echo "ERROR: No tmux forge session found. Run forge-start first."
-    exit 1
-fi
+# --- Session-independent globals (no tmux required) ---
 
 WINDOW="0"
 DEV_DIR=".dev"
 SUMMARY_LOG="$DEV_DIR/forge-log.yml"
 CONTEXT_FILE="$DEV_DIR/forge-context.yml"
+SESSION=""   # populated by require_tmux_session() for tmux-required commands
+
+# Required pane count (Phase 2: 5 panes)
+FORGE_REQUIRED_PANES="${FORGE_REQUIRED_PANES:-5}"
+
+# --- Session Detection (called explicitly by tmux-required commands) ---
+
+require_pane_count() {
+    local s="$1"
+    local required="${2:-$FORGE_REQUIRED_PANES}"
+    local count
+    count=$(tmux list-panes -t "$s" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$count" -lt "$required" ]; then
+        cat >&2 <<EOF
+ERROR: Forge session '$s' has $count panes (need $required).
+       This session is pre-Phase-2 (4-pane). Migration required:
+         1. Pause or complete the current pipeline stage
+         2. tmux kill-session -t $s
+         3. rm -f ~/.cache/forge/${s}-pane*.snapshot ~/.cache/forge/${s}-pane*.last-stall-check
+         4. forge-start
+         5. ~/bin/forge-bridge context && type 'forge-resume' to the orchestrator
+EOF
+        return 1
+    fi
+    return 0
+}
+
+require_tmux_session() {
+    local cmd="${1:-(unknown)}"
+
+    SESSION="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+
+    # Fallback 1: read session name from .dev/.forge-session (written by forge-start)
+    if [ -z "$SESSION" ]; then
+        local _dir
+        _dir="$(pwd)"
+        while [ "$_dir" != "/" ]; do
+            if [ -f "$_dir/.dev/.forge-session" ]; then
+                SESSION=$(cat "$_dir/.dev/.forge-session")
+                break
+            fi
+            _dir=$(dirname "$_dir")
+        done
+    fi
+
+    # Fallback 2: auto-detect a forge session with the required pane count
+    if [ -z "$SESSION" ]; then
+        SESSION=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+            | grep '^forge' \
+            | while read -r s; do
+                local panes
+                panes=$(tmux list-panes -t "$s" 2>/dev/null | wc -l | tr -d ' ')
+                if [ "$panes" -ge "$FORGE_REQUIRED_PANES" ]; then echo "$s"; fi
+              done | tail -1)
+    fi
+
+    if [ -z "$SESSION" ]; then
+        echo "ERROR: command '$cmd' requires a tmux forge session. Run forge-start first." >&2
+        return 1
+    fi
+
+    # Validate pane count at every entry point, not just the auto-scan fallback
+    require_pane_count "$SESSION" "$FORGE_REQUIRED_PANES" || return 1
+    return 0
+}
 
 # ---- Helpers ----
 
+# Alias maps must stay in lockstep across:
+#   - pane_index() / pane_name()
+#   - every inline Python ALIAS_TO_CANONICAL map in this file
+#   - cmd_stall_check_status NAME_TO_IDX
+#   - cmd_send worker allowlist
+# Run `~/bin/forge-bridge alias-self-test --strict` after edits.
 pane_index() {
     case "$1" in
-        inline|general|claude-general) echo "0" ;;
-        claude|orchestrator) echo "1" ;;
-        codex|codex-a)  echo "2" ;;
-        codex-b)        echo "3" ;;
-        *)              echo "$1" ;;
+        inline|general|claude-general|claude-opus|opus) echo "0" ;;
+        claude|orchestrator|claude-orchestrator)        echo "1" ;;
+        codex|codex-a)                                  echo "2" ;;
+        codex-b)                                        echo "3" ;;
+        claude-sonnet|sonnet)                           echo "4" ;;
+        *)                                              echo "$1" ;;
     esac
 }
 
 pane_name() {
     case "$1" in
-        0) echo "inline" ;;
+        0) echo "claude-opus" ;;
         1) echo "claude" ;;
         2) echo "codex-a" ;;
         3) echo "codex-b" ;;
+        4) echo "claude-sonnet" ;;
         *) echo "pane-$1" ;;
     esac
 }
@@ -135,13 +191,53 @@ yaml_escape() {
 
 # ---- Hook: Check for pending log entry ----
 
-has_pending_log() {
-    # Returns 0 (true) if there's a log entry with response: null
-    if [ -f "$SUMMARY_LOG" ]; then
-        grep -q "response: null" "$SUMMARY_LOG" 2>/dev/null
-        return $?
+# Resolve any pane alias to its canonical name via pane_index → pane_name.
+canonical_pane_name() {
+    pane_name "$(pane_index "$1")"
+}
+
+# Per-target pending-log check. Returns 0 if a log entry with
+# response: null exists targeting the canonical form of the requested pane.
+# Both the request and each log entry's `to:` field are normalized via
+# the alias map so historical entries (e.g. `to: claude`) resolve correctly.
+has_pending_log_for() {
+    local target_canonical="$1"
+    if [ ! -f "$SUMMARY_LOG" ]; then
+        return 1
     fi
-    return 1
+    python3 - "$SUMMARY_LOG" "$target_canonical" << 'PYEOF'
+import sys, yaml
+
+log_file, target_canonical = sys.argv[1], sys.argv[2]
+
+# Inline alias map mirroring shell pane_index/pane_name.
+# Keep this in lockstep with all other ALIAS_TO_CANONICAL maps.
+ALIAS_TO_CANONICAL = {
+    'inline': 'claude-opus', 'general': 'claude-opus', 'claude-general': 'claude-opus',
+    'claude-opus': 'claude-opus', 'opus': 'claude-opus',
+    'claude': 'claude', 'orchestrator': 'claude', 'claude-orchestrator': 'claude',
+    'codex': 'codex-a', 'codex-a': 'codex-a',
+    'codex-b': 'codex-b',
+    'claude-sonnet': 'claude-sonnet', 'sonnet': 'claude-sonnet',
+}
+
+def canonical(name):
+    return ALIAS_TO_CANONICAL.get(name, name)
+
+try:
+    with open(log_file) as f:
+        data = yaml.safe_load(f) or {}
+except FileNotFoundError:
+    sys.exit(1)
+
+for entry in data.get('entries', []):
+    if entry.get('response') is not None:
+        continue
+    entry_target = canonical(entry.get('to', ''))
+    if entry_target == target_canonical:
+        sys.exit(0)
+sys.exit(1)
+PYEOF
 }
 
 # ---- Hook: Update forge-context.yml ----
@@ -172,21 +268,32 @@ except:
 " 2>/dev/null)
     fi
 
-    # Determine next stage
+    # Determine next stage.
+    # qa, qa-fix, and qa-retry do NOT auto-advance — the orchestrator
+    # decides whether to enter qa-fix (findings present), qa-retry,
+    # verify, or halt. For these stages, preserve any prior orchestrator
+    # intent in next_stage; otherwise fall back to "pending-orchestrator-decision".
     local next_stage=""
     if [ "$status" = "done" ]; then
         case "$stage" in
-            proposal)       next_stage="review" ;;
-            review)         next_stage="incorporate" ;;
-            incorporate)    next_stage="implementation" ;;
-            implementation) next_stage="impl-review" ;;
-            impl-review)    next_stage="coding" ;;
-            coding)         next_stage="qa" ;;
-            qa)             next_stage="verify" ;;
-            verify)         next_stage="complete" ;;
-            commit-review)  next_stage="" ;;  # side-channel, not a pipeline stage
-            *)              next_stage="unknown" ;;
+            proposal)            next_stage="review" ;;
+            review)              next_stage="incorporate" ;;
+            incorporate)         next_stage="implementation" ;;
+            implementation)      next_stage="impl-review" ;;
+            impl-review)         next_stage="coding" ;;
+            coding)              next_stage="qa" ;;
+            qa|qa-fix|qa-retry)  next_stage="" ;;       # orchestrator decides
+            verify)              next_stage="complete" ;;
+            commit-review)       next_stage="" ;;       # side-channel, not a pipeline stage
+            *)                   next_stage="unknown" ;;
         esac
+
+        # For orchestrator-decision stages, preserve previous intent if any.
+        if [ -z "$next_stage" ] && [ "$stage" != "commit-review" ]; then
+            local existing
+            existing=$(grep "^next_stage:" "$CONTEXT_FILE" 2>/dev/null | awk '{print $2}')
+            next_stage="${existing:-pending-orchestrator-decision}"
+        fi
     fi
 
     # Write context file
@@ -323,9 +430,9 @@ cmd_review_status() {
 # ---- Commands ----
 
 cmd_send() {
-    local FORCE=false
+    require_tmux_session "send" || return 1
 
-    # Check for --force flag
+    local FORCE=false
     if [ "$1" = "--force" ]; then
         FORCE=true
         shift
@@ -334,17 +441,24 @@ cmd_send() {
     local PANE_NAME="$1"
     local PANE
     PANE=$(pane_index "$1")
+    local TARGET
+    TARGET=$(canonical_pane_name "$1")
     shift
     local MSG="$*"
 
-    # Hook 1: Enforce log-before-send (skip for --force or messages to non-worker panes)
-    if [ "$FORCE" = false ] && [ "$PANE_NAME" != "claude" ] && [ "$PANE_NAME" != "orchestrator" ] && [ "$PANE_NAME" != "inline" ] && [ "$PANE_NAME" != "general" ] && [ "$PANE_NAME" != "claude-general" ]; then
-        if ! has_pending_log; then
-            echo "HOOK BLOCKED: No pending log entry found."
-            echo "Run 'forge-bridge log' before sending to a worker."
-            echo "Or use 'forge-bridge send --force' to bypass for non-pipeline messages."
-            return 1
-        fi
+    # Per-target log-before-send hook. Worker panes only.
+    # Hard Rule 20's /clear is the only worker-pane --force exemption.
+    if [ "$FORCE" = false ]; then
+        case "$TARGET" in
+            codex-a|codex-b|claude-opus|claude-sonnet)
+                if ! has_pending_log_for "$TARGET"; then
+                    echo "HOOK BLOCKED: No pending log entry targeting '$TARGET'." >&2
+                    echo "Run 'forge-bridge log --to $TARGET ...' before sending." >&2
+                    echo "Or use 'forge-bridge send --force' to bypass for non-pipeline messages." >&2
+                    return 1
+                fi
+                ;;
+        esac
     fi
 
     tmux select-pane -t "$SESSION:$WINDOW.$PANE"
@@ -355,6 +469,7 @@ cmd_send() {
 }
 
 cmd_read() {
+    require_tmux_session "read" || return 1
     local PANE
     PANE=$(pane_index "$1")
     local LINES="${2:-20}"
@@ -362,12 +477,14 @@ cmd_read() {
 }
 
 cmd_focus() {
+    require_tmux_session "focus" || return 1
     local PANE
     PANE=$(pane_index "$1")
     tmux select-pane -t "$SESSION:$WINDOW.$PANE"
 }
 
 cmd_back() {
+    require_tmux_session "back" || return 1
     tmux select-pane -t "$SESSION:$WINDOW.1"
 }
 
@@ -396,6 +513,23 @@ cmd_log() {
     local escaped_prompt
     escaped_prompt=$(yaml_escape "$prompt")
 
+    # Phase 1b Step 4b: record session in pending entries so cmd_stall_check_status
+    # can filter by current session (multi-session correlation, review item #4).
+    local session
+    session="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+    if [ -z "$session" ]; then
+        local _dir
+        _dir="$(pwd)"
+        while [ "$_dir" != "/" ]; do
+            if [ -f "$_dir/.dev/.forge-session" ]; then
+                session=$(cat "$_dir/.dev/.forge-session")
+                break
+            fi
+            _dir=$(dirname "$_dir")
+        done
+    fi
+    [ -z "$session" ] && session="unknown"
+
     ensure_pipeline_log "$slug"
     ensure_summary_log
 
@@ -407,6 +541,7 @@ cmd_log() {
     stage: $stage
     from: $from
     to: $to
+    session: $session
     prompt: $escaped_prompt
     response: null
     files: []
@@ -419,14 +554,21 @@ EOF
     stage: $stage
     from: $from
     to: $to
+    session: $session
     response: null
 EOF
 
-    echo "Logged: $from → $to | $slug/$stage | $ts"
+    echo "Logged: $from → $to | $slug/$stage | $ts (session=$session)"
 }
 
 cmd_log_response() {
-    local slug="" response=""
+    # Phase 1b Step 4a: target-aware response update.
+    # New flags: --to <pane> (alias-normalized), --stage <stage>
+    # Without --to/--stage, ambiguity guard refuses if more than one
+    # `response: null` entry exists in the pipeline log (review item #3).
+    # Backward compat: single-pending-entry pipelines work unchanged.
+
+    local slug="" response="" target="" target_stage=""
     local -a files=()
 
     while [ $# -gt 0 ]; do
@@ -434,13 +576,15 @@ cmd_log_response() {
             --slug)     slug="$2";     shift 2 ;;
             --response) response="$2"; shift 2 ;;
             --file)     files+=("$2"); shift 2 ;;
+            --to)       target="$2";   shift 2 ;;
+            --stage)    target_stage="$2"; shift 2 ;;
             *)          shift ;;
         esac
     done
 
     if [ -z "$slug" ] || [ -z "$response" ]; then
         echo "ERROR: Missing required flags."
-        echo "Usage: forge-bridge log-response --slug <s> --response <r> [--file <path:action>]..."
+        echo "Usage: forge-bridge log-response --slug <s> --response <r> [--to <pane>] [--stage <stage>] [--file <path:action>]..."
         return 1
     fi
 
@@ -449,6 +593,12 @@ cmd_log_response() {
     if [ ! -f "$pipeline_log" ]; then
         echo "ERROR: No log file for pipeline '$slug'"
         return 1
+    fi
+
+    # Normalize --to via the same alias map used in has_pending_log_for.
+    local target_canonical=""
+    if [ -n "$target" ]; then
+        target_canonical=$(canonical_pane_name "$target")
     fi
 
     local files_yaml="[]"
@@ -463,11 +613,8 @@ cmd_log_response() {
         done
     fi
 
-    # Determine status and stage from response
+    # Determine status from response keyword.
     local status="unknown"
-    local stage=""
-    local worker=""
-
     if echo "$response" | grep -qi "FORGE_DONE"; then
         status="done"
     elif echo "$response" | grep -qi "FORGE_BLOCKED"; then
@@ -476,66 +623,130 @@ cmd_log_response() {
         status="error"
     fi
 
-    # Extract stage and worker from the last pending log entry
-    if [ -f "$pipeline_log" ]; then
-        stage=$(python3 -c "
-import yaml
-with open('$pipeline_log') as f:
-    data = yaml.safe_load(f) or {}
-entries = data.get('entries', [])
-for e in reversed(entries):
-    if e.get('response') is None or e.get('response') == 'null':
-        print(e.get('stage', ''))
-        break
-" 2>/dev/null)
-        worker=$(python3 -c "
-import yaml
-with open('$pipeline_log') as f:
-    data = yaml.safe_load(f) or {}
-entries = data.get('entries', [])
-for e in reversed(entries):
-    if e.get('response') is None or e.get('response') == 'null':
-        print(e.get('to', ''))
-        break
-" 2>/dev/null)
+    # Find the target entry's timestamp (the surgical anchor for string-replace).
+    # Filter pending entries by --to (canonical) and --stage. Apply ambiguity
+    # guard if no filters provided and more than one pending entry exists.
+    local matched
+    matched=$(python3 - "$pipeline_log" "$target_canonical" "$target_stage" << 'PYEOF'
+import sys, yaml
+
+pipeline_log = sys.argv[1]
+target_canonical = sys.argv[2] or None
+target_stage = sys.argv[3] or None
+
+ALIAS_TO_CANONICAL = {
+    'inline': 'claude-opus', 'general': 'claude-opus', 'claude-general': 'claude-opus',
+    'claude-opus': 'claude-opus', 'opus': 'claude-opus',
+    'claude': 'claude', 'orchestrator': 'claude', 'claude-orchestrator': 'claude',
+    'codex': 'codex-a', 'codex-a': 'codex-a',
+    'codex-b': 'codex-b',
+    'claude-sonnet': 'claude-sonnet', 'sonnet': 'claude-sonnet',
+}
+def canonical(name):
+    return ALIAS_TO_CANONICAL.get(name, name)
+
+try:
+    with open(pipeline_log) as f:
+        data = yaml.safe_load(f) or {}
+except Exception as ex:
+    print(f"ERR_PARSE:{ex}", file=sys.stderr); sys.exit(2)
+
+entries = data.get('entries') or []
+pending = [e for e in entries if e.get('response') is None]
+if not pending:
+    print("ERR_NO_PENDING", file=sys.stderr); sys.exit(2)
+
+def matches(e):
+    if target_canonical and canonical(e.get('to', '')) != target_canonical:
+        return False
+    if target_stage and e.get('stage', '') != target_stage:
+        return False
+    return True
+
+candidates = [e for e in pending if matches(e)]
+if not candidates:
+    filt = []
+    if target_canonical: filt.append(f"--to={target_canonical}")
+    if target_stage: filt.append(f"--stage={target_stage}")
+    print(f"ERR_NO_MATCH:{' '.join(filt)}", file=sys.stderr); sys.exit(2)
+
+# Ambiguity guard: only when caller supplied no filters.
+if len(candidates) > 1 and not target_canonical and not target_stage:
+    msg = f"ERR_AMBIGUOUS:{len(candidates)} pending entries (run with --to and/or --stage to disambiguate):\n"
+    for e in candidates:
+        msg += f"  - to={e.get('to','?')} stage={e.get('stage','?')} ts={e.get('timestamp','?')}\n"
+    print(msg, file=sys.stderr); sys.exit(2)
+
+# Most recent matching entry (last in list-order).
+chosen = candidates[-1]
+print(f"OK\t{chosen.get('timestamp','')}\t{chosen.get('stage','')}\t{chosen.get('to','')}")
+PYEOF
+)
+    local rc=$?
+    if [ $rc -ne 0 ] || [[ "$matched" != OK* ]]; then
+        # python wrote diagnostic to stderr already; surface a one-line stdout summary
+        echo "ERROR: log-response: target-resolution failed for slug=$slug" >&2
+        return 1
     fi
 
-    # Update the log files
+    local target_ts target_stage_resolved target_to
+    target_ts=$(echo "$matched" | awk -F'\t' '{print $2}')
+    target_stage_resolved=$(echo "$matched" | awk -F'\t' '{print $3}')
+    target_to=$(echo "$matched" | awk -F'\t' '{print $4}')
+
+    # Targeted string-replace anchored to the resolved timestamp. Preserves
+    # YAML formatting / comments (yaml.dump would re-emit and lose them).
     python3 << PYEOF
-escaped_response = """$response""".replace('"', '\\"')
+import re, sys
 
-with open("$pipeline_log", "r") as f:
-    content = f.read()
-
-parts = content.rsplit("response: null", 1)
-if len(parts) == 2:
-    content = parts[0] + 'response: "' + escaped_response + '"' + parts[1]
-
+target_ts = """$target_ts"""
+escaped_response = """$response""".replace('\\\\', '\\\\\\\\').replace('"', '\\\\"')
 files_data = """$files_yaml""".strip()
-if files_data and files_data != "[]":
-    parts = content.rsplit("files: []", 1)
-    if len(parts) == 2:
-        content = parts[0] + "files:" + files_data + parts[1]
 
+# Match the entry by its timestamp anchor; replace ONLY its response: null
+# (and files: [] if files_data is provided).
+pat = re.compile(
+    r'(timestamp:\s*"' + re.escape(target_ts) + r'"[^\n]*\n(?:\s+[^\n]*\n)*?\s+)response:\s*null',
+    re.MULTILINE)
+
+def patch_response(text):
+    new_text, n = pat.subn(
+        lambda m: m.group(1) + 'response: "' + escaped_response + '"', text, count=1)
+    return new_text, n
+
+# Pipeline log
+with open("$pipeline_log") as f:
+    content = f.read()
+content, n = patch_response(content)
+if n != 1:
+    print(f"ERR: pipeline_log patch failed (n={n}, ts={target_ts})", file=sys.stderr)
+    sys.exit(2)
+if files_data and files_data != "[]":
+    fpat = re.compile(
+        r'(timestamp:\s*"' + re.escape(target_ts) + r'"[^\n]*\n(?:\s+[^\n]*\n)*?\s+)files:\s*\[\]',
+        re.MULTILINE)
+    content, _ = fpat.subn(
+        lambda m: m.group(1) + 'files:' + files_data, content, count=1)
 with open("$pipeline_log", "w") as f:
     f.write(content)
 
-with open("$SUMMARY_LOG", "r") as f:
-    content = f.read()
+# Summary log: same anchor; soft-fail if not found (older entries may pre-date Phase 1b).
+try:
+    with open("$SUMMARY_LOG") as f:
+        s_content = f.read()
+    s_new, sn = patch_response(s_content)
+    if sn == 1:
+        with open("$SUMMARY_LOG", "w") as f:
+            f.write(s_new)
+except FileNotFoundError:
+    pass
 
-parts = content.rsplit("response: null", 1)
-if len(parts) == 2:
-    content = parts[0] + 'response: "' + escaped_response + '"' + parts[1]
-
-with open("$SUMMARY_LOG", "w") as f:
-    f.write(content)
-
-print("Updated: $slug | response: $response")
+print("Updated: $slug | to=$target_to | stage=$target_stage_resolved | ts=$target_ts | response: $response")
 PYEOF
 
-    # Hook 2: Auto-update forge-context.yml
-    if [ -n "$stage" ] && [ -n "$status" ]; then
-        update_context "$slug" "$stage" "$status" "$worker"
+    # Hook 2: auto-update forge-context.yml using the resolved entry.
+    if [ -n "$target_stage_resolved" ] && [ -n "$status" ]; then
+        update_context "$slug" "$target_stage_resolved" "$status" "$target_to"
     fi
 }
 
@@ -568,6 +779,22 @@ cmd_pipeline_log() {
 # ---- Context (session start / recovery) ----
 
 cmd_context() {
+    # Phase 1b Step 3: prepend stall-check-status section if non-empty.
+    # Inserted BEFORE the existing early-return so stale-pending warnings
+    # surface even when no $CONTEXT_FILE exists yet.
+    local _stall_status_output
+    local _resolved_root
+    _resolved_root=$(_resolve_project_root "")
+    if [ -n "$_resolved_root" ]; then
+        _stall_status_output=$(cmd_stall_check_status --project-root "$_resolved_root" 2>/dev/null)
+    else
+        _stall_status_output=$(cmd_stall_check_status 2>/dev/null)
+    fi
+    if [ -n "$_stall_status_output" ]; then
+        echo "$_stall_status_output"
+        echo ""
+    fi
+
     if [ ! -f "$CONTEXT_FILE" ]; then
         echo "(no forge context — no active pipeline)"
         echo ""
@@ -687,6 +914,189 @@ else:
     cmd_context
 }
 
+cmd_preflight() {
+    # Pre-flight discipline (Phase 1a). Prints a kickoff snapshot and a
+    # final status_code line. Does NOT require a tmux session. Always
+    # exits 0; orchestrator decides whether to halt based on status_code.
+
+    local cur_pwd
+    cur_pwd=$(pwd)
+
+    # Resolve expected_root: forge-project.yml field, else nearest-ancestor walk-up.
+    local expected_root="" project_yml=""
+    local _dir="$cur_pwd"
+    while [ "$_dir" != "/" ]; do
+        if [ -f "$_dir/.claude/forge-project.yml" ]; then
+            project_yml="$_dir/.claude/forge-project.yml"
+            break
+        fi
+        _dir=$(dirname "$_dir")
+    done
+
+    if [ -n "$project_yml" ]; then
+        expected_root=$(python3 -c "
+import yaml
+try:
+    with open('$project_yml') as f:
+        data = yaml.safe_load(f) or {}
+    print(data.get('forge', {}).get('expected_root', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+        if [ -z "$expected_root" ]; then
+            expected_root=$(dirname "$(dirname "$project_yml")")
+        fi
+    fi
+
+    local directory_state="OK"
+    if [ -z "$expected_root" ]; then
+        directory_state="UNKNOWN"
+    elif [ "$cur_pwd" != "$expected_root" ]; then
+        directory_state="WRONG_DIRECTORY"
+    fi
+
+    # Branch detection
+    local branch
+    branch=$(git branch --show-current 2>/dev/null)
+    local detached="false"
+    if [ -z "$branch" ]; then
+        local sha
+        sha=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        branch="(detached: $sha)"
+        detached="true"
+    fi
+
+    # Resolve base_ref: forge-project.yml override, else origin/HEAD, else origin/main, else main
+    local base_ref=""
+    if [ -n "$project_yml" ]; then
+        base_ref=$(python3 -c "
+import yaml
+try:
+    with open('$project_yml') as f:
+        data = yaml.safe_load(f) or {}
+    print(data.get('forge', {}).get('base_ref', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+    fi
+    if [ -z "$base_ref" ]; then
+        base_ref=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/@@')
+    fi
+    if [ -z "$base_ref" ] && git rev-parse --verify origin/main >/dev/null 2>&1; then
+        base_ref="origin/main"
+    fi
+    if [ -z "$base_ref" ]; then
+        base_ref="main"
+    fi
+
+    # Merge state detection — see check_merge_state() below
+    local merge_state="" merge_method="" merge_detail=""
+    if [ "$detached" = "true" ]; then
+        merge_state="DETACHED_HEAD"
+        merge_method="n/a"
+        merge_detail="HEAD is detached at $branch"
+    else
+        # Method 1: gh-aware
+        if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+            local pr_json
+            pr_json=$(gh pr list --state merged --head "$branch" --limit 1 --json number,mergedAt 2>/dev/null)
+            local pr_num
+            pr_num=$(echo "$pr_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['number']) if d else None" 2>/dev/null)
+            if [ -n "$pr_num" ] && [ "$pr_num" != "None" ]; then
+                local pr_merged_at
+                pr_merged_at=$(echo "$pr_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['mergedAt'][:10]) if d else None" 2>/dev/null)
+                local cherry_count
+                cherry_count=$(git rev-list --cherry-pick --right-only --count "$base_ref...$branch" 2>/dev/null || echo "?")
+                merge_method="gh"
+                if [ "$cherry_count" = "0" ]; then
+                    merge_state="BRANCH_MERGED_CLEAN"
+                    merge_detail="PR #$pr_num merged $pr_merged_at; no drift"
+                elif [ "$cherry_count" = "?" ]; then
+                    merge_state="BRANCH_UNCLEAR"
+                    merge_detail="PR #$pr_num merged $pr_merged_at; cherry-pick count failed"
+                else
+                    merge_state="BRANCH_MERGED_WITH_DRIFT"
+                    merge_detail="PR #$pr_num merged $pr_merged_at; $cherry_count commits since merge (vs $base_ref)"
+                fi
+            fi
+        fi
+
+        # Method 2: git-only fallback
+        if [ -z "$merge_state" ]; then
+            merge_method="git-only"
+            if git merge-base --is-ancestor HEAD "$base_ref" 2>/dev/null; then
+                merge_state="BRANCH_MERGED_CLEAN"
+                merge_detail="HEAD is an ancestor of $base_ref"
+            else
+                local cherry_count
+                cherry_count=$(git rev-list --cherry-pick --right-only --count "$base_ref...$branch" 2>/dev/null)
+                if [ "$cherry_count" = "0" ]; then
+                    merge_state="BRANCH_MERGED_CLEAN"
+                    merge_detail="cherry-pick count vs $base_ref is 0"
+                else
+                    merge_state="BRANCH_UNMERGED"
+                    merge_detail="${cherry_count:-?} unique commits vs $base_ref"
+                fi
+            fi
+        fi
+    fi
+
+    # Determine status_code and human status
+    local status_code=""
+    local status=""
+    case "$merge_state" in
+        BRANCH_UNMERGED)
+            if [ "$directory_state" = "WRONG_DIRECTORY" ]; then
+                status_code="WRONG_DIRECTORY"
+                status="HALT: pwd does not match expected_root ($expected_root)."
+            else
+                status_code="OK"
+                status="OK"
+            fi
+            ;;
+        BRANCH_MERGED_CLEAN)
+            if [ "$directory_state" = "WRONG_DIRECTORY" ]; then
+                status_code="WRONG_DIRECTORY"
+                status="HALT: pwd does not match expected_root ($expected_root)."
+            else
+                status_code="BRANCH_MERGED_CLEAN"
+                status="WARN: branch is fully merged with no drift. Proceed only if intentionally re-using a merged branch."
+            fi
+            ;;
+        BRANCH_MERGED_WITH_DRIFT)
+            status_code="BRANCH_MERGED_WITH_DRIFT"
+            status="HALT: branch was merged in $merge_detail. Continuing risks piling onto an already-merged branch."
+            ;;
+        DETACHED_HEAD)
+            status_code="DETACHED_HEAD"
+            status="HALT: HEAD is detached. Check out a branch before running pipeline."
+            ;;
+        BRANCH_UNCLEAR)
+            status_code="BRANCH_UNCLEAR"
+            status="HALT: merge state is ambiguous. Resolve manually before proceeding."
+            ;;
+        *)
+            status_code="UNKNOWN"
+            status="HALT: merge state could not be determined."
+            ;;
+    esac
+
+    cat <<EOF
+=== Forge Preflight ===
+pwd:                $cur_pwd
+expected_root:      ${expected_root:-(not configured)}
+directory_state:    $directory_state
+branch:             $branch
+base_ref:           $base_ref
+merge_state:        $merge_state
+merge_check_method: $merge_method
+merge_check_detail: $merge_detail
+status:             $status
+status_code:        $status_code
+EOF
+    return 0
+}
+
 cmd_add_note() {
     local note="$*"
 
@@ -720,6 +1130,551 @@ print("Note added.")
 PYEOF
 }
 
+# ---- Stall Detection (Phase 1b) ----
+
+# Cache and config locations.
+FORGE_CACHE_DIR="${FORGE_CACHE_DIR:-$HOME/.cache/forge}"
+FORGE_IDLE_PROMPTS_FILE="${FORGE_IDLE_PROMPTS_FILE:-$HOME/.config/forge/idle-prompts.yml}"
+
+# Resolve project root. With $1 set (explicit --project-root arg), validate
+# the path contains .claude/forge-project.yml. Without, walk up from cwd.
+# Echoes the resolved absolute path on success; empty on failure.
+_resolve_project_root() {
+    local explicit="$1"
+    if [ -n "$explicit" ]; then
+        if [ -d "$explicit" ] && [ -f "$explicit/.claude/forge-project.yml" ]; then
+            (cd "$explicit" && pwd)
+            return 0
+        fi
+        return 1
+    fi
+    local _dir
+    _dir="$(pwd)"
+    while [ "$_dir" != "/" ]; do
+        if [ -f "$_dir/.claude/forge-project.yml" ]; then
+            echo "$_dir"
+            return 0
+        fi
+        _dir=$(dirname "$_dir")
+    done
+    return 1
+}
+
+# stall-check — classify pane state per Phase 1b §2.1 gate.
+# Tmux-required. Reads pane via capture-pane; writes per-pane snapshot to
+# ~/.cache/forge/; writes signal via cmd_signal on STALLED/PROMPTING/
+# COMPLETED-PENDING-LOG-RESPONSE/DEAD; never writes to .dev/forge-log.yml.
+cmd_stall_check() {
+    local project_root_arg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --project-root) project_root_arg="$2"; shift 2 ;;
+            --) shift; break ;;
+            -*) echo "Unknown flag: $1" >&2; return 1 ;;
+            *) break ;;
+        esac
+    done
+    local target="$1"
+    if [ -z "$target" ]; then
+        echo "Usage: forge-bridge stall-check [--project-root <path>] <pane>" >&2
+        return 1
+    fi
+
+    # §2.6: resolve project root and cd before any .dev/ access.
+    local project_root
+    project_root=$(_resolve_project_root "$project_root_arg")
+    if [ -z "$project_root" ]; then
+        echo "UNKNOWN no_project_root pane=$target"
+        return 0
+    fi
+    cd "$project_root" || { echo "UNKNOWN cd_failed pane=$target"; return 0; }
+
+    require_tmux_session "stall-check" || return 1
+
+    local canonical idx
+    canonical=$(canonical_pane_name "$target")
+    idx=$(pane_index "$target")
+
+    # Pane existence check → DEAD signal.
+    if ! tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_index}' 2>/dev/null | grep -qx "$idx"; then
+        cmd_signal "stall-check" "DEAD pane=$canonical session=$SESSION" >/dev/null
+        echo "DEAD pane=$canonical session=$SESSION"
+        return 0
+    fi
+
+    mkdir -p "$FORGE_CACHE_DIR"
+    local cache_file="$FORGE_CACHE_DIR/${SESSION}-pane${idx}.snapshot"
+    local last_check_file="$FORGE_CACHE_DIR/${SESSION}-pane${idx}.last-stall-check"
+
+    # Capture pane → temp file (avoids argv size limits on large scrollback).
+    local raw_file
+    raw_file=$(mktemp -t forge-stall-XXXXXX)
+    tmux capture-pane -p -t "$SESSION:$WINDOW.$idx" -S -50 > "$raw_file" 2>/dev/null
+    if [ ! -s "$raw_file" ]; then
+        rm -f "$raw_file"
+        echo "UNKNOWN capture_failed pane=$canonical"
+        return 0
+    fi
+
+    # has_pending_log_for is internal; runs against $SUMMARY_LOG in cwd.
+    local pending="false"
+    if has_pending_log_for "$canonical"; then
+        pending="true"
+    fi
+
+    local threshold="${FORGE_STALL_THRESHOLD_S:-600}"
+    local now
+    now=$(date +%s)
+
+    # Run the classifier. Outputs: STATE: <line> [\n SIGNAL: <payload>].
+    local out
+    out=$(python3 - "$raw_file" "$cache_file" "$last_check_file" "$pending" \
+        "$threshold" "$now" "$canonical" "$FORGE_IDLE_PROMPTS_FILE" \
+        "$SUMMARY_LOG" "$project_root" <<'PYEOF'
+import sys, os, re, hashlib, yaml
+
+(raw_file, cache_file, last_check_file, pending_str,
+ threshold_s, now_s, canonical, prompts_file, summary_log, project_root) = sys.argv[1:11]
+pending = (pending_str == "true")
+threshold = int(threshold_s)
+now = int(now_s)
+
+with open(raw_file) as f:
+    raw = f.read()
+
+# V3 normalization rules (committed at verification/phase1b-step0/normalize/regex.yml).
+strip_rules = [
+    (r'\x1B\[[0-9;]*[A-Za-z]', ''),
+    (r'\x1B\][0-9;]*\x07', ''),
+    (r'^•\s+Working\s+\([^)]*\)(\s+·\s+.*)?$', '• Working (...)'),
+    (r'^─\s+Worked\s+for\s+\d+m?\s*\d*s\s*─*$', '─ Worked for X ──'),
+    (r'…\s*$', ''),
+    (r'[⠀-⣿]+\s*$', ''),
+    (r'\s+$', ''),
+]
+def normalize(text):
+    out = text
+    for pat, repl in strip_rules:
+        out = re.sub(pat, repl, out, flags=re.MULTILINE)
+    return out
+
+# Regex tables from idle-prompts.yml. Missing/empty → UNKNOWN per §3 #3.
+prompts = {}
+try:
+    with open(prompts_file) as f:
+        prompts = yaml.safe_load(f) or {}
+except (FileNotFoundError, yaml.YAMLError):
+    prompts = {}
+
+regex_set = (prompts.get(canonical) or {}) if isinstance(prompts, dict) else {}
+idle_re_str = (regex_set.get('idle_prompt_anchor') or
+               regex_set.get('idle_prompt') or '').strip()
+prompting_re_str = (regex_set.get('approval_prompt') or '').strip()
+active_re_str = (regex_set.get('active_work_marker') or '').strip()
+
+idle_re = None
+if idle_re_str:
+    try:
+        idle_re = re.compile(idle_re_str, re.MULTILINE)
+    except re.error:
+        idle_re = None
+
+prompting_re = None
+if prompting_re_str:
+    try:
+        prompting_re = re.compile(prompting_re_str, re.MULTILINE)
+    except re.error:
+        prompting_re = None
+
+active_re = None
+if active_re_str:
+    try:
+        active_re = re.compile(active_re_str, re.MULTILINE)
+    except re.error:
+        active_re = None
+
+normalized = normalize(raw)
+new_hash = hashlib.sha256(normalized.encode()).hexdigest()
+
+def _drop_trailing_blanks(text):
+    out = text.splitlines()
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+raw_lines = _drop_trailing_blanks(raw)
+norm_lines_stripped = _drop_trailing_blanks(normalized)
+last5 = '\n'.join(raw_lines[-5:])
+norm_last5 = '\n'.join(norm_lines_stripped[-5:])
+norm_last30 = '\n'.join(norm_lines_stripped[-30:])
+lines = raw.splitlines()  # PROMPTING excerpt scan uses raw lines.
+
+# Look up pending entry meta (slug, stage) for signal payload enrichment.
+ALIAS_TO_CANONICAL = {
+    'inline': 'claude-opus', 'general': 'claude-opus', 'claude-general': 'claude-opus',
+    'claude-opus': 'claude-opus', 'opus': 'claude-opus',
+    'claude': 'claude', 'orchestrator': 'claude', 'claude-orchestrator': 'claude',
+    'codex': 'codex-a', 'codex-a': 'codex-a',
+    'codex-b': 'codex-b',
+    'claude-sonnet': 'claude-sonnet', 'sonnet': 'claude-sonnet',
+}
+def alias_canonical(name):
+    return ALIAS_TO_CANONICAL.get(name, name)
+
+def lookup_pending_meta():
+    try:
+        with open(summary_log) as f:
+            data = yaml.safe_load(f) or {}
+    except (FileNotFoundError, yaml.YAMLError):
+        return None, None
+    for e in data.get('entries', []) or []:
+        if e.get('response') is not None: continue
+        if alias_canonical(e.get('to', '')) != canonical: continue
+        return e.get('pipeline', ''), e.get('stage', '')
+    return None, None
+
+slug_meta, stage_meta = lookup_pending_meta()
+
+cache = None
+if os.path.exists(cache_file):
+    try:
+        with open(cache_file) as f:
+            cache = yaml.safe_load(f) or {}
+    except Exception:
+        cache = None
+
+def write_cache(c):
+    with open(cache_file, 'w') as f:
+        yaml.safe_dump(c, f, default_flow_style=False, sort_keys=False)
+
+def touch_last_check():
+    with open(last_check_file, 'w') as f:
+        f.write(str(now))
+
+def emit(state, extra="", signal_payload=None):
+    line = f"{state} pane={canonical}"
+    if extra:
+        line += f" {extra}"
+    print(f"STATE: {line}")
+    if signal_payload:
+        print(f"SIGNAL: {signal_payload}")
+    touch_last_check()
+
+def make_payload(state, **kv):
+    parts = [f"{state} pane={canonical}"]
+    if slug_meta: parts.append(f"slug={slug_meta}")
+    if stage_meta: parts.append(f"stage={stage_meta}")
+    for k, v in kv.items():
+        parts.append(f"{k}={v}")
+    return " ".join(parts)
+
+# 1. PROMPTING — before any threshold (§2.3).
+if prompting_re and prompting_re.search(raw):
+    excerpt = ""
+    for line in lines[::-1]:
+        if prompting_re.search(line):
+            excerpt = line.strip()[:100].replace('"', "'")
+            break
+    payload = make_payload("PROMPTING", excerpt=f'"{excerpt}"' if excerpt else 'none')
+    emit("PROMPTING", f'excerpt="{excerpt}"' if excerpt else "", payload)
+    sys.exit(0)
+
+# 2. No cache → baseline (§2.2 explicit UNKNOWN, never ACTIVE).
+if not cache:
+    write_cache({'version': 1, 'hash': new_hash,
+                 'last_changed_at': now, 'last_checked_at': now,
+                 'last_signaled_state': '', 'last_signaled_at': 0,
+                 'project_root': project_root})
+    emit("UNKNOWN", "baseline_pending")
+    sys.exit(0)
+
+# Project-root mismatch → wipe and rebaseline (§2.6 self-heal).
+if cache.get('project_root') and cache.get('project_root') != project_root:
+    write_cache({'version': 1, 'hash': new_hash,
+                 'last_changed_at': now, 'last_checked_at': now,
+                 'last_signaled_state': '', 'last_signaled_at': 0,
+                 'project_root': project_root})
+    emit("UNKNOWN", "project_root_mismatch_rebased")
+    sys.exit(0)
+
+# Version mismatch → wipe and rebaseline.
+if cache.get('version') != 1:
+    write_cache({'version': 1, 'hash': new_hash,
+                 'last_changed_at': now, 'last_checked_at': now,
+                 'last_signaled_state': '', 'last_signaled_at': 0,
+                 'project_root': project_root})
+    emit("UNKNOWN", "version_mismatch_rebased")
+    sys.exit(0)
+
+# 3. No pending dispatch → IDLE. By construction never STALLED (§2.1 gate).
+if not pending:
+    if new_hash != cache.get('hash'):
+        cache.update(hash=new_hash, last_changed_at=now, last_checked_at=now)
+    else:
+        cache['last_checked_at'] = now
+    write_cache(cache)
+    emit("IDLE")
+    sys.exit(0)
+
+# 4. Pending exists. Idle-regex availability pre-check (§3 #3 — never permissive).
+if not idle_re:
+    cache['last_checked_at'] = now
+    write_cache(cache)
+    emit("UNKNOWN", "reason=idle_regex_unavailable")
+    sys.exit(0)
+
+# Phase 2: Claude panes require active_work_marker negative gate (§3 #3).
+CLAUDE_WORKERS = {'claude-opus', 'claude-sonnet'}
+if canonical in CLAUDE_WORKERS and not active_re:
+    cache['last_checked_at'] = now
+    write_cache(cache)
+    emit("UNKNOWN", "reason=active_work_marker_unavailable")
+    sys.exit(0)
+
+# 5. Hash changed → real activity.
+if new_hash != cache.get('hash'):
+    cache.update(hash=new_hash, last_changed_at=now, last_checked_at=now,
+                 last_signaled_state='', last_signaled_at=0)
+    write_cache(cache)
+    elapsed = now - cache['last_changed_at']
+    emit("ACTIVE", f"elapsed={elapsed}s")
+    sys.exit(0)
+
+elapsed = now - cache.get('last_changed_at', now)
+
+# Phase 2: ACTIVE-via-active_work_marker. This must precede COMPLETED-PENDING
+# because Claude's model status line is visible during work and matches the
+# idle anchor; the active marker is the discriminator.
+if active_re and active_re.search(norm_last30):
+    cache.update(hash=new_hash, last_changed_at=now, last_checked_at=now,
+                 last_signaled_state='', last_signaled_at=0)
+    write_cache(cache)
+    elapsed = now - cache['last_changed_at']
+    emit("ACTIVE", f"elapsed={elapsed}s")
+    sys.exit(0)
+
+# 6. Hash unchanged AND idle regex matches normalized tail → COMPLETED-PENDING-LOG-RESPONSE.
+if idle_re.search(norm_last5):
+    payload = make_payload("COMPLETED-PENDING-LOG-RESPONSE",
+                           hint=f'"run forge-bridge log-response --to {canonical} from pane scrollback"')
+    cache.update(last_checked_at=now,
+                 last_signaled_state='COMPLETED-PENDING-LOG-RESPONSE',
+                 last_signaled_at=now)
+    write_cache(cache)
+    emit("COMPLETED-PENDING-LOG-RESPONSE", "", payload)
+    sys.exit(0)
+
+# 7. Hash unchanged + no idle match + elapsed >= threshold → STALLED (idempotent).
+if elapsed >= threshold:
+    last_signaled_at = cache.get('last_signaled_at', 0) or 0
+    last_changed_at = cache.get('last_changed_at', 0) or 0
+    signal_payload = None
+    if cache.get('last_signaled_state') != 'STALLED' or last_signaled_at < last_changed_at:
+        signal_payload = make_payload("STALLED",
+            elapsed=f"{elapsed}s",
+            last_change=last_changed_at,
+            reason="no-output-with-pending-dispatch")
+        cache['last_signaled_state'] = 'STALLED'
+        cache['last_signaled_at'] = now
+    cache['last_checked_at'] = now
+    write_cache(cache)
+    emit("STALLED", f"elapsed={elapsed}s", signal_payload)
+    sys.exit(0)
+
+# 8. Hash unchanged + below threshold → ACTIVE (waiting). Don't bump last_changed_at.
+cache['last_checked_at'] = now
+write_cache(cache)
+emit("ACTIVE", f"elapsed={elapsed}s")
+PYEOF
+)
+    rm -f "$raw_file"
+
+    local state_line signal_payload
+    state_line=$(echo "$out" | grep '^STATE: ' | sed 's/^STATE: //' | head -1)
+    signal_payload=$(echo "$out" | grep '^SIGNAL: ' | sed 's/^SIGNAL: //' | head -1)
+
+    if [ -n "$signal_payload" ]; then
+        cmd_signal "stall-check" "$signal_payload" >/dev/null
+    fi
+
+    if [ -n "$state_line" ]; then
+        echo "$state_line"
+    else
+        echo "UNKNOWN classifier_failed pane=$canonical"
+    fi
+}
+
+# stall-check-status — no-tmux self-check for stale stall-check coverage.
+# Reads pending entries from $SUMMARY_LOG, filters by current session,
+# checks last-stall-check timestamp per pane, prints WARN block to stdout
+# when stale entries exist. Empty output when healthy.
+cmd_stall_check_status() {
+    local project_root_arg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --project-root) project_root_arg="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local project_root
+    project_root=$(_resolve_project_root "$project_root_arg")
+    [ -z "$project_root" ] && return 0
+    cd "$project_root" || return 0
+
+    local threshold="${FORGE_STALL_THRESHOLD_S:-600}"
+
+    # Resolve current session (no tmux required for the env path).
+    local current_session
+    current_session="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+    if [ -z "$current_session" ] && [ -f ".dev/.forge-session" ]; then
+        current_session=$(cat ".dev/.forge-session")
+    fi
+
+    python3 - "$SUMMARY_LOG" "$FORGE_CACHE_DIR" "$current_session" "$threshold" "$project_root" <<'PYEOF'
+import sys, os, time, yaml
+
+summary_log, cache_dir, current_session, threshold_s, project_root = sys.argv[1:6]
+threshold = int(threshold_s)
+now = int(time.time())
+stale_threshold = 2 * threshold
+
+ALIAS_TO_CANONICAL = {
+    'inline': 'claude-opus', 'general': 'claude-opus', 'claude-general': 'claude-opus',
+    'claude-opus': 'claude-opus', 'opus': 'claude-opus',
+    'claude': 'claude', 'orchestrator': 'claude', 'claude-orchestrator': 'claude',
+    'codex': 'codex-a', 'codex-a': 'codex-a',
+    'codex-b': 'codex-b',
+    'claude-sonnet': 'claude-sonnet', 'sonnet': 'claude-sonnet',
+}
+def canonical(name): return ALIAS_TO_CANONICAL.get(name, name)
+
+NAME_TO_IDX = {'claude-opus': 0, 'claude': 1, 'codex-a': 2, 'codex-b': 3, 'claude-sonnet': 4}
+
+try:
+    with open(summary_log) as f:
+        data = yaml.safe_load(f) or {}
+except (FileNotFoundError, yaml.YAMLError):
+    sys.exit(0)
+
+warnings = []
+for entry in data.get('entries', []) or []:
+    if entry.get('response') is not None:
+        continue
+    target = canonical(entry.get('to', ''))
+    idx = NAME_TO_IDX.get(target)
+    if idx is None:
+        continue
+    entry_session = entry.get('session', '')
+    if entry_session and current_session and entry_session != current_session:
+        continue  # different session; skip silently
+    legacy = not bool(entry_session)
+    session_for_cache = current_session or entry_session or 'unknown'
+    last_check_file = os.path.join(cache_dir, f"{session_for_cache}-pane{idx}.last-stall-check")
+    age = None
+    if os.path.exists(last_check_file):
+        try:
+            age = now - int(open(last_check_file).read().strip())
+        except Exception:
+            age = None
+    if age is None or age > stale_threshold:
+        slug = entry.get('pipeline', '?')
+        stage = entry.get('stage', '?')
+        ago = f"{age // 60}m" if age is not None else "never"
+        legacy_note = " (legacy entry, no session field)" if legacy else ""
+        cmd = f"~/bin/forge-bridge stall-check --project-root \"{project_root}\" {target}"
+        warnings.append((target, slug, stage, ago, legacy_note, cmd))
+
+if warnings:
+    print("=== Stall Check Status ===")
+    for (target, slug, stage, ago, legacy_note, cmd) in warnings:
+        print(f"WARN: {target} has pending dispatch (slug={slug}, stage={stage})")
+        print(f"      stall-check has not run in {ago}.{legacy_note}")
+        print(f"      Run: {cmd}")
+PYEOF
+}
+
+cmd_alias_self_test() {
+    local STRICT=false
+    if [ "${1:-}" = "--strict" ]; then
+        STRICT=true
+        shift
+    fi
+
+    python3 - "$0" "$STRICT" <<'PYEOF'
+import re, sys
+
+bridge = sys.argv[1]
+strict = (sys.argv[2] == 'true')
+with open(bridge) as f:
+    src = f.read()
+
+pane_index_block = re.search(r'pane_index\(\)\s*\{(.*?)\n\}', src, re.DOTALL)
+pane_name_block = re.search(r'pane_name\(\)\s*\{(.*?)\n\}', src, re.DOTALL)
+problems = []
+if not pane_index_block:
+    problems.append("missing pane_index() block")
+if not pane_name_block:
+    problems.append("missing pane_name() block")
+if problems:
+    for p in problems:
+        print(f"alias-self-test: {p}", file=sys.stderr)
+    sys.exit(1)
+
+m_idx = {}
+for line in pane_index_block.group(1).splitlines():
+    mm = re.match(r'\s+(\S+)\)\s*echo\s*"(\d+|\$1)"', line)
+    if not mm:
+        continue
+    if mm.group(2) == '$1':
+        continue
+    for alias in mm.group(1).split('|'):
+        m_idx[alias] = int(mm.group(2))
+
+m_name = {}
+for line in pane_name_block.group(1).splitlines():
+    mm = re.match(r'\s+(\d+)\)\s*echo\s*"([^"]+)"', line)
+    if mm:
+        m_name[int(mm.group(1))] = mm.group(2)
+
+expected_canonical = {alias: m_name[idx] for alias, idx in m_idx.items() if idx in m_name}
+if strict and len(expected_canonical) < 7:
+    print(f"alias-self-test: STRICT FAIL — parser found {len(expected_canonical)} aliases, expected >=7", file=sys.stderr)
+    sys.exit(2)
+
+py_maps = re.findall(r"ALIAS_TO_CANONICAL\s*=\s*\{([^}]+)\}", src)
+if strict and len(py_maps) < 4:
+    print(f"alias-self-test: STRICT FAIL — parser found {len(py_maps)} ALIAS_TO_CANONICAL maps, expected >=4", file=sys.stderr)
+    sys.exit(2)
+
+for i, py_map in enumerate(py_maps):
+    pairs = re.findall(r"'([^']+)':\s*'([^']+)'", py_map)
+    py_canon = dict(pairs)
+    for alias, canonical in expected_canonical.items():
+        if alias not in py_canon:
+            problems.append(f"map#{i}: missing alias '{alias}'")
+        elif py_canon[alias] != canonical:
+            problems.append(f"map#{i}: '{alias}' bash='{canonical}' python='{py_canon[alias]}'")
+
+name_to_idx_match = re.search(r"NAME_TO_IDX\s*=\s*\{([^}]+)\}", src)
+if not name_to_idx_match:
+    problems.append("NAME_TO_IDX missing")
+else:
+    pairs = re.findall(r"'([^']+)':\s*(\d+)", name_to_idx_match.group(1))
+    name_to_idx = dict(pairs)
+    for canonical in set(expected_canonical.values()):
+        if canonical not in name_to_idx:
+            problems.append(f"NAME_TO_IDX missing '{canonical}'")
+
+if problems:
+    for p in problems:
+        print(f"alias-self-test: {p}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"alias-self-test: OK ({len(expected_canonical)} aliases verified, {len(py_maps)} maps checked)")
+PYEOF
+}
+
 # ---- Main ----
 
 case "${1:-help}" in
@@ -738,43 +1693,47 @@ case "${1:-help}" in
     context)         cmd_context ;;
     set-context)     shift; cmd_set_context "$@" ;;
     add-note)        shift; cmd_add_note "$@" ;;
+    preflight)       cmd_preflight ;;
+    stall-check)         shift; cmd_stall_check "$@" ;;
+    stall-check-status)  shift; cmd_stall_check_status "$@" ;;
+    alias-self-test)     shift; cmd_alias_self_test "$@" ;;
     help|*)
         echo "forge-bridge — cross-pane messaging with hooks and audit log"
-        echo "Session: ${SESSION:-none} (auto-detected)"
         echo ""
-        echo "Messaging (requires tmux):"
-        echo "  send <pane> <message>         Send to a pane (enforces log-before-send)"
+        echo "Tmux-required commands (operate on panes; need an active forge session):"
+        echo "  send <pane> <message>         Send to a pane (enforces per-target log-before-send)"
         echo "  send --force <pane> <message>  Bypass log check (non-pipeline messages)"
         echo "  read <pane> [lines]           Read last N lines from a pane"
         echo "  focus <pane>                  Switch focus to a pane"
         echo "  back                          Return focus to orchestrator"
+        echo "  stall-check [--project-root <p>] <pane>"
+        echo "                                Classify pane state (IDLE/ACTIVE/STALLED/PROMPTING/COMPLETED-PENDING-LOG-RESPONSE/DEAD/UNKNOWN)"
         echo ""
-        echo "Signals (file-based, no tmux needed — works from sandboxed agents):"
+        echo "No-tmux commands (file-based; work from any directory, with or without a session):"
+        echo "  preflight                     Print kickoff snapshot (pwd, branch, merge state, halt status)"
         echo "  signal <from> <message>       Write a signal file to .dev/signals/"
         echo "  check-signals                 List pending signals"
         echo "  clear-signals                 Remove all signal files"
-        echo ""
-        echo "Reviews (commit-review pipeline):"
         echo "  review-status                 Show pending/completed review counts and blocking items"
-        echo ""
-        echo "Logging:"
         echo "  log --slug <s> --stage <s> --from <f> --to <t> --prompt <p>"
         echo "                                Log a dispatch entry"
-        echo "  log-response --slug <s> --response <r> [--file <path:action>]..."
-        echo "                                Update last entry with response + files"
         echo "  history [lines]               Show project-wide summary"
         echo "  pipeline-log <slug> [lines]   Show per-pipeline detail"
-        echo ""
-        echo "Context (session start / recovery):"
         echo "  context                       Show current pipeline state"
         echo "  set-context --slug <s>        Set active pipeline (auto-derives state)"
         echo "  add-note <text>               Add a note to context (persists across sessions)"
+        echo "  stall-check-status [--project-root <p>]"
+        echo "                                List panes with pending dispatch and stale stall-check coverage"
+        echo "  alias-self-test [--strict]    Verify pane alias maps stay in lockstep"
+        echo "  log-response --slug <s> --response <r> [--to <pane>] [--stage <stage>] [--file <path:action>]..."
+        echo "                                Update a pending entry; --to disambiguates when multiple pending"
         echo ""
-        echo "Panes: inline/general (0), claude/orchestrator (1), codex/codex-a (2), codex-b (3)"
+        echo "Panes: claude-opus/opus/inline/general (0), claude/orchestrator/claude-orchestrator (1), codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)"
         echo ""
         echo "Hooks (automatic):"
-        echo "  - send blocks unless log entry exists (use --force to bypass)"
-        echo "  - log-response auto-updates forge-context.yml"
-        echo "  - context reads pipeline state for session recovery"
+        echo "  - send blocks unless a pending log entry targets the same pane (per-target check)"
+        echo "  - log-response auto-updates forge-context.yml (qa/qa-fix/qa-retry are orchestrator-decided)"
+        echo "  - require_pane_count validates pane count at every tmux session entry point"
+        echo "  - preflight halts on BRANCH_MERGED_WITH_DRIFT / WRONG_DIRECTORY / DETACHED_HEAD / BRANCH_UNCLEAR"
         ;;
 esac

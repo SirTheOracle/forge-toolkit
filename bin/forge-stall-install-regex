@@ -1,0 +1,149 @@
+#!/bin/bash
+# ============================================================
+# forge-stall-install-regex — install runtime idle-prompt regex from
+# committed verification fixtures.
+# ============================================================
+#
+# The runtime config at ~/.config/forge/idle-prompts.yml is an installed
+# copy of fields from committed fixtures at:
+#   - <project>/.dev/proposals/forge-sonnet-pane/verification/phase1b-step0/codex-idle/regex.yml
+#   - <project>/.dev/proposals/forge-sonnet-pane/verification/phase1b-step0/codex-prompting/regex.yml
+#   - <project>/.dev/proposals/forge-sonnet-pane/verification/phase2-step0/claude-opus-idle/regex.yml
+#   - <project>/.dev/proposals/forge-sonnet-pane/verification/phase2-step0/claude-prompting/regex.yml
+#
+# Usage:
+#   forge-stall-install-regex                    # uses cwd's project root
+#   forge-stall-install-regex --project-root <p>
+# ============================================================
+
+set -e
+
+PROJECT_ROOT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+        *) echo "Unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Walk up to find project root if not given.
+if [ -z "$PROJECT_ROOT" ]; then
+    _dir="$(pwd)"
+    while [ "$_dir" != "/" ]; do
+        if [ -f "$_dir/.claude/forge-project.yml" ]; then
+            PROJECT_ROOT="$_dir"
+            break
+        fi
+        _dir=$(dirname "$_dir")
+    done
+fi
+
+if [ -z "$PROJECT_ROOT" ] || [ ! -d "$PROJECT_ROOT" ]; then
+    echo "ERROR: cannot resolve project root. Pass --project-root <path>." >&2
+    exit 1
+fi
+
+IDLE_FIXTURE="$PROJECT_ROOT/.dev/proposals/forge-sonnet-pane/verification/phase1b-step0/codex-idle/regex.yml"
+PROMPTING_FIXTURE="$PROJECT_ROOT/.dev/proposals/forge-sonnet-pane/verification/phase1b-step0/codex-prompting/regex.yml"
+PHASE2_IDLE_FIXTURE="$PROJECT_ROOT/.dev/proposals/forge-sonnet-pane/verification/phase2-step0/claude-opus-idle/regex.yml"
+PHASE2_PROMPTING_FIXTURE="$PROJECT_ROOT/.dev/proposals/forge-sonnet-pane/verification/phase2-step0/claude-prompting/regex.yml"
+RUNTIME_FILE="$HOME/.config/forge/idle-prompts.yml"
+
+if [ ! -f "$IDLE_FIXTURE" ]; then
+    echo "ERROR: idle fixture not found at $IDLE_FIXTURE" >&2
+    exit 1
+fi
+
+if [ ! -f "$PHASE2_IDLE_FIXTURE" ]; then
+    echo "ERROR: Phase 2 idle fixture not found at $PHASE2_IDLE_FIXTURE" >&2
+    exit 1
+fi
+
+if [ ! -f "$PHASE2_PROMPTING_FIXTURE" ]; then
+    echo "WARN: Phase 2 prompting fixture not found at $PHASE2_PROMPTING_FIXTURE; Claude PROMPTING runtime entries will have empty approval_prompt" >&2
+fi
+
+mkdir -p "$(dirname "$RUNTIME_FILE")"
+
+python3 - "$IDLE_FIXTURE" "$PROMPTING_FIXTURE" "$PHASE2_IDLE_FIXTURE" "$PHASE2_PROMPTING_FIXTURE" "$RUNTIME_FILE" <<'PYEOF'
+import sys, os, yaml
+
+idle_path, prompting_path, phase2_idle_path, phase2_prompting_path, runtime_path = sys.argv[1:6]
+
+with open(idle_path) as f:
+    idle_data = yaml.safe_load(f) or {}
+
+prompting_data = {}
+if os.path.exists(prompting_path):
+    try:
+        with open(prompting_path) as f:
+            full = yaml.safe_load(f) or {}
+        # codex-prompting fixture has nested `regexes:` block per V2 schema.
+        prompting_data = full.get('regexes', {})
+    except Exception:
+        prompting_data = {}
+
+phase2_idle_data = {}
+if os.path.exists(phase2_idle_path):
+    try:
+        with open(phase2_idle_path) as f:
+            phase2_idle_data = yaml.safe_load(f) or {}
+    except Exception:
+        phase2_idle_data = {}
+
+phase2_prompting_data = {}
+if os.path.exists(phase2_prompting_path):
+    try:
+        with open(phase2_prompting_path) as f:
+            full = yaml.safe_load(f) or {}
+        phase2_prompting_data = {
+            k: v for k, v in full.items()
+            if k in ('claude-opus', 'claude-sonnet') and isinstance(v, dict)
+        }
+    except Exception:
+        phase2_prompting_data = {}
+
+runtime = {'version': 1}
+
+def copy_entry(canonical, idle_source, prompt_source, default_empty_prompt=False):
+    entry = {}
+    src_idle = idle_source.get(canonical, {}) if isinstance(idle_source.get(canonical), dict) else {}
+    if src_idle.get('idle_prompt_anchor'):
+        entry['idle_prompt_anchor'] = src_idle['idle_prompt_anchor']
+    if src_idle.get('active_work_marker'):
+        entry['active_work_marker'] = src_idle['active_work_marker']
+    if src_idle.get('past_work_marker'):
+        entry['past_work_marker'] = src_idle['past_work_marker']
+    src_prompt = prompt_source.get(canonical, {}) if isinstance(prompt_source.get(canonical), dict) else {}
+    if src_prompt.get('approval_prompt'):
+        entry['approval_prompt'] = src_prompt['approval_prompt']
+    elif default_empty_prompt:
+        entry['approval_prompt'] = ''
+    if entry:
+        runtime[canonical] = entry
+
+for canonical in ('codex-a', 'codex-b'):
+    copy_entry(canonical, idle_data, prompting_data, default_empty_prompt=True)
+
+# Phase 2 fixture shape: one claude-opus-idle/regex.yml file contains both
+# claude-opus and claude-sonnet blocks.
+missing_phase2_prompting = []
+for canonical in ('claude-opus', 'claude-sonnet'):
+    copy_entry(canonical, phase2_idle_data, phase2_prompting_data, default_empty_prompt=True)
+    if not runtime.get(canonical, {}).get('approval_prompt'):
+        missing_phase2_prompting.append(canonical)
+
+if missing_phase2_prompting:
+    print("WARN: Phase 2 prompting fixture did not provide approval_prompt for: "
+          + ", ".join(missing_phase2_prompting),
+          file=sys.stderr)
+
+with open(runtime_path, 'w') as f:
+    yaml.safe_dump(runtime, f, default_flow_style=False, sort_keys=False)
+
+print(f"Installed: {runtime_path}")
+print(f"  source: {idle_path}")
+print(f"          {prompting_path}")
+print(f"          {phase2_idle_path}")
+print(f"          {phase2_prompting_path}")
+PYEOF

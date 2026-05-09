@@ -5,17 +5,17 @@
 #
 # Layout:
 #   ┌──────────────────┬──────────────────┐
-#   │                  │  Pane 1          │
-#   │                  │  Claude          │
-#   │                  │  (orchestrator)  │
+#   │ Pane 0           │ Pane 2           │
+#   │ Claude Opus      │ Codex A          │
+#   │ worker           │                  │
+#   ├──────────────────┤                  │
+#   │ Pane 1           ├──────────────────┤
+#   │ Claude Opus      │ Pane 3           │
+#   │ orchestrator     │ Codex B          │
 #   │                  ├──────────────────┤
-#   │  Pane 0          │  Pane 2          │
-#   │  Claude          │  Codex A         │
-#   │  (inline)        │                  │
-#   │                  ├──────────────────┤
-#   │                  │  Pane 3          │
-#   │                  │  Codex B         │
-#   │                  │                  │
+#   │                  │ Pane 4           │
+#   │                  │ Claude Sonnet    │
+#   │                  │ worker           │
 #   └──────────────────┴──────────────────┘
 #
 # Usage:
@@ -37,41 +37,60 @@ else
     SESSION="forge-$COUNT"
 fi
 
-# Create session — pane 0 (left: claude inline)
+# 5-pane split sequence (verified by Phase 2 Step 0 V6).
 tmux new-session -d -s "$SESSION" -c "$DIR"
-
-# Split right — pane 1 (right side: orchestrator)
 tmux split-window -h -t "$SESSION:.0" -c "$DIR" -p 50
-
-# Split pane 1 down — pane 2 (codex A, middle-right)
-tmux split-window -v -t "$SESSION:.1" -c "$DIR" -p 66
-
-# Split pane 2 down — pane 3 (codex B, bottom-right)
-tmux split-window -v -t "$SESSION:.2" -c "$DIR" -p 50
+tmux split-window -v -t "$SESSION:.0" -c "$DIR" -p 50
+tmux split-window -v -t "$SESSION:.2" -c "$DIR" -p 66
+tmux split-window -v -t "$SESSION:.3" -c "$DIR" -p 50
 
 # Enable mouse
 tmux set -g mouse on
 
-# Launch CLIs in each pane
-tmux send-keys -t "$SESSION:.0" "claude" Enter
-tmux send-keys -t "$SESSION:.1" "claude" Enter
+# Launch CLIs in each pane (verified by Phase 2 Step 0 V7).
+tmux send-keys -t "$SESSION:.0" "claude --model claude-opus-4-7 --permission-mode acceptEdits" Enter
+tmux send-keys -t "$SESSION:.1" "claude --model claude-opus-4-7" Enter
 tmux send-keys -t "$SESSION:.2" "codex" Enter
 tmux send-keys -t "$SESSION:.3" "codex" Enter
+tmux send-keys -t "$SESSION:.4" "claude --model claude-sonnet-4-6 --permission-mode acceptEdits" Enter
 
-# Focus on pane 0 (claude inline)
-tmux select-pane -t "$SESSION:.0"
+# Layout invariant assertion: panes 0/1 left, panes 2/3/4 right.
+_actual=$(tmux list-panes -t "$SESSION" -F '#{pane_index} #{pane_left}' | sort -n)
+_left_idx=$(echo "$_actual" | awk '$2==0 {print $1}' | tr '\n' ',' | sed 's/,$//')
+_right_idx=$(echo "$_actual" | awk '$2!=0 {print $1}' | tr '\n' ',' | sed 's/,$//')
+if [ "$_left_idx" != "0,1" ] || [ "$_right_idx" != "2,3,4" ]; then
+    echo "ERROR: forge-start layout invariant failed (left={$_left_idx} right={$_right_idx})" >&2
+    tmux list-panes -t "$SESSION" -F '#{pane_index} L=#{pane_left} T=#{pane_top}' >&2
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    rm -f "$DIR/.dev/.forge-session"
+    exit 1
+fi
+
+# Focus on pane 1 (orchestrator)
+tmux select-pane -t "$SESSION:.1"
+
+# Phase 1b §2.7: wipe stall-check cache for any prior session reusing this name.
+# (forge-1 etc. get reused after kill-session; without this, the new session
+# inherits stale per-pane snapshots/timestamps from the prior incarnation.)
+mkdir -p "$HOME/.cache/forge"
+rm -f "$HOME/.cache/forge/${SESSION}-pane"*.snapshot \
+      "$HOME/.cache/forge/${SESSION}-pane"*.last-stall-check 2>/dev/null
 
 # Persist session name so forge-bridge works from any subprocess
 mkdir -p "$DIR/.dev"
 echo "$SESSION" > "$DIR/.dev/.forge-session"
 
+# Defensive alias drift check; WARN-not-halt.
+~/bin/forge-bridge alias-self-test --strict || echo "WARN: forge-bridge alias maps drifted or parser skipped entries; investigate before running pipelines" >&2
+
 echo ""
 echo "Session '$SESSION' ready."
 echo ""
-echo "  Pane 0 (left):          Claude inline"
-echo "  Pane 1 (top-right):     Claude orchestrator"
-echo "  Pane 2 (middle-right):  Codex A"
-echo "  Pane 3 (bottom-right):  Codex B"
+echo "  Pane 0 (top-left):      Claude Opus worker"
+echo "  Pane 1 (bottom-left):   Claude Opus orchestrator"
+echo "  Pane 2 (top-right):     Codex A"
+echo "  Pane 3 (middle-right):  Codex B"
+echo "  Pane 4 (bottom-right):  Claude Sonnet worker"
 echo ""
 echo "Attach with:  tmux attach -t $SESSION"
 echo ""
