@@ -1,0 +1,58 @@
+version: 1
+
+# Forge system docs-refresh manifest.
+#
+# The forge "project" lives across three locations:
+#   - ~/bin/forge-bridge                   — the coordination shell script
+#   - ~/.claude/agents/forge-orchestrator.md — the orchestrator agent body
+#   - ~/.claude/commands/forge*.md         — slash-command entry points
+#   - ~/.config/forge/                     — runtime config (prompts, classifier tables)
+#
+# This workspace (~/sirtheoracle/automation/forge-files/) holds the handoff
+# notes and plans for the ongoing refactor. The manifest references the
+# real source files by absolute path so docs stay aligned with code.
+
+sources:
+  forge.bridge:
+    - /Users/sirdrafton/bin/forge-bridge
+  forge.orchestrator:
+    - /Users/sirdrafton/.claude/agents/forge-orchestrator.md
+  forge.commands:
+    - /Users/sirdrafton/.claude/commands/forge.md
+    - /Users/sirdrafton/.claude/commands/forge-orchestrator.md
+    - /Users/sirdrafton/.claude/commands/forge-status.md
+  forge.classifier:
+    - /Users/sirdrafton/.config/forge/idle-prompts.yml
+  forge.project_schema:
+    - /Users/sirdrafton/sirtheoracle/automation/promptlol/.claude/forge-project.yml
+
+targets:
+  - id: technical-reference
+    path: docs/technical-reference.md
+    sections:
+      - id: architecture
+        sources: [forge.orchestrator, forge.commands, forge.bridge]
+      - id: bridge-commands
+        sources: [forge.bridge]
+      - id: orchestrator-hard-rules
+        sources: [forge.orchestrator]
+      - id: stage-routing
+        sources: [forge.orchestrator]
+      - id: pane-layout-and-classifier
+        sources: [forge.bridge, forge.classifier]
+      - id: project-config
+        sources: [forge.project_schema, forge.orchestrator]
+
+  - id: operator-guide
+    path: docs/forge-operator-guide.md
+    sections:
+      - id: getting-started
+        sources: [forge.commands, forge.orchestrator]
+      - id: running-a-pipeline
+        sources: [forge.orchestrator]
+      - id: interrupting-and-resuming
+        sources: [forge.orchestrator]
+      - id: status-and-health
+        sources: [forge.bridge, forge.commands]
+      - id: recovery
+        sources: [forge.orchestrator, forge.bridge]
