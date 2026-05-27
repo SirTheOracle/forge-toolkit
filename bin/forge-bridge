@@ -666,6 +666,65 @@ EOF
     echo "Logged: $from → $to | $slug/$stage | $ts (session=$session)"
 }
 
+# Internal no-context patch primitive (orphan-log-entries fix, v2 Review #1).
+# Rewrites `response: null` -> a given string on a timestamp anchor in BOTH the
+# per-pipeline log and the summary log, reusing the same surgical string-replace
+# as cmd_log_response (preserves YAML/comments) but WITHOUT deriving a status or
+# calling update_context. Used by `dispatch --supersede` and the orphan
+# migration to close pendings as sentinels — routing those through the public
+# cmd_log_response would corrupt forge-context.yml (status=unknown) and spam a
+# STAGE heartbeat. Real worker callbacks must still use cmd_log_response.
+#   _patch_response_by_ts <slug> <timestamp> <response>
+_patch_response_by_ts() {
+    local slug="$1" target_ts="$2" response="$3"
+    local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
+    if [ ! -f "$pipeline_log" ]; then
+        echo "ERROR: _patch_response_by_ts: no log file for pipeline '$slug'" >&2
+        return 1
+    fi
+    python3 - "$pipeline_log" "$SUMMARY_LOG" "$target_ts" "$response" <<'PYEOF'
+import re, sys
+
+pipeline_log, summary_log, target_ts, response = sys.argv[1:5]
+escaped_response = response.replace('\\', '\\\\').replace('"', '\\"')
+
+# Match the entry by its timestamp anchor; replace ONLY its `response: null`.
+pat = re.compile(
+    r'(timestamp:\s*"' + re.escape(target_ts) + r'"[^\n]*\n(?:\s+[^\n]*\n)*?\s+)response:\s*null',
+    re.MULTILINE)
+
+def patch(text):
+    return pat.subn(lambda m: m.group(1) + 'response: "' + escaped_response + '"',
+                    text, count=1)
+
+with open(pipeline_log) as f:
+    content = f.read()
+content, n = patch(content)
+if n != 1:
+    print(f"ERR: _patch_response_by_ts: pipeline_log patch failed (n={n}, ts={target_ts})",
+          file=sys.stderr)
+    sys.exit(2)
+with open(pipeline_log, "w") as f:
+    f.write(content)
+
+# Summary log: same anchor; soft-fail if absent (older entries may pre-date it).
+try:
+    with open(summary_log) as f:
+        s_content = f.read()
+    s_new, sn = patch(s_content)
+    if sn == 1:
+        with open(summary_log, "w") as f:
+            f.write(s_new)
+except FileNotFoundError:
+    pass
+PYEOF
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "ERROR: _patch_response_by_ts: failed for slug=$slug ts=$target_ts" >&2
+        return 1
+    fi
+}
+
 cmd_log_response() {
     # Phase 1b Step 4a: target-aware response update.
     # New flags: --to <pane> (alias-normalized), --stage <stage>
@@ -784,7 +843,13 @@ if len(candidates) > 1 and not target_canonical and not target_stage:
 
 # Most recent matching entry (last in list-order).
 chosen = candidates[-1]
-print(f"OK\t{chosen.get('timestamp','')}\t{chosen.get('stage','')}\t{chosen.get('to','')}")
+# D2 (orphan-log-entries): a filtered call may still match >1 pending (the
+# ambiguity guard above fires only when NO filters are given). We close this
+# most-recent one and report the older skipped duplicates so the shell can emit
+# a durable WARN + audit event. Extra tab fields are ignored by older callers.
+skipped = candidates[:-1]
+skipped_ts = ",".join(e.get('timestamp', '') for e in skipped)
+print(f"OK\t{chosen.get('timestamp','')}\t{chosen.get('stage','')}\t{chosen.get('to','')}\t{len(skipped)}\t{skipped_ts}")
 PYEOF
 )
     local rc=$?
@@ -794,10 +859,12 @@ PYEOF
         return 1
     fi
 
-    local target_ts target_stage_resolved target_to
+    local target_ts target_stage_resolved target_to n_skipped skipped_ts
     target_ts=$(echo "$matched" | awk -F'\t' '{print $2}')
     target_stage_resolved=$(echo "$matched" | awk -F'\t' '{print $3}')
     target_to=$(echo "$matched" | awk -F'\t' '{print $4}')
+    n_skipped=$(echo "$matched" | awk -F'\t' '{print $5}')
+    skipped_ts=$(echo "$matched" | awk -F'\t' '{print $6}')
 
     # Targeted string-replace anchored to the resolved timestamp. Preserves
     # YAML formatting / comments (yaml.dump would re-emit and lose them).
@@ -852,6 +919,18 @@ except FileNotFoundError:
 
 print("Updated: $slug | to=$target_to | stage=$target_stage_resolved | ts=$target_ts | response: $response")
 PYEOF
+
+    # D2 (orphan-log-entries): >1 pending matched the filter; we closed the most
+    # recent (candidates[-1]) and left the older duplicate(s) OPEN. Emit a loud
+    # stderr WARN AND a durable audit event. cmd_callback runs this with
+    # >/dev/null 2>&1 (the normal callback path), so the audit event — not the
+    # stderr WARN — is the signal that survives there. MUST NOT change the exit
+    # code: this sits before the final update_context, whose rc stays the
+    # function's return value (the orchestrator reads it as success/failure).
+    if [ -n "$n_skipped" ] && [ "$n_skipped" -gt 0 ] 2>/dev/null; then
+        echo "WARN: log-response closed the most recent of $((n_skipped + 1)) pending entries for slug=$slug stage=$target_stage_resolved to=$target_to; $n_skipped older duplicate(s) left OPEN (ts: $skipped_ts). Run 'dispatch --supersede' or the orphan migration to close them." >&2
+        _emit_event WARN_DUP_PENDING "$slug" "stage=$target_stage_resolved to=$target_to closed_ts=$target_ts skipped=$n_skipped skipped_ts=$skipped_ts"
+    fi
 
     # Hook 2: auto-update forge-context.yml using the resolved entry.
     if [ -n "$target_stage_resolved" ] && [ -n "$status" ]; then
@@ -1108,6 +1187,32 @@ current_since  = (pending[-1].get('timestamp') if pending else None)
 def short_time(ts):
     return ts[11:16] if isinstance(ts, str) and len(ts) >= 16 else (ts or '?')
 
+def _stale_suffix(ts):
+    # D3 (orphan-log-entries): mark a pending entry STALE when its age exceeds
+    # 2 * FORGE_STALL_THRESHOLD_S (env, default 600) — same semantics as
+    # cmd_stall_check_status without sharing its out-of-scope heredoc constant.
+    # Compare the UTC 'Z' timestamp against now(UTC) (this heredoc's `now` at the
+    # bottom is local naive time, used only for display). Skip silently on a
+    # missing/malformed ts so `status` never breaks. Label-only — does NOT change
+    # which pending is chosen.
+    if not ts or not isinstance(ts, str):
+        return ''
+    try:
+        thr = int(os.environ.get('FORGE_STALL_THRESHOLD_S', '600'))
+    except (TypeError, ValueError):
+        thr = 600
+    stale = 2 * thr
+    raw = ts.strip()
+    iso = raw[:-1] + '+00:00' if raw.endswith('Z') else raw
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return ''
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
+    return f" (STALE — pending since {short_time(ts)}, possible orphan)" if age > stale else ''
+
 # Recent activity: last 15 entries.
 activity = []
 for e in entries[-15:]:
@@ -1152,7 +1257,7 @@ L.append("# Forge Pipeline Status")
 L.append("")
 L.append(f"Pipeline: {slug}")
 if pending:
-    L.append(f"Current stage: {current_stage} ({current_worker}, PENDING since {short_time(current_since)})")
+    L.append(f"Current stage: {current_stage} ({current_worker}, PENDING since {short_time(current_since)}){_stale_suffix(current_since)}")
 else:
     L.append(f"Current stage: (idle) — last completed: {last_stage} → {last_status} by {last_worker}")
 L.append(f"Next stage: {next_stage}")
@@ -1318,20 +1423,21 @@ PYEOF
 # --clear: send /clear to the worker pane before the dispatch (Hard Rule 20).
 # --dry-run: print rendered prompt to stdout; do NOT write/log/send.
 cmd_dispatch() {
-    local slug="" stage="" worker="" do_clear=false dry_run=false
+    local slug="" stage="" worker="" do_clear=false dry_run=false supersede=false
     while [ $# -gt 0 ]; do
         case "$1" in
-            --slug)    slug="$2";   shift 2 ;;
-            --stage)   stage="$2";  shift 2 ;;
-            --worker)  worker="$2"; shift 2 ;;
-            --clear)   do_clear=true; shift ;;
-            --dry-run) dry_run=true;  shift ;;
-            *)         shift ;;
+            --slug)      slug="$2";   shift 2 ;;
+            --stage)     stage="$2";  shift 2 ;;
+            --worker)    worker="$2"; shift 2 ;;
+            --clear)     do_clear=true; shift ;;
+            --dry-run)   dry_run=true;  shift ;;
+            --supersede) supersede=true; shift ;;
+            *)           shift ;;
         esac
     done
 
     if [ -z "$slug" ] || [ -z "$stage" ] || [ -z "$worker" ]; then
-        echo "Usage: forge-bridge dispatch --slug <s> --stage <s> --worker <w> [--clear] [--dry-run]" >&2
+        echo "Usage: forge-bridge dispatch --slug <s> --stage <s> --worker <w> [--clear] [--dry-run] [--supersede]" >&2
         return 1
     fi
 
@@ -1368,6 +1474,55 @@ cmd_dispatch() {
         return 0
     fi
 
+    # --- Slug-scoped dispatch guard (orphan-log-entries fix) ---
+    # Refuse to dispatch a new stage while ANY pending (response: null) entry
+    # exists for this slug, unless --supersede. Stops class-2 (advance-without-
+    # close) and class-3 (rapid re-dispatch) orphans at the only birth site for
+    # dispatched pendings. The predicate is SLUG-scoped, not (stage,to)-scoped:
+    # a (stage,to) predicate would let a different-stage advance through and
+    # re-open class 2 (see fix-plan.md). Placed AFTER the dry-run early-return so
+    # `--dry-run` never blocks. The destructive --supersede close is deferred to
+    # just before cmd_log (after preflight) — see below.
+    local guard_log="$DEV_DIR/proposals/$slug/forge-log.yml"
+    local pending_ts
+    pending_ts=$(python3 - "$guard_log" <<'PYEOF'
+import sys, yaml
+guard_log = sys.argv[1]
+try:
+    with open(guard_log) as f:
+        data = yaml.safe_load(f) or {}
+except FileNotFoundError:
+    sys.exit(0)
+except Exception as ex:
+    print(f"ERR_PARSE:{ex}", file=sys.stderr); sys.exit(3)
+for e in (data.get('entries') or []):
+    if e.get('response') is None:
+        ts = e.get('timestamp', '')
+        if ts:
+            print(ts)
+PYEOF
+)
+    if [ $? -eq 3 ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=dispatch-guard-parse-failed"
+        echo "ERROR: dispatch guard could not parse $guard_log — refusing to dispatch." >&2
+        return 1
+    fi
+    local n_pending=0
+    [ -n "$pending_ts" ] && n_pending=$(printf '%s\n' "$pending_ts" | grep -c .)
+    if [ "$n_pending" -gt 0 ] && [ "$supersede" != true ]; then
+        {
+            echo "HOOK BLOCKED: dispatch refused — slug '$slug' has $n_pending open pending entry(ies) (response: null):"
+            printf '%s\n' "$pending_ts" | while IFS= read -r t; do [ -n "$t" ] && echo "    - pending since $t"; done
+            echo "  A prior stage was never closed. Close it first — a worker callback, or for a local"
+            echo "  to:claude stage run:"
+            echo "    ~/bin/forge-bridge log-response --slug $slug --to claude --stage <stage> --response \"FORGE_DONE: <stage> — ...\""
+            echo "  then retry; or re-run this dispatch with --supersede to auto-close the open entry(ies)"
+            echo "  (FORGE_SUPERSEDED) and dispatch anew."
+        } >&2
+        _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=open-pending-exists worker=$worker_canonical n_pending=$n_pending"
+        return 1
+    fi
+
     require_tmux_session "dispatch" || {
         _emit_event ERROR "$slug" "stage=$stage reason=tmux-session-missing"
         return 1
@@ -1381,6 +1536,25 @@ cmd_dispatch() {
     if [ "$do_clear" = true ]; then
         tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" "/clear" Enter
         sleep "${FORGE_CLEAR_WAIT_S:-2}"
+    fi
+
+    # --supersede destructive close (deferred — fix-plan Review #5): close every
+    # open same-slug pending as FORGE_SUPERSEDED via the no-context helper (NOT
+    # cmd_log_response, which would corrupt context). Done HERE, after
+    # require_tmux_session/clear preflight, so a preflight failure can't leave a
+    # slug with closed-old entries and no replacement. Loops over ALL pendings —
+    # cmd_log_response closes only candidates[-1], so a single delegated call
+    # would silently leave duplicates open on a multi-pending slug.
+    if [ "$supersede" = true ] && [ "$n_pending" -gt 0 ]; then
+        local _sup_ts _sup_now
+        _sup_now=$(timestamp)
+        printf '%s\n' "$pending_ts" | while IFS= read -r _sup_ts; do
+            [ -z "$_sup_ts" ] && continue
+            _patch_response_by_ts "$slug" "$_sup_ts" \
+                "FORGE_SUPERSEDED: re-dispatched $stage (orphan-log-entries guard); auto-closed $_sup_now" \
+                || echo "WARN: --supersede: failed to close pending ts=$_sup_ts for slug=$slug" >&2
+        done
+        _emit_event SUPERSEDE "$slug" "stage=$stage closed_pending=$n_pending worker=$worker_canonical"
     fi
 
     local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
