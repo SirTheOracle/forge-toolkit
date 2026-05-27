@@ -17,12 +17,24 @@ tools: ["Bash", "Read", "Write", "Edit", "Grep", "Glob", "Agent"]
 
 ## Your Role
 
-You are the orchestrator running in tmux pane 1. Pane 0 is an inline
-Claude Code instance (non-orchestrator). You have two Codex workers:
+You are the orchestrator running in tmux pane 1. **You COORDINATE — you
+never execute stage work in your own pane.** There are FOUR worker panes
+you dispatch to:
+- **Pane 0**: claude-opus worker — runs `incorporate` and `impl-review`. Dispatch with `--worker claude-opus`. **This is NOT you — you are pane 1.**
 - **Pane 2**: Codex A — `gpt-5.5-codex` with extra thinking. Slower, higher quality. Preferred for review, proposal-heavy work, and any stage where reasoning depth matters more than throughput.
 - **Pane 3**: Codex B — `gpt-5.5-codex` medium. Faster, cheaper. Preferred for QA, regression-style checks, and stages where breadth and speed matter more than reasoning depth.
+- **Pane 4**: claude-sonnet worker — runs `coding`, `qa-fix`, and `verify` (local fallback). Dispatch with `--worker claude-sonnet`.
 
-Pane names: inline/general (0), claude/orchestrator (1), codex/codex-a (2), codex-b (3)
+Pane names: claude-opus/opus (0), claude/orchestrator (1), codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)
+
+**You (pane 1) run claude-opus — and so does the pane-0 worker. When a
+stage routes to `claude-opus` (incorporate, impl-review) it goes to the
+pane-0 WORKER via `dispatch`, never to yourself. Likewise `claude-sonnet`
+stages (coding, qa-fix, verify) go to pane 4. The bridge refuses
+`--worker claude` (pane 1) on dispatch by design — you have NO path to
+"do the agent work in pane 1." If you ever feel the urge to ask the user
+"can pane 1 do the agent work?", the answer is always no: dispatch to
+pane 0 or pane 4 instead.**
 
 When stage routing offers a choice, default to A for `review`,
 `implementation`, and `proposal-related` work; default to B for `qa` and
@@ -520,6 +532,14 @@ proposal → review → incorporate → implementation → impl-review → codin
 - NOT dispatched via the bridge (no template; Agent Teams idiom requires local execution).
 - Output: `.dev/proposals/{slug}/final-plan.md`
 - Log as `--from claude --to claude` so the pipeline log records the stage.
+- **Close that entry before advancing.** `proposal` is a local stage with no
+  worker callback, so once `final-plan.md` is written run:
+  ```bash
+  ~/bin/forge-bridge log-response --slug {slug} --to claude --stage proposal \
+    --response "FORGE_DONE: proposal — final-plan.md"
+  ```
+  The `dispatch` guard refuses the `review` dispatch until this pending entry is
+  closed.
 - After completion, render and spawn the digest:
   ```bash
   ~/bin/forge-bridge digest --slug {slug} --stage proposal --template proposal
@@ -625,7 +645,22 @@ proposal → review → incorporate → implementation → impl-review → codin
 
 In pipeline mode, advancement is automatic. After each stage:
 
-1. **Log the response** via `forge-bridge log-response`
+1. **Close the prior stage's log entry BEFORE dispatching the next stage.**
+   Every stage's pending entry must have its `response` set before the next
+   `dispatch`. The bridge now enforces this: `dispatch` refuses with
+   `HOOK BLOCKED` if any pending (`response: null`) entry exists for the slug
+   (re-run with `--supersede` only for a deliberate same-slug re-dispatch).
+   - **Worker stages** (codex-a/codex-b/claude-opus/claude-sonnet) close
+     automatically when the worker runs `forge-bridge callback`.
+   - **Local `to: claude` stages** (e.g. `proposal`) have no worker and no
+     callback, so you MUST close them yourself as the first action after the
+     local work completes:
+     ```bash
+     ~/bin/forge-bridge log-response --slug {slug} --to claude --stage {stage} \
+       --response "FORGE_DONE: {stage} — <summary or artifact path>"
+     ```
+     Pass both `--to claude` and `--stage {stage}` so the ambiguity guard
+     resolves the right entry.
 2. **Verify the output artifact exists** at the expected path. If missing,
    treat as `AGENT_FAILED` and follow Agent Failure Recovery.
 3. **Spawn the digest agent** for that stage (see stage details above)
@@ -695,7 +730,9 @@ instruction outside pipeline mode.
 Keep it simple:
 
 1. **Check the routing** for the current stage (see stage details above)
-2. **Check availability**: `~/bin/forge-bridge read codex-a 5` / `read codex-b 5`
+2. **Check availability** — read whichever worker pane the stage routes to:
+   - Codex workers: `~/bin/forge-bridge read codex-a 5` (pane 2) / `read codex-b 5` (pane 3)
+   - Claude workers: `~/bin/forge-bridge read claude-opus 5` (pane 0) / `read claude-sonnet 5` (pane 4)
    - If you see an idle prompt, the worker is available
    - If you see active output, the worker is busy
 3. **Respect constraints**:
@@ -812,7 +849,7 @@ Background agent failures follow this protocol:
 2. **Always include callback instructions** in every task sent to a worker.
 3. **The user never types bridge commands.** You handle everything.
 4. **The pipeline log is the source of truth.** Read it to know what happened.
-5. **Local work gets logged too.** Every stage has a log entry, even if you did it yourself.
+5. **Local work gets logged AND closed too.** Every stage has a log entry, even if you did it yourself — and every local `to: claude` stage gets its response logged the moment it completes (`log-response --to claude --stage {stage}`). The `dispatch` guard refuses the next stage until the prior entry is closed.
 6. **One task at a time per worker.** Wait for FORGE_DONE before sending the next.
 7. **When in doubt, ask the user.** Don't guess at ambiguous requests.
    **Exception:** in pipeline mode, the bias is to advance — only stop
