@@ -82,6 +82,65 @@ EOF
     return 0
 }
 
+# Count live forge-* sessions with the required pane count (reuses the exact
+# refuse-if-ambiguous criterion from require_tmux_session's auto-detect block).
+_count_live_forge_candidates() {
+    tmux list-sessions -F '#{session_name}' 2>/dev/null \
+        | grep '^forge' \
+        | while read -r s; do
+            local panes; panes=$(tmux list-panes -t "$s" 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$panes" -ge "$FORGE_REQUIRED_PANES" ]; then echo "$s"; fi
+          done | grep -c '^forge' || true
+}
+
+# Resolve the current forge session name for FILE-NAMING / FILTERING only.
+# Echoes the name, or "" if none can be safely resolved. Steps 1-3 of the
+# canonical idiom; NO auto-pick, NO pane gate, NO existence validation.
+#   1. TMUX_SESSION env            (trusted unconditionally — caller declared id)
+#   2. tmux display-message        (trusted; only if inside tmux: $TMUX set)
+#   3. .dev/.forge-session walk-up (trusted ONLY if <=1 live candidate; else "")
+_resolve_session() {
+    local s="${TMUX_SESSION:-}"
+    if [ -z "$s" ] && [ -n "${TMUX:-}" ]; then
+        s="$(tmux display-message -p '#{session_name}' 2>/dev/null)"
+    fi
+    if [ -z "$s" ]; then
+        local _dir; _dir="$(pwd)"
+        while [ "$_dir" != "/" ]; do
+            if [ -f "$_dir/.dev/.forge-session" ]; then
+                s="$(cat "$_dir/.dev/.forge-session")"
+                # B-lite ambiguity guard: the single file is last-write-wins, so
+                # it cannot be trusted when multiple sessions are live in this
+                # project. Refuse -> "" -> sentinel -> "no active pipeline".
+                if [ "$(_count_live_forge_candidates)" -gt 1 ]; then
+                    s=""
+                fi
+                break
+            fi
+            _dir="$(dirname "$_dir")"
+        done
+    fi
+    # Charset guard: session names are tmux-legal and used unquoted as targets;
+    # reject anything that could escape .dev/ as a filename segment.
+    if [ -n "$s" ] && ! printf '%s' "$s" | grep -Eq '^[A-Za-z0-9_.-]+$'; then
+        s=""
+    fi
+    # Collision guard: a real session must never masquerade as the sentinel.
+    if [ "$s" = "__nosession__" ]; then
+        s=""
+    fi
+    printf '%s' "$s"
+}
+
+# Map "no session" to a private sentinel token (never a real forge-N name).
+_session_or_sentinel() {
+    local s; s="$(_resolve_session)"
+    printf '%s' "${s:-__nosession__}"
+}
+
+# Per-call context pointer path. Pure function of the resolved session token.
+_context_file() { printf '%s/forge-context.%s.yml' "$DEV_DIR" "$(_session_or_sentinel)"; }
+
 require_tmux_session() {
     local cmd="${1:-(unknown)}"
 
@@ -94,39 +153,26 @@ require_tmux_session() {
     # session globally, which is unrelated to cwd. Skip step 2 in that case so
     # cwd-rooted invocations (Claude Code agents, cron, headless scripts) route
     # to the correct session via .dev/.forge-session.
-    SESSION="${TMUX_SESSION:-}"
-    if [ -z "$SESSION" ] && [ -n "${TMUX:-}" ]; then
-        SESSION="$(tmux display-message -p '#{session_name}' 2>/dev/null)"
-    fi
+    # Steps 1-3 (env / tmux / guarded walk-up) via the unified resolver. Its
+    # B-lite ambiguity guard only makes the walk-up MORE conservative; the
+    # step-4 auto-detect and pane gate below are unchanged.
+    SESSION="$(_resolve_session)"
 
-    # Fallback 1: read session name from .dev/.forge-session (written by forge-start)
-    local _session_source=""
-    if [ -n "$SESSION" ]; then
-        _session_source="env-or-tmux"
-    fi
-    if [ -z "$SESSION" ]; then
-        local _dir _session_file=""
-        _dir="$(pwd)"
-        while [ "$_dir" != "/" ]; do
-            if [ -f "$_dir/.dev/.forge-session" ]; then
-                SESSION=$(cat "$_dir/.dev/.forge-session")
-                _session_file="$_dir/.dev/.forge-session"
-                _session_source="forge-session-file"
-                break
-            fi
-            _dir=$(dirname "$_dir")
-        done
-        # If .dev/.forge-session resolved a name, validate the session exists
-        # before falling through to auto-detect — stale files used to silently
-        # misroute callers to a random forge-* session.
-        if [ -n "$SESSION" ] && ! tmux has-session -t "$SESSION" 2>/dev/null; then
-            cat >&2 <<EOF
-ERROR: .dev/.forge-session refers to tmux session '$SESSION' but no such session exists.
-       File: $_session_file
-       Either delete the stale file (rm "$_session_file") or run forge-start to (re)create the session.
+    # Stale-session validation: if a name resolved (from TMUX_SESSION, $TMUX, or
+    # the .dev/.forge-session walk-up) but no such tmux session exists, refuse
+    # rather than fall through to auto-detect and silently misroute to a random
+    # forge-* session. Validating EVERY resolved name (not just the walk-up path)
+    # also covers the "$TMUX set but display-message empty, walk-up succeeded"
+    # case the prior inline gate skipped. Hard Rule 0 guarantees a legitimately-
+    # pinned name is always live, so no valid flow breaks.
+    if [ -n "$SESSION" ] && ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        cat >&2 <<EOF
+ERROR: resolved tmux session '$SESSION' but no such session exists.
+       (resolved from TMUX_SESSION, \$TMUX, or .dev/.forge-session)
+       Clear the stale source (e.g. rm .dev/.forge-session / unset TMUX_SESSION)
+       or run forge-start to (re)create the session.
 EOF
-            return 1
-        fi
+        return 1
     fi
 
     # Fallback 2: auto-detect a forge session with the required pane count.
@@ -288,13 +334,14 @@ canonical_pane_name() {
 # the alias map so historical entries (e.g. `to: claude`) resolve correctly.
 has_pending_log_for() {
     local target_canonical="$1"
+    local current_session="${2:-$(_resolve_session)}"
     if [ ! -f "$SUMMARY_LOG" ]; then
         return 1
     fi
-    python3 - "$SUMMARY_LOG" "$target_canonical" << 'PYEOF'
+    python3 - "$SUMMARY_LOG" "$target_canonical" "$current_session" << 'PYEOF'
 import sys, yaml
 
-log_file, target_canonical = sys.argv[1], sys.argv[2]
+log_file, target_canonical, current_session = sys.argv[1], sys.argv[2], sys.argv[3]
 
 # Inline alias map mirroring shell pane_index/pane_name.
 # Keep this in lockstep with all other ALIAS_TO_CANONICAL maps.
@@ -319,6 +366,12 @@ except FileNotFoundError:
 for entry in data.get('entries', []):
     if entry.get('response') is not None:
         continue
+    entry_session = entry.get('session', '') or ''
+    # Never skip legacy (no/empty session) entries — keeps in-flight upgrades
+    # closeable; only skip a CONFIRMED different-session pending. Mirrors
+    # cmd_stall_check_status's filter verbatim.
+    if entry_session and current_session and entry_session != current_session:
+        continue  # different session; skip silently
     entry_target = canonical(entry.get('to', ''))
     if entry_target == target_canonical:
         sys.exit(0)
@@ -333,6 +386,9 @@ update_context() {
     local stage="$2"
     local status="$3"  # done, blocked, error
     local worker="$4"
+    # Per-call session-scoped pointer. Shadows the static global so the SOLE
+    # writer never writes the bare forge-context.yml for a live session (§4.1).
+    local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
     local ts
     ts=$(timestamp)
 
@@ -551,7 +607,7 @@ cmd_send() {
     if [ "$FORCE" = false ]; then
         case "$TARGET" in
             codex-a|codex-b|claude-opus|claude-sonnet)
-                if ! has_pending_log_for "$TARGET"; then
+                if ! has_pending_log_for "$TARGET" "$SESSION"; then
                     echo "HOOK BLOCKED: No pending log entry targeting '$TARGET'." >&2
                     echo "Run 'forge-bridge log --to $TARGET ...' before sending." >&2
                     echo "Or use 'forge-bridge send --force' to bypass for non-pipeline messages." >&2
@@ -617,22 +673,12 @@ cmd_log() {
     # can filter by current session (multi-session correlation, review item #4).
     # Session resolution mirrors require_tmux_session: only consult
     # `tmux display-message` when inside tmux; otherwise walk up to .dev/.forge-session.
+    # Stamp the resolving session into pending entries so the send-hook and
+    # stall-check-status can filter by session. Empty -> "unknown" (NOT the
+    # context sentinel): the never-skip-legacy filter keys on empty/"unknown" to
+    # keep in-flight upgrades closeable. See final-plan §4.3.
     local session
-    session="${TMUX_SESSION:-}"
-    if [ -z "$session" ] && [ -n "${TMUX:-}" ]; then
-        session="$(tmux display-message -p '#{session_name}' 2>/dev/null)"
-    fi
-    if [ -z "$session" ]; then
-        local _dir
-        _dir="$(pwd)"
-        while [ "$_dir" != "/" ]; do
-            if [ -f "$_dir/.dev/.forge-session" ]; then
-                session=$(cat "$_dir/.dev/.forge-session")
-                break
-            fi
-            _dir=$(dirname "$_dir")
-        done
-    fi
+    session="$(_resolve_session)"
     [ -z "$session" ] && session="unknown"
 
     ensure_pipeline_log "$slug"
@@ -967,6 +1013,10 @@ cmd_pipeline_log() {
 # ---- Context (session start / recovery) ----
 
 cmd_context() {
+    # Per-call session-scoped pointer (shadows the static global). No
+    # require_tmux_session — this runs at session start with no $TMUX; the
+    # resolver degrades to the __nosession__ sentinel safely.
+    local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
     # Phase 1b Step 3: prepend stall-check-status section if non-empty.
     # Inserted BEFORE the existing early-return so stale-pending warnings
     # surface even when no $CONTEXT_FILE exists yet.
@@ -986,6 +1036,18 @@ cmd_context() {
     if [ ! -f "$CONTEXT_FILE" ]; then
         echo "(no forge context — no active pipeline)"
         echo ""
+        # Read-only migration HINT (§6): a legacy SHARED forge-context.yml may
+        # hold a pre-upgrade pipeline. Surface it; NEVER auto-adopt (could import
+        # another session's pointer). The owning session runs set-context --slug.
+        local _legacy_ctx="$DEV_DIR/forge-context.yml"
+        if [ -f "$_legacy_ctx" ]; then
+            local _legacy_slug
+            _legacy_slug=$(grep "^active_pipeline:" "$_legacy_ctx" 2>/dev/null | awk '{print $2}')
+            if [ -n "$_legacy_slug" ] && [ "$_legacy_slug" != "null" ]; then
+                echo "legacy shared context found; if this pipeline is yours, run: set-context --slug $_legacy_slug"
+                echo ""
+            fi
+        fi
         echo "Start a new pipeline with forge-bridge log, or set one manually:"
         echo "  forge-bridge set-context --slug <slug-name>"
 
@@ -1109,7 +1171,11 @@ else:
 # Computed from forge-context.yml + the per-pipeline log; never the source of
 # truth.
 
-FORGE_STATUS_FILE_NAME="forge-status.md"
+# Per-session rendered-status filename (mirrors _context_file's session scope).
+# Defined once and used at BOTH the render-write site and the cmd_status read
+# site so the two can never drift. (Replaces the old static status-filename
+# constant, which is now removed — it had no remaining reader.)
+_status_file_name() { printf 'forge-status.%s.md' "$(_session_or_sentinel)"; }
 
 _render_status_file() {
     # Resolve project root; if we can't, skip silently (status is best-effort).
@@ -1118,7 +1184,11 @@ _render_status_file() {
     if [ -z "$project_root" ]; then
         return 0
     fi
-    local out_file="$project_root/$DEV_DIR/$FORGE_STATUS_FILE_NAME"
+    # Per-session read + output (in-place resolve; this function does not cd).
+    # Callers run pinned/in-pane (dispatch, callback, wait), so the resolver
+    # names the correct session for both the read path and the output name.
+    local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
+    local out_file="$project_root/$DEV_DIR/$(_status_file_name)"
     mkdir -p "$(dirname "$out_file")"
     python3 - "$project_root/$CONTEXT_FILE" "$project_root/$DEV_DIR" "$out_file" <<'PYEOF'
 import sys, os, yaml, datetime
@@ -1305,7 +1375,7 @@ cmd_status() {
         echo "ERROR: status requires forge-project.yml in cwd ancestry" >&2
         return 1
     fi
-    local out_file="$project_root/$DEV_DIR/$FORGE_STATUS_FILE_NAME"
+    local out_file="$project_root/$DEV_DIR/$(_status_file_name)"
     if [ -f "$out_file" ]; then
         cat "$out_file"
     else
@@ -2095,6 +2165,8 @@ EOF
 
 cmd_add_note() {
     local note="$*"
+    # Per-call session-scoped pointer (shadows the static global).
+    local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
 
     if [ -z "$note" ]; then
         echo "Usage: forge-bridge add-note <your note>"
@@ -2214,7 +2286,7 @@ cmd_stall_check() {
 
     # has_pending_log_for is internal; runs against $SUMMARY_LOG in cwd.
     local pending="false"
-    if has_pending_log_for "$canonical"; then
+    if has_pending_log_for "$canonical" "$SESSION"; then
         pending="true"
     fi
 
@@ -2520,16 +2592,11 @@ cmd_stall_check_status() {
 
     local threshold="${FORGE_STALL_THRESHOLD_S:-600}"
 
-    # Resolve current session (no tmux required for the env path).
-    # Only trust `tmux display-message` when actually inside tmux.
+    # Resolve current session via the unified resolver (env / tmux / guarded
+    # walk-up). Empty -> the python filter treats every entry as same-session
+    # (over-warn, the safe direction on an ambiguous host).
     local current_session
-    current_session="${TMUX_SESSION:-}"
-    if [ -z "$current_session" ] && [ -n "${TMUX:-}" ]; then
-        current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null)"
-    fi
-    if [ -z "$current_session" ] && [ -f ".dev/.forge-session" ]; then
-        current_session=$(cat ".dev/.forge-session")
-    fi
+    current_session="$(_resolve_session)"
 
     python3 - "$SUMMARY_LOG" "$FORGE_CACHE_DIR" "$current_session" "$threshold" "$project_root" <<'PYEOF'
 import sys, os, time, yaml

@@ -311,9 +311,15 @@ The bridge enforces two automatic hooks:
    `forge-bridge log` first. Use `send --force` only for non-pipeline
    messages (e.g., asking a worker a question outside a stage).
 
-2. **log-response auto-context** — `log-response` automatically updates
-   `.dev/forge-context.yml` with the current stage, status (done/blocked/error),
-   worker, and next stage. This powers session recovery via `forge-bridge context`.
+2. **log-response auto-context** — `log-response` automatically updates the
+   per-session context pointer `.dev/forge-context.<session>.yml` (session-scoped
+   so concurrent forge sessions in one project never read each other's pipeline)
+   with the current stage, status (done/blocked/error), worker, and next stage.
+   This powers session recovery via `forge-bridge context`. On first run after the
+   upgrade, `context` may print a one-line legacy-migration hint pointing at any
+   pre-upgrade shared `.dev/forge-context.yml`; run the suggested
+   `set-context --slug <slug>` once to adopt it (it never auto-adopts another
+   session's pipeline).
 
 **Required (see Hard Rule 0):** the orchestrator MUST `export TMUX_SESSION=<name>`
 at session start. Background agents you spawn inherit env from your shell,
