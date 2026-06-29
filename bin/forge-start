@@ -48,10 +48,10 @@ tmux split-window -v -t "$SESSION:.3" -c "$DIR" -p 50
 tmux set -g mouse on
 
 # Launch CLIs in each pane (verified by Phase 2 Step 0 V7).
-tmux send-keys -t "$SESSION:.0" "claude --model claude-opus-4-7 --permission-mode acceptEdits" Enter
-tmux send-keys -t "$SESSION:.1" "claude --model claude-opus-4-7" Enter
-tmux send-keys -t "$SESSION:.2" "codex" Enter
-tmux send-keys -t "$SESSION:.3" "codex" Enter
+tmux send-keys -t "$SESSION:.0" "claude --model claude-opus-4-8 --permission-mode acceptEdits" Enter
+tmux send-keys -t "$SESSION:.1" "claude --model claude-opus-4-8" Enter
+tmux send-keys -t "$SESSION:.2" "codex -m gpt-5.5 -c model_reasoning_effort=xhigh -c service_tier=fast" Enter
+tmux send-keys -t "$SESSION:.3" "codex -m gpt-5.5 -c model_reasoning_effort=medium -c service_tier=fast" Enter
 tmux send-keys -t "$SESSION:.4" "claude --model claude-sonnet-4-6 --permission-mode acceptEdits" Enter
 
 # Layout invariant assertion: panes 0/1 left, panes 2/3/4 right.

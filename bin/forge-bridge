@@ -82,33 +82,135 @@ EOF
     return 0
 }
 
+# Count live forge-* sessions with the required pane count (reuses the exact
+# refuse-if-ambiguous criterion from require_tmux_session's auto-detect block).
+_count_live_forge_candidates() {
+    tmux list-sessions -F '#{session_name}' 2>/dev/null \
+        | grep '^forge' \
+        | while read -r s; do
+            local panes; panes=$(tmux list-panes -t "$s" 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$panes" -ge "$FORGE_REQUIRED_PANES" ]; then echo "$s"; fi
+          done | grep -c '^forge' || true
+}
+
+# Resolve the current forge session name for FILE-NAMING / FILTERING only.
+# Echoes the name, or "" if none can be safely resolved. Steps 1-3 of the
+# canonical idiom; NO auto-pick, NO pane gate, NO existence validation.
+#   1. TMUX_SESSION env            (trusted unconditionally — caller declared id)
+#   2. tmux display-message        (trusted; only if inside tmux: $TMUX set)
+#   3. .dev/.forge-session walk-up (trusted ONLY if <=1 live candidate; else "")
+_resolve_session() {
+    local s="${TMUX_SESSION:-}"
+    if [ -z "$s" ] && [ -n "${TMUX:-}" ]; then
+        s="$(tmux display-message -p '#{session_name}' 2>/dev/null)"
+    fi
+    if [ -z "$s" ]; then
+        local _dir; _dir="$(pwd)"
+        while [ "$_dir" != "/" ]; do
+            if [ -f "$_dir/.dev/.forge-session" ]; then
+                s="$(cat "$_dir/.dev/.forge-session")"
+                # B-lite ambiguity guard: the single file is last-write-wins, so
+                # it cannot be trusted when multiple sessions are live in this
+                # project. Refuse -> "" -> sentinel -> "no active pipeline".
+                if [ "$(_count_live_forge_candidates)" -gt 1 ]; then
+                    s=""
+                fi
+                break
+            fi
+            _dir="$(dirname "$_dir")"
+        done
+    fi
+    # Charset guard: session names are tmux-legal and used unquoted as targets;
+    # reject anything that could escape .dev/ as a filename segment.
+    if [ -n "$s" ] && ! printf '%s' "$s" | grep -Eq '^[A-Za-z0-9_.-]+$'; then
+        s=""
+    fi
+    # Collision guard: a real session must never masquerade as the sentinel.
+    if [ "$s" = "__nosession__" ]; then
+        s=""
+    fi
+    printf '%s' "$s"
+}
+
+# Map "no session" to a private sentinel token (never a real forge-N name).
+_session_or_sentinel() {
+    local s; s="$(_resolve_session)"
+    printf '%s' "${s:-__nosession__}"
+}
+
+# Per-call context pointer path. Pure function of the resolved session token.
+_context_file() { printf '%s/forge-context.%s.yml' "$DEV_DIR" "$(_session_or_sentinel)"; }
+
+# Per-call usage snapshot path. Same session scoping as _context_file, but a
+# DEDICATED file so the resume-critical update_context() heredoc writer is never
+# touched (folding usage into the context file would force a clobber-preservation
+# edit there). Relative to $DEV_DIR like _context_file; callers prefix
+# $project_root. See .dev/proposals/per-task-usage-reporting/final-plan.md.
+_usage_file() { printf '%s/forge-usage.%s.yml' "$DEV_DIR" "$(_session_or_sentinel)"; }
+
 require_tmux_session() {
     local cmd="${1:-(unknown)}"
 
-    SESSION="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+    # Resolution order:
+    #   1. TMUX_SESSION env (explicit override)
+    #   2. tmux display-message — ONLY if we're inside tmux ($TMUX set)
+    #   3. .dev/.forge-session walk-up from cwd
+    #   4. Auto-pick a forge-* session with the required pane count
+    # Outside tmux, `tmux display-message` returns the most-recently-attached
+    # session globally, which is unrelated to cwd. Skip step 2 in that case so
+    # cwd-rooted invocations (Claude Code agents, cron, headless scripts) route
+    # to the correct session via .dev/.forge-session.
+    # Steps 1-3 (env / tmux / guarded walk-up) via the unified resolver. Its
+    # B-lite ambiguity guard only makes the walk-up MORE conservative; the
+    # step-4 auto-detect and pane gate below are unchanged.
+    SESSION="$(_resolve_session)"
 
-    # Fallback 1: read session name from .dev/.forge-session (written by forge-start)
-    if [ -z "$SESSION" ]; then
-        local _dir
-        _dir="$(pwd)"
-        while [ "$_dir" != "/" ]; do
-            if [ -f "$_dir/.dev/.forge-session" ]; then
-                SESSION=$(cat "$_dir/.dev/.forge-session")
-                break
-            fi
-            _dir=$(dirname "$_dir")
-        done
+    # Stale-session validation: if a name resolved (from TMUX_SESSION, $TMUX, or
+    # the .dev/.forge-session walk-up) but no such tmux session exists, refuse
+    # rather than fall through to auto-detect and silently misroute to a random
+    # forge-* session. Validating EVERY resolved name (not just the walk-up path)
+    # also covers the "$TMUX set but display-message empty, walk-up succeeded"
+    # case the prior inline gate skipped. Hard Rule 0 guarantees a legitimately-
+    # pinned name is always live, so no valid flow breaks.
+    if [ -n "$SESSION" ] && ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        cat >&2 <<EOF
+ERROR: resolved tmux session '$SESSION' but no such session exists.
+       (resolved from TMUX_SESSION, \$TMUX, or .dev/.forge-session)
+       Clear the stale source (e.g. rm .dev/.forge-session / unset TMUX_SESSION)
+       or run forge-start to (re)create the session.
+EOF
+        return 1
     fi
 
-    # Fallback 2: auto-detect a forge session with the required pane count
+    # Fallback 2: auto-detect a forge session with the required pane count.
+    # Refuse-if-ambiguous: only auto-pick when exactly one forge-* session has
+    # the required pane count. Picking arbitrarily when many candidates exist
+    # is what made the orchestrator wander into other users' sessions.
     if [ -z "$SESSION" ]; then
-        SESSION=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+        local _candidates _ncand
+        _candidates=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
             | grep '^forge' \
             | while read -r s; do
                 local panes
                 panes=$(tmux list-panes -t "$s" 2>/dev/null | wc -l | tr -d ' ')
                 if [ "$panes" -ge "$FORGE_REQUIRED_PANES" ]; then echo "$s"; fi
-              done | tail -1)
+              done)
+        _ncand=$(printf '%s\n' "$_candidates" | grep -c '^forge' || true)
+        if [ "$_ncand" -gt 1 ]; then
+            {
+                echo "ERROR: multiple forge sessions present — refuse to auto-pick for command '$cmd'."
+                echo "Candidates with >= $FORGE_REQUIRED_PANES panes:"
+                printf '%s\n' "$_candidates" | sed 's/^/  /'
+                echo "Resolve by either:"
+                echo "  - export TMUX_SESSION=<name>   (explicit override)"
+                echo "  - run from a project dir containing .dev/.forge-session"
+            } >&2
+            return 1
+        fi
+        if [ "$_ncand" -eq 1 ]; then
+            SESSION="$_candidates"
+            _session_source="auto-detect-sole-candidate"
+        fi
     fi
 
     if [ -z "$SESSION" ]; then
@@ -189,6 +291,260 @@ yaml_escape() {
     fi
 }
 
+# ---- Heartbeat event log helpers (passive pane-1 event stream) ----
+#
+# Caller-visible behavior: any value passed through _sanitize_event_value
+# is mutated for the log line:
+#   1) CR/LF/TAB collapse to space
+#   2) double-quote -> single-quote
+#   3) runs of whitespace -> single underscore (keeps KV tokens parseable)
+#   4) byte-truncate to 200 bytes, with "…" suffix on overflow
+# Idempotent. cmd_emit callers (e.g. the orchestrator) should keep values
+# short and avoid embedded whitespace; verbatim round-trip is NOT preserved.
+_sanitize_event_value() {
+    local raw="$1"
+    local clean
+    clean=$(printf '%s' "$raw" \
+        | tr '\r\n\t' '   ' \
+        | sed -e 's/"/'\''/g' -e 's/[[:space:]][[:space:]]*/_/g')
+    printf '%s' "$clean" | awk '{ if (length($0) > 200) print substr($0, 1, 200) "…"; else print $0 }'
+}
+
+# _emit_event <TYPE> <slug> [fields-string]
+# Best-effort line-emit to <project_root>/.dev/forge-tmp/orchestrator-events.log.
+# Never writes to stdout/stderr (bridge contract: callers may parse those).
+# Silently skips on unresolvable project root or fs write failure.
+# Structured key=value tokens are NOT re-sanitized here — callers sanitize
+# freeform values via _sanitize_event_value before assembling the fields arg.
+_emit_event() {
+    local type="$1"; shift
+    local slug="$1"; shift
+    local project_root
+    project_root=$(_resolve_project_root "" 2>/dev/null) || return 0
+    [ -z "$project_root" ] && return 0
+    local log_dir="$project_root/.dev/forge-tmp"
+    local log_file="$log_dir/orchestrator-events.log"
+    mkdir -p "$log_dir" 2>/dev/null || return 0
+    printf '%s: pipeline=%s %s\n' "$type" "$slug" "$*" >> "$log_file" 2>/dev/null || true
+}
+
+# _observe_usage <worker_canonical> <slug> <stage> <worker_idx> <project_root>
+# Read-only, family-aware per-task usage observation. Invoked from cmd_callback
+# AFTER all critical callback work, wrapped `|| true`. ALWAYS returns 0 — usage
+# observation must never delay or break a callback or the pipeline. It NEVER
+# sends keystrokes and NEVER issues /clear, /new, or /compact: it only
+# `capture-pane`s (read-only) and writes an advisory snapshot + a USAGE event.
+#
+# Claude panes carry usage in the persistent footer `[Model] ctx: Nk (P%)` — the
+# same line stall-check's idle_prompt_anchor matches (shared `ctx: Nk (P%)` shape,
+# so a footer-format drift breaks both in lockstep). Codex panes expose NO usage
+# in pane text on the current gpt-5.5 build (the trailing `· …` segment is the
+# git branch, not usage) → recorded as honest unknown, no capture, no regex.
+# See .dev/proposals/per-task-usage-reporting/final-plan.md.
+_observe_usage() {
+    local worker="$1" slug="$2" stage="$3" worker_idx="$4" project_root="$5"
+
+    # Guard 1: only the four worker panes (an orchestrator self-callback that
+    # resolves to `claude` is silently skipped — no usage signal wanted there).
+    case "$worker" in
+        claude-opus|claude-sonnet|codex-a|codex-b) ;;
+        *) return 0 ;;
+    esac
+
+    # Family from the canonical worker name (mirrors family() in cmd_health).
+    local family
+    case "$worker" in
+        claude-*) family="claude" ;;
+        codex-*)  family="codex"  ;;
+        *)        return 0 ;;
+    esac
+
+    local usage_file="$project_root/$(_usage_file)"
+    local measured_at; measured_at=$(timestamp)
+    local fields=""
+
+    if [ "$family" = "codex" ]; then
+        # No usage in pane text — honest unknown. No capture, no regex.
+        fields="pct=null tokens=null headroom=unknown source=unsupported confidence=none reason=codex-no-pane-usage"
+        FORGE_U_FAMILY="$family" FORGE_U_WORKER="$worker" FORGE_U_STAGE="$stage" \
+        FORGE_U_AT="$measured_at" FORGE_U_RAWFILE="" \
+            python3 - "$usage_file" >/dev/null 2>&1 <<'PYEOF' || true
+import os, sys, re, yaml, fcntl
+usage_file = sys.argv[1]
+fam   = os.environ.get("FORGE_U_FAMILY", "")
+wk    = os.environ.get("FORGE_U_WORKER", "")
+stage = os.environ.get("FORGE_U_STAGE", "")
+at    = os.environ.get("FORGE_U_AT", "")
+rawf  = os.environ.get("FORGE_U_RAWFILE", "")
+
+record = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
+          "source": "unsupported", "confidence": "none",
+          "reason": "codex-no-pane-usage", "stage": stage, "measured_at": at}
+
+def upsert(path, worker, rec, updated):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    lp = path + ".lock"
+    with open(lp, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            data = {}
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        data = yaml.safe_load(f) or {}
+                except Exception:
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            workers = data.get("workers")
+            if not isinstance(workers, dict):
+                workers = {}
+            workers[worker] = rec
+            data["workers"] = workers
+            data["updated"] = updated
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
+            os.replace(tmp, path)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+try:
+    upsert(usage_file, wk, record, at)
+except Exception:
+    pass
+PYEOF
+        _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+        return 0
+    fi
+
+    # Claude: capture the pane footer (read-only) and parse the ctx usage.
+    # Test seam: FORGE_USAGE_FIXTURE points at a pre-captured pane file and
+    # bypasses tmux entirely (used by T1 unit tests; never set in production).
+    local raw_file="" fixture_mode=""
+    if [ -n "${FORGE_USAGE_FIXTURE:-}" ] && [ -f "${FORGE_USAGE_FIXTURE}" ]; then
+        raw_file="$FORGE_USAGE_FIXTURE"; fixture_mode=1
+    else
+        # cmd_callback does NOT call require_tmux_session, so the global SESSION
+        # is empty here — resolve the pane the same way cmd_callback does.
+        case "$worker_idx" in
+            ''|*[!0-9]*) fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=bad-pane"
+                         _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+                         return 0 ;;
+        esac
+        local sess
+        sess="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+        if [ -z "$sess" ]; then
+            fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=no-session"
+            _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+            return 0
+        fi
+        raw_file=$(mktemp -t forge-usage-XXXXXX 2>/dev/null) || raw_file=""
+        if [ -n "$raw_file" ]; then
+            tmux capture-pane -p -t "$sess:$WINDOW.$worker_idx" -S -12 > "$raw_file" 2>/dev/null || true
+        fi
+    fi
+
+    # Parse + persist in one python pass; it prints the USAGE event fields (NOT
+    # the raw footer line — raw lives only in the snapshot YAML, never in the
+    # line-oriented event log) and always exits 0 with a well-formed fields line.
+    fields=$(FORGE_U_FAMILY="$family" FORGE_U_WORKER="$worker" FORGE_U_STAGE="$stage" \
+             FORGE_U_AT="$measured_at" FORGE_U_RAWFILE="${raw_file:-}" \
+             python3 - "$usage_file" 2>/dev/null <<'PYEOF'
+import os, sys, re, yaml, fcntl
+usage_file = sys.argv[1]
+fam   = os.environ.get("FORGE_U_FAMILY", "")
+wk    = os.environ.get("FORGE_U_WORKER", "")
+stage = os.environ.get("FORGE_U_STAGE", "")
+at    = os.environ.get("FORGE_U_AT", "")
+rawf  = os.environ.get("FORGE_U_RAWFILE", "")
+
+def fields_line(d):
+    def v(x):
+        return "null" if x is None else x
+    return ("pct=%s tokens=%s headroom=%s source=%s confidence=%s%s" % (
+        v(d.get("pct")), v(d.get("tokens")), v(d.get("headroom")), v(d.get("source")),
+        v(d.get("confidence")),
+        (" reason=%s" % d["reason"]) if d.get("reason") else ""))
+
+def upsert(path, worker, rec, updated):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    lp = path + ".lock"
+    with open(lp, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            data = {}
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        data = yaml.safe_load(f) or {}
+                except Exception:
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            workers = data.get("workers")
+            if not isinstance(workers, dict):
+                workers = {}
+            workers[worker] = rec
+            data["workers"] = workers
+            data["updated"] = updated
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
+            os.replace(tmp, path)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+# Defaults → unknown; refined on a successful parse.
+rec = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
+       "raw": None, "source": "pane-footer", "confidence": "none",
+       "reason": "no-anchor", "stage": stage, "measured_at": at}
+try:
+    raw = ""
+    if rawf and os.path.exists(rawf):
+        with open(rawf) as f:
+            raw = f.read()
+    if not raw.strip():
+        rec["reason"] = "capture-failed"
+    else:
+        # Strip ANSI/OSC, then find the LAST `ctx: Nk (P%)` footer line.
+        norm = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', raw)
+        norm = re.sub(r'\x1b\][0-9;]*\x07', '', norm)
+        found = None
+        for line in reversed([l for l in norm.splitlines() if l.strip()][-12:]):
+            mm = re.search(r'ctx:\s*(\d+)(k?)\s*\((\d+)%\)', line)
+            if mm:
+                found = (mm, line.strip()); break
+        if found:
+            mm, line = found
+            pct = int(mm.group(3))
+            tokens = mm.group(1) + (mm.group(2) or "")
+            headroom = max(0, min(100, 100 - pct))
+            rec.update({"pct": pct, "tokens": tokens, "headroom": headroom,
+                        "raw": line, "source": "pane-footer",
+                        "confidence": ("high" if 0 <= pct <= 100 else "low"),
+                        "reason": None})
+except Exception:
+    rec = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
+           "raw": None, "source": "pane-footer", "confidence": "none",
+           "reason": "observe-error", "stage": stage, "measured_at": at}
+
+try:
+    upsert(usage_file, wk, rec, at)
+except Exception:
+    pass
+
+print(fields_line(rec))
+PYEOF
+)
+    [ -z "$fixture_mode" ] && [ -n "$raw_file" ] && rm -f "$raw_file" 2>/dev/null
+    [ -z "$fields" ] && fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=observe-error"
+    _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+    return 0
+}
+
 # ---- Hook: Check for pending log entry ----
 
 # Resolve any pane alias to its canonical name via pane_index → pane_name.
@@ -202,13 +558,14 @@ canonical_pane_name() {
 # the alias map so historical entries (e.g. `to: claude`) resolve correctly.
 has_pending_log_for() {
     local target_canonical="$1"
+    local current_session="${2:-$(_resolve_session)}"
     if [ ! -f "$SUMMARY_LOG" ]; then
         return 1
     fi
-    python3 - "$SUMMARY_LOG" "$target_canonical" << 'PYEOF'
+    python3 - "$SUMMARY_LOG" "$target_canonical" "$current_session" << 'PYEOF'
 import sys, yaml
 
-log_file, target_canonical = sys.argv[1], sys.argv[2]
+log_file, target_canonical, current_session = sys.argv[1], sys.argv[2], sys.argv[3]
 
 # Inline alias map mirroring shell pane_index/pane_name.
 # Keep this in lockstep with all other ALIAS_TO_CANONICAL maps.
@@ -233,6 +590,12 @@ except FileNotFoundError:
 for entry in data.get('entries', []):
     if entry.get('response') is not None:
         continue
+    entry_session = entry.get('session', '') or ''
+    # Never skip legacy (no/empty session) entries — keeps in-flight upgrades
+    # closeable; only skip a CONFIRMED different-session pending. Mirrors
+    # cmd_stall_check_status's filter verbatim.
+    if entry_session and current_session and entry_session != current_session:
+        continue  # different session; skip silently
     entry_target = canonical(entry.get('to', ''))
     if entry_target == target_canonical:
         sys.exit(0)
@@ -247,6 +610,9 @@ update_context() {
     local stage="$2"
     local status="$3"  # done, blocked, error
     local worker="$4"
+    # Per-call session-scoped pointer. Shadows the static global so the SOLE
+    # writer never writes the bare forge-context.yml for a live session (§4.1).
+    local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
     local ts
     ts=$(timestamp)
 
@@ -316,6 +682,20 @@ EOF
         done
     else
         echo "notes: []" >> "$CONTEXT_FILE"
+    fi
+
+    # Heartbeat: stage RESULT recorded (not necessarily an advance).
+    # commit-review is a side-channel, not a pipeline stage transition — skip.
+    # Fires from both cmd_log_response (normal callback path) and cmd_set_context
+    # (manual operator recovery); the second source is intentional so pane 1 sees
+    # interventions.
+    if [ "$stage" != "commit-review" ]; then
+        _emit_event STAGE "$slug" "result_stage=$stage status=$status next=${next_stage:-pending-orchestrator-decision} worker=$worker"
+    fi
+
+    # Heartbeat: pipeline complete — strict terminal condition.
+    if [ "$stage" = "verify" ] && [ "$status" = "done" ] && [ "$next_stage" = "complete" ]; then
+        _emit_event COMPLETE "$slug" "last_stage=$stage worker=$worker"
     fi
 }
 
@@ -451,7 +831,7 @@ cmd_send() {
     if [ "$FORCE" = false ]; then
         case "$TARGET" in
             codex-a|codex-b|claude-opus|claude-sonnet)
-                if ! has_pending_log_for "$TARGET"; then
+                if ! has_pending_log_for "$TARGET" "$SESSION"; then
                     echo "HOOK BLOCKED: No pending log entry targeting '$TARGET'." >&2
                     echo "Run 'forge-bridge log --to $TARGET ...' before sending." >&2
                     echo "Or use 'forge-bridge send --force' to bypass for non-pipeline messages." >&2
@@ -463,9 +843,15 @@ cmd_send() {
 
     tmux select-pane -t "$SESSION:$WINDOW.$PANE"
     sleep 0.3
-    tmux send-keys -t "$SESSION:$WINDOW.$PANE" "$MSG" Enter
-    sleep 0.2
-    tmux send-keys -t "$SESSION:$WINDOW.$PANE" "" Enter
+    # Split the send into two events: type the text literally first (-l), pause
+    # so the worker TUI commits the line into its input buffer, THEN press Enter
+    # as a standalone keystroke. Combining text+Enter into one send-keys call
+    # leaves the text sitting UNSUBMITTED on current Codex/Claude TUI builds —
+    # the dispatch reports success but the worker pane never receives the prompt.
+    # Same fix already proven on the callback path (see _send notify below).
+    tmux send-keys -t "$SESSION:$WINDOW.$PANE" -l "$MSG"
+    sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
+    tmux send-keys -t "$SESSION:$WINDOW.$PANE" Enter
 }
 
 cmd_read() {
@@ -515,19 +901,14 @@ cmd_log() {
 
     # Phase 1b Step 4b: record session in pending entries so cmd_stall_check_status
     # can filter by current session (multi-session correlation, review item #4).
+    # Session resolution mirrors require_tmux_session: only consult
+    # `tmux display-message` when inside tmux; otherwise walk up to .dev/.forge-session.
+    # Stamp the resolving session into pending entries so the send-hook and
+    # stall-check-status can filter by session. Empty -> "unknown" (NOT the
+    # context sentinel): the never-skip-legacy filter keys on empty/"unknown" to
+    # keep in-flight upgrades closeable. See final-plan §4.3.
     local session
-    session="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
-    if [ -z "$session" ]; then
-        local _dir
-        _dir="$(pwd)"
-        while [ "$_dir" != "/" ]; do
-            if [ -f "$_dir/.dev/.forge-session" ]; then
-                session=$(cat "$_dir/.dev/.forge-session")
-                break
-            fi
-            _dir=$(dirname "$_dir")
-        done
-    fi
+    session="$(_resolve_session)"
     [ -z "$session" ] && session="unknown"
 
     ensure_pipeline_log "$slug"
@@ -559,6 +940,65 @@ EOF
 EOF
 
     echo "Logged: $from → $to | $slug/$stage | $ts (session=$session)"
+}
+
+# Internal no-context patch primitive (orphan-log-entries fix, v2 Review #1).
+# Rewrites `response: null` -> a given string on a timestamp anchor in BOTH the
+# per-pipeline log and the summary log, reusing the same surgical string-replace
+# as cmd_log_response (preserves YAML/comments) but WITHOUT deriving a status or
+# calling update_context. Used by `dispatch --supersede` and the orphan
+# migration to close pendings as sentinels — routing those through the public
+# cmd_log_response would corrupt forge-context.yml (status=unknown) and spam a
+# STAGE heartbeat. Real worker callbacks must still use cmd_log_response.
+#   _patch_response_by_ts <slug> <timestamp> <response>
+_patch_response_by_ts() {
+    local slug="$1" target_ts="$2" response="$3"
+    local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
+    if [ ! -f "$pipeline_log" ]; then
+        echo "ERROR: _patch_response_by_ts: no log file for pipeline '$slug'" >&2
+        return 1
+    fi
+    python3 - "$pipeline_log" "$SUMMARY_LOG" "$target_ts" "$response" <<'PYEOF'
+import re, sys
+
+pipeline_log, summary_log, target_ts, response = sys.argv[1:5]
+escaped_response = response.replace('\\', '\\\\').replace('"', '\\"')
+
+# Match the entry by its timestamp anchor; replace ONLY its `response: null`.
+pat = re.compile(
+    r'(timestamp:\s*"' + re.escape(target_ts) + r'"[^\n]*\n(?:\s+[^\n]*\n)*?\s+)response:\s*null',
+    re.MULTILINE)
+
+def patch(text):
+    return pat.subn(lambda m: m.group(1) + 'response: "' + escaped_response + '"',
+                    text, count=1)
+
+with open(pipeline_log) as f:
+    content = f.read()
+content, n = patch(content)
+if n != 1:
+    print(f"ERR: _patch_response_by_ts: pipeline_log patch failed (n={n}, ts={target_ts})",
+          file=sys.stderr)
+    sys.exit(2)
+with open(pipeline_log, "w") as f:
+    f.write(content)
+
+# Summary log: same anchor; soft-fail if absent (older entries may pre-date it).
+try:
+    with open(summary_log) as f:
+        s_content = f.read()
+    s_new, sn = patch(s_content)
+    if sn == 1:
+        with open(summary_log, "w") as f:
+            f.write(s_new)
+except FileNotFoundError:
+    pass
+PYEOF
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "ERROR: _patch_response_by_ts: failed for slug=$slug ts=$target_ts" >&2
+        return 1
+    fi
 }
 
 cmd_log_response() {
@@ -679,7 +1119,13 @@ if len(candidates) > 1 and not target_canonical and not target_stage:
 
 # Most recent matching entry (last in list-order).
 chosen = candidates[-1]
-print(f"OK\t{chosen.get('timestamp','')}\t{chosen.get('stage','')}\t{chosen.get('to','')}")
+# D2 (orphan-log-entries): a filtered call may still match >1 pending (the
+# ambiguity guard above fires only when NO filters are given). We close this
+# most-recent one and report the older skipped duplicates so the shell can emit
+# a durable WARN + audit event. Extra tab fields are ignored by older callers.
+skipped = candidates[:-1]
+skipped_ts = ",".join(e.get('timestamp', '') for e in skipped)
+print(f"OK\t{chosen.get('timestamp','')}\t{chosen.get('stage','')}\t{chosen.get('to','')}\t{len(skipped)}\t{skipped_ts}")
 PYEOF
 )
     local rc=$?
@@ -689,10 +1135,12 @@ PYEOF
         return 1
     fi
 
-    local target_ts target_stage_resolved target_to
+    local target_ts target_stage_resolved target_to n_skipped skipped_ts
     target_ts=$(echo "$matched" | awk -F'\t' '{print $2}')
     target_stage_resolved=$(echo "$matched" | awk -F'\t' '{print $3}')
     target_to=$(echo "$matched" | awk -F'\t' '{print $4}')
+    n_skipped=$(echo "$matched" | awk -F'\t' '{print $5}')
+    skipped_ts=$(echo "$matched" | awk -F'\t' '{print $6}')
 
     # Targeted string-replace anchored to the resolved timestamp. Preserves
     # YAML formatting / comments (yaml.dump would re-emit and lose them).
@@ -701,7 +1149,11 @@ import re, sys
 
 target_ts = """$target_ts"""
 escaped_response = """$response""".replace('\\\\', '\\\\\\\\').replace('"', '\\\\"')
-files_data = """$files_yaml""".strip()
+files_data = """$files_yaml"""
+# Preserve the leading newline that separates `files:` from the first list
+# item; an inline `files:- path:` is malformed YAML. Keep trailing whitespace
+# trimmed only.
+files_data = files_data.rstrip()
 
 # Match the entry by its timestamp anchor; replace ONLY its response: null
 # (and files: [] if files_data is provided).
@@ -744,6 +1196,18 @@ except FileNotFoundError:
 print("Updated: $slug | to=$target_to | stage=$target_stage_resolved | ts=$target_ts | response: $response")
 PYEOF
 
+    # D2 (orphan-log-entries): >1 pending matched the filter; we closed the most
+    # recent (candidates[-1]) and left the older duplicate(s) OPEN. Emit a loud
+    # stderr WARN AND a durable audit event. cmd_callback runs this with
+    # >/dev/null 2>&1 (the normal callback path), so the audit event — not the
+    # stderr WARN — is the signal that survives there. MUST NOT change the exit
+    # code: this sits before the final update_context, whose rc stays the
+    # function's return value (the orchestrator reads it as success/failure).
+    if [ -n "$n_skipped" ] && [ "$n_skipped" -gt 0 ] 2>/dev/null; then
+        echo "WARN: log-response closed the most recent of $((n_skipped + 1)) pending entries for slug=$slug stage=$target_stage_resolved to=$target_to; $n_skipped older duplicate(s) left OPEN (ts: $skipped_ts). Run 'dispatch --supersede' or the orphan migration to close them." >&2
+        _emit_event WARN_DUP_PENDING "$slug" "stage=$target_stage_resolved to=$target_to closed_ts=$target_ts skipped=$n_skipped skipped_ts=$skipped_ts"
+    fi
+
     # Hook 2: auto-update forge-context.yml using the resolved entry.
     if [ -n "$target_stage_resolved" ] && [ -n "$status" ]; then
         update_context "$slug" "$target_stage_resolved" "$status" "$target_to"
@@ -779,6 +1243,10 @@ cmd_pipeline_log() {
 # ---- Context (session start / recovery) ----
 
 cmd_context() {
+    # Per-call session-scoped pointer (shadows the static global). No
+    # require_tmux_session — this runs at session start with no $TMUX; the
+    # resolver degrades to the __nosession__ sentinel safely.
+    local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
     # Phase 1b Step 3: prepend stall-check-status section if non-empty.
     # Inserted BEFORE the existing early-return so stale-pending warnings
     # surface even when no $CONTEXT_FILE exists yet.
@@ -798,6 +1266,18 @@ cmd_context() {
     if [ ! -f "$CONTEXT_FILE" ]; then
         echo "(no forge context — no active pipeline)"
         echo ""
+        # Read-only migration HINT (§6): a legacy SHARED forge-context.yml may
+        # hold a pre-upgrade pipeline. Surface it; NEVER auto-adopt (could import
+        # another session's pointer). The owning session runs set-context --slug.
+        local _legacy_ctx="$DEV_DIR/forge-context.yml"
+        if [ -f "$_legacy_ctx" ]; then
+            local _legacy_slug
+            _legacy_slug=$(grep "^active_pipeline:" "$_legacy_ctx" 2>/dev/null | awk '{print $2}')
+            if [ -n "$_legacy_slug" ] && [ "$_legacy_slug" != "null" ]; then
+                echo "legacy shared context found; if this pipeline is yours, run: set-context --slug $_legacy_slug"
+                echo ""
+            fi
+        fi
         echo "Start a new pipeline with forge-bridge log, or set one manually:"
         echo "  forge-bridge set-context --slug <slug-name>"
 
@@ -912,6 +1392,938 @@ else:
     update_context "$slug" "$last_stage" "$last_status" "$last_worker"
     echo "Context set to pipeline: $slug"
     cmd_context
+}
+
+# ---- Status file (.dev/forge-status.md) ----
+#
+# Human-readable rolling summary. Re-rendered as a side effect of dispatch,
+# wait, and callback so a fresh `cat .dev/forge-status.md` always works.
+# Computed from forge-context.yml + the per-pipeline log; never the source of
+# truth.
+
+# Per-session rendered-status filename (mirrors _context_file's session scope).
+# Defined once and used at BOTH the render-write site and the cmd_status read
+# site so the two can never drift. (Replaces the old static status-filename
+# constant, which is now removed — it had no remaining reader.)
+_status_file_name() { printf 'forge-status.%s.md' "$(_session_or_sentinel)"; }
+
+_render_status_file() {
+    # Resolve project root; if we can't, skip silently (status is best-effort).
+    local project_root
+    project_root=$(_resolve_project_root "" 2>/dev/null)
+    if [ -z "$project_root" ]; then
+        return 0
+    fi
+    # Per-session read + output (in-place resolve; this function does not cd).
+    # Callers run pinned/in-pane (dispatch, callback, wait), so the resolver
+    # names the correct session for both the read path and the output name.
+    local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
+    local out_file="$project_root/$DEV_DIR/$(_status_file_name)"
+    mkdir -p "$(dirname "$out_file")"
+    python3 - "$project_root/$CONTEXT_FILE" "$project_root/$DEV_DIR" "$out_file" <<'PYEOF'
+import sys, os, yaml, datetime
+
+context_file, dev_dir, out_file = sys.argv[1:4]
+
+ctx = {}
+try:
+    with open(context_file) as f:
+        ctx = yaml.safe_load(f) or {}
+except FileNotFoundError:
+    pass
+
+slug          = ctx.get('active_pipeline') or '(none)'
+last_stage    = ctx.get('last_stage_completed') or '(none)'
+last_status   = ctx.get('last_stage_status') or '(none)'
+last_worker   = ctx.get('last_worker') or '(none)'
+next_stage    = ctx.get('next_stage') or '(none)'
+notes         = ctx.get('notes') or []
+
+# Read per-pipeline log (canonical event timeline for this slug). Fall back
+# to regex extraction when yaml.safe_load fails on malformed entries
+# (some legacy log-response emissions produced bad indentation in `files:`).
+entries = []
+if slug and slug != '(none)':
+    pipeline_log = os.path.join(dev_dir, 'proposals', slug, 'forge-log.yml')
+    if os.path.exists(pipeline_log):
+        try:
+            with open(pipeline_log) as f:
+                data = yaml.safe_load(f) or {}
+            entries = data.get('entries', []) or []
+        except Exception:
+            import re
+            with open(pipeline_log) as f:
+                raw = f.read()
+            # Best-effort parse of `  - timestamp: ... stage: ... to: ... response: ...` blocks.
+            # Splits on the entry-start marker and reconstructs fields per block.
+            block_re = re.compile(
+                r'^\s*-\s+timestamp:\s*"([^"]+)"', re.MULTILINE)
+            starts = [(m.start(), m.group(1)) for m in block_re.finditer(raw)]
+            for i, (off, ts) in enumerate(starts):
+                end = starts[i+1][0] if i+1 < len(starts) else len(raw)
+                blk = raw[off:end]
+                def grab(field):
+                    m = re.search(rf'^\s+{field}:\s*(.*?)\s*$', blk, re.MULTILINE)
+                    return m.group(1).strip() if m else None
+                stage = grab('stage')
+                to    = grab('to')
+                # Response can be `null` or a quoted string.
+                rmatch = re.search(r'^\s+response:\s*(null|"(?:[^"\\]|\\.)*")', blk, re.MULTILINE)
+                if not rmatch:
+                    continue
+                resp_raw = rmatch.group(1)
+                response = None if resp_raw == 'null' else resp_raw.strip('"').replace('\\"', '"')
+                entries.append({
+                    'timestamp': ts, 'stage': stage, 'to': to, 'response': response,
+                    'files': [],
+                })
+
+# Pending = response: null entries; current stage = most recent pending.
+pending = [e for e in entries if e.get('response') is None]
+current_stage  = (pending[-1].get('stage')  if pending else next_stage) or '(idle)'
+current_worker = (pending[-1].get('to')     if pending else None)
+current_since  = (pending[-1].get('timestamp') if pending else None)
+
+def short_time(ts):
+    return ts[11:16] if isinstance(ts, str) and len(ts) >= 16 else (ts or '?')
+
+def _stale_suffix(ts):
+    # D3 (orphan-log-entries): mark a pending entry STALE when its age exceeds
+    # 2 * FORGE_STALL_THRESHOLD_S (env, default 600) — same semantics as
+    # cmd_stall_check_status without sharing its out-of-scope heredoc constant.
+    # Compare the UTC 'Z' timestamp against now(UTC) (this heredoc's `now` at the
+    # bottom is local naive time, used only for display). Skip silently on a
+    # missing/malformed ts so `status` never breaks. Label-only — does NOT change
+    # which pending is chosen.
+    if not ts or not isinstance(ts, str):
+        return ''
+    try:
+        thr = int(os.environ.get('FORGE_STALL_THRESHOLD_S', '600'))
+    except (TypeError, ValueError):
+        thr = 600
+    stale = 2 * thr
+    raw = ts.strip()
+    iso = raw[:-1] + '+00:00' if raw.endswith('Z') else raw
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return ''
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds()
+    return f" (STALE — pending since {short_time(ts)}, possible orphan)" if age > stale else ''
+
+# Recent activity: last 15 entries.
+activity = []
+for e in entries[-15:]:
+    ts = short_time(e.get('timestamp'))
+    stage = e.get('stage', '?')
+    worker = e.get('to', '?')
+    resp = e.get('response')
+    if resp is None:
+        activity.append(f"  {ts}  · dispatched {stage:<14} → {worker} (PENDING)")
+    else:
+        rs = str(resp)
+        if 'FORGE_DONE' in rs:
+            icon, tag = '✓', 'complete'
+        elif 'FORGE_BLOCKED' in rs:
+            icon, tag = '✗', 'BLOCKED'
+        elif 'FORGE_ERROR' in rs:
+            icon, tag = '⚠', 'ERROR'
+        else:
+            icon, tag = '·', 'updated'
+        tail = rs.split('—', 1)[1].strip() if '—' in rs else ''
+        tail = (tail[:60] + '…') if len(tail) > 60 else tail
+        line = f"  {ts}  {icon} {stage:<14} {tag}"
+        if tail:
+            line += f"  ({tail})"
+        activity.append(line)
+
+# Artifacts: union of `files[].path` across entries.
+artifacts = []
+seen = set()
+for e in entries:
+    for f_entry in (e.get('files') or []):
+        if isinstance(f_entry, dict):
+            p = f_entry.get('path', '')
+            if p and p not in seen:
+                seen.add(p)
+                artifacts.append(p)
+
+now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+L = []
+L.append("# Forge Pipeline Status")
+L.append("")
+L.append(f"Pipeline: {slug}")
+if pending:
+    L.append(f"Current stage: {current_stage} ({current_worker}, PENDING since {short_time(current_since)}){_stale_suffix(current_since)}")
+else:
+    L.append(f"Current stage: (idle) — last completed: {last_stage} → {last_status} by {last_worker}")
+L.append(f"Next stage: {next_stage}")
+L.append(f"Last update: {now}")
+L.append("")
+L.append("## Recent activity")
+L.append("")
+L.extend(activity or ["  (no activity yet)"])
+L.append("")
+L.append("## Pending callbacks")
+L.append("")
+if pending:
+    for e in pending:
+        L.append(f"  - {e.get('stage','?')} ({e.get('to','?')}, since {short_time(e.get('timestamp'))})")
+else:
+    L.append("  (none)")
+L.append("")
+L.append("## Artifacts")
+L.append("")
+if artifacts:
+    for a in artifacts:
+        L.append(f"  {a}")
+else:
+    L.append("  (none yet)")
+L.append("")
+L.append("## Notes")
+L.append("")
+if notes:
+    for n in notes:
+        L.append(f"  - {n}")
+else:
+    L.append("  (none)")
+L.append("")
+
+with open(out_file, 'w') as f:
+    f.write("\n".join(L))
+PYEOF
+}
+
+cmd_status() {
+    _render_status_file
+    local project_root
+    project_root=$(_resolve_project_root "" 2>/dev/null)
+    if [ -z "$project_root" ]; then
+        echo "ERROR: status requires forge-project.yml in cwd ancestry" >&2
+        return 1
+    fi
+    local out_file="$project_root/$DEV_DIR/$(_status_file_name)"
+    if [ -f "$out_file" ]; then
+        cat "$out_file"
+    else
+        echo "(no status file)"
+    fi
+}
+
+# ---- Prompt template rendering (Phase 3) ----
+#
+# Template directories:
+#   ~/.config/forge/prompts/  — stage prompts; supports <<<INCLUDE _name>>>
+#   ~/.config/forge/digests/  — digest prompts; same include syntax
+#
+# Variables substituted in rendered prompts:
+#   {slug}, {worker}, {worker_pane}, {project_root}
+#
+# The synthetic <<<INCLUDE _preamble>>> is generated from forge-project.yml
+# (services.backend, services.frontend, forge.expected_root). Other includes
+# resolve to ~/.config/forge/prompts/<name>.txt.
+
+FORGE_PROMPTS_DIR="${FORGE_PROMPTS_DIR:-$HOME/.config/forge/prompts}"
+FORGE_DIGESTS_DIR="${FORGE_DIGESTS_DIR:-$HOME/.config/forge/digests}"
+
+# Render the {ENVIRONMENT_PREAMBLE} block from a project_root containing
+# .claude/forge-project.yml. Echoes preamble text on stdout; empty on miss.
+_render_preamble() {
+    local project_root="$1"
+    local yml="$project_root/.claude/forge-project.yml"
+    if [ ! -f "$yml" ]; then
+        return 0
+    fi
+    python3 - "$yml" "$project_root" <<'PYEOF'
+import sys, yaml
+yml_path, project_root = sys.argv[1], sys.argv[2]
+try:
+    with open(yml_path) as f:
+        data = yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(0)
+services = data.get('services') or {}
+backend = services.get('backend') or {}
+frontend = services.get('frontend') or {}
+lines = ["Environment setup (run before any other commands):"]
+lines.append(f"  Working directory: {project_root}")
+venv = backend.get('activate_venv')
+if venv:
+    bw = backend.get('working_dir')
+    if bw and venv.startswith('source ') and not venv.startswith(f'source {bw}/'):
+        venv = f"source {bw}/" + venv[len('source '):]
+    lines.append(f"  Python venv: {venv}")
+app_env = (data.get('forge') or {}).get('app_env') or data.get('app_env')
+if app_env:
+    lines.append(f"  APP_ENV: {app_env}")
+bp = backend.get('port')
+if bp:
+    lines.append(f"  Backend port: {bp}")
+fp = frontend.get('port')
+if fp:
+    lines.append(f"  Frontend port: {fp}")
+print("\n".join(lines))
+PYEOF
+}
+
+# Render a template file with includes + variable substitution.
+# Args: template_path slug stage worker worker_pane project_root
+# Echoes rendered text on stdout. Returns 1 if template missing.
+_render_template() {
+    local tmpl_path="$1" slug="$2" stage="$3" worker="$4" worker_pane="$5" project_root="$6"
+    if [ ! -f "$tmpl_path" ]; then
+        echo "ERROR: template not found: $tmpl_path" >&2
+        return 1
+    fi
+    local preamble
+    preamble=$(_render_preamble "$project_root")
+    python3 - "$tmpl_path" "$FORGE_PROMPTS_DIR" "$slug" "$stage" "$worker" \
+        "$worker_pane" "$project_root" "$preamble" <<'PYEOF'
+import sys, os, re
+(tmpl_path, prompts_dir, slug, stage, worker, worker_pane, project_root, preamble) = sys.argv[1:9]
+
+with open(tmpl_path) as f:
+    text = f.read()
+
+INCLUDE_RE = re.compile(r'<<<INCLUDE\s+(\S+)\s*>>>')
+
+def resolve_include(name):
+    if name == '_preamble':
+        return preamble
+    path = os.path.join(prompts_dir, f"{name}.txt")
+    if not os.path.exists(path):
+        sys.stderr.write(f"ERROR: include not found: {name}\n")
+        sys.exit(2)
+    with open(path) as f:
+        return f.read().rstrip('\n')
+
+# Resolve includes (single pass; nested includes are not supported by design).
+def expand(m):
+    return resolve_include(m.group(1))
+text = INCLUDE_RE.sub(expand, text)
+
+# Substitute variables.
+text = (text
+        .replace('{slug}', slug)
+        .replace('{stage}', stage)
+        .replace('{worker}', worker)
+        .replace('{worker_pane}', str(worker_pane))
+        .replace('{project_root}', project_root))
+
+sys.stdout.write(text)
+PYEOF
+}
+
+# dispatch — render a stage prompt, write it, log, send.
+#   forge-bridge dispatch --slug <s> --stage <s> --worker <w>
+#                          [--clear] [--dry-run]
+# --clear: send /clear to the worker pane before the dispatch (Hard Rule 20).
+# --dry-run: print rendered prompt to stdout; do NOT write/log/send.
+cmd_dispatch() {
+    local slug="" stage="" worker="" do_clear=false dry_run=false supersede=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)      slug="$2";   shift 2 ;;
+            --stage)     stage="$2";  shift 2 ;;
+            --worker)    worker="$2"; shift 2 ;;
+            --clear)     do_clear=true; shift ;;
+            --dry-run)   dry_run=true;  shift ;;
+            --supersede) supersede=true; shift ;;
+            *)           shift ;;
+        esac
+    done
+
+    if [ -z "$slug" ] || [ -z "$stage" ] || [ -z "$worker" ]; then
+        echo "Usage: forge-bridge dispatch --slug <s> --stage <s> --worker <w> [--clear] [--dry-run] [--supersede]" >&2
+        return 1
+    fi
+
+    local worker_canonical worker_pane
+    worker_canonical=$(canonical_pane_name "$worker")
+    worker_pane=$(pane_index "$worker")
+
+    case "$worker_canonical" in
+        claude-opus|claude-sonnet|codex-a|codex-b) ;;
+        *)
+            _emit_event ERROR "$slug" "stage=$stage reason=invalid-worker worker=$worker"
+            echo "ERROR: --worker must resolve to a worker pane (claude-opus|claude-sonnet|codex-a|codex-b); got '$worker_canonical'" >&2
+            return 1
+            ;;
+    esac
+
+    # --- Reasoning-tier routing policy guard (SKILL Hard Rule 22) ---
+    # Enforce stage->pane tier so HIGH-reasoning stages cannot be dispatched to a
+    # throughput pane (and vice-versa). Placed BEFORE the --dry-run early return
+    # so `dispatch --dry-run` exercises it (negative tests). Only the main
+    # build-pipeline stages are constrained; fix-pipeline / commit-review / ad-hoc
+    # stages are unlisted and fall through unconstrained. The verify "!= latest QA
+    # worker" exclusion stays in orchestrator prose — the bridge enforces tier,
+    # not pipeline history.
+    case "$stage" in
+        review|incorporate|implementation|impl-review|verify)
+            case "$worker_canonical" in
+                claude-opus|codex-a) ;;
+                *)
+                    _emit_event ERROR "$slug" "stage=$stage reason=tier-violation tier=high worker=$worker_canonical"
+                    echo "ERROR: stage '$stage' is HIGH-reasoning tier (Hard Rule 22): --worker must be claude-opus or codex-a, got '$worker_canonical'. High-thought stages never route to a throughput pane (claude-sonnet/codex-b)." >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        coding|qa|qa-fix|qa-retry)
+            case "$worker_canonical" in
+                claude-sonnet|codex-b) ;;
+                *)
+                    _emit_event ERROR "$slug" "stage=$stage reason=tier-violation tier=throughput worker=$worker_canonical"
+                    echo "ERROR: stage '$stage' is THROUGHPUT tier (Hard Rule 22): --worker must be claude-sonnet or codex-b, got '$worker_canonical'." >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        proposal)
+            _emit_event ERROR "$slug" "stage=$stage reason=proposal-not-dispatchable worker=$worker_canonical"
+            echo "ERROR: stage 'proposal' runs locally in pane 1 via Agent Teams; it is not dispatchable to a worker. Run it inline, then close with 'forge-bridge log-response --to claude --stage proposal'." >&2
+            return 1
+            ;;
+    esac
+
+    local project_root
+    project_root=$(_resolve_project_root "")
+    if [ -z "$project_root" ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=project-root-unresolvable"
+        echo "ERROR: dispatch requires a forge-project.yml. Walk-up from cwd failed." >&2
+        return 1
+    fi
+
+    local tmpl_path="$FORGE_PROMPTS_DIR/$stage.txt"
+    local rendered
+    rendered=$(_render_template "$tmpl_path" "$slug" "$stage" "$worker_canonical" "$worker_pane" "$project_root") || {
+        _emit_event ERROR "$slug" "stage=$stage reason=template-render-failed"
+        return 1
+    }
+
+    if [ "$dry_run" = true ]; then
+        printf '%s' "$rendered"
+        return 0
+    fi
+
+    # --- Slug-scoped dispatch guard (orphan-log-entries fix) ---
+    # Refuse to dispatch a new stage while ANY pending (response: null) entry
+    # exists for this slug, unless --supersede. Stops class-2 (advance-without-
+    # close) and class-3 (rapid re-dispatch) orphans at the only birth site for
+    # dispatched pendings. The predicate is SLUG-scoped, not (stage,to)-scoped:
+    # a (stage,to) predicate would let a different-stage advance through and
+    # re-open class 2 (see fix-plan.md). Placed AFTER the dry-run early-return so
+    # `--dry-run` never blocks. The destructive --supersede close is deferred to
+    # just before cmd_log (after preflight) — see below.
+    local guard_log="$DEV_DIR/proposals/$slug/forge-log.yml"
+    local pending_ts
+    pending_ts=$(python3 - "$guard_log" <<'PYEOF'
+import sys, yaml
+guard_log = sys.argv[1]
+try:
+    with open(guard_log) as f:
+        data = yaml.safe_load(f) or {}
+except FileNotFoundError:
+    sys.exit(0)
+except Exception as ex:
+    print(f"ERR_PARSE:{ex}", file=sys.stderr); sys.exit(3)
+for e in (data.get('entries') or []):
+    if e.get('response') is None:
+        ts = e.get('timestamp', '')
+        if ts:
+            print(ts)
+PYEOF
+)
+    if [ $? -eq 3 ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=dispatch-guard-parse-failed"
+        echo "ERROR: dispatch guard could not parse $guard_log — refusing to dispatch." >&2
+        return 1
+    fi
+    local n_pending=0
+    [ -n "$pending_ts" ] && n_pending=$(printf '%s\n' "$pending_ts" | grep -c .)
+    if [ "$n_pending" -gt 0 ] && [ "$supersede" != true ]; then
+        {
+            echo "HOOK BLOCKED: dispatch refused — slug '$slug' has $n_pending open pending entry(ies) (response: null):"
+            printf '%s\n' "$pending_ts" | while IFS= read -r t; do [ -n "$t" ] && echo "    - pending since $t"; done
+            echo "  A prior stage was never closed. Close it first — a worker callback, or for a local"
+            echo "  to:claude stage run:"
+            echo "    ~/bin/forge-bridge log-response --slug $slug --to claude --stage <stage> --response \"FORGE_DONE: <stage> — ...\""
+            echo "  then retry; or re-run this dispatch with --supersede to auto-close the open entry(ies)"
+            echo "  (FORGE_SUPERSEDED) and dispatch anew."
+        } >&2
+        _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=open-pending-exists worker=$worker_canonical n_pending=$n_pending"
+        return 1
+    fi
+
+    require_tmux_session "dispatch" || {
+        _emit_event ERROR "$slug" "stage=$stage reason=tmux-session-missing"
+        return 1
+    }
+
+    local prompt_file="$project_root/.dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
+    mkdir -p "$(dirname "$prompt_file")"
+    printf '%s' "$rendered" > "$prompt_file"
+
+    # Hard Rule 20 — orchestrator (this bridge call) drives /clear, never the worker.
+    if [ "$do_clear" = true ]; then
+        # Split text/Enter (same TUI-commit reason as cmd_send) so /clear
+        # reliably submits instead of sitting unsubmitted in the worker input.
+        tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" -l "/clear"
+        sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
+        tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" Enter
+        sleep "${FORGE_CLEAR_WAIT_S:-2}"
+    fi
+
+    # --supersede destructive close (deferred — fix-plan Review #5): close every
+    # open same-slug pending as FORGE_SUPERSEDED via the no-context helper (NOT
+    # cmd_log_response, which would corrupt context). Done HERE, after
+    # require_tmux_session/clear preflight, so a preflight failure can't leave a
+    # slug with closed-old entries and no replacement. Loops over ALL pendings —
+    # cmd_log_response closes only candidates[-1], so a single delegated call
+    # would silently leave duplicates open on a multi-pending slug.
+    if [ "$supersede" = true ] && [ "$n_pending" -gt 0 ]; then
+        local _sup_ts _sup_now
+        _sup_now=$(timestamp)
+        printf '%s\n' "$pending_ts" | while IFS= read -r _sup_ts; do
+            [ -z "$_sup_ts" ] && continue
+            _patch_response_by_ts "$slug" "$_sup_ts" \
+                "FORGE_SUPERSEDED: re-dispatched $stage (orphan-log-entries guard); auto-closed $_sup_now" \
+                || echo "WARN: --supersede: failed to close pending ts=$_sup_ts for slug=$slug" >&2
+        done
+        _emit_event SUPERSEDE "$slug" "stage=$stage closed_pending=$n_pending worker=$worker_canonical"
+    fi
+
+    local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
+    cmd_log --slug "$slug" --stage "$stage" --from claude --to "$worker_canonical" --prompt "$ref_msg" >/dev/null
+    cmd_send "$worker_canonical" "$ref_msg" || {
+        _emit_event ERROR "$slug" "stage=$stage reason=send-failed worker=$worker_canonical"
+        return 1
+    }
+
+    _emit_event DISPATCH "$slug" "stage=$stage worker=$worker_canonical"
+    _render_status_file
+    echo "DISPATCHED stage=$stage worker=$worker_canonical slug=$slug prompt=$prompt_file"
+}
+
+# callback — worker-side declarative completion signal.
+#   forge-bridge callback --slug <s> --stage <s> --status <DONE|BLOCKED|ERROR>
+#                         [--message <m>] [--worker <w>]
+# Behavior:
+#   1. Writes .dev/forge-tmp/callbacks/<slug>-<stage>.callback (machine-readable)
+#   2. Auto-calls log-response to mark the matching pending log entry done
+#   3. (Back-compat) sends a FORGE_<STATUS>: <stage> — <message> line to the
+#      orchestrator pane for any human reading scrollback.
+# --worker auto-resolves from TMUX_PANE if omitted.
+cmd_callback() {
+    local slug="" stage="" status="" message="" worker="" quiet=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)    slug="$2";    shift 2 ;;
+            --stage)   stage="$2";   shift 2 ;;
+            --status)  status="$2";  shift 2 ;;
+            --message) message="$2"; shift 2 ;;
+            --worker)  worker="$2";  shift 2 ;;
+            --quiet)   quiet=true;   shift ;;
+            *)         shift ;;
+        esac
+    done
+    if [ -z "$slug" ] || [ -z "$stage" ] || [ -z "$status" ]; then
+        echo "Usage: forge-bridge callback --slug <s> --stage <s> --status <DONE|BLOCKED|ERROR> [--message <m>] [--worker <w>] [--quiet]" >&2
+        return 1
+    fi
+    case "$status" in
+        DONE|BLOCKED|ERROR) ;;
+        *)
+            _emit_event ERROR "$slug" "stage=$stage reason=invalid-status status=$status"
+            echo "ERROR: --status must be DONE, BLOCKED, or ERROR; got '$status'" >&2
+            return 1
+            ;;
+    esac
+
+    # Auto-resolve worker from TMUX_PANE if not supplied.
+    if [ -z "$worker" ]; then
+        local pane_id="${TMUX_PANE:-}"
+        if [ -n "$pane_id" ]; then
+            local sess
+            sess="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+            if [ -n "$sess" ]; then
+                local idx
+                idx=$(tmux list-panes -t "$sess:$WINDOW" -F '#{pane_index} #{pane_id}' 2>/dev/null \
+                    | awk -v pid="$pane_id" '$2==pid {print $1}')
+                if [ -n "$idx" ]; then
+                    worker=$(pane_name "$idx")
+                fi
+            fi
+        fi
+    fi
+    if [ -z "$worker" ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=worker-unresolvable"
+        echo "ERROR: callback requires --worker (TMUX_PANE auto-resolution failed)" >&2
+        return 1
+    fi
+    local worker_canonical
+    worker_canonical=$(canonical_pane_name "$worker")
+
+    # Pane index for the worker, resolved UNCONDITIONALLY. The TMUX_PANE
+    # auto-resolve block above only runs when --worker is omitted, but installed
+    # stage prompts always pass --worker — so derive the index here (used by the
+    # read-only usage observation below; never re-derive from the conditional
+    # auto-resolve `idx`, which is unset on the normal --worker path).
+    local worker_idx
+    worker_idx=$(pane_index "$worker_canonical")
+
+    local project_root
+    project_root=$(_resolve_project_root "")
+    if [ -z "$project_root" ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=project-root-unresolvable"
+        echo "ERROR: callback requires forge-project.yml in cwd ancestry" >&2
+        return 1
+    fi
+
+    local cb_dir="$project_root/.dev/forge-tmp/callbacks"
+    mkdir -p "$cb_dir"
+    local cb_file="$cb_dir/${slug}-${stage}.callback"
+    local ts
+    ts=$(timestamp)
+    cat > "$cb_file" <<EOF
+slug: $slug
+stage: $stage
+status: $status
+worker: $worker_canonical
+timestamp: $ts
+message: $(yaml_escape "$message")
+EOF
+
+    # Auto log-response. Construct the legacy-style response string.
+    local legacy="FORGE_${status}: ${stage}"
+    if [ -n "$message" ]; then
+        legacy="${legacy} — ${message}"
+    fi
+    (cd "$project_root" && cmd_log_response --slug "$slug" --stage "$stage" \
+        --to "$worker_canonical" --response "$legacy" >/dev/null 2>&1) || true
+
+    # Back-compat: still notify the orchestrator pane so humans see the line.
+    # Suppressed by --quiet. Only attempts when inside a tmux session.
+    #
+    # Split the send-keys call: type the text first, sleep briefly so Claude's
+    # TUI input buffer commits the line, THEN press Enter. Combining text and
+    # Enter into one send-keys call leaves the text sitting in the input
+    # unsubmitted on current Claude TUI builds.
+    if [ "$quiet" != true ] && [ -n "${TMUX:-}" ]; then
+        local sess
+        sess="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+        if [ -n "$sess" ]; then
+            tmux send-keys -t "$sess:$WINDOW.1" -l "$legacy" 2>/dev/null || true
+            sleep 0.2
+            tmux send-keys -t "$sess:$WINDOW.1" Enter 2>/dev/null || true
+        fi
+    fi
+
+    local cb_msg_len
+    cb_msg_len=$(printf '%s' "$message" | wc -c | tr -d ' ')
+    _emit_event CALLBACK "$slug" "stage=$stage worker=$worker_canonical status=$status message_len=$cb_msg_len callback_file=$cb_file"
+
+    # Read-only, family-aware per-task usage observation. Placed AFTER all
+    # critical callback work above (callback file, log-response, CALLBACK emit)
+    # and wrapped `|| true` so it can never delay or break the callback. NEVER
+    # issues /clear, /new, or /compact — see _observe_usage.
+    _observe_usage "$worker_canonical" "$slug" "$stage" "$worker_idx" "$project_root" || true
+
+    _render_status_file
+    echo "CALLBACK $status stage=$stage slug=$slug worker=$worker_canonical → $cb_file"
+}
+
+# wait — block until a callback file appears for <slug>/<stage>, or until
+# stall-check classifies the worker as STALLED/PROMPTING/DEAD.
+#   forge-bridge wait --slug <s> --stage <s> --worker <w>
+#                     [--timeout <seconds>]
+#                     [--digest-template <name>]
+#                     [--interval <seconds>]
+# Outputs a single structured block on stdout. Forwards SIGINT cleanly.
+cmd_wait() {
+    local slug="" stage="" worker="" timeout="" digest_template="" interval="${FORGE_WAIT_INTERVAL_S:-15}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)            slug="$2";            shift 2 ;;
+            --stage)           stage="$2";           shift 2 ;;
+            --worker)          worker="$2";          shift 2 ;;
+            --timeout)         timeout="$2";         shift 2 ;;
+            --digest-template) digest_template="$2"; shift 2 ;;
+            --interval)        interval="$2";        shift 2 ;;
+            *)                 shift ;;
+        esac
+    done
+    if [ -z "$slug" ] || [ -z "$stage" ] || [ -z "$worker" ]; then
+        echo "Usage: forge-bridge wait --slug <s> --stage <s> --worker <w> [--timeout <s>] [--digest-template <name>] [--interval <s>]" >&2
+        return 1
+    fi
+
+    local worker_canonical
+    worker_canonical=$(canonical_pane_name "$worker")
+
+    local project_root
+    project_root=$(_resolve_project_root "")
+    if [ -z "$project_root" ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=project-root-unresolvable"
+        echo "ERROR: wait requires forge-project.yml in cwd ancestry" >&2
+        return 1
+    fi
+
+    require_tmux_session "wait" || {
+        _emit_event ERROR "$slug" "stage=$stage reason=tmux-session-missing"
+        return 1
+    }
+
+    local cb_file="$project_root/.dev/forge-tmp/callbacks/${slug}-${stage}.callback"
+    local started
+    started=$(date +%s)
+
+    # Trap SIGINT: emit ERROR FIRST so it survives even if the printf is
+    # interrupted; use :-unknown defaults so a SIGINT during arg-parse still
+    # produces a §4.1.8-conforming line.
+    trap '_emit_event ERROR "${slug:-unknown}" "stage=${stage:-unknown} worker=${worker_canonical:-unknown} reason=INTERRUPTED"; printf "STATUS: INTERRUPTED\nSTAGE: %s\nSLUG: %s\nWORKER: %s\n" "$stage" "$slug" "$worker_canonical"; exit 130' INT
+
+    _emit_event WAIT "$slug" "stage=$stage worker=$worker_canonical"
+
+    while true; do
+        if [ -f "$cb_file" ]; then
+            _wait_emit_callback "$cb_file" "$slug" "$stage" "$worker_canonical" \
+                "$digest_template" "$project_root"
+            _render_status_file
+            return 0
+        fi
+
+        local sc_out sc_state
+        sc_out=$(cmd_stall_check --project-root "$project_root" "$worker_canonical" 2>/dev/null)
+        sc_state=$(echo "$sc_out" | awk '{print $1}')
+        case "$sc_state" in
+            STALLED|PROMPTING|DEAD)
+                _emit_event STALL "$slug" "stage=$stage worker=$worker_canonical state=$sc_state"
+                printf 'STATUS: %s\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nDETAIL: %s\n' \
+                    "$sc_state" "$stage" "$slug" "$worker_canonical" "$sc_out"
+                _render_status_file
+                return 0
+                ;;
+        esac
+
+        if [ -n "$timeout" ]; then
+            local elapsed
+            elapsed=$(( $(date +%s) - started ))
+            if [ "$elapsed" -ge "$timeout" ]; then
+                _emit_event STALL "$slug" "stage=$stage worker=$worker_canonical state=TIMEOUT elapsed=${elapsed}s"
+                printf 'STATUS: TIMEOUT\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nELAPSED: %ss\n' \
+                    "$stage" "$slug" "$worker_canonical" "$elapsed"
+                _render_status_file
+                return 0
+            fi
+        fi
+
+        sleep "$interval"
+    done
+}
+
+# Internal: emit the structured block from a callback file. Optionally render
+# a digest prompt to disk for the orchestrator to spawn an Agent against.
+_wait_emit_callback() {
+    local cb_file="$1" slug="$2" stage="$3" worker_canonical="$4" digest_template="$5" project_root="$6"
+
+    local status message
+    status=$(grep '^status:' "$cb_file" | awk '{print $2}')
+    message=$(python3 -c "
+import yaml, sys
+with open('$cb_file') as f:
+    d = yaml.safe_load(f) or {}
+print(d.get('message', '') or '')
+" 2>/dev/null)
+
+    printf 'STATUS: %s\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nCALLBACK: %s\n' \
+        "$status" "$stage" "$slug" "$worker_canonical" "$message"
+
+    if [ -n "$digest_template" ] && [ "$status" = "DONE" ]; then
+        local digest_tmpl="$FORGE_DIGESTS_DIR/$digest_template.txt"
+        if [ ! -f "$digest_tmpl" ]; then
+            _emit_event ERROR "$slug" "stage=$stage reason=digest-template-not-found template=$digest_template"
+            printf 'DIGEST_PROMPT_ERROR: template not found: %s\n' "$digest_tmpl"
+            return 0
+        fi
+        local digest_out_dir="$project_root/.dev/forge-tmp"
+        mkdir -p "$digest_out_dir"
+        local digest_out="$digest_out_dir/digest-${stage}-${slug}.txt"
+        local worker_pane
+        worker_pane=$(pane_index "$worker_canonical")
+        _render_template "$digest_tmpl" "$slug" "$stage" "$worker_canonical" \
+            "$worker_pane" "$project_root" > "$digest_out" || return 0
+        _emit_event DIGEST "$slug" "stage=$stage template=$digest_template event=prompt-rendered out_file=$digest_out"
+        printf 'DIGEST_PROMPT: %s\n' "$digest_out"
+    fi
+}
+
+# digest — render a digest prompt to disk for ad-hoc use.
+#   forge-bridge digest --slug <s> --stage <s> --template <name> [--worker <w>]
+# Worker defaults to claude-opus when not supplied (digest agents are
+# orchestrator-side; the worker token here only affects {worker}/{worker_pane}
+# substitutions, which most digest templates do not reference).
+cmd_digest() {
+    local slug="" stage="" template="" worker="claude-opus"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)     slug="$2";     shift 2 ;;
+            --stage)    stage="$2";    shift 2 ;;
+            --template) template="$2"; shift 2 ;;
+            --worker)   worker="$2";   shift 2 ;;
+            *)          shift ;;
+        esac
+    done
+    if [ -z "$slug" ] || [ -z "$stage" ] || [ -z "$template" ]; then
+        echo "Usage: forge-bridge digest --slug <s> --stage <s> --template <name> [--worker <w>]" >&2
+        return 1
+    fi
+
+    local project_root
+    project_root=$(_resolve_project_root "")
+    if [ -z "$project_root" ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=project-root-unresolvable"
+        echo "ERROR: digest requires forge-project.yml in cwd ancestry" >&2
+        return 1
+    fi
+
+    local worker_canonical worker_pane
+    worker_canonical=$(canonical_pane_name "$worker")
+    worker_pane=$(pane_index "$worker")
+
+    local tmpl_path="$FORGE_DIGESTS_DIR/$template.txt"
+    local out_dir="$project_root/.dev/forge-tmp"
+    mkdir -p "$out_dir"
+    local out_file="$out_dir/digest-${stage}-${slug}.txt"
+
+    _render_template "$tmpl_path" "$slug" "$stage" "$worker_canonical" \
+        "$worker_pane" "$project_root" > "$out_file" || {
+        _emit_event ERROR "$slug" "stage=$stage reason=template-render-failed template=$template"
+        return 1
+    }
+
+    _emit_event DIGEST "$slug" "stage=$stage template=$template event=prompt-rendered out_file=$out_file"
+    echo "DIGEST_PROMPT: $out_file"
+}
+
+# emit — orchestrator-driven event emission for the heartbeat log.
+#   forge-bridge emit <TYPE> --slug <s> [--stage <s>] [key=value …]
+# Validates TYPE against the 9-event whitelist; sanitizes the RHS of each
+# passthrough key=value and forwards through _emit_event. Used by the
+# orchestrator to emit DIGEST verdicts after consuming digest output
+# (and, in v2, routing-decision events).
+cmd_emit() {
+    if [ $# -lt 1 ]; then
+        echo "Usage: forge-bridge emit <TYPE> --slug <s> [--stage <s>] [key=value …]" >&2
+        return 1
+    fi
+    local type="$1"; shift
+    case "$type" in
+        DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE) ;;
+        *)
+            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE; got '$type'" >&2
+            return 1
+            ;;
+    esac
+    local slug="" stage=""
+    local -a passthrough=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)  slug="$2";  shift 2 ;;
+            --stage) stage="$2"; shift 2 ;;
+            *)
+                if [[ "$1" == *=* ]]; then
+                    local k="${1%%=*}" v="${1#*=}"
+                    local v_clean
+                    v_clean=$(_sanitize_event_value "$v")
+                    passthrough+=("$k=$v_clean")
+                else
+                    passthrough+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+    if [ -z "$slug" ]; then
+        echo "ERROR: emit requires --slug" >&2
+        return 1
+    fi
+    local fields=""
+    [ -n "$stage" ] && fields="stage=$stage"
+    if [ "${#passthrough[@]}" -gt 0 ]; then
+        if [ -n "$fields" ]; then
+            fields="$fields ${passthrough[*]}"
+        else
+            fields="${passthrough[*]}"
+        fi
+    fi
+    _emit_event "$type" "$slug" "$fields"
+}
+
+# usage — print the per-worker usage snapshot for the current session.
+#   forge-bridge usage [<worker>]
+# Read-only FILE read (forge-usage.<session>.yml); never scrapes a pane — a
+# status query must not perturb workers. Recorded per task by _observe_usage.
+cmd_usage() {
+    local filter="${1:-}"
+    local project_root
+    project_root=$(_resolve_project_root "")
+    if [ -z "$project_root" ]; then
+        echo "usage: no project root resolved (run from a forge project directory)"
+        return 0
+    fi
+    local sess_token; sess_token=$(_session_or_sentinel)
+    if [ "$sess_token" = "__nosession__" ]; then
+        echo "usage: no forge session resolved — cannot identify a usage snapshot."
+        echo "       (set TMUX_SESSION, or run from a project dir with .dev/.forge-session)"
+        return 0
+    fi
+    local usage_file="$project_root/$(_usage_file)"
+    if [ ! -f "$usage_file" ]; then
+        echo "usage: no usage recorded yet for session '$sess_token'"
+        echo "       ($usage_file)"
+        return 0
+    fi
+    FORGE_U_FILTER="$filter" python3 - "$usage_file" 2>/dev/null <<'PYEOF'
+import os, sys, yaml
+usage_file = sys.argv[1]
+flt = os.environ.get("FORGE_U_FILTER", "")
+try:
+    with open(usage_file) as f:
+        data = yaml.safe_load(f) or {}
+except Exception as e:
+    print("usage: snapshot unreadable: %s" % e); sys.exit(0)
+if not isinstance(data, dict):
+    data = {}
+workers = data.get("workers") or {}
+updated = data.get("updated", "?")
+print("usage snapshot (updated %s):" % updated)
+if not isinstance(workers, dict) or not workers:
+    print("  (empty)"); sys.exit(0)
+order = ["claude-opus", "claude-sonnet", "codex-a", "codex-b"]
+keys = [k for k in order if k in workers] + [k for k in workers if k not in order]
+shown = 0
+for w in keys:
+    if flt and w != flt:
+        continue
+    r = workers[w] if isinstance(workers[w], dict) else {}
+    hr = r.get("headroom", "?")
+    if hr == "unknown":
+        extra = "reason=%s" % r.get("reason", "?")
+    else:
+        extra = "pct=%s tokens=%s" % (r.get("pct", "?"), r.get("tokens", "?"))
+    print("  %-13s family=%-6s headroom=%-7s confidence=%-5s stage=%-13s %s" % (
+        w, r.get("family", "?"), hr, r.get("confidence", "?"),
+        r.get("stage", "?"), extra))
+    shown += 1
+if flt and shown == 0:
+    print("  (no record for worker '%s')" % flt)
+PYEOF
+    return 0
 }
 
 cmd_preflight() {
@@ -1099,6 +2511,8 @@ EOF
 
 cmd_add_note() {
     local note="$*"
+    # Per-call session-scoped pointer (shadows the static global).
+    local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
 
     if [ -z "$note" ]; then
         echo "Usage: forge-bridge add-note <your note>"
@@ -1218,7 +2632,7 @@ cmd_stall_check() {
 
     # has_pending_log_for is internal; runs against $SUMMARY_LOG in cwd.
     local pending="false"
-    if has_pending_log_for "$canonical"; then
+    if has_pending_log_for "$canonical" "$SESSION"; then
         pending="true"
     fi
 
@@ -1524,12 +2938,11 @@ cmd_stall_check_status() {
 
     local threshold="${FORGE_STALL_THRESHOLD_S:-600}"
 
-    # Resolve current session (no tmux required for the env path).
+    # Resolve current session via the unified resolver (env / tmux / guarded
+    # walk-up). Empty -> the python filter treats every entry as same-session
+    # (over-warn, the safe direction on an ambiguous host).
     local current_session
-    current_session="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
-    if [ -z "$current_session" ] && [ -f ".dev/.forge-session" ]; then
-        current_session=$(cat ".dev/.forge-session")
-    fi
+    current_session="$(_resolve_session)"
 
     python3 - "$SUMMARY_LOG" "$FORGE_CACHE_DIR" "$current_session" "$threshold" "$project_root" <<'PYEOF'
 import sys, os, time, yaml
@@ -1675,6 +3088,180 @@ print(f"alias-self-test: OK ({len(expected_canonical)} aliases verified, {len(py
 PYEOF
 }
 
+cmd_health() {
+    # Per-pane health check. For each canonical pane in the active forge
+    # session, verify the pane exists and capture-pane output indicates the
+    # expected worker process is running. Exits 0 only if every pane is OK.
+    #
+    # Output: one line per pane, machine-parseable:
+    #   OK pane=<name> idx=<n> kind=<claude|codex> state=<idle|busy|prompting>
+    #   DEAD pane=<name> idx=<n>
+    #   WRONG_PROCESS pane=<name> idx=<n> expected=<kind> got=<shell|other|empty>
+    #   UNKNOWN pane=<name> idx=<n> reason=<capture_failed|...>
+    #
+    # Followed by a one-line summary: SUMMARY total=5 ok=N dead=N wrong=N unknown=N
+
+    require_tmux_session "health" || return 1
+
+    local tmpdir
+    tmpdir=$(mktemp -d -t forge-health-XXXXXX)
+    trap 'rm -rf "$tmpdir"' RETURN
+
+    # Expected (canonical_name, idx, kind) tuples.
+    # kind is 'claude' or 'codex' — matched against idle-prompts.yml regex tables.
+    local specs=(
+        "claude-opus:0:claude-opus"
+        "claude:1:claude-opus"
+        "codex-a:2:codex-a"
+        "codex-b:3:codex-b"
+        "claude-sonnet:4:claude-sonnet"
+    )
+
+    local existing_idxs
+    existing_idxs=$(tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_index}' 2>/dev/null | tr '\n' ' ')
+
+    local ok=0 dead=0 wrong=0 unknown=0
+    local spec name idx kind raw_file out
+    for spec in "${specs[@]}"; do
+        name="${spec%%:*}"
+        local rest="${spec#*:}"
+        idx="${rest%%:*}"
+        kind="${rest##*:}"
+
+        if ! echo " $existing_idxs " | grep -q " $idx "; then
+            echo "DEAD pane=$name idx=$idx"
+            dead=$((dead+1))
+            continue
+        fi
+
+        raw_file="$tmpdir/pane-$idx.txt"
+        tmux capture-pane -p -t "$SESSION:$WINDOW.$idx" -S -50 > "$raw_file" 2>/dev/null
+        if [ ! -s "$raw_file" ]; then
+            echo "UNKNOWN pane=$name idx=$idx reason=capture_failed"
+            unknown=$((unknown+1))
+            continue
+        fi
+
+        out=$(python3 - "$raw_file" "$kind" "$FORGE_IDLE_PROMPTS_FILE" <<'PYEOF'
+import sys, re, yaml
+
+raw_file, expected_kind, prompts_file = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(raw_file) as f:
+    raw = f.read()
+
+# Same V3 normalization the stall classifier uses.
+strip_rules = [
+    (r'\x1B\[[0-9;]*[A-Za-z]', ''),
+    (r'\x1B\][0-9;]*\x07', ''),
+    (r'^•\s+Working\s+\([^)]*\)(\s+·\s+.*)?$', '• Working (...)'),
+    (r'^─\s+Worked\s+for\s+\d+m?\s*\d*s\s*─*$', '─ Worked for X ──'),
+    (r'…\s*$', ''),
+    (r'[⠀-⣿]+\s*$', ''),
+    (r'\s+$', ''),
+]
+def normalize(text):
+    out = text
+    for pat, repl in strip_rules:
+        out = re.sub(pat, repl, out, flags=re.MULTILINE)
+    return out
+
+norm = normalize(raw)
+lines = [ln for ln in norm.splitlines() if ln.strip() != '']
+tail = lines[-25:] if lines else []
+tail_text = '\n'.join(tail)
+
+try:
+    with open(prompts_file) as f:
+        prompts = yaml.safe_load(f) or {}
+except (FileNotFoundError, yaml.YAMLError):
+    print(f"UNKNOWN reason=prompts_file_missing")
+    sys.exit(0)
+
+cfg = prompts.get(expected_kind) or {}
+idle_re = cfg.get('idle_prompt_anchor') or ''
+active_re = cfg.get('active_work_marker') or ''
+approval_re = cfg.get('approval_prompt') or ''
+
+def any_match(pattern, text):
+    if not pattern:
+        return False
+    try:
+        return re.search(pattern, text, re.MULTILINE) is not None
+    except re.error:
+        return False
+
+# Detect the broad family. Claude panes show '━' bordered prompt; codex
+# panes show 'gpt-X.X' header. Look for ANY claude/codex idle anchor across
+# all known kinds, then compare against the expected one.
+all_idle = {}
+all_active = {}
+for k, v in (prompts or {}).items():
+    if not isinstance(v, dict):
+        continue
+    all_idle[k] = v.get('idle_prompt_anchor') or ''
+    all_active[k] = v.get('active_work_marker') or ''
+
+detected_kind = None
+for k, pat in all_idle.items():
+    if any_match(pat, tail_text):
+        detected_kind = k
+        break
+if detected_kind is None:
+    for k, pat in all_active.items():
+        if any_match(pat, tail_text):
+            detected_kind = k
+            break
+
+if detected_kind is None:
+    # No worker prompts detected. Heuristic for raw shell.
+    last = tail[-1] if tail else ''
+    shellish = bool(re.search(r'[\$%#>]\s*$', last)) or 'bash-' in last or last.endswith('$')
+    if shellish:
+        print(f"WRONG_PROCESS got=shell")
+    else:
+        print(f"UNKNOWN reason=no_marker_match")
+    sys.exit(0)
+
+# Normalize family: claude-opus/claude-sonnet → claude, codex-a/codex-b → codex
+def family(k):
+    if k.startswith('claude'): return 'claude'
+    if k.startswith('codex'):  return 'codex'
+    return k
+
+if family(detected_kind) != family(expected_kind):
+    print(f"WRONG_PROCESS got={detected_kind}")
+    sys.exit(0)
+
+# Right family. Determine state.
+state = 'idle'
+if any_match(active_re, tail_text):
+    state = 'busy'
+elif any_match(approval_re, tail_text):
+    state = 'prompting'
+elif any_match(idle_re, tail_text):
+    state = 'idle'
+else:
+    state = 'unknown'
+
+print(f"OK kind={family(detected_kind)} state={state}")
+PYEOF
+)
+        case "$out" in
+            OK*)            echo "OK pane=$name idx=$idx ${out#OK }"; ok=$((ok+1)) ;;
+            WRONG_PROCESS*) echo "WRONG_PROCESS pane=$name idx=$idx expected=$kind ${out#WRONG_PROCESS }"; wrong=$((wrong+1)) ;;
+            *)              echo "UNKNOWN pane=$name idx=$idx ${out#UNKNOWN }"; unknown=$((unknown+1)) ;;
+        esac
+    done
+
+    echo "SUMMARY total=5 ok=$ok dead=$dead wrong=$wrong unknown=$unknown session=$SESSION"
+
+    if [ "$ok" -eq 5 ]; then
+        return 0
+    fi
+    return 1
+}
+
 # ---- Main ----
 
 case "${1:-help}" in
@@ -1693,10 +3280,18 @@ case "${1:-help}" in
     context)         cmd_context ;;
     set-context)     shift; cmd_set_context "$@" ;;
     add-note)        shift; cmd_add_note "$@" ;;
+    usage)           shift; cmd_usage "$@" ;;
     preflight)       cmd_preflight ;;
+    status)          shift; cmd_status "$@" ;;
+    dispatch)        shift; cmd_dispatch "$@" ;;
+    callback)        shift; cmd_callback "$@" ;;
+    wait)            shift; cmd_wait "$@" ;;
+    digest)          shift; cmd_digest "$@" ;;
+    emit)            shift; cmd_emit "$@" ;;
     stall-check)         shift; cmd_stall_check "$@" ;;
     stall-check-status)  shift; cmd_stall_check_status "$@" ;;
     alias-self-test)     shift; cmd_alias_self_test "$@" ;;
+    health)              cmd_health ;;
     help|*)
         echo "forge-bridge — cross-pane messaging with hooks and audit log"
         echo ""
@@ -1706,8 +3301,13 @@ case "${1:-help}" in
         echo "  read <pane> [lines]           Read last N lines from a pane"
         echo "  focus <pane>                  Switch focus to a pane"
         echo "  back                          Return focus to orchestrator"
+        echo "  dispatch --slug <s> --stage <s> --worker <w> [--clear] [--dry-run]"
+        echo "                                Render stage prompt from ~/.config/forge/prompts/, write, log, send"
+        echo "  wait --slug <s> --stage <s> --worker <w> [--timeout <s>] [--digest-template <name>]"
+        echo "                                Block until callback or stall; emit one structured block"
         echo "  stall-check [--project-root <p>] <pane>"
         echo "                                Classify pane state (IDLE/ACTIVE/STALLED/PROMPTING/COMPLETED-PENDING-LOG-RESPONSE/DEAD/UNKNOWN)"
+        echo "  health                        Verify all 5 panes exist and run expected worker process; exits 0 only if all OK"
         echo ""
         echo "No-tmux commands (file-based; work from any directory, with or without a session):"
         echo "  preflight                     Print kickoff snapshot (pwd, branch, merge state, halt status)"
@@ -1719,14 +3319,22 @@ case "${1:-help}" in
         echo "                                Log a dispatch entry"
         echo "  history [lines]               Show project-wide summary"
         echo "  pipeline-log <slug> [lines]   Show per-pipeline detail"
+        echo "  status                        Render and print .dev/forge-status.md (human-readable rolling summary)"
         echo "  context                       Show current pipeline state"
         echo "  set-context --slug <s>        Set active pipeline (auto-derives state)"
         echo "  add-note <text>               Add a note to context (persists across sessions)"
+        echo "  usage [<worker>]              Show per-worker usage snapshot (read-only; from forge-usage.<session>.yml)"
         echo "  stall-check-status [--project-root <p>]"
         echo "                                List panes with pending dispatch and stale stall-check coverage"
         echo "  alias-self-test [--strict]    Verify pane alias maps stay in lockstep"
         echo "  log-response --slug <s> --response <r> [--to <pane>] [--stage <stage>] [--file <path:action>]..."
         echo "                                Update a pending entry; --to disambiguates when multiple pending"
+        echo "  callback --slug <s> --stage <s> --status <DONE|BLOCKED|ERROR> [--message <m>] [--worker <w>] [--quiet]"
+        echo "                                Worker-side declarative completion: writes callback file, auto-logs, notifies orchestrator (--quiet suppresses notification)"
+        echo "  digest --slug <s> --stage <s> --template <name> [--worker <w>]"
+        echo "                                Render digest prompt to .dev/forge-tmp/ for ad-hoc Agent dispatch"
+        echo "  emit <TYPE> --slug <s> [--stage <s>] [key=value …]"
+        echo "                                Orchestrator-driven heartbeat emit (TYPE: DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE)"
         echo ""
         echo "Panes: claude-opus/opus/inline/general (0), claude/orchestrator/claude-orchestrator (1), codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)"
         echo ""
