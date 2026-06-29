@@ -1754,6 +1754,42 @@ cmd_dispatch() {
             ;;
     esac
 
+    # --- Reasoning-tier routing policy guard (SKILL Hard Rule 22) ---
+    # Enforce stage->pane tier so HIGH-reasoning stages cannot be dispatched to a
+    # throughput pane (and vice-versa). Placed BEFORE the --dry-run early return
+    # so `dispatch --dry-run` exercises it (negative tests). Only the main
+    # build-pipeline stages are constrained; fix-pipeline / commit-review / ad-hoc
+    # stages are unlisted and fall through unconstrained. The verify "!= latest QA
+    # worker" exclusion stays in orchestrator prose — the bridge enforces tier,
+    # not pipeline history.
+    case "$stage" in
+        review|incorporate|implementation|impl-review|verify)
+            case "$worker_canonical" in
+                claude-opus|codex-a) ;;
+                *)
+                    _emit_event ERROR "$slug" "stage=$stage reason=tier-violation tier=high worker=$worker_canonical"
+                    echo "ERROR: stage '$stage' is HIGH-reasoning tier (Hard Rule 22): --worker must be claude-opus or codex-a, got '$worker_canonical'. High-thought stages never route to a throughput pane (claude-sonnet/codex-b)." >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        coding|qa|qa-fix|qa-retry)
+            case "$worker_canonical" in
+                claude-sonnet|codex-b) ;;
+                *)
+                    _emit_event ERROR "$slug" "stage=$stage reason=tier-violation tier=throughput worker=$worker_canonical"
+                    echo "ERROR: stage '$stage' is THROUGHPUT tier (Hard Rule 22): --worker must be claude-sonnet or codex-b, got '$worker_canonical'." >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        proposal)
+            _emit_event ERROR "$slug" "stage=$stage reason=proposal-not-dispatchable worker=$worker_canonical"
+            echo "ERROR: stage 'proposal' runs locally in pane 1 via Agent Teams; it is not dispatchable to a worker. Run it inline, then close with 'forge-bridge log-response --to claude --stage proposal'." >&2
+            return 1
+            ;;
+    esac
+
     local project_root
     project_root=$(_resolve_project_root "")
     if [ -z "$project_root" ]; then

@@ -15,11 +15,11 @@ session, plus a file-based control bus on disk.
 
 | Pane | Process | Role |
 |---|---|---|
-| 0 | `claude --model claude-opus-4-7 --permission-mode acceptEdits` | `claude-opus` worker — incorporate, impl-review |
-| 1 | `claude --model claude-opus-4-7` (no acceptEdits) | Orchestrator (Hard Rule 21) |
-| 2 | `codex` | `codex-a` worker — review, implementation (preferred), QA fallback |
-| 3 | `codex` | `codex-b` worker — qa, verify (when claude-sonnet did qa) |
-| 4 | `claude --model claude-sonnet-4-6 --permission-mode acceptEdits` | `claude-sonnet` worker — coding, qa-fix, verify (when codex-b did qa) |
+| 0 | `claude --model claude-opus-4-8 --permission-mode acceptEdits` | `claude-opus` worker (HIGH tier) — incorporate, impl-review; HIGH-tier fallback for implementation + verify |
+| 1 | `claude --model claude-opus-4-8` (no acceptEdits) | Orchestrator (Hard Rule 21) |
+| 2 | `codex -m gpt-5.5 -c model_reasoning_effort=xhigh -c service_tier=fast` | `codex-a` worker (HIGH tier) — review, implementation (default), verify (default) |
+| 3 | `codex -m gpt-5.5 -c model_reasoning_effort=medium -c service_tier=fast` | `codex-b` worker (THROUGHPUT tier) — qa, qa-retry |
+| 4 | `claude --model claude-sonnet-4-6 --permission-mode acceptEdits` | `claude-sonnet` worker (THROUGHPUT tier) — coding, qa-fix, qa (local fallback) |
 
 **Control bus:** `~/bin/forge-bridge` — a single shell script that owns all
 inter-pane messaging, dispatch logging, callback collection, stall
@@ -38,7 +38,8 @@ directly; everything goes through the bridge.
 | `.dev/proposals/{slug}/*.md` | workers | Stage artifacts (final-plan.md, review-feedback.md, etc.) |
 | `.dev/qa/{slug}/` | qa workers | issues.md, manifest.yaml, verification-report.yaml |
 | `.dev/forge-tmp/{worker}-{stage}-{slug}.txt` | `dispatch` | Rendered stage prompt sent to worker |
-| `.dev/forge-tmp/orchestrator-events.log` | `_emit_event` | Heartbeat event stream for pane-1 Monitor |
+| `.dev/forge-tmp/orchestrator-events.log` | `_emit_event` | Heartbeat event stream for pane-1 Monitor (incl. `USAGE` events) |
+| `.dev/forge-usage.<session>.yml` | `callback` (read-only pane observation) | Per-worker usage snapshot (normalized `headroom`; Claude from footer, Codex `unknown`) |
 
 **Two orchestrator invocation modes:**
 
@@ -95,9 +96,10 @@ directory).
 | `context` | Show current pipeline state |
 | `set-context --slug <s>` | Manually set the active pipeline (auto-derives state) |
 | `add-note <text>` | Annotate context; persists across sessions in `forge-context.yml` |
-| `callback --slug <s> --stage <s> --status <DONE\|BLOCKED\|ERROR> [--message <m>] [--worker <w>] [--quiet]` | Worker-side declarative completion: writes callback file, auto-logs, notifies orchestrator |
+| `usage [<worker>]` | Show the per-worker usage snapshot from `forge-usage.<session>.yml` (read-only; never scrapes a pane) |
+| `callback --slug <s> --stage <s> --status <DONE\|BLOCKED\|ERROR> [--message <m>] [--worker <w>] [--quiet]` | Worker-side declarative completion: writes callback file, auto-logs, notifies orchestrator, **records read-only usage** |
 | `digest --slug <s> --stage <s> --template <name> [--worker <w>]` | Render digest prompt to `.dev/forge-tmp/` for ad-hoc Agent dispatch |
-| `emit <TYPE> --slug <s> [--stage <s>] [key=value …]` | Orchestrator-driven heartbeat emit (TYPE: DISPATCH \| WAIT \| CALLBACK \| DIGEST \| STAGE \| STALL \| ERROR \| COMPLETE) |
+| `emit <TYPE> --slug <s> [--stage <s>] [key=value …]` | Orchestrator-driven heartbeat emit (TYPE: DISPATCH \| WAIT \| CALLBACK \| DIGEST \| STAGE \| STALL \| ERROR \| COMPLETE \| USAGE) |
 | `stall-check-status [--project-root <p>]` | List panes with pending dispatch and stale stall-check coverage |
 | `alias-self-test [--strict]` | Verify pane alias maps stay in lockstep |
 
@@ -164,6 +166,7 @@ rationale.
 | 19 | Stall detection lives in `forge-bridge wait` | Don't call `stall-check` directly during a pipeline run |
 | 20 | `dispatch --clear` between same-pane Claude dispatches | Claude panes accumulate context; pass `--clear` when re-using one. Codex panes don't need it |
 | 21 | Worker permission-mode and ident contract | Pane-launch flags fixed; git idents are repo-local only (`git -C ... config` — never `--global`) |
+| 22 | Reasoning-tier routing (bridge-enforced) | HIGH stages (review, incorporate, implementation, impl-review, verify) → codex-a or claude-opus only; THROUGHPUT stages (coding, qa, qa-fix, qa-retry) → claude-sonnet or codex-b. `proposal` is the local pane-1 exception (not dispatchable). `dispatch` rejects illegal stage/worker pairs |
 <!-- docs-refresh:end section=orchestrator-hard-rules -->
 
 ## Stage Routing
@@ -180,16 +183,16 @@ proposal → review → incorporate → implementation → impl-review → codin
 
 | Stage | Worker | Notes |
 |---|---|---|
-| proposal | local (Agent Teams) | Spawns A, B, C teammates in the orchestrator's foreground — NOT dispatched via the bridge |
-| review | codex-a | Adversarial proposal review. Codex-a only; do not silently fall back |
-| incorporate | claude-opus | Merge review feedback into final-plan.md |
-| implementation | codex-a (codex-b fallback) | Adversarial implementation doc. Fall back only on explicit high-usage signal |
-| impl-review | claude-opus (with `--clear`) | Verify implementation against plan + scope diff check |
-| coding | claude-sonnet | Execute the implementation via the `forge-coder` skill. No worktrees |
-| qa | codex-b (claude-sonnet local fallback) | Adversarial QA + regression sweep |
-| qa-fix | claude-sonnet (with `--clear`) | Resolve QA findings — only entered if qa digest has findings |
-| qa-retry | codex-b or claude-sonnet | Re-run QA after qa-fix; one re-run only |
-| verify | claude-sonnet OR codex-b (exclusion-based) | Final verification. MUST NOT be the same worker that ran the most recent qa stage |
+| proposal | local (Agent Teams) | HIGH tier, local pane-1 exception. Spawns A, B, C teammates in the orchestrator's foreground — NOT dispatched via the bridge |
+| review | codex-a | HIGH. Adversarial proposal review. Codex-a only; do not silently fall back |
+| incorporate | claude-opus | HIGH. Merge review feedback into final-plan.md |
+| implementation | codex-a (**claude-opus** fallback, `--clear`) | HIGH. Adversarial implementation doc. Fall back to the other HIGH pane only on explicit high-usage signal — never to a throughput pane |
+| impl-review | claude-opus (with `--clear`) | HIGH. Verify implementation against plan + scope diff check |
+| coding | claude-sonnet | THROUGHPUT. Execute the implementation via the `forge-coder` skill. No worktrees |
+| qa | codex-b (claude-sonnet local fallback) | THROUGHPUT (medium-reasoning, throughput-routed). Adversarial QA + regression sweep |
+| qa-fix | claude-sonnet (with `--clear`) | THROUGHPUT. Resolve QA findings — only entered if qa digest has findings |
+| qa-retry | codex-b or claude-sonnet | THROUGHPUT. Re-run QA after qa-fix; one re-run only |
+| verify | **codex-a (claude-opus fallback)** | HIGH. Final verification. Exclusion guard: MUST NOT be the same worker that ran the most recent qa stage (auto-satisfied under current QA routing) |
 
 ### Transition table
 
@@ -225,8 +228,10 @@ proposal → review → incorporate → implementation → impl-review → codin
 
 Codex panes don't need `--clear`. Claude panes accumulate in-conversation
 context, so `--clear` is mandatory when re-dispatching to a pane that
-already ran a prior stage (impl-review after incorporate; qa-fix or
-verify after coding).
+already ran a prior stage. The common pane-0 (claude-opus) reuse cases are
+impl-review after incorporate, the implementation fallback after
+incorporate, and the verify fallback after impl-review; pane-4
+(claude-sonnet) reuse is qa-fix after coding.
 <!-- docs-refresh:end section=stage-routing -->
 
 ## Pane Layout and Classifier
