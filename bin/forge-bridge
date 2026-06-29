@@ -141,6 +141,13 @@ _session_or_sentinel() {
 # Per-call context pointer path. Pure function of the resolved session token.
 _context_file() { printf '%s/forge-context.%s.yml' "$DEV_DIR" "$(_session_or_sentinel)"; }
 
+# Per-call usage snapshot path. Same session scoping as _context_file, but a
+# DEDICATED file so the resume-critical update_context() heredoc writer is never
+# touched (folding usage into the context file would force a clobber-preservation
+# edit there). Relative to $DEV_DIR like _context_file; callers prefix
+# $project_root. See .dev/proposals/per-task-usage-reporting/final-plan.md.
+_usage_file() { printf '%s/forge-usage.%s.yml' "$DEV_DIR" "$(_session_or_sentinel)"; }
+
 require_tmux_session() {
     local cmd="${1:-(unknown)}"
 
@@ -319,6 +326,223 @@ _emit_event() {
     local log_file="$log_dir/orchestrator-events.log"
     mkdir -p "$log_dir" 2>/dev/null || return 0
     printf '%s: pipeline=%s %s\n' "$type" "$slug" "$*" >> "$log_file" 2>/dev/null || true
+}
+
+# _observe_usage <worker_canonical> <slug> <stage> <worker_idx> <project_root>
+# Read-only, family-aware per-task usage observation. Invoked from cmd_callback
+# AFTER all critical callback work, wrapped `|| true`. ALWAYS returns 0 — usage
+# observation must never delay or break a callback or the pipeline. It NEVER
+# sends keystrokes and NEVER issues /clear, /new, or /compact: it only
+# `capture-pane`s (read-only) and writes an advisory snapshot + a USAGE event.
+#
+# Claude panes carry usage in the persistent footer `[Model] ctx: Nk (P%)` — the
+# same line stall-check's idle_prompt_anchor matches (shared `ctx: Nk (P%)` shape,
+# so a footer-format drift breaks both in lockstep). Codex panes expose NO usage
+# in pane text on the current gpt-5.5 build (the trailing `· …` segment is the
+# git branch, not usage) → recorded as honest unknown, no capture, no regex.
+# See .dev/proposals/per-task-usage-reporting/final-plan.md.
+_observe_usage() {
+    local worker="$1" slug="$2" stage="$3" worker_idx="$4" project_root="$5"
+
+    # Guard 1: only the four worker panes (an orchestrator self-callback that
+    # resolves to `claude` is silently skipped — no usage signal wanted there).
+    case "$worker" in
+        claude-opus|claude-sonnet|codex-a|codex-b) ;;
+        *) return 0 ;;
+    esac
+
+    # Family from the canonical worker name (mirrors family() in cmd_health).
+    local family
+    case "$worker" in
+        claude-*) family="claude" ;;
+        codex-*)  family="codex"  ;;
+        *)        return 0 ;;
+    esac
+
+    local usage_file="$project_root/$(_usage_file)"
+    local measured_at; measured_at=$(timestamp)
+    local fields=""
+
+    if [ "$family" = "codex" ]; then
+        # No usage in pane text — honest unknown. No capture, no regex.
+        fields="pct=null tokens=null headroom=unknown source=unsupported confidence=none reason=codex-no-pane-usage"
+        FORGE_U_FAMILY="$family" FORGE_U_WORKER="$worker" FORGE_U_STAGE="$stage" \
+        FORGE_U_AT="$measured_at" FORGE_U_RAWFILE="" \
+            python3 - "$usage_file" >/dev/null 2>&1 <<'PYEOF' || true
+import os, sys, re, yaml, fcntl
+usage_file = sys.argv[1]
+fam   = os.environ.get("FORGE_U_FAMILY", "")
+wk    = os.environ.get("FORGE_U_WORKER", "")
+stage = os.environ.get("FORGE_U_STAGE", "")
+at    = os.environ.get("FORGE_U_AT", "")
+rawf  = os.environ.get("FORGE_U_RAWFILE", "")
+
+record = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
+          "source": "unsupported", "confidence": "none",
+          "reason": "codex-no-pane-usage", "stage": stage, "measured_at": at}
+
+def upsert(path, worker, rec, updated):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    lp = path + ".lock"
+    with open(lp, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            data = {}
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        data = yaml.safe_load(f) or {}
+                except Exception:
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            workers = data.get("workers")
+            if not isinstance(workers, dict):
+                workers = {}
+            workers[worker] = rec
+            data["workers"] = workers
+            data["updated"] = updated
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
+            os.replace(tmp, path)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+try:
+    upsert(usage_file, wk, record, at)
+except Exception:
+    pass
+PYEOF
+        _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+        return 0
+    fi
+
+    # Claude: capture the pane footer (read-only) and parse the ctx usage.
+    # Test seam: FORGE_USAGE_FIXTURE points at a pre-captured pane file and
+    # bypasses tmux entirely (used by T1 unit tests; never set in production).
+    local raw_file="" fixture_mode=""
+    if [ -n "${FORGE_USAGE_FIXTURE:-}" ] && [ -f "${FORGE_USAGE_FIXTURE}" ]; then
+        raw_file="$FORGE_USAGE_FIXTURE"; fixture_mode=1
+    else
+        # cmd_callback does NOT call require_tmux_session, so the global SESSION
+        # is empty here — resolve the pane the same way cmd_callback does.
+        case "$worker_idx" in
+            ''|*[!0-9]*) fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=bad-pane"
+                         _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+                         return 0 ;;
+        esac
+        local sess
+        sess="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+        if [ -z "$sess" ]; then
+            fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=no-session"
+            _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+            return 0
+        fi
+        raw_file=$(mktemp -t forge-usage-XXXXXX 2>/dev/null) || raw_file=""
+        if [ -n "$raw_file" ]; then
+            tmux capture-pane -p -t "$sess:$WINDOW.$worker_idx" -S -12 > "$raw_file" 2>/dev/null || true
+        fi
+    fi
+
+    # Parse + persist in one python pass; it prints the USAGE event fields (NOT
+    # the raw footer line — raw lives only in the snapshot YAML, never in the
+    # line-oriented event log) and always exits 0 with a well-formed fields line.
+    fields=$(FORGE_U_FAMILY="$family" FORGE_U_WORKER="$worker" FORGE_U_STAGE="$stage" \
+             FORGE_U_AT="$measured_at" FORGE_U_RAWFILE="${raw_file:-}" \
+             python3 - "$usage_file" 2>/dev/null <<'PYEOF'
+import os, sys, re, yaml, fcntl
+usage_file = sys.argv[1]
+fam   = os.environ.get("FORGE_U_FAMILY", "")
+wk    = os.environ.get("FORGE_U_WORKER", "")
+stage = os.environ.get("FORGE_U_STAGE", "")
+at    = os.environ.get("FORGE_U_AT", "")
+rawf  = os.environ.get("FORGE_U_RAWFILE", "")
+
+def fields_line(d):
+    def v(x):
+        return "null" if x is None else x
+    return ("pct=%s tokens=%s headroom=%s source=%s confidence=%s%s" % (
+        v(d.get("pct")), v(d.get("tokens")), v(d.get("headroom")), v(d.get("source")),
+        v(d.get("confidence")),
+        (" reason=%s" % d["reason"]) if d.get("reason") else ""))
+
+def upsert(path, worker, rec, updated):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    lp = path + ".lock"
+    with open(lp, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            data = {}
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        data = yaml.safe_load(f) or {}
+                except Exception:
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            workers = data.get("workers")
+            if not isinstance(workers, dict):
+                workers = {}
+            workers[worker] = rec
+            data["workers"] = workers
+            data["updated"] = updated
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
+            os.replace(tmp, path)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+# Defaults → unknown; refined on a successful parse.
+rec = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
+       "raw": None, "source": "pane-footer", "confidence": "none",
+       "reason": "no-anchor", "stage": stage, "measured_at": at}
+try:
+    raw = ""
+    if rawf and os.path.exists(rawf):
+        with open(rawf) as f:
+            raw = f.read()
+    if not raw.strip():
+        rec["reason"] = "capture-failed"
+    else:
+        # Strip ANSI/OSC, then find the LAST `ctx: Nk (P%)` footer line.
+        norm = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', raw)
+        norm = re.sub(r'\x1b\][0-9;]*\x07', '', norm)
+        found = None
+        for line in reversed([l for l in norm.splitlines() if l.strip()][-12:]):
+            mm = re.search(r'ctx:\s*(\d+)(k?)\s*\((\d+)%\)', line)
+            if mm:
+                found = (mm, line.strip()); break
+        if found:
+            mm, line = found
+            pct = int(mm.group(3))
+            tokens = mm.group(1) + (mm.group(2) or "")
+            headroom = max(0, min(100, 100 - pct))
+            rec.update({"pct": pct, "tokens": tokens, "headroom": headroom,
+                        "raw": line, "source": "pane-footer",
+                        "confidence": ("high" if 0 <= pct <= 100 else "low"),
+                        "reason": None})
+except Exception:
+    rec = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
+           "raw": None, "source": "pane-footer", "confidence": "none",
+           "reason": "observe-error", "stage": stage, "measured_at": at}
+
+try:
+    upsert(usage_file, wk, rec, at)
+except Exception:
+    pass
+
+print(fields_line(rec))
+PYEOF
+)
+    [ -z "$fixture_mode" ] && [ -n "$raw_file" ] && rm -f "$raw_file" 2>/dev/null
+    [ -z "$fields" ] && fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=observe-error"
+    _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+    return 0
 }
 
 # ---- Hook: Check for pending log entry ----
@@ -619,9 +843,15 @@ cmd_send() {
 
     tmux select-pane -t "$SESSION:$WINDOW.$PANE"
     sleep 0.3
-    tmux send-keys -t "$SESSION:$WINDOW.$PANE" "$MSG" Enter
-    sleep 0.2
-    tmux send-keys -t "$SESSION:$WINDOW.$PANE" "" Enter
+    # Split the send into two events: type the text literally first (-l), pause
+    # so the worker TUI commits the line into its input buffer, THEN press Enter
+    # as a standalone keystroke. Combining text+Enter into one send-keys call
+    # leaves the text sitting UNSUBMITTED on current Codex/Claude TUI builds —
+    # the dispatch reports success but the worker pane never receives the prompt.
+    # Same fix already proven on the callback path (see _send notify below).
+    tmux send-keys -t "$SESSION:$WINDOW.$PANE" -l "$MSG"
+    sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
+    tmux send-keys -t "$SESSION:$WINDOW.$PANE" Enter
 }
 
 cmd_read() {
@@ -1604,7 +1834,11 @@ PYEOF
 
     # Hard Rule 20 — orchestrator (this bridge call) drives /clear, never the worker.
     if [ "$do_clear" = true ]; then
-        tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" "/clear" Enter
+        # Split text/Enter (same TUI-commit reason as cmd_send) so /clear
+        # reliably submits instead of sitting unsubmitted in the worker input.
+        tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" -l "/clear"
+        sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
+        tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" Enter
         sleep "${FORGE_CLEAR_WAIT_S:-2}"
     fi
 
@@ -1698,6 +1932,14 @@ cmd_callback() {
     local worker_canonical
     worker_canonical=$(canonical_pane_name "$worker")
 
+    # Pane index for the worker, resolved UNCONDITIONALLY. The TMUX_PANE
+    # auto-resolve block above only runs when --worker is omitted, but installed
+    # stage prompts always pass --worker — so derive the index here (used by the
+    # read-only usage observation below; never re-derive from the conditional
+    # auto-resolve `idx`, which is unset on the normal --worker path).
+    local worker_idx
+    worker_idx=$(pane_index "$worker_canonical")
+
     local project_root
     project_root=$(_resolve_project_root "")
     if [ -z "$project_root" ]; then
@@ -1748,6 +1990,12 @@ EOF
     local cb_msg_len
     cb_msg_len=$(printf '%s' "$message" | wc -c | tr -d ' ')
     _emit_event CALLBACK "$slug" "stage=$stage worker=$worker_canonical status=$status message_len=$cb_msg_len callback_file=$cb_file"
+
+    # Read-only, family-aware per-task usage observation. Placed AFTER all
+    # critical callback work above (callback file, log-response, CALLBACK emit)
+    # and wrapped `|| true` so it can never delay or break the callback. NEVER
+    # issues /clear, /new, or /compact — see _observe_usage.
+    _observe_usage "$worker_canonical" "$slug" "$stage" "$worker_idx" "$project_root" || true
 
     _render_status_file
     echo "CALLBACK $status stage=$stage slug=$slug worker=$worker_canonical → $cb_file"
@@ -1928,7 +2176,7 @@ cmd_digest() {
 
 # emit — orchestrator-driven event emission for the heartbeat log.
 #   forge-bridge emit <TYPE> --slug <s> [--stage <s>] [key=value …]
-# Validates TYPE against the 8-event whitelist; sanitizes the RHS of each
+# Validates TYPE against the 9-event whitelist; sanitizes the RHS of each
 # passthrough key=value and forwards through _emit_event. Used by the
 # orchestrator to emit DIGEST verdicts after consuming digest output
 # (and, in v2, routing-decision events).
@@ -1939,9 +2187,9 @@ cmd_emit() {
     fi
     local type="$1"; shift
     case "$type" in
-        DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE) ;;
+        DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE) ;;
         *)
-            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE; got '$type'" >&2
+            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE; got '$type'" >&2
             return 1
             ;;
     esac
@@ -1978,6 +2226,68 @@ cmd_emit() {
         fi
     fi
     _emit_event "$type" "$slug" "$fields"
+}
+
+# usage — print the per-worker usage snapshot for the current session.
+#   forge-bridge usage [<worker>]
+# Read-only FILE read (forge-usage.<session>.yml); never scrapes a pane — a
+# status query must not perturb workers. Recorded per task by _observe_usage.
+cmd_usage() {
+    local filter="${1:-}"
+    local project_root
+    project_root=$(_resolve_project_root "")
+    if [ -z "$project_root" ]; then
+        echo "usage: no project root resolved (run from a forge project directory)"
+        return 0
+    fi
+    local sess_token; sess_token=$(_session_or_sentinel)
+    if [ "$sess_token" = "__nosession__" ]; then
+        echo "usage: no forge session resolved — cannot identify a usage snapshot."
+        echo "       (set TMUX_SESSION, or run from a project dir with .dev/.forge-session)"
+        return 0
+    fi
+    local usage_file="$project_root/$(_usage_file)"
+    if [ ! -f "$usage_file" ]; then
+        echo "usage: no usage recorded yet for session '$sess_token'"
+        echo "       ($usage_file)"
+        return 0
+    fi
+    FORGE_U_FILTER="$filter" python3 - "$usage_file" 2>/dev/null <<'PYEOF'
+import os, sys, yaml
+usage_file = sys.argv[1]
+flt = os.environ.get("FORGE_U_FILTER", "")
+try:
+    with open(usage_file) as f:
+        data = yaml.safe_load(f) or {}
+except Exception as e:
+    print("usage: snapshot unreadable: %s" % e); sys.exit(0)
+if not isinstance(data, dict):
+    data = {}
+workers = data.get("workers") or {}
+updated = data.get("updated", "?")
+print("usage snapshot (updated %s):" % updated)
+if not isinstance(workers, dict) or not workers:
+    print("  (empty)"); sys.exit(0)
+order = ["claude-opus", "claude-sonnet", "codex-a", "codex-b"]
+keys = [k for k in order if k in workers] + [k for k in workers if k not in order]
+shown = 0
+for w in keys:
+    if flt and w != flt:
+        continue
+    r = workers[w] if isinstance(workers[w], dict) else {}
+    hr = r.get("headroom", "?")
+    if hr == "unknown":
+        extra = "reason=%s" % r.get("reason", "?")
+    else:
+        extra = "pct=%s tokens=%s" % (r.get("pct", "?"), r.get("tokens", "?"))
+    print("  %-13s family=%-6s headroom=%-7s confidence=%-5s stage=%-13s %s" % (
+        w, r.get("family", "?"), hr, r.get("confidence", "?"),
+        r.get("stage", "?"), extra))
+    shown += 1
+if flt and shown == 0:
+    print("  (no record for worker '%s')" % flt)
+PYEOF
+    return 0
 }
 
 cmd_preflight() {
@@ -2934,6 +3244,7 @@ case "${1:-help}" in
     context)         cmd_context ;;
     set-context)     shift; cmd_set_context "$@" ;;
     add-note)        shift; cmd_add_note "$@" ;;
+    usage)           shift; cmd_usage "$@" ;;
     preflight)       cmd_preflight ;;
     status)          shift; cmd_status "$@" ;;
     dispatch)        shift; cmd_dispatch "$@" ;;
@@ -2976,6 +3287,7 @@ case "${1:-help}" in
         echo "  context                       Show current pipeline state"
         echo "  set-context --slug <s>        Set active pipeline (auto-derives state)"
         echo "  add-note <text>               Add a note to context (persists across sessions)"
+        echo "  usage [<worker>]              Show per-worker usage snapshot (read-only; from forge-usage.<session>.yml)"
         echo "  stall-check-status [--project-root <p>]"
         echo "                                List panes with pending dispatch and stale stall-check coverage"
         echo "  alias-self-test [--strict]    Verify pane alias maps stay in lockstep"
@@ -2986,7 +3298,7 @@ case "${1:-help}" in
         echo "  digest --slug <s> --stage <s> --template <name> [--worker <w>]"
         echo "                                Render digest prompt to .dev/forge-tmp/ for ad-hoc Agent dispatch"
         echo "  emit <TYPE> --slug <s> [--stage <s>] [key=value …]"
-        echo "                                Orchestrator-driven heartbeat emit (TYPE: DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE)"
+        echo "                                Orchestrator-driven heartbeat emit (TYPE: DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE)"
         echo ""
         echo "Panes: claude-opus/opus/inline/general (0), claude/orchestrator/claude-orchestrator (1), codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)"
         echo ""

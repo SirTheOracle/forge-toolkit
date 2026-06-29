@@ -196,6 +196,7 @@ Five commands cover "what's going on right now":
 | `~/bin/forge-bridge health` | Per-pane check: do all 5 panes exist and run the expected worker process? Exits 0 only when every pane is `OK`. Output lines: `OK \| DEAD \| WRONG_PROCESS \| UNKNOWN pane=<name> idx=<n> …` and a `SUMMARY` line |
 | `~/bin/forge-bridge preflight` | Kickoff snapshot: pwd, branch, merge state, halt status code |
 | `~/bin/forge-bridge history [lines]` / `pipeline-log <slug> [lines]` | Recent activity across all pipelines / detail for one pipeline |
+| `~/bin/forge-bridge usage [<worker>]` | Per-worker usage snapshot recorded at each task completion: normalized `headroom` (0-100 = % capacity remaining) + `confidence`. Claude workers report from the pane footer; Codex is always `unknown` (the CLI exposes no usage in pane text). Read-only — never scrapes a pane |
 
 ### When to run each
 
@@ -204,6 +205,7 @@ Five commands cover "what's going on right now":
 | "What's happening right now?" | `forge-bridge context` |
 | "Show me the human summary" | `/forge status` |
 | "The orchestrator says a pane is wrong" | `forge-bridge health` |
+| "How used up are the workers?" | `forge-bridge usage` |
 | "Is this branch safe to dispatch on?" | `forge-bridge preflight` |
 | "Where did we leave off last week?" | `forge-bridge context`, then `history 20` |
 
