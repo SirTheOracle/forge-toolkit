@@ -41,8 +41,17 @@ err()   { printf "${RED}%s${NC}\n" "$1"; }
 if [ "${1:-}" = "--uninstall" ]; then
     info "Uninstalling forge toolkit..."
 
+    # Unload the forge-watch launchd agent before removing its symlink, else it
+    # keeps firing every 30s against a now-dangling path.
+    FW_PLIST="$HOME/Library/LaunchAgents/com.forge.watch.plist"
+    if [ -f "$FW_PLIST" ]; then
+        launchctl unload "$FW_PLIST" 2>/dev/null || true
+        rm -f "$FW_PLIST"
+        ok "  Unloaded and removed com.forge.watch launchd agent"
+    fi
+
     # Remove bin symlinks
-    for script in forge-bridge forge-start forge-dispatch-review; do
+    for script in forge-bridge forge-start forge-dispatch-review forge-watch; do
         if [ -L "$BIN_DIR/$script" ]; then
             rm "$BIN_DIR/$script"
             ok "  Removed ~/bin/$script"
@@ -86,7 +95,7 @@ info "Step 1: Symlinking bin scripts to ~/bin/"
 
 mkdir -p "$BIN_DIR"
 
-for script in forge-bridge forge-start forge-dispatch-review; do
+for script in forge-bridge forge-start forge-dispatch-review forge-watch; do
     src="$SCRIPT_DIR/bin/$script"
     dst="$BIN_DIR/$script"
 
@@ -217,6 +226,8 @@ info "Quick start:"
 echo "  forge-start              # Launch a forge tmux session"
 echo "  forge-bridge help        # See all forge-bridge commands"
 echo "  forge-bridge context     # Show current forge context"
+echo "  forge-watch status       # One-shot scan for blocked pipelines"
+echo "  forge-watch install      # Enable background blocked-on-you notifications"
 echo ""
 info "Skills available (Claude Code + Codex):"
 echo "  /adversarial-proposal    # 4-round adversarial planning (Opus)"

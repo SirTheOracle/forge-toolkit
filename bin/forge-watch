@@ -1,0 +1,853 @@
+#!/bin/bash
+# forge-watch — Blocked-on-You notifications for forge pipelines.
+#
+# A single READ-ONLY watcher. It discovers live forge sessions from tmux,
+# derives pipeline state from bridge-owned files under each project's .dev/,
+# and notifies the operator (macOS notification) only when a pipeline is
+# actually waiting on a human: a decision after QA, a BLOCKED worker, a stage
+# error, a stalled worker, or a pipeline error.
+#
+# It NEVER writes under any project's .dev/, NEVER sends input to panes, and
+# NEVER touches tmux/session state. Its only writes are its own cache/config
+# (~/.cache/forge-watch, ~/.config/forge) and, on `install`, a launchd plist.
+# If the watcher is dead or uninstalled, the workflow degrades to exactly
+# today's poll-the-tabs behavior — no pipeline depends on it.
+#
+# See .tmpFiles/forge-watch-proposal.md (r3) for the full design.
+#
+# Verbs:
+#   forge-watch check      one scan; print findings AND deliver notifications
+#   forge-watch status     one scan; print findings only (no notifications)
+#   forge-watch ack <t>    silence current conditions for <t> (session|slug|root)
+#   forge-watch install    write+load the launchd agent (30s interval)
+#   forge-watch uninstall  unload+remove the launchd agent
+#
+# Tuning (env var wins, else ~/.config/forge/watch.env, else default):
+#   FORGE_STALL_THRESHOLD_S   default 600  (STALE = 2x this, matches the bridge)
+#   FORGE_WATCH_DWELL_S       default 300  (NEEDS-DECISION dwell)
+#   FORGE_WATCH_RENOTIFY_S    default 900  (re-notify base; x2 backoff, cap 4h)
+#   FORGE_WATCH_ZOMBIE_AGE_D  default 7    (recent-context window for ZOMBIE-ACTIVE
+#                                           and the WORKER-STALLED/residue split)
+#   FORGE_WATCH_NOTIFY_COMPLETE       default 1  (notify on pipeline completion)
+#   FORGE_WATCH_NOTIFY_STALE_ZOMBIE   default 0  (notify on old zombie contexts)
+#   FORGE_WATCH_ROOTS_FILE            path to a roots list (default ~/.config/forge/watch-roots)
+
+set -euo pipefail
+
+LABEL="com.forge.watch"
+CACHE_DIR="${FORGE_WATCH_CACHE_DIR:-$HOME/.cache/forge-watch}"
+CONFIG_DIR="${FORGE_WATCH_CONFIG_DIR:-$HOME/.config/forge}"
+WATCH_ENV="$CONFIG_DIR/watch.env"
+WATCH_ROOTS="$CONFIG_DIR/watch-roots"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+# Resolve the real path of this script so the plist points at the installed
+# location (works whether ~/bin/forge-watch is a symlink or a copy).
+SELF="$( cd "$(dirname "$0")" >/dev/null 2>&1 && pwd )/$(basename "$0")"
+
+mkdir -p "$CACHE_DIR" "$CONFIG_DIR" 2>/dev/null || true
+
+# ── Notification sink (the one swappable shell function) ──────────────────
+# In tests, set FORGE_WATCH_SINK_CAPTURE to a file: notifications are appended
+# as "title<TAB>body" instead of being delivered, so the full debounce path is
+# exercised without real notifications.
+fw_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+fw_notify() {
+    local title="$1" body="$2"
+    if [ -n "${FORGE_WATCH_SINK_CAPTURE:-}" ]; then
+        printf '%s\t%s\n' "$title" "$body" >> "$FORGE_WATCH_SINK_CAPTURE"
+        return 0
+    fi
+    osascript -e "display notification \"$(fw_escape "$body")\" with title \"$(fw_escape "$title")\"" >/dev/null 2>&1 || true
+}
+
+# ── The engine: scan → evaluate → debounce → emit ────────────────────────
+# argv: <mode: check|status|ack> <notify_out: path|-> <ack_target>
+# Human-readable findings go to stdout. When notify_out is a file, one
+# "title<TAB>body" line per notification-to-deliver is appended to it.
+run_engine() {
+    python3 - "$1" "$2" "${3:-}" <<'PYEOF'
+import sys, os, re, glob, json, time, fcntl, datetime, subprocess
+
+MODE       = sys.argv[1]
+NOTIFY_OUT = sys.argv[2]
+ACK_TARGET = sys.argv[3] if len(sys.argv) > 3 else ''
+# Only `check` may mutate persistent state (event offsets, debounce timestamps).
+# `status` is a pure read; `ack` persists ONLY the acked flags it sets.
+PERSIST    = (MODE == 'check')
+
+HOME       = os.path.expanduser('~')
+CACHE_DIR  = os.environ.get('FORGE_WATCH_CACHE_DIR',  os.path.join(HOME, '.cache', 'forge-watch'))
+CONFIG_DIR = os.environ.get('FORGE_WATCH_CONFIG_DIR', os.path.join(HOME, '.config', 'forge'))
+STATE_FILE = os.path.join(CACHE_DIR, 'state.json')
+LOCK_FILE  = os.path.join(CACHE_DIR, 'state.lock')
+WATCH_ENV  = os.path.join(CONFIG_DIR, 'watch.env')
+WATCH_ROOTS= os.path.join(CONFIG_DIR, 'watch-roots')
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+UTC = datetime.timezone.utc
+NOW = datetime.datetime.now(UTC)
+
+# ── config (watch.env parsed as DATA, never sourced) ─────────────────────
+ALLOWED_KEYS = {
+    'FORGE_STALL_THRESHOLD_S', 'FORGE_WATCH_DWELL_S', 'FORGE_WATCH_RENOTIFY_S',
+    'FORGE_WATCH_ZOMBIE_AGE_D', 'FORGE_WATCH_NOTIFY_COMPLETE',
+    'FORGE_WATCH_NOTIFY_STALE_ZOMBIE', 'FORGE_WATCH_ROOTS_FILE',
+}
+# Conservative value grammar: allow path-ish chars (incl. space and ~ for real
+# paths) but no shell metacharacters, substitutions, or quotes. Values are only
+# ever used as data (int/bool/path), never sourced or eval'd.
+_SAFE_VAL = re.compile(r'^[A-Za-z0-9 _./:+~-]*$')
+config = {}
+config_warnings = []
+
+def load_config():
+    if not os.path.exists(WATCH_ENV):
+        return
+    try:
+        with open(WATCH_ENV) as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        config_warnings.append(f"watch.env unreadable: {e}")
+        return
+    for n, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' not in line:
+            config_warnings.append(f"watch.env:{n}: not KEY=value, ignored")
+            continue
+        key, val = line.split('=', 1)
+        key, val = key.strip(), val.strip()
+        if key not in ALLOWED_KEYS:
+            config_warnings.append(f"watch.env:{n}: unknown key '{key}', ignored")
+            continue
+        if not _SAFE_VAL.match(val):
+            config_warnings.append(f"watch.env:{n}: unsafe value for '{key}', ignored")
+            continue
+        config[key] = val
+
+load_config()
+
+def cfg(key, default):
+    # env var wins (interactive), then watch.env (launchd), then default.
+    v = os.environ.get(key)
+    if v is None:
+        v = config.get(key)
+    return v if v is not None else default
+
+def cfg_int(key, default):
+    try:
+        return int(cfg(key, default))
+    except (TypeError, ValueError):
+        return default
+
+def cfg_bool(key, default):
+    v = str(cfg(key, '1' if default else '0')).lower()
+    return v in ('1', 'true', 'yes', 'on')
+
+STALL_THRESHOLD = cfg_int('FORGE_STALL_THRESHOLD_S', 600)
+STALE_AGE       = 2 * STALL_THRESHOLD
+DWELL_S         = cfg_int('FORGE_WATCH_DWELL_S', 300)
+RENOTIFY_S      = cfg_int('FORGE_WATCH_RENOTIFY_S', 900)
+BACKOFF_CAP_S   = 4 * 3600
+ZOMBIE_AGE_S    = cfg_int('FORGE_WATCH_ZOMBIE_AGE_D', 7) * 86400
+NOTIFY_COMPLETE = cfg_bool('FORGE_WATCH_NOTIFY_COMPLETE', True)
+NOTIFY_STALE_ZOMBIE = cfg_bool('FORGE_WATCH_NOTIFY_STALE_ZOMBIE', False)
+
+# ── time helpers ─────────────────────────────────────────────────────────
+def parse_iso(ts):
+    # PyYAML auto-types an unquoted `updated_at: 2026-...Z` into a datetime/date;
+    # accept those directly so the dwell/recency gates still work.
+    if isinstance(ts, datetime.datetime):
+        return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
+    if isinstance(ts, datetime.date):
+        return datetime.datetime(ts.year, ts.month, ts.day, tzinfo=UTC)
+    if not ts or not isinstance(ts, str):
+        return None
+    raw = ts.strip().strip('"').strip("'")
+    iso = raw[:-1] + '+00:00' if raw.endswith('Z') else raw
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+def age_s(ts):
+    dt = parse_iso(ts)
+    return None if dt is None else (NOW - dt).total_seconds()
+
+def hhmm(ts):
+    return ts[11:16] if isinstance(ts, str) and len(ts) >= 16 else (ts or '?')
+
+def human_age(sec):
+    if sec is None:
+        return '?'
+    sec = int(sec)
+    if sec < 90:
+        return f"{sec}s"
+    if sec < 5400:
+        return f"{sec // 60}m"
+    if sec < 172800:
+        return f"{sec // 3600}h"
+    return f"{sec // 86400}d"
+
+# ── state (lock-guarded, atomic write, corrupt-recovery) ─────────────────
+_lock_fh = open(LOCK_FILE, 'w')
+try:
+    fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    # Another instance holds the lock (manual run vs launchd tick). Exit quietly.
+    sys.exit(0)
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {'event_offsets': {}, 'conditions': {}}
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError('state root not an object')
+        data.setdefault('event_offsets', {})
+        data.setdefault('conditions', {})
+        return data
+    except (ValueError, OSError):
+        # Preserve the bad file; continue with empty advisory state.
+        try:
+            bad = STATE_FILE + '.bad.' + NOW.strftime('%Y%m%dT%H%M%SZ')
+            os.replace(STATE_FILE, bad)
+            config_warnings.append(f"corrupt state preserved as {os.path.basename(bad)}")
+        except OSError:
+            pass
+        return {'event_offsets': {}, 'conditions': {}}
+
+def save_state(state):
+    tmp = STATE_FILE + '.tmp.' + str(os.getpid())
+    with open(tmp, 'w') as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, STATE_FILE)
+
+state = load_state()
+
+# ── discovery ────────────────────────────────────────────────────────────
+def tmux_sessions():
+    """Map session_name -> realpath(session_path). Empty if no tmux server.
+    Test seam: FORGE_WATCH_TMUX_LIST names a file of 'name<TAB>path' lines used
+    instead of shelling out to tmux."""
+    inject = os.environ.get('FORGE_WATCH_TMUX_LIST')
+    if inject is not None:
+        m = {}
+        try:
+            with open(inject) as f:
+                for line in f:
+                    line = line.rstrip('\n')
+                    if '\t' in line:
+                        name, path = line.split('\t', 1)
+                        m[name] = os.path.realpath(path)
+        except OSError:
+            pass
+        return m
+    try:
+        out = subprocess.run(
+            ['tmux', 'list-sessions', '-F', '#{session_name}\t#{session_path}'],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if out.returncode != 0:
+        return {}
+    m = {}
+    for line in out.stdout.splitlines():
+        if '\t' not in line:
+            continue
+        name, path = line.split('\t', 1)
+        m[name] = os.path.realpath(path)
+    return m
+
+SESSIONS = tmux_sessions()
+
+def discover_roots():
+    roots = set(SESSIONS.values())
+    roots_file = os.path.expanduser(cfg('FORGE_WATCH_ROOTS_FILE', WATCH_ROOTS))
+    if roots_file and os.path.exists(roots_file):
+        try:
+            with open(roots_file) as f:
+                for line in f:
+                    p = line.strip()
+                    if p and not p.startswith('#'):
+                        roots.add(os.path.realpath(os.path.expanduser(p)))
+        except OSError:
+            pass
+    # Only roots that actually have a .dev/ dir are interesting.
+    return sorted(r for r in roots if os.path.isdir(os.path.join(r, '.dev')))
+
+# ── low-level parsers ────────────────────────────────────────────────────
+try:
+    import yaml
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+
+# Files whose parse failed both ways this scan -> STATE-UNPARSEABLE findings.
+unparseable = []  # list of (root, path)
+
+def note_unparseable(root, path):
+    unparseable.append((root, path))
+
+def load_context(root, path):
+    """Return dict of context fields, or None if unparseable."""
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except OSError:
+        return None
+    if HAVE_YAML:
+        try:
+            data = yaml.safe_load(raw) or {}
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    # Minimal line fallback (tolerates heredoc and yaml.dump writer styles).
+    data = {}
+    for line in raw.splitlines():
+        m = re.match(r'^([a-z_]+):\s*(.*)$', line)
+        if m:
+            k, v = m.group(1), m.group(2).strip().strip('"').strip("'")
+            data[k] = v
+    if not data:
+        note_unparseable(root, path)
+        return None
+    return data
+
+def pending_entries(root, path):
+    """Open (response: null) entries in a forge-log.yml.
+    Returns list of dicts {stage,to,timestamp}. Uses the bridge's regex
+    fallback when yaml.safe_load chokes on legacy malformed entries."""
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except OSError:
+        return []
+    entries = None
+    if HAVE_YAML:
+        try:
+            data = yaml.safe_load(raw) or {}
+            entries = data.get('entries', []) or []
+        except Exception:
+            entries = None
+    if entries is None:
+        # Port of forge-bridge _render_status_file regex fallback.
+        entries = []
+        block_re = re.compile(r'^\s*-\s+timestamp:\s*"([^"]+)"', re.MULTILINE)
+        starts = [(m.start(), m.group(1)) for m in block_re.finditer(raw)]
+        if not starts and raw.strip():
+            note_unparseable(root, path)
+            return []
+        for i, (off, ts) in enumerate(starts):
+            end = starts[i + 1][0] if i + 1 < len(starts) else len(raw)
+            blk = raw[off:end]
+            def grab(field):
+                mm = re.search(rf'^\s+{field}:\s*(.*?)\s*$', blk, re.MULTILINE)
+                return mm.group(1).strip() if mm else None
+            rmatch = re.search(r'^\s+response:\s*(null|"(?:[^"\\]|\\.)*")', blk, re.MULTILINE)
+            if not rmatch:
+                continue
+            resp = None if rmatch.group(1) == 'null' else rmatch.group(1)
+            entries.append({'timestamp': ts, 'stage': grab('stage'),
+                            'to': grab('to'), 'response': resp})
+    out = []
+    for e in entries:
+        # A hand-edited/legacy log can yield non-dict list items; skip them
+        # rather than letting e.get() abort the whole root's scan.
+        if isinstance(e, dict) and e.get('response') is None:
+            out.append({'stage': e.get('stage'), 'to': e.get('to'),
+                        'timestamp': e.get('timestamp')})
+    return out
+
+def parse_callback(path):
+    """Parse a .callback file's scalar header. Returns dict or None."""
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except OSError:
+        return None
+    d = {}
+    for line in raw.splitlines():
+        if line.startswith('message:'):
+            break
+        m = re.match(r'^([a-z_]+):\s*(.*)$', line)
+        if m:
+            d[m.group(1)] = m.group(2).strip()
+    return d or None
+
+# ── findings ─────────────────────────────────────────────────────────────
+# policy: 'standard' (backoff), 'daily' (>=24h), 'never' (status-only)
+findings = []  # dict: condition, root, key, policy, session, slug, stage, msg
+
+def add_finding(condition, root, key, msg, policy='standard',
+                session=None, slug=None, stage=None):
+    findings.append({
+        'condition': condition, 'root': root,
+        'key': f"{root}\t{condition}\t{key}", 'policy': policy,
+        'session': session, 'slug': slug, 'stage': stage, 'msg': msg,
+    })
+
+def root_label(root):
+    return os.path.basename(root.rstrip('/')) or root
+
+QA_FAMILY = {'qa', 'qa-fix', 'qa-retry'}
+
+def scan_root(root):
+    dev = os.path.join(root, '.dev')
+    tmp = os.path.join(dev, 'forge-tmp')
+    label = root_label(root)
+
+    # --- pipeline logs: open + stale pendings, indexed by slug ---
+    open_by_slug = {}     # slug -> [pending,...]
+    stale_pendings = []   # (slug, pending)
+    for logp in glob.glob(os.path.join(dev, 'proposals', '*', 'forge-log.yml')):
+        slug = os.path.basename(os.path.dirname(logp))
+        pend = pending_entries(root, logp)
+        if pend:
+            open_by_slug[slug] = pend
+        for p in pend:
+            a = age_s(p.get('timestamp'))
+            if a is not None and a > STALE_AGE:
+                stale_pendings.append((slug, p))
+
+    def has_open_pending(slug, stage=None):
+        pend = open_by_slug.get(slug, [])
+        if stage is None:
+            return bool(pend)
+        return any(p.get('stage') == stage for p in pend)
+
+    # --- callback files: live BLOCKED (open pending still present) ---
+    live_blocked = {}  # (slug,stage) -> callback dict
+    for cbp in glob.glob(os.path.join(tmp, 'callbacks', '*.callback')):
+        cb = parse_callback(cbp)
+        if not cb:
+            continue
+        if (cb.get('status') or '').upper() != 'BLOCKED':
+            continue
+        slug, stage = cb.get('slug'), cb.get('stage')
+        if slug and stage and has_open_pending(slug, stage):
+            live_blocked[(slug, stage)] = cb
+
+    for (slug, stage), cb in live_blocked.items():
+        msg = f"{label} · {slug} — worker BLOCKED at {stage} (needs a human)"
+        add_finding('WORKER-BLOCKED', root, f"{slug}\t{stage}", msg,
+                    slug=slug, stage=stage)
+
+    # --- WORKER-STALLED (suppressed when a live BLOCKED callback covers it) ---
+    # A pending crossing the STALE threshold (2x FORGE_STALL_THRESHOLD_S) is an
+    # actionable stall ONLY within the zombie age window; beyond that it is an
+    # abandoned/never-closed proposal log (live .dev dirs accumulate months of
+    # them), which is residue, not a worker to chase — so it is status-only.
+    # Same active-vs-residue split the zombie triggers use, same knob.
+    for slug, p in stale_pendings:
+        stage = p.get('stage')
+        if (slug, stage) in live_blocked:
+            continue
+        sec = age_s(p.get('timestamp'))
+        a = human_age(sec)
+        if sec is not None and sec <= ZOMBIE_AGE_S:
+            msg = (f"{label} · {slug} — worker stalled at {stage} "
+                   f"(pending {a}, to {p.get('to')})")
+            add_finding('WORKER-STALLED', root, f"{slug}\t{stage}", msg,
+                        slug=slug, stage=stage)
+        else:
+            msg = (f"{label} · {slug} — abandoned open pending at {stage} "
+                   f"(pending {a}, to {p.get('to')}); never-closed log residue")
+            add_finding('STALE-PENDING', root, f"{slug}\t{stage}", msg,
+                        policy='never', slug=slug, stage=stage)
+
+    # --- event log (per-root; offset baselined to EOF on first sight) ---
+    evlog = os.path.join(tmp, 'orchestrator-events.log')
+    if os.path.exists(evlog):
+        try:
+            size = os.path.getsize(evlog)
+        except OSError:
+            size = 0
+        offsets = state['event_offsets']
+        prev = offsets.get(root)
+        if prev is None or prev > size:
+            # First sight, or log recreated/truncated -> baseline, process nothing.
+            # Persist the baseline ONLY on `check`: a read-only `status`/`ack`
+            # peek must never consume events out from under the launchd `check`.
+            if PERSIST:
+                offsets[root] = size
+        else:
+            # Binary read: offsets are byte positions (text-mode seek only
+            # accepts tell() values and breaks on multibyte content).
+            try:
+                with open(evlog, 'rb') as f:
+                    f.seek(prev)
+                    blob = f.read()
+            except OSError:
+                blob = b''
+            # Only consume complete lines (a half-written trailing line waits).
+            nl = blob.rfind(b'\n')
+            consumed = blob[:nl + 1] if nl >= 0 else b''
+            if PERSIST:
+                offsets[root] = prev + len(consumed)
+            for line in consumed.decode('utf-8', 'replace').splitlines():
+                _handle_event_line(root, label, line)
+
+    # --- context files ---
+    live_seen = False
+    ctx_paths = sorted(glob.glob(os.path.join(dev, 'forge-context.*.yml')))
+    for cp in ctx_paths:
+        base = os.path.basename(cp)
+        m = re.match(r'^forge-context\.(.+)\.yml$', base)
+        embedded = m.group(1) if m else ''
+        is_live = (embedded in SESSIONS and SESSIONS[embedded] == root)
+        if is_live:
+            live_seen = True
+        _eval_context(root, label, cp, embedded, is_live,
+                      has_open_pending, open_by_slug, live_blocked)
+
+    # --- LEGACY bare context (status-only, only if no live suffixed ctx) ---
+    legacy = os.path.join(dev, 'forge-context.yml')
+    if os.path.exists(legacy) and not live_seen:
+        ctx = load_context(root, legacy)
+        if ctx:
+            slug = str(ctx.get('active_pipeline') or '').strip()
+            if slug and slug != 'null':
+                msg = (f"{label} — legacy forge-context.yml points at '{slug}' "
+                       f"(stage {ctx.get('last_stage_completed')}); "
+                       f"migration hint, not owned by any live session")
+                add_finding('LEGACY-CONTEXT', root, slug, msg, policy='never',
+                            slug=slug)
+
+def _handle_event_line(root, label, line):
+    if ':' not in line:
+        return
+    typ, rest = line.split(':', 1)
+    typ = typ.strip()
+    fields = {}
+    toks = rest.split()
+    slug = None
+    for t in toks:
+        if '=' in t:
+            k, v = t.split('=', 1)
+            fields[k] = v
+            if k == 'pipeline':
+                slug = v
+    stage = fields.get('result_stage') or fields.get('stage')
+    if typ == 'CALLBACK' and fields.get('status', '').upper() == 'BLOCKED':
+        msg = f"{label} · {slug} — worker BLOCKED at {stage} (needs a human)"
+        add_finding('WORKER-BLOCKED', root, f"{slug}\t{stage}", msg,
+                    slug=slug, stage=stage)
+    elif typ == 'STAGE' and fields.get('status') == 'error':
+        msg = f"{label} · {slug} — stage {stage} ERRORED"
+        add_finding('STAGE-ERROR', root, f"{slug}\t{stage}", msg,
+                    slug=slug, stage=stage)
+    elif typ in ('ERROR', 'GUARD_BLOCK'):
+        reason = fields.get('reason', typ.lower())
+        msg = f"{label} · {slug} — pipeline {typ.lower()} at {stage} ({reason})"
+        add_finding('PIPELINE-ERROR', root, f"{slug}\t{stage}\t{reason}", msg,
+                    slug=slug, stage=stage)
+    elif typ == 'STALL':
+        st = fields.get('state', '')
+        msg = f"{label} · {slug} — worker stall reported at {stage} ({st})"
+        add_finding('WORKER-STALL-EVENT', root, f"{slug}\t{stage}\t{st}", msg,
+                    slug=slug, stage=stage)
+    elif typ == 'COMPLETE' and NOTIFY_COMPLETE:
+        msg = f"{label} · {slug} — pipeline COMPLETE"
+        add_finding('PIPELINE-COMPLETE', root, slug, msg, policy='once', slug=slug)
+
+def _eval_context(root, label, cp, embedded, is_live,
+                  has_open_pending, open_by_slug, live_blocked):
+    ctx = load_context(root, cp)
+    if ctx is None:
+        return  # unparseable already recorded
+    slug   = str(ctx.get('active_pipeline') or '').strip()
+    last   = str(ctx.get('last_stage_completed') or '').strip()
+    status = str(ctx.get('last_stage_status') or '').strip()
+    nxt    = str(ctx.get('next_stage') or '').strip()
+    updated = ctx.get('updated_at')
+    if not slug or slug == 'null':
+        return
+
+    if is_live:
+        # PIPELINE-COMPLETE fallback: context reached terminal next_stage with
+        # no COMPLETE event seen. Same slug key as the event source, so the two
+        # dedup; the context source persists the condition so the event-consumed
+        # finding does not re-fire on the next scan.
+        if nxt == 'complete' and NOTIFY_COMPLETE:
+            add_finding('PIPELINE-COMPLETE', root, slug,
+                        f"{label} · {slug} — pipeline COMPLETE",
+                        policy='once', session=embedded, slug=slug)
+        # STAGE-ERROR from context.
+        if status == 'error':
+            msg = f"{label} · {slug} — stage {last} ERRORED"
+            add_finding('STAGE-ERROR', root, f"{slug}\t{last}", msg,
+                        session=embedded, slug=slug, stage=last)
+        # NEEDS-DECISION: decision predicate + no open pending + dwelled.
+        decision = (nxt == 'pending-orchestrator-decision' or
+                    (last in QA_FAMILY and status == 'done' and nxt != 'complete'))
+        if decision and not has_open_pending(slug):
+            a = age_s(updated)
+            if a is not None and a >= DWELL_S:
+                msg = (f"{label} · {slug} — decision needed after {last} "
+                       f"(idle {human_age(a)})")
+                add_finding('NEEDS-DECISION', root, slug, msg,
+                            session=embedded, slug=slug, stage=last)
+        return
+
+    # --- zombie: context whose session is not live at this root ---
+    if nxt == 'complete':
+        return  # finished; not a zombie
+    evidence = (has_open_pending(slug) or
+                any(s == slug for (s, _st) in live_blocked) or
+                status == 'error')
+    a = age_s(updated)
+    recent = (a is not None and a <= ZOMBIE_AGE_S)
+    if evidence or recent:
+        msg = (f"{label} · {slug} — ZOMBIE (session '{embedded}' gone, "
+               f"stage {last}, next {nxt or '(empty)'}, {human_age(a)} old)")
+        add_finding('ZOMBIE-ACTIVE', root, slug, msg, policy='daily',
+                    session=embedded, slug=slug, stage=last)
+    else:
+        policy = 'standard' if NOTIFY_STALE_ZOMBIE else 'never'
+        msg = (f"{label} · {slug} — stale zombie context (session '{embedded}' "
+               f"gone, stage {last}, next {nxt or '(empty)'}, {human_age(a)} old)")
+        add_finding('ZOMBIE-STALE-CONTEXT', root, slug, msg, policy=policy,
+                    session=embedded, slug=slug, stage=last)
+
+# ── run the scan ─────────────────────────────────────────────────────────
+for root in discover_roots():
+    try:
+        scan_root(root)
+    except Exception as e:
+        config_warnings.append(f"scan error in {root_label(root)}: {e}")
+
+# STATE-UNPARSEABLE (keyed by path + mtime/size so a changed file re-fires).
+for root, path in unparseable:
+    try:
+        stt = os.stat(path)
+        ver = f"{int(stt.st_mtime)}:{stt.st_size}"
+    except OSError:
+        ver = '0:0'
+    msg = f"{root_label(root)} — unparseable state file {os.path.basename(path)}"
+    add_finding('STATE-UNPARSEABLE', root, f"{path}\t{ver}", msg, slug=None)
+
+# A dead-session pipeline with a stale open pending would otherwise fire both
+# ZOMBIE-ACTIVE and WORKER-STALLED/STALE-PENDING for the same (root, slug). The
+# zombie carries strictly more information (session gone), so drop the stall/
+# residue twins for any slug already flagged as a zombie.
+zombie_slugs = {(f['root'], f['slug']) for f in findings
+                if f['condition'] == 'ZOMBIE-ACTIVE' and f['slug']}
+if zombie_slugs:
+    findings = [f for f in findings
+                if not (f['condition'] in ('WORKER-STALLED', 'STALE-PENDING')
+                        and (f['root'], f['slug']) in zombie_slugs)]
+
+# ── dedup findings by key (context+event may agree) ──────────────────────
+by_key = {}
+for f in findings:
+    by_key.setdefault(f['key'], f)
+findings = list(by_key.values())
+
+# ── ACK mode: mark matching current conditions acked, then exit ──────────
+def finding_matches(f, target):
+    fields = [f.get('session'), f.get('slug'),
+              os.path.basename(f['root'].rstrip('/')), f['root']]
+    return any(x and x == target for x in fields)
+
+if MODE == 'ack':
+    conds = state['conditions']
+    n = 0
+    for f in findings:
+        if finding_matches(f, ACK_TARGET):
+            e = conds.setdefault(f['key'], {'first_seen': NOW.isoformat(),
+                                            'last_notified': None, 'count': 0})
+            e['acked'] = True
+            n += 1
+            print(f"  acked: {f['condition']}  {f['msg']}")
+    save_state(state)
+    if n == 0:
+        print(f"(no active conditions match '{ACK_TARGET}')")
+    else:
+        print(f"Acknowledged {n} condition(s) for '{ACK_TARGET}'.")
+    sys.exit(0)
+
+# ── debounce / backoff, decide deliveries ────────────────────────────────
+conds = state['conditions']
+current_keys = set()
+deliveries = []  # (title, body)
+
+def interval_for(policy, count):
+    if policy == 'daily':
+        return 86400
+    return min(RENOTIFY_S * (2 ** max(0, count - 1)), BACKOFF_CAP_S)
+
+# Only `check` mutates debounce state and persists. `status` is a pure read
+# (below, the output section reads `conds` without touching it).
+if MODE == 'check':
+    for f in findings:
+        key = f['key']
+        current_keys.add(key)
+        policy = f['policy']
+        e = conds.get(key)
+        if policy == 'never':
+            if e is None:
+                conds[key] = {'first_seen': NOW.isoformat(),
+                              'last_notified': None, 'count': 0, 'acked': False}
+            continue
+        want = False
+        if e is None:
+            conds[key] = {'first_seen': NOW.isoformat(),
+                          'last_notified': NOW.isoformat(), 'count': 1, 'acked': False}
+            want = True
+        elif e.get('acked') or policy == 'once':
+            # 'once' = notify on transition only; never re-notify while it
+            # persists (e.g. a completed pipeline whose pane stays open).
+            want = False
+        else:
+            last = parse_iso(e.get('last_notified'))
+            count = e.get('count', 1)
+            due = last is None or (NOW - last).total_seconds() >= interval_for(policy, count)
+            if due:
+                e['count'] = count + 1
+                e['last_notified'] = NOW.isoformat()
+                want = True
+        if want:
+            deliveries.append((f"forge · {f['condition']}", f['msg']))
+
+    # Clear entries whose condition is no longer current (fresh on re-entry).
+    for key in list(conds.keys()):
+        if key not in current_keys:
+            del conds[key]
+
+    save_state(state)
+
+# ── output ───────────────────────────────────────────────────────────────
+NOTIFY = ['NEEDS-DECISION', 'WORKER-BLOCKED', 'STAGE-ERROR', 'PIPELINE-ERROR',
+          'WORKER-STALLED', 'WORKER-STALL-EVENT', 'PIPELINE-COMPLETE',
+          'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE']
+order = {c: i for i, c in enumerate(
+    NOTIFY + ['ZOMBIE-STALE-CONTEXT', 'STALE-PENDING', 'LEGACY-CONTEXT'])}
+findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
+
+for w in config_warnings:
+    print(f"! {w}")
+
+if not findings:
+    print("forge-watch: all clear" + ("" if SESSIONS else " (no tmux server)"))
+else:
+    for f in findings:
+        acked = conds.get(f['key'], {}).get('acked')
+        tag = ' [acked]' if acked else ''
+        print(f"[{f['condition']}]{tag} {f['msg']}")
+
+# Emit deliveries for the bash sink.
+if MODE == 'check' and NOTIFY_OUT and NOTIFY_OUT != '-' and deliveries:
+    with open(NOTIFY_OUT, 'w') as f:
+        for title, body in deliveries:
+            f.write(f"{title}\t{body}\n")
+PYEOF
+}
+
+# ── verbs ────────────────────────────────────────────────────────────────
+cmd_check() {
+    local nout; nout="$(mktemp "$CACHE_DIR/notify.XXXXXX")"
+    run_engine check "$nout" ""
+    if [ -s "$nout" ]; then
+        while IFS=$'\t' read -r title body; do
+            [ -n "$title" ] && fw_notify "$title" "$body"
+        done < "$nout"
+    fi
+    rm -f "$nout"
+}
+
+cmd_status() { run_engine status "-" ""; }
+
+cmd_ack() {
+    if [ -z "${1:-}" ]; then
+        echo "Usage: forge-watch ack <session|slug|project-dirname>" >&2
+        return 1
+    fi
+    run_engine ack "-" "$1"
+}
+
+cmd_install() {
+    cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$SELF</string>
+    <string>check</string>
+  </array>
+  <key>StartInterval</key><integer>30</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>$CACHE_DIR/launchd.err</string>
+  <key>StandardOutPath</key><string>$CACHE_DIR/launchd.out</string>
+</dict>
+</plist>
+PLISTEOF
+
+    # Seed watch.env from the current shell's values so launchd (which does not
+    # inherit .zshrc) agrees with the interactive environment.
+    if [ ! -f "$WATCH_ENV" ]; then
+        {
+            echo "# forge-watch tuning — parsed as data (KEY=value), never sourced."
+            for k in FORGE_STALL_THRESHOLD_S FORGE_WATCH_DWELL_S \
+                     FORGE_WATCH_RENOTIFY_S FORGE_WATCH_ZOMBIE_AGE_D; do
+                v="$(eval "printf '%s' \"\${$k:-}\"")"
+                [ -n "$v" ] && echo "$k=$v"
+            done
+        } > "$WATCH_ENV"
+        echo "Seeded $WATCH_ENV"
+    fi
+
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load "$PLIST"
+    echo "Loaded launchd agent $LABEL (30s interval)."
+
+    # Best-effort test notification. NOTE: notifications from osascript are
+    # attributed to Script Editor/osascript; if that app lacks notification
+    # permission, delivery silently no-ops.
+    fw_notify "forge-watch installed" "If you do not see this, grant notification permission to Script Editor in System Settings ▸ Notifications."
+    echo "Fired a test notification. If you did not see it, grant notification"
+    echo "permission to 'Script Editor' in System Settings ▸ Notifications, then"
+    echo "re-run: forge-watch check"
+}
+
+cmd_uninstall() {
+    launchctl unload "$PLIST" 2>/dev/null || true
+    rm -f "$PLIST"
+    echo "Unloaded and removed launchd agent $LABEL."
+    echo "(Cache and config left in place: $CACHE_DIR, $CONFIG_DIR)"
+}
+
+usage() {
+    cat >&2 <<EOF
+forge-watch — blocked-on-you notifications for forge pipelines
+
+Usage:
+  forge-watch check       one scan; print findings and deliver notifications
+  forge-watch status      one scan; print findings only (no notifications)
+  forge-watch ack <t>     silence current conditions for <t> (session|slug|dir)
+  forge-watch install     write+load the launchd agent (30s interval)
+  forge-watch uninstall   unload+remove the launchd agent
+EOF
+}
+
+case "${1:-status}" in
+    check)     cmd_check ;;
+    status)    cmd_status ;;
+    ack)       shift; cmd_ack "${1:-}" ;;
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+esac
