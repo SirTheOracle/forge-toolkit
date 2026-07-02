@@ -624,24 +624,51 @@ proposal → review → incorporate → implementation → impl-review → codin
 - Pre-dispatch: ensure feature branch (`git checkout -b {slug}` if not on it). Do NOT use worktrees — they block access to `~/.claude/skills/` and `~/bin/`.
 - Inputs: `.dev/proposals/{slug}/implementation.md`
 - Output: code changes + `.dev/proposals/{slug}/coder-report.md`
+- **🔒 Infra stage — wrap in the infra lock (Hard Rule 23, Shape A).** Acquire
+  before dispatch; release only on terminal `DONE`/`ERROR`; on dispatch failure,
+  release then surface and stop. (coding is **excluded** from restart-on-entry —
+  forge-coder must never start/stop services; its tests self-start via Playwright.)
 - Dispatch:
   ```bash
-  ~/bin/forge-bridge dispatch --slug {slug} --stage coding --worker claude-sonnet
+  ~/bin/forge-bridge infra-lock acquire --slug {slug} --stage coding
+  ~/bin/forge-bridge dispatch --slug {slug} --stage coding --worker claude-sonnet \
+    || { ~/bin/forge-bridge infra-lock release --slug {slug} --stage coding; echo "dispatch failed — STOP"; }
   ~/bin/forge-bridge wait --slug {slug} --stage coding --worker claude-sonnet --digest-template coding
+  # on DONE/ERROR:
+  ~/bin/forge-bridge infra-lock release --slug {slug} --stage coding
   ```
   Then spawn the digest agent against the returned `DIGEST_PROMPT` path.
+  (Hold the lock through PROMPTING/STALLED/TIMEOUT/DEAD/BLOCKED — see Rule 23.)
 - If BLOCKING_ITEMS > 0: read coder-report.md for details before advancing.
 - Advance to qa.
 
 **qa** — codex-b preferred (external); claude-sonnet local fallback
 - Template: `~/.config/forge/prompts/qa.txt` (skill: `adversarial-qa`; includes the UNCHANGED-FLOW REGRESSION SWEEP partial that workers MUST exercise).
 - Output: `.dev/qa/{slug}/issues.md` and `.dev/qa/{slug}/manifest.yaml`
-- **Path A: codex-b dispatch (preferred)**
+- **🔒 Infra stage — wrap in the infra lock (Hard Rule 23).** Path A = Shape A,
+  Path B = Shape B. The installed `adversarial-qa` SKILL does restart-on-entry
+  (brings up THIS worktree's services before testing) under the held lock.
+- **Path A: codex-b dispatch (preferred)** — Shape A:
   ```bash
-  ~/bin/forge-bridge dispatch --slug {slug} --stage qa --worker codex-b
+  ~/bin/forge-bridge infra-lock acquire --slug {slug} --stage qa
+  ~/bin/forge-bridge dispatch --slug {slug} --stage qa --worker codex-b \
+    || { ~/bin/forge-bridge infra-lock release --slug {slug} --stage qa; echo "dispatch failed — STOP"; }
   ~/bin/forge-bridge wait --slug {slug} --stage qa --worker codex-b --digest-template qa
+  # on DONE/ERROR: ~/bin/forge-bridge infra-lock release --slug {slug} --stage qa
   ```
-- **Path B: local fallback** — adversarial-qa needs Agent Teams, so run it inline (foreground) when codex-b is unavailable. Spawn the digest the same way (`forge-bridge digest --slug X --stage qa --template qa`).
+- **Path B: local fallback (qa local fallback)** — adversarial-qa needs Agent
+  Teams, so run it inline (foreground) in pane 1 when codex-b is unavailable
+  (Hard Rule 22 second pane-1 exception). Use **Shape B** — acquire, `log` (open
+  pending), restart-on-entry, run inline, `log-response` (close on EVERY exit),
+  **release**, then digest:
+  ```bash
+  ~/bin/forge-bridge infra-lock acquire --slug {slug} --stage qa
+  ~/bin/forge-bridge log --slug {slug} --stage qa --from claude --to claude --prompt "local qa (codex-b unavailable)"
+  # restart-on-entry, then run adversarial-qa inline (lock HELD)
+  ~/bin/forge-bridge log-response --slug {slug} --to claude --stage qa --response "FORGE_DONE: qa — issues.md"   # or FORGE_ERROR on failure
+  ~/bin/forge-bridge infra-lock release --slug {slug} --stage qa
+  ~/bin/forge-bridge digest --slug {slug} --stage qa --template qa
+  ```
 - Severity routing on digest:
   - `critical` / `major` → enter the QA Fix Loop (must be resolved)
   - `minor` → enter the QA Fix Loop; individual minor items may be skipped only with a one-line rationale captured via `forge-bridge add-note`
@@ -654,15 +681,25 @@ proposal → review → incorporate → implementation → impl-review → codin
 - **Worker selection:** verify is a HIGH-reasoning stage (Hard Rule 22) — the only valid workers are `codex-a` and `claude-opus`; the bridge rejects `codex-b`/`claude-sonnet`. Default to **codex-a**; fall back to **claude-opus** only if Codex A is unavailable or already high-fill (surfaced, per Hard Rule 9).
 - **Exclusion guard:** verify MUST NOT use the worker that ran the most recent `qa`/`qa-retry` stage. Under current QA routing (codex-b, or claude-sonnet local fallback) the high-tier verify workers are always disjoint from the QA workers, so the guard is normally satisfied automatically. Still read the latest `qa`/`qa-retry` log entry and confirm before dispatch — the guard protects against future QA-routing changes; it is no longer the primary selection algorithm.
 - Output: `.dev/qa/{slug}/verification-report.yaml`
+- **🔒 Infra stage — wrap in the infra lock (Hard Rule 23, Shape A).** Acquire
+  before dispatch; release on terminal `DONE`/`ERROR`; dispatch-failure releases
+  then stops. The installed `adversarial-verify` SKILL does restart-on-entry
+  (this worktree's services) under the held lock.
 - Dispatch (default — codex-a):
   ```bash
-  ~/bin/forge-bridge dispatch --slug {slug} --stage verify --worker codex-a
+  ~/bin/forge-bridge infra-lock acquire --slug {slug} --stage verify
+  ~/bin/forge-bridge dispatch --slug {slug} --stage verify --worker codex-a \
+    || { ~/bin/forge-bridge infra-lock release --slug {slug} --stage verify; echo "dispatch failed — STOP"; }
   ~/bin/forge-bridge wait --slug {slug} --stage verify --worker codex-a --digest-template verify
+  # on DONE/ERROR: ~/bin/forge-bridge infra-lock release --slug {slug} --stage verify
   ```
   Fallback (claude-opus) — pass `--clear` if pane 0 already ran a stage (incorporate / impl-review / implementation fallback) in this pipeline (Hard Rule 20):
   ```bash
-  ~/bin/forge-bridge dispatch --slug {slug} --stage verify --worker claude-opus --clear
+  ~/bin/forge-bridge infra-lock acquire --slug {slug} --stage verify
+  ~/bin/forge-bridge dispatch --slug {slug} --stage verify --worker claude-opus --clear \
+    || { ~/bin/forge-bridge infra-lock release --slug {slug} --stage verify; echo "dispatch failed — STOP"; }
   ~/bin/forge-bridge wait --slug {slug} --stage verify --worker claude-opus --digest-template verify
+  # on DONE/ERROR: ~/bin/forge-bridge infra-lock release --slug {slug} --stage verify
   ```
   Then spawn the digest agent against the returned `DIGEST_PROMPT` path.
 - Callback message will be `CLEAR` or `ISSUES_REMAIN`.
@@ -724,16 +761,24 @@ When the `qa` digest reports findings of severity `minor` or above:
    this is one of the cases where you do read the full artifact, because
    you're about to act on it.
 2. **Resolve via qa-fix stage** (`claude-sonnet`, with `--clear` because the
-   same pane ran coding earlier).
+   same pane ran coding earlier). **🔒 Infra stage — wrap in the infra lock
+   (Hard Rule 23, Shape A).** `qa-fix` does **no** restart-on-entry by default
+   (its prompt runs no live tests), but it is locked as part of the infra-heavy
+   QA loop.
    - Template: `~/.config/forge/prompts/qa-fix.txt`
    - Output: `.dev/qa/{slug}/qa-fix-report.md`
    ```bash
-   ~/bin/forge-bridge dispatch --slug {slug} --stage qa-fix --worker claude-sonnet --clear
+   ~/bin/forge-bridge infra-lock acquire --slug {slug} --stage qa-fix
+   ~/bin/forge-bridge dispatch --slug {slug} --stage qa-fix --worker claude-sonnet --clear \
+     || { ~/bin/forge-bridge infra-lock release --slug {slug} --stage qa-fix; echo "dispatch failed — STOP"; }
    ~/bin/forge-bridge wait --slug {slug} --stage qa-fix --worker claude-sonnet --digest-template qa-fix
+   # on DONE/ERROR: ~/bin/forge-bridge infra-lock release --slug {slug} --stage qa-fix
    ```
    Then spawn the digest agent against the returned `DIGEST_PROMPT` path.
-3. **Re-run QA once** as stage `qa-retry` (same dispatch as `qa`, same worker
-   preference: codex-b external, claude-sonnet local fallback).
+3. **Re-run QA once** as stage `qa-retry` — **🔒 wrap in the infra lock (Hard
+   Rule 23)**, same shape as `qa`: Shape A for codex-b dispatch, Shape B for the
+   pane-1 local fallback (codex-b external preferred, claude-sonnet/pane-1 local
+   fallback). `qa-retry` also does restart-on-entry (installed adversarial-qa).
 4. **If qa-retry digest is clean** → advance to verify.
 5. **If qa-retry still has findings** → escalate to user with the remaining
    findings. Do not loop a third time.
@@ -1052,9 +1097,11 @@ Background agent failures follow this protocol:
 
     - **`proposal` — local HIGH-reasoning exception.** It runs in pane 1
       via Agent Teams (the orchestrator's own Opus context) because the
-      Agent Teams idiom is orchestrator-local. It is the ONLY stage that
-      executes locally, and it is NOT dispatchable (the bridge refuses
-      `dispatch --stage proposal`).
+      Agent Teams idiom is orchestrator-local. It is the **primary** stage
+      that executes locally in pane 1, and it is NOT dispatchable (the
+      bridge refuses `dispatch --stage proposal`). It is no longer the
+      *only* pane-1-local execution — the gated `qa`/`qa-retry` fallback
+      below is the second (D2).
     - **Dispatched HIGH-tier stages — `review`, `incorporate`,
       `implementation`, `impl-review`, `verify`** — run ONLY on Codex A
       (pane 2) or Opus pane 0. They NEVER run in pane 1, and NEVER fall
@@ -1063,13 +1110,117 @@ Background agent failures follow this protocol:
     - **THROUGHPUT-tier stages — `coding`, `qa`, `qa-fix`, `qa-retry`** —
       run on Sonnet (pane 4) or Codex B (pane 3). (`qa` is medium-
       reasoning but throughput-routed by design — there is no third tier.)
-    - **All other stage work is forbidden in pane 1.** Pane 1 dispatches
-      and consumes digests; it does not execute stages (proposal excepted).
+    - **Local `qa`/`qa-retry` fallback — second pane-1 exception (D2).**
+      When **codex-b is unavailable**, `qa`/`qa-retry` may run inline in
+      pane 1 via Agent Teams (adversarial-qa needs the Agent Teams idiom,
+      which is orchestrator-local — the same reason `proposal` is local).
+      This pane-1 exception is gated on **both** conditions:
+      `(codex-b unavailable) AND (the infra lock is HELD for this slug/stage)`.
+      It is the **qa local fallback** (Hard Rule 23, Shape B). claude-sonnet
+      (pane 4) dispatch is still preferred over pane-1-local when sonnet is
+      free; pane-1-local is the last resort when no throughput pane is
+      available. The infra lock MUST be held around the inline run (Shape B).
+    - **All other stage work is forbidden in pane 1**, with exactly two
+      named exceptions: `proposal`, and the gated local `qa`/`qa-retry`
+      fallback above (Hard Rule 23 Shape B). Pane 1 otherwise only
+      dispatches and consumes digests; it does not execute stages.
 
     The bridge guard enforces tier only; the verify "≠ latest QA worker"
     exclusion remains orchestrator prose (the bridge does not read pipeline
     history). Fix-pipeline, commit-review, and ad-hoc stages are not
     tier-constrained.
+
+23. **Cross-worktree infra lock (the five infra stages run one at a time
+    globally).** Forge is share-nothing per worktree EXCEPT all worktrees hit
+    one shared infra stack (fixed-port services + a shared Postgres). A single
+    cross-worktree mutex (`forge-bridge infra-lock`, anchored at the git common
+    dir so every worktree resolves it identically) serializes the **five
+    infra-touching stages** so they never overlap across worktrees:
+
+    - **Infra stages (locked):** `coding`, `qa`, `qa-fix`, `qa-retry`, `verify`.
+    - **Reasoning stages (NEVER locked):** `proposal`, `review`, `incorporate`,
+      `implementation`, `impl-review` — these stay fully parallel across
+      worktrees and must never call `infra-lock`.
+
+    **Terminality rule (the core discipline).** Acquire the lock **before**
+    `dispatch` (or before an inline Shape B run). **Release only when the stage
+    reaches terminal completion** — `wait` returns `STATUS=DONE` or
+    `STATUS=ERROR`. **HOLD** the lock through every non-terminal `wait` outcome —
+    `PROMPTING`, `STALLED`, `TIMEOUT`, `DEAD`, `BLOCKED` — because none of them
+    prove the worker has stopped touching infra. Releasing on a single
+    non-terminal `wait` return would let another worktree onto the shared stack
+    while this stage's worker is still live. A held lock is reclaimed later by
+    that same stage's eventual terminal callback, by dead-session steal (a killed
+    worktree auto-releases), or by operator `release --force` on an explicit
+    abort. **Never** wrap the release in a blanket `trap EXIT` — that would
+    release while a worker still runs.
+
+    ### Shape A — dispatched infra stage
+
+    ```bash
+    ~/bin/forge-bridge infra-lock acquire --slug {slug} --stage {stage}   # blocks visibly; escalates on the wait ceiling
+    ~/bin/forge-bridge dispatch --slug {slug} --stage {stage} --worker {W} [--clear]
+    #   └─ if dispatch FAILS (orphan-pending guard / tmux validation / send):
+    #        ~/bin/forge-bridge infra-lock release --slug {slug} --stage {stage}  →  surface the dispatch error  →  STOP
+    #        (safe: the worker never started, so infra was never touched — F2)
+    # loop:
+    ~/bin/forge-bridge wait --slug {slug} --stage {stage} --worker {W} --digest-template {stage}
+    #   DONE | ERROR  -> infra-lock release --slug {slug} --stage {stage} ; then digest + advance/handle   (terminal: pending already closed by the bridge)
+    #   PROMPTING     -> surface to user; on approval re-enter the wait loop                                (HOLD)
+    #   STALLED|TIMEOUT -> Agent-Failure-Recovery; re-enter loop or abort                                   (HOLD; abort path force-releases AFTER confirming the stage is stopped)
+    #   DEAD          -> DEAD sub-policy below                                                              (HOLD by default)
+    #   BLOCKED       -> the bridge LEFT the BLOCKED callback in place and kept the pending OPEN; do NOT release.
+    #                    Read the blocked message (the canonical callback file is the source of truth),
+    #                    run repair (may itself touch infra — fine, the lock is HELD),
+    #                    ~/bin/forge-bridge send --force {W} "<continuation>"
+    #                      on send SUCCESS: ~/bin/forge-bridge callback-consume --slug {slug} --stage {stage} --status BLOCKED ; re-enter the wait loop
+    #                      on send FAIL / crash before send: leave it — the canonical BLOCKED stays visible and resume re-surfaces it
+    ```
+
+    Release the lock the moment `wait` returns `DONE`/`ERROR`, **then** spawn the
+    digest (the digest reads disk artifacts only — Rule 10 — so it needs no lock).
+
+    **DEAD sub-policy.** `DEAD` = the worker pane is gone; `dispatch` needs a live
+    session + correct pane count, so repair may be required before re-dispatch:
+    - pane dead, session repairable → keep the lock **HELD**, repair (`health`),
+      re-dispatch (re-acquire is reentrant → `ALREADY_HELD`).
+    - session will be killed/restarted → the lock auto-resolves via dead-session
+      steal once the session dies; or force-release as part of an explicit abort.
+    - repair abandoned → `release --force` **only after** confirming no child
+      service/test process from the dead stage is still bound to the shared ports.
+
+    ### Shape B — local fallback infra stage (`qa` Path B / `qa-retry` inline)
+
+    When codex-b is unavailable and `qa`/`qa-retry` runs **inline in pane 1**
+    (Agent Teams), there is no `dispatch`/`wait` to key off — so the lock brackets
+    the inline run, and per Rule 5 the local stage must also be logged AND closed:
+
+    ```bash
+    ~/bin/forge-bridge infra-lock acquire --slug {slug} --stage {stage}
+    ~/bin/forge-bridge log --slug {slug} --stage {stage} --from claude --to claude --prompt "<local qa run>"   # open the pending (Rule 5)
+    # restart-on-entry (qa/qa-retry): bring up THIS worktree's services before testing (installed adversarial-qa SKILL) — under the held lock
+    # run adversarial-qa inline (pane 1)                                                                        # lock HELD
+    #   success  -> ~/bin/forge-bridge log-response --slug {slug} --to claude --stage {stage} --response "FORGE_DONE: {stage} — <artifact>"
+    #   FAIL/ABORT -> ~/bin/forge-bridge log-response --slug {slug} --to claude --stage {stage} --response "FORGE_ERROR: {stage} — <reason>"   # close anyway (R3-6)
+    ~/bin/forge-bridge infra-lock release --slug {slug} --stage {stage}   # release as soon as artifacts written + pending CLOSED (failure path: only after confirming no unsafe service proc)
+    ~/bin/forge-bridge digest --slug {slug} --stage {stage} --template qa   # AFTER release — digest reads disk only (Rule 10)
+    ```
+
+    Close the local pending on **every** exit (success or failure): an inline QA
+    that errors before the close leaks **both** the lock and an open pending (the
+    next `dispatch` is then refused). Release **before** the digest.
+
+    ### Lock is intentionally held while non-terminal
+
+    The lock may **intentionally remain held** while an infra stage is
+    `PROMPTING`, `STALLED`, `TIMEOUT`, `DEAD`-pending-redispatch, or being
+    unblocked (`BLOCKED` → repair → continue). That is correct, not a leak. It is
+    released on the stage's terminal callback, dead-session steal, or operator
+    `release --force`. Env: `FORGE_INFRA_LOCK_TIMEOUT_S` (wait ceiling, default
+    1800s), `FORGE_INFRA_LOCK_INTERVAL_S` (poll, default 15s). On the ceiling,
+    `acquire` exits non-zero with a full holder-metadata escalation block — surface
+    it to the user; do not silently retry forever. The five reasoning stages are
+    explicitly out of this rule's scope.
 
 ---
 
@@ -1133,12 +1284,13 @@ Phase 1 is advisory — reviews don't hard-block pipeline advancement.
 
 <!--
 Source: ~/.claude/skills/forge-orchestrator/SKILL.md
-Source sha256: a13506e796b689671e4b849862a5cff6be52d2cb8809d9a9cf5485eb58525f25
-Generated: 2026-06-28
+Source sha256: 33c0f6b3ee0111a1c2f2b7f3e8dde795cd3529bf6e1710bb05b9193b44962557
+Generated: 2026-06-29
 Hash tool: shasum -a 256 (macOS) or sha256sum (Linux).
 Hash input: the body ABOVE this comment block, i.e.
   awk '/^<!--$/{exit} {print}' SKILL.md | shasum -a 256
 Regenerate: see move2-plan-2026-05-14.md §10 step 6(a) or hash-drift check.
 Tools amendment: 'Agent' added per CP-4 sub-test (f) finding (2026-05-14) — required so the orchestrator can spawn digest children (SKILL.md Hard Rule 17 mandates this).
 2026-06-28: Reasoning-tier routing (Hard Rule 22) — verify re-tiered HIGH (codex-a/claude-opus), implementation fallback codex-b→claude-opus, bridge dispatch tier guard. See handoffs/handoff-2026-06-28-stage-pane-routing-plan.md.
+2026-06-29: Cross-worktree infra lock (Hard Rule 23) — acquire-before-dispatch / release-on-terminality wrapping for the five infra stages (coding/qa/qa-fix/qa-retry/verify), Shapes A/B, Hard Rule 22 amended for the gated local qa/qa-retry pane-1 fallback (D2). See handoffs/handoff-2026-06-29-infra-lock-plan.md.
 -->
