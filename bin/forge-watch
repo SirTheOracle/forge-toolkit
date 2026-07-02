@@ -776,6 +776,15 @@ cmd_ack() {
 }
 
 cmd_install() {
+    # launchd runs with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin) that does
+    # NOT include Homebrew — where tmux and (often) python3 live. Without this,
+    # `tmux list-sessions` fails to launch and the agent silently sees zero
+    # sessions. Bake in the dirs of the tmux/python3 we resolve right now.
+    local tmux_dir py_dir fw_path
+    tmux_dir="$(dirname "$(command -v tmux 2>/dev/null || echo /opt/homebrew/bin/tmux)")"
+    py_dir="$(dirname "$(command -v python3 2>/dev/null || echo /usr/bin/python3)")"
+    fw_path="$tmux_dir:$py_dir:/usr/bin:/bin:/usr/sbin:/sbin"
+
     cat > "$PLIST" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -787,6 +796,10 @@ cmd_install() {
     <string>$SELF</string>
     <string>check</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$fw_path</string>
+  </dict>
   <key>StartInterval</key><integer>30</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardErrorPath</key><string>$CACHE_DIR/launchd.err</string>
