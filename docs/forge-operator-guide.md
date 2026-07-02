@@ -20,7 +20,7 @@ A forge project needs:
 2. **`forge-start`** to create the 5-pane tmux session and write
    `.dev/.forge-session` with the session name.
 
-### Starting a pipeline (canonical path)
+### Starting a pipeline
 
 From pane 1 of your forge session, type:
 
@@ -30,49 +30,51 @@ From pane 1 of your forge session, type:
 
 What happens:
 
-1. `/forge` confirms `.dev/.forge-session` exists in the cwd; refuses
+1. `/forge` confirms `.dev/.forge-session` exists in the cwd; it refuses
    otherwise.
-2. It assembles a canonical spawn prompt containing `Canonical user
-   intent`, `Original user request`, `Project root`, `Tmux session`,
-   and the path to the heartbeat event log.
-3. It spawns the orchestrator as a background agent named
-   `pipeline-<slug>` via `Agent({subagent_type: "forge-orchestrator"})`
-   and immediately streams the agent's output with `Monitor`.
-4. A second `Monitor` tails the bridge heartbeat event log
-   (`.dev/forge-tmp/orchestrator-events.log`), filtered to the active
-   slug. `tail -F -n 0` skips backlog so resumes don't replay.
-5. The orchestrator runs Hard Rule 0 first (pin session, `export
-   TMUX_SESSION`), then `preflight` + `health` (Hard Rule 18), then
-   enters Pipeline Mode and dispatches `proposal`.
+2. It parses the argument line into a canonical intent:
+   `forge-pipeline <slug>`, `forge-fix-pipeline <slug>`, resume mode,
+   local status/pause, or an ad-hoc request.
+3. For pipeline/fix/ad-hoc orchestration, it loads
+   `~/.claude/skills/forge-orchestrator/SKILL.md` into pane 1. You now
+   **are** the in-pane orchestrator; there is no hidden background agent
+   and no forwarding layer.
+4. The orchestrator seeds itself with the original request, project root,
+   tmux session, and `.dev/forge-tmp/orchestrator-events.log`.
+5. It runs Hard Rule 0 first (pin session, `export TMUX_SESSION`), then
+   `preflight` + `health` (Hard Rule 18), then enters the requested mode.
 
 ### Other `/forge` forms
 
 | You type | What happens |
 |---|---|
-| `/forge pipeline <slug>` | Spawn orchestrator in pipeline mode (above) |
-| `/forge resume <slug>` | Spawn orchestrator with the resume preamble (cd, preflight, context, inspect pending callback, resume `wait` or dispatch next) |
+| `/forge pipeline <slug>` | Load the in-pane orchestrator and enter Pipeline Mode |
+| `/forge start pipeline <slug>` | Same as `/forge pipeline <slug>` |
+| `/forge fix-pipeline <slug> [--reproduce]` | Load the orchestrator and enter Fix Pipeline Mode |
+| `/forge resume <slug>` | Load the in-pane orchestrator with the resume preamble (cd, preflight, context, inspect pending callback, resume `wait` or dispatch next) |
 | `/forge status` | Local: runs `~/bin/forge-bridge status` and prints verbatim |
-| `/forge pause` | Forwards literal `forge-pause` to the active pipeline agent via `SendMessage`. Errors if none active |
-| anything else | Treated as an ad-hoc dispatch; forwarded to the active agent if one exists, otherwise spawns an ad-hoc agent |
+| `/forge pause` | In-pane pause: stop dispatching, leave callbacks intact, print bridge status, explain `/forge resume <slug>` |
+| anything else | Treated as an ad-hoc request; handled by the in-pane orchestrator unless the wording is an exact pipeline trigger |
 
 ### Subsequent messages
 
-Once an agent is running, every following message in the same chat is
-classified by prefix only:
+Once `/forge` has loaded the orchestrator, the user speaks to pane 1
+directly. There is no active-agent forwarding grammar. Two literal
+exceptions are handled specially:
 
-- `/forge …` — re-enter the grammar above (does NOT spawn a second
-  pipeline agent — second `/forge pipeline` errors loudly)
-- Other `/…` — handled as that command's own slash command; not
-  forwarded
-- `local:…` — strip the prefix; handle as a local request in pane 1
-- Anything else — forwarded verbatim via `SendMessage({to:
-  "pipeline-<slug>", message: "…"})`
+- `/forge status` or `/forge-status` prints `~/bin/forge-bridge status`
+  verbatim, then continues.
+- `/forge pause` pauses per the local pause behavior above.
+
+If a user-typed line begins with `FORGE_DONE:`, `FORGE_BLOCKED:`, or
+`FORGE_ERROR:`, the orchestrator drops it as synthetic worker-callback
+noise.
 
 ### Escape hatch
 
 `/forge-orchestrator` loads the orchestrator body directly into the
-current session for manual driving (debugging, one-off stage runs). The
-behavioral rules below apply equally to both modes.
+current session for manual driving without the `/forge` argument grammar.
+The behavioral rules below apply equally to both modes.
 <!-- docs-refresh:end section=getting-started -->
 
 ## Running a Pipeline
@@ -110,6 +112,18 @@ Between stages the orchestrator:
 4. Otherwise applies the **Change-of-Course Heuristic**: read the disk
    artifact, classify as risk-flagging (advance with `add-note`) or
    real defect (escalate to user)
+
+### Infra-lock discipline
+
+The five infra-touching stages (`coding`, `qa`, `qa-fix`, `qa-retry`,
+`verify`) are wrapped in `forge-bridge infra-lock` so parallel worktrees
+do not collide on fixed ports or the shared database. Reasoning stages
+(`proposal`, `review`, `incorporate`, `implementation`, `impl-review`)
+never lock and can run in parallel across worktrees.
+
+For dispatched infra stages, the orchestrator acquires before dispatch
+and releases only after terminal `DONE` or `ERROR`. It intentionally holds
+the lock through `PROMPTING`, `STALLED`, `TIMEOUT`, `DEAD`, and `BLOCKED`.
 
 ### Status messages between stages
 
@@ -168,35 +182,45 @@ The orchestrator's resume preamble runs:
 2. `~/bin/forge-bridge preflight` (validates session, panes, working
    tree)
 3. `~/bin/forge-bridge context` (renders current pipeline context)
-4. Inspect `.dev/forge-context.yml` for the active stage / worker / wait
-   state
+4. Inspect the session-scoped `.dev/forge-context.<session>.yml` for the
+   active stage / worker / wait state
 5. If a stage is pending callback, resume `forge-bridge wait` for that
    stage. Otherwise, dispatch the next stage per the transition table
 
-`.dev/forge-status.md` is **human-facing display**, not the primary
-machine recovery source. Use `forge-bridge context` (Hard Rule 16) to
-load the canonical state.
+`.dev/forge-status.<session>.md` is **human-facing display**, not the
+primary machine recovery source. Use `forge-bridge context` (Hard Rule 16)
+to load the canonical state.
+
+If `context` reports a legacy shared `.dev/forge-context.yml`, use the
+suggested `set-context --slug <slug>` only when that pipeline is yours.
+The bridge deliberately does not auto-adopt a legacy context from another
+session.
 
 ### Skip with care
 
 `forge-skip qa` is allowed but logged with a warning. `forge-skip
 verify` is refused — if you really want to skip verify, use `forge-stop`
 and re-invoke the next pipeline manually.
+
+<!-- TODO: `/forge` command prose still says resume should inspect
+`.dev/forge-context.yml`; bridge code is authoritative and resolves
+`.dev/forge-context.<session>.yml`. -->
 <!-- docs-refresh:end section=interrupting-and-resuming -->
 
 ## Status and Health
 
 <!-- docs-refresh:start section=status-and-health -->
-Five commands cover "what's going on right now":
+Core commands for "what's going on right now":
 
 | Command | When |
 |---|---|
-| `/forge status` (or `~/bin/forge-bridge status`) | Rolling human-readable summary — pipeline + stage + recent activity + pending callbacks + artifacts + notes |
+| `/forge status` (or `~/bin/forge-bridge status`) | Rolling human-readable summary — pipeline + stage + recent activity + pending callbacks + artifacts + notes + infra-lock line when resolvable |
 | `~/bin/forge-bridge context` | Active pipeline + last completed stage + next stage + notes + recent log entries + pending signals — the canonical machine-recovery view |
 | `~/bin/forge-bridge health` | Per-pane check: do all 5 panes exist and run the expected worker process? Exits 0 only when every pane is `OK`. Output lines: `OK \| DEAD \| WRONG_PROCESS \| UNKNOWN pane=<name> idx=<n> …` and a `SUMMARY` line |
 | `~/bin/forge-bridge preflight` | Kickoff snapshot: pwd, branch, merge state, halt status code |
 | `~/bin/forge-bridge history [lines]` / `pipeline-log <slug> [lines]` | Recent activity across all pipelines / detail for one pipeline |
 | `~/bin/forge-bridge usage [<worker>]` | Per-worker usage snapshot recorded at each task completion: normalized `headroom` (0-100 = % capacity remaining) + `confidence`. Claude workers report from the pane footer; Codex is always `unknown` (the CLI exposes no usage in pane text). Read-only — never scrapes a pane |
+| `~/bin/forge-bridge infra-lock status` | Whether the global infra lock is free, held live, stale, foreign-host, or corrupt |
 
 ### When to run each
 
@@ -206,38 +230,117 @@ Five commands cover "what's going on right now":
 | "Show me the human summary" | `/forge status` |
 | "The orchestrator says a pane is wrong" | `forge-bridge health` |
 | "How used up are the workers?" | `forge-bridge usage` |
+| "Why is an infra stage waiting?" | `forge-bridge infra-lock status` |
 | "Is this branch safe to dispatch on?" | `forge-bridge preflight` |
 | "Where did we leave off last week?" | `forge-bridge context`, then `history 20` |
 
 ### Status file mechanics
 
-`.dev/forge-status.md` is auto-maintained by the bridge as a side effect
-of `dispatch` / `wait` / `callback`. It summarizes:
+`.dev/forge-status.<session>.md` is auto-maintained by the bridge as a
+side effect of `dispatch` / `wait` / `callback` / `status`. It summarizes:
 
 - Active pipeline + current stage (or "idle" with last completed)
 - Next stage (per the canonical transition table)
 - Recent activity (last 15 events: dispatches, completions, blocks)
 - Pending callbacks (`response: null` entries)
 - Artifacts (files produced so far)
-- Notes (from `forge-context.yml`)
+- Notes (from `forge-context.<session>.yml`)
+- Infra lock status when the bridge can resolve tmux identity and git
+  common-dir
 
 `/forge status` surfaces this file verbatim — the orchestrator should
 not re-narrate or compress it (forge-status command body).
 
 ### Heartbeat event log
 
-`~/.claude/commands/forge.md` starts a second `Monitor` against
-`.dev/forge-tmp/orchestrator-events.log` that streams the bridge's
-own `_emit_event` lines:
+The bridge writes `_emit_event` lines to
+`.dev/forge-tmp/orchestrator-events.log`:
 
 ```
-DISPATCH | WAIT | CALLBACK | DIGEST | STAGE | STALL | ERROR | COMPLETE: pipeline=<slug> <key=value …>
+DISPATCH | WAIT | CALLBACK | DIGEST | STAGE | STALL | ERROR | COMPLETE | USAGE | LOCK: pipeline=<slug> <key=value …>
 ```
 
-This is filtered with `grep -F 'pipeline=<slug>'` so the user sees only
-the active pipeline's events. `tail -F -n 0` skips backlog so resumes
-don't replay old events.
+Use it as a low-level audit stream when debugging. The current `/forge`
+path is in-pane and does not create the older hidden-agent monitor layer.
+
+<!-- TODO: `~/.claude/commands/forge-status.md` still says the status file
+lives at `.dev/forge-status.md`; bridge code is authoritative and renders
+`.dev/forge-status.<session>.md`. -->
 <!-- docs-refresh:end section=status-and-health -->
+
+## Blocked-on-You Notifications (`forge-watch`)
+
+`forge-watch` inverts the polling workflow: instead of clicking through tabs
+to find a pipeline waiting on you, it watches every live forge session and
+fires a macOS notification only when one is actually blocked on a human.
+
+It is strictly **read-only** against forge state — it never writes under any
+project's `.dev/`, never sends keys to a pane, never touches tmux/session
+state. Its only writes are its own cache (`~/.cache/forge-watch`) and config
+(`~/.config/forge`). If it dies or is uninstalled, you are back to exactly
+today's poll-the-tabs workflow; no pipeline depends on it.
+
+### Commands
+
+| Command | What |
+|---|---|
+| `forge-watch status` | One scan, print findings only — no notifications. The debug surface: shows everything, including status-only items (stale zombies, legacy contexts, abandoned pendings). |
+| `forge-watch check` | One scan, print findings **and** deliver notifications with debounce. This is what the launchd agent runs. |
+| `forge-watch ack <session\|slug\|project-dir>` | Silence every current condition for that target until it clears and re-enters. The "I know, leave me alone" verb. |
+| `forge-watch install` | Write and load the launchd agent (30s interval) and fire a test notification. |
+| `forge-watch uninstall` | Unload and remove the launchd agent (cache/config left in place). |
+
+### What it notifies on
+
+| Condition | Meaning |
+|---|---|
+| `NEEDS-DECISION` | A live pipeline finished a QA-family stage and is waiting for your call (fires after a short dwell, and only when nothing is dispatched — an in-flight stage suppresses it). |
+| `WORKER-BLOCKED` | A worker sent `FORGE_BLOCKED` and is explicitly waiting on a human. |
+| `STAGE-ERROR` | A stage completed with `error` status. |
+| `PIPELINE-ERROR` | The bridge logged an `ERROR`/`GUARD_BLOCK` (dispatch guard, tier violation, callback publish failure, …). |
+| `WORKER-STALLED` | An open dispatch has been pending past the bridge's STALE threshold (2× `FORGE_STALL_THRESHOLD_S`) — and is recent enough to still be actionable. |
+| `WORKER-STALL-EVENT` | The bridge's own content-level stall detector reported a stuck worker. |
+| `PIPELINE-COMPLETE` | A pipeline reached `complete` (info; disable with `FORGE_WATCH_NOTIFY_COMPLETE=0`). |
+| `ZOMBIE-ACTIVE` | A context with recent/active work points at a session that is no longer live (e.g. an abandoned pipeline after a session restart). |
+
+Status-only (never notify by default): `ZOMBIE-STALE-CONTEXT` (a dead session's
+week-plus-old leftover context), `STALE-PENDING` (a months-old never-closed
+proposal log — residue, not a live stall), and `LEGACY-CONTEXT` (a bare
+`forge-context.yml` migration hint). These keep the notification stream honest
+while still being visible in `forge-watch status`.
+
+### How it finds sessions
+
+Discovery is driven by `tmux list-sessions` — each session's working directory
+is a project root. A context file counts as *live* only when its embedded
+session name is live **and** that session's path matches the project root;
+because `forge-N` names get reused across restarts, a name-only check would
+alias one project's session onto another's stale context. Projects whose
+sessions are dead can still be watched by listing their roots in
+`~/.config/forge/watch-roots` (one path per line).
+
+### Tuning
+
+Environment variables win when set; otherwise `~/.config/forge/watch.env`
+(parsed as `KEY=value` **data**, never sourced) supplies them; otherwise
+defaults apply. `install` seeds `watch.env` from your current shell so the
+launchd agent — which does not inherit `.zshrc` — agrees with your terminal.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `FORGE_STALL_THRESHOLD_S` | 600 | Stall threshold; STALE = 2× this. Match the bridge. |
+| `FORGE_WATCH_DWELL_S` | 300 | How long a decision state must persist before `NEEDS-DECISION` fires. |
+| `FORGE_WATCH_RENOTIFY_S` | 900 | Re-notify base for a persistent condition (×2 backoff each repeat, capped at 4h). |
+| `FORGE_WATCH_ZOMBIE_AGE_D` | 7 | Window separating actionable zombies/stalls from old residue. |
+| `FORGE_WATCH_NOTIFY_COMPLETE` | 1 | Notify on pipeline completion. |
+
+### Notification permission gotcha
+
+macOS attributes `osascript` notifications to **Script Editor**. If you never
+see notifications (but `forge-watch status` clearly shows findings), grant
+notification permission to Script Editor in **System Settings ▸ Notifications**,
+then re-run `forge-watch check`. `install` fires one test notification so you
+can catch this immediately.
 
 ## Recovery
 
@@ -266,6 +369,10 @@ Recovery order:
    artifact on disk. If complete, re-spawn the digest via `forge-bridge
    digest`. If not, re-dispatch the stage
 
+If the stage is one of `coding`, `qa`, `qa-fix`, `qa-retry`, or `verify`,
+the infra lock may intentionally still be held while the stage is
+non-terminal. Do not release it merely because the orchestrator restarted.
+
 ### Handling FORGE_BLOCKED
 
 When `wait` returns `STATUS: BLOCKED`:
@@ -279,7 +386,21 @@ When `wait` returns `STATUS: BLOCKED`:
    ```
    ~/bin/forge-bridge send --force {worker} "Fixed X. Continue."
    ```
-4. Wait again with the same args; the next callback resolves it
+4. After the continuation send succeeds, archive the consumed BLOCKED
+   callback so the next `wait` does not re-read the stale callback:
+   ```
+   ~/bin/forge-bridge callback-consume --slug {slug} --stage {stage} --status BLOCKED
+   ```
+5. Wait again with the same args; the next callback resolves it
+
+If the continuation send fails or the orchestrator crashes before sending,
+leave the callback file in place. Resume will surface the same BLOCKED state
+again.
+
+For infra stages, the lock remains held during BLOCKED repair and the
+continuation loop. Release only after terminal DONE/ERROR, or after an
+explicit abort where the operator has confirmed no worker/service process
+is still touching shared infra.
 
 ### Agent Failure Recovery
 
@@ -293,6 +414,23 @@ Background-agent failures follow this protocol:
    error, options to fix, skip (non-critical only), or abort the
    pipeline
 4. **Never auto-retry more than once per stage**
+
+### Infra-lock recovery
+
+`forge-bridge infra-lock status` reports:
+
+| State | Meaning |
+|---|---|
+| `FREE` | No holder sidecar exists |
+| `HELD live` | Another live tmux session owns the lock |
+| `STALE` | Holder session is dead; the next acquire can steal it, or the operator can force-release after confirming the stage is stopped |
+| `HELD foreign-host` | Holder is on another host; liveness is not verifiable locally |
+| `ESCALATE` | The holder sidecar is corrupt and needs manual inspection |
+
+`infra-lock acquire` waits with defaults `FORGE_INFRA_LOCK_TIMEOUT_S=1800`
+and `FORGE_INFRA_LOCK_INTERVAL_S=15`. On timeout it prints holder metadata
+and a force-release command. Do not run the force-release command blindly;
+forcing while a worker still runs can collide on the shared DB or ports.
 
 ### Stall classification (the seven `wait` outcomes)
 
@@ -313,6 +451,10 @@ legitimately-long stages. Coding and QA typically need more than the
 default 600s. See `references/stall-detection.md` for the per-stage
 timeout table.
 
+For infra stages, `PROMPTING`, `STALLED`, `TIMEOUT`, `DEAD`, and `BLOCKED`
+are all non-terminal; the lock stays held unless the operator explicitly
+aborts and safely force-releases.
+
 ### Multiple forge sessions, wrong pane
 
 Symptom: the orchestrator reads or sends to a pane in a different forge
@@ -326,8 +468,9 @@ session.
 Fix:
 
 1. The orchestrator should `export TMUX_SESSION=<name>` at session
-   start. Verify by inspecting the spawn prompt — it should contain
-   `Tmux session: forge-N`.
+   start. `/forge` seeds the session from `.dev/.forge-session`; manual
+   `/forge-orchestrator` should read the same file or use an explicit
+   `TMUX_SESSION`.
 2. If multiple `forge-*` sessions exist, the bridge now refuses to
    auto-pick and lists the candidates. The error message tells you to
    either `export TMUX_SESSION=<name>` or run from a project dir
