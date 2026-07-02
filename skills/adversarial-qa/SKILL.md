@@ -36,6 +36,41 @@ The QA testers need a running application. Service commands come from the projec
 
 The Playwright config (`{{frontend_working_dir}}/{{playwright_config}}`) can auto-start servers (mode: `{{playwright_autostart}}`), so testers can also just run `{{e2e_command}}` directly.
 
+### Restart-on-entry (cross-worktree infra lock — qa / qa-retry)
+
+This QA stage runs under the cross-worktree **infra lock** (orchestrator-held;
+see forge-orchestrator Hard Rule 23). All worktrees of this repo share one infra
+stack (fixed-port services + a shared DB), so a dev server left running by a
+*different* worktree's earlier stage would serve **that** worktree's code to your
+tests. Before testing, **restart the services against THIS worktree** so you
+exercise THIS worktree's code. This is config-driven and identity-checked — do
+**not** blindly kill whatever holds a port:
+
+1. **Expected service shape** (from the preamble / `forge-project.yml`):
+   - backend: `{{backend_command}}` in `{{backend_working_dir}}/`, URL `{{backend_url}}`
+   - frontend: `{{frontend_command}}` in `{{frontend_working_dir}}/`, URL `{{frontend_url}}`
+   - the port is the `:PORT` in each URL.
+2. **Inspect each configured port:** `lsof -nP -iTCP:<port> -sTCP:LISTEN`; for any
+   listener get its command + cwd (`ps -o command= -p <pid>`, `lsof -p <pid> | grep -i cwd`).
+3. **Decide per listener:**
+   - **Matches the project's expected dev-server shape** (command matches
+     `{{backend_command}}`/`{{frontend_command}}` AND cwd is a worktree of THIS
+     repo) → it is a Forge-owned server for some worktree. **Stop it** (`kill <pid>`;
+     `kill -9` only if it refuses) so you can start THIS worktree's server fresh.
+     **Log** pid, command, cwd, port, and the owning worktree.
+   - **Unknown process** (not the expected shape) → **STOP and ESCALATE — do NOT
+     kill it.** Report `INFRA ESCALATION: configured port <port> held by an unknown
+     process (pid=<pid> cmd=<command> cwd=<cwd>) not matching the expected
+     dev-server shape; refusing to kill.` Emit `FORGE_BLOCKED` and wait for a human.
+   - **Nothing listening** → proceed to start.
+4. **Start THIS worktree's services** from `{{backend_working_dir}}`/`{{frontend_working_dir}}`,
+   or rely on Playwright `webServer` autostart **only if** it starts a fresh server
+   (NOT `reuseExistingServer: true`). Confirm the backend URL responds before testing.
+
+Safe under the lock: exactly one infra stage runs globally at a time, so stopping
+a prior holder's leftover server cannot race another live QA run. (`coding` and
+`qa-fix` do NOT restart-on-entry — Hard Rule 23.)
+
 ## Modes
 
 | Mode | Flag | Behavior |

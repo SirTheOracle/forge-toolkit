@@ -1195,6 +1195,16 @@ except FileNotFoundError:
 
 print("Updated: $slug | to=$target_to | stage=$target_stage_resolved | ts=$target_ts | response: $response")
 PYEOF
+    # R4-2: the patch block above can fail (regex anchor not found ⇒ sys.exit(2))
+    # but its exit code was previously dropped, so a failed close returned ~0.
+    # The terminal callback path now relies on a TRUE failure signal to refuse
+    # publishing a DONE/ERROR callback over an unclosed pending — propagate it.
+    local _patch_rc=$?
+    if [ "$_patch_rc" -ne 0 ]; then
+        echo "ERROR: log-response: failed to patch the pending entry for slug=$slug stage=$target_stage_resolved (response NOT recorded; anchor ts=$target_ts not found or write failed)." >&2
+        _emit_event ERROR "$slug" "stage=$target_stage_resolved reason=log-response-patch-failed rc=$_patch_rc to=$target_to"
+        return 1
+    fi
 
     # D2 (orphan-log-entries): >1 pending matched the filter; we closed the most
     # recent (candidates[-1]) and left the older duplicate(s) OPEN. Emit a loud
@@ -1420,10 +1430,16 @@ _render_status_file() {
     local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
     local out_file="$project_root/$DEV_DIR/$(_status_file_name)"
     mkdir -p "$(dirname "$out_file")"
-    python3 - "$project_root/$CONTEXT_FILE" "$project_root/$DEV_DIR" "$out_file" <<'PYEOF'
+    # Infra-lock status line (best-effort; empty when identity/anchor/git is
+    # unresolved or there is no tmux session — never fatal to status rendering).
+    # `infra-lock status` does not call _render_status_file, so no recursion.
+    local il_line=""
+    il_line=$(cmd_infra_lock status 2>/dev/null | sed 's/^INFRA_LOCK: //')
+    python3 - "$project_root/$CONTEXT_FILE" "$project_root/$DEV_DIR" "$out_file" "$il_line" <<'PYEOF'
 import sys, os, yaml, datetime
 
 context_file, dev_dir, out_file = sys.argv[1:4]
+infra_lock_line = sys.argv[4] if len(sys.argv) > 4 else ''
 
 ctx = {}
 try:
@@ -1562,6 +1578,8 @@ else:
     L.append(f"Current stage: (idle) — last completed: {last_stage} → {last_status} by {last_worker}")
 L.append(f"Next stage: {next_stage}")
 L.append(f"Last update: {now}")
+if infra_lock_line:
+    L.append(f"Infra lock: {infra_lock_line}")
 L.append("")
 L.append("## Recent activity")
 L.append("")
@@ -1987,24 +2005,83 @@ cmd_callback() {
     local cb_dir="$project_root/.dev/forge-tmp/callbacks"
     mkdir -p "$cb_dir"
     local cb_file="$cb_dir/${slug}-${stage}.callback"
-    local ts
+    local ts cb_id
     ts=$(timestamp)
-    cat > "$cb_file" <<EOF
+    # Filename-safe unique id for this callback. timestamp() is ISO-8601 with
+    # colons (not filename-safe), so derive a separate id used to name the
+    # archive on `callback-consume`. epoch+pid+RANDOM is unique across a stage's
+    # lifetime even within the same wall-clock second.
+    cb_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
+
+    # Render the callback body once; published atomically (temp → mv) below so a
+    # polling `wait` never observes a half-written file. yaml_escape may emit a
+    # multi-line block scalar for a newline-bearing message; command-substitution
+    # preserves the internal newlines and the printf re-adds the single trailing
+    # one — byte-equivalent to the prior heredoc.
+    local cb_body
+    cb_body=$(cat <<EOF
 slug: $slug
 stage: $stage
 status: $status
 worker: $worker_canonical
+callback_id: $cb_id
 timestamp: $ts
 message: $(yaml_escape "$message")
 EOF
-
-    # Auto log-response. Construct the legacy-style response string.
+)
+    # Legacy-style response string (for log-response close + the human notify).
     local legacy="FORGE_${status}: ${stage}"
     if [ -n "$message" ]; then
         legacy="${legacy} — ${message}"
     fi
-    (cd "$project_root" && cmd_log_response --slug "$slug" --stage "$stage" \
-        --to "$worker_canonical" --response "$legacy" >/dev/null 2>&1) || true
+
+    # --- Callback lifecycle: terminal vs non-terminal (R3-3 / R4-1 / R4-2) ---
+    # Atomic publish writes to a temp file in the SAME dir (same filesystem) then
+    # renames into place.
+    local cb_tmp="$cb_dir/.${slug}-${stage}.callback.tmp.$$"
+    case "$status" in
+        DONE|ERROR)
+            # R4-2 (terminal path — used by EVERY stage, highest blast radius):
+            # close the pending log entry FIRST. A failed close MUST abort and
+            # MUST NOT publish the terminal callback (the old `|| true` is gone),
+            # so a polling `wait` can never observe DONE/ERROR before the pending
+            # is closed — which would let the orchestrator release the infra lock
+            # and race the next dispatch against the open-pending guard.
+            if ! (cd "$project_root" && cmd_log_response --slug "$slug" --stage "$stage" \
+                    --to "$worker_canonical" --response "$legacy" >/dev/null 2>&1); then
+                _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=terminal-close-failed status=$status"
+                echo "ERROR: callback $status: failed to close the pending log entry for slug=$slug stage=$stage; terminal callback NOT published (no matching open pending, or patch failed). Resolve the log state and retry." >&2
+                rm -f "$cb_tmp"
+                return 1
+            fi
+            # Close succeeded → publish the terminal callback atomically.
+            if ! { printf '%s\n' "$cb_body" > "$cb_tmp" && mv -f "$cb_tmp" "$cb_file"; }; then
+                rm -f "$cb_tmp"
+                _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=callback-publish-failed status=$status"
+                echo "ERROR: callback $status: pending closed but callback publish failed for slug=$slug stage=$stage." >&2
+                return 1
+            fi
+            ;;
+        BLOCKED)
+            # R3-3 / R4-1 / R4-3 (non-terminal): publish the BLOCKED callback
+            # atomically and KEEP the dispatch pending (response: null) OPEN — do
+            # NOT call log-response. The open pending is the durable "in-flight
+            # under a held infra lock" signal the stall-classifier and
+            # `/forge status` depend on (else the held lock looks abandoned). The
+            # canonical callback file is the source of truth for the blocked
+            # message; `wait` reads it (read-only) and it is archived only later
+            # by `callback-consume`, AFTER the orchestrator commits a
+            # `send --force` continuation. add-note is deliberately NOT the source
+            # of truth (R4-3); the canonical file + the human notify below carry
+            # the message.
+            if ! { printf '%s\n' "$cb_body" > "$cb_tmp" && mv -f "$cb_tmp" "$cb_file"; }; then
+                rm -f "$cb_tmp"
+                _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=callback-publish-failed status=$status"
+                echo "ERROR: callback BLOCKED: callback publish failed for slug=$slug stage=$stage." >&2
+                return 1
+            fi
+            ;;
+    esac
 
     # Back-compat: still notify the orchestrator pane so humans see the line.
     # Suppressed by --quiet. Only attempts when inside a tmux session.
@@ -2160,6 +2237,467 @@ print(d.get('message', '') or '')
         _emit_event DIGEST "$slug" "stage=$stage template=$digest_template event=prompt-rendered out_file=$digest_out"
         printf 'DIGEST_PROMPT: %s\n' "$digest_out"
     fi
+}
+
+# callback-consume — archive a CONSUMED non-terminal (BLOCKED) callback (R4-1).
+#   forge-bridge callback-consume --slug <s> --stage <s> --status BLOCKED
+# Read and consume are deliberately SPLIT: `wait` reads the canonical BLOCKED
+# callback and LEAVES it in place (so a resume before the continuation re-surfaces
+# the same blocked state — no deadlock). The orchestrator calls THIS only AFTER a
+# `send --force` continuation has succeeded, atomically moving the canonical
+# callback out of the way so the next `wait` blocks for the worker's FRESH
+# callback instead of re-reading the stale one. No timestamps (timestamp() is
+# second-resolution) — purely presence-based.
+#   - Canonical BLOCKED present  -> atomic `mv` to
+#       .dev/forge-tmp/callbacks/archive/<slug>-<stage>.<callback_id>.callback
+#   - Nothing to consume (no canonical file, or its status != the requested
+#     non-terminal status) -> STRUCTURED NO-OP (exit 0) so the orchestrator does
+#     not re-wait blindly.
+cmd_callback_consume() {
+    local slug="" stage="" status="BLOCKED"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)   slug="$2";   shift 2 ;;
+            --stage)  stage="$2";  shift 2 ;;
+            --status) status="$2"; shift 2 ;;
+            *)        shift ;;
+        esac
+    done
+    if [ -z "$slug" ] || [ -z "$stage" ]; then
+        echo "Usage: forge-bridge callback-consume --slug <s> --stage <s> [--status BLOCKED]" >&2
+        return 1
+    fi
+    # Only non-terminal statuses are consumable. Terminal callbacks (DONE/ERROR)
+    # are the stage's permanent record and are never archived here.
+    case "$status" in
+        BLOCKED) ;;
+        *)
+            echo "ERROR: callback-consume only consumes non-terminal callbacks (--status BLOCKED); got '$status'" >&2
+            return 1
+            ;;
+    esac
+
+    local project_root
+    project_root=$(_resolve_project_root "")
+    if [ -z "$project_root" ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=project-root-unresolvable"
+        echo "ERROR: callback-consume requires forge-project.yml in cwd ancestry" >&2
+        return 1
+    fi
+
+    local cb_dir="$project_root/.dev/forge-tmp/callbacks"
+    local cb_file="$cb_dir/${slug}-${stage}.callback"
+
+    # Structured no-op: nothing to consume.
+    if [ ! -f "$cb_file" ]; then
+        _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=noop reason=no-canonical-callback status=$status"
+        echo "CALLBACK_CONSUME NOOP stage=$stage slug=$slug reason=no-canonical-callback (nothing to archive)"
+        return 0
+    fi
+
+    # Verify the on-disk status matches the requested non-terminal status. If the
+    # worker already advanced to a terminal callback (DONE/ERROR) at the same
+    # path, this is NOT ours to consume — leave it, no-op (R4-1: continuation
+    # fails / nothing fresh to consume).
+    local file_status file_cb_id
+    file_status=$(grep '^status:' "$cb_file" | awk '{print $2}')
+    if [ "$file_status" != "$status" ]; then
+        _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=noop reason=status-mismatch want=$status have=$file_status"
+        echo "CALLBACK_CONSUME NOOP stage=$stage slug=$slug reason=status-mismatch (canonical status=$file_status, not $status; left in place)"
+        return 0
+    fi
+
+    file_cb_id=$(grep '^callback_id:' "$cb_file" | awk '{print $2}')
+    if [ -z "$file_cb_id" ]; then
+        # Defensive: a callback written before callback_id existed. Synthesize a
+        # filename-safe unique id so the archive name is still unique.
+        file_cb_id="legacy-$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
+    fi
+
+    local archive_dir="$cb_dir/archive"
+    mkdir -p "$archive_dir"
+    local archive_file="$archive_dir/${slug}-${stage}.${file_cb_id}.callback"
+    # Atomic same-filesystem rename (archive/ is a subdir of callbacks/), preserves
+    # bytes. If the target name somehow already exists, the id was non-unique —
+    # fall back to an extra suffix rather than clobber.
+    if [ -e "$archive_file" ]; then
+        archive_file="$archive_dir/${slug}-${stage}.${file_cb_id}.$$-${RANDOM}.callback"
+    fi
+    if ! mv -f "$cb_file" "$archive_file"; then
+        _emit_event ERROR "$slug" "stage=$stage reason=callback-archive-failed status=$status"
+        echo "ERROR: callback-consume: failed to archive $cb_file → $archive_file" >&2
+        return 1
+    fi
+    _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=archived status=$status callback_id=$file_cb_id archive=$archive_file"
+    echo "CALLBACK_CONSUME ARCHIVED stage=$stage slug=$slug status=$status → $archive_file"
+}
+
+# ===========================================================================
+# infra-lock — cross-worktree mutex serializing infra-touching stages.
+#
+# Forge is share-nothing per worktree EXCEPT all worktrees hit one shared infra
+# stack (fixed-port services + a shared Postgres). This is a single global mutex
+# so the five infra stages {coding, qa, qa-fix, qa-retry, verify} never run
+# simultaneously across worktrees; the five reasoning stages stay fully parallel.
+# It is a LOCK, not a scheduler. See docs/forge-technical-reference.md (Hard
+# Rule 23) and the orchestrator SKILL (Shapes A/B).
+#
+# Anchor: $(git rev-parse --path-format=absolute --git-common-dir)/forge-infra-lock/
+# (worktrees share .git but not .dev/, so the git COMMON dir is the one anchor
+# all worktrees resolve identically). Override with FORGE_INFRA_LOCK_DIR (tests).
+#   - infra.flock  : flock guard, held only during the brief check-then-act
+#   - infra.holder : sidecar YAML, present  <=>  lock held (ephemeral, rm on release)
+#
+# Owner key = (host, session_id, session_created, slug) for BOTH acquire
+# same-session detection AND release match (release omits only `stage`, so a
+# stage-update holder still releases cleanly). Liveness uses REAL tmux (no shell
+# eval). A dead holder (session id+creation no longer live on this host) is stolen
+# by the next waiter under the flock guard; a live-but-abandoned or foreign-host
+# holder surfaces via status + the wait-ceiling escalation for operator recovery.
+# ===========================================================================
+
+# Resolve the lock anchor dir. FORGE_INFRA_LOCK_DIR overrides (tests / debug).
+_infra_lock_anchor() {
+    if [ -n "${FORGE_INFRA_LOCK_DIR:-}" ]; then
+        printf '%s' "$FORGE_INFRA_LOCK_DIR"
+        return 0
+    fi
+    local common
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+    [ -z "$common" ] && return 1
+    printf '%s/forge-infra-lock' "$common"
+}
+
+# Resolve THIS process's session identity for the owner key. From tmux when in a
+# session; overridable via data-only FORGE_LOCK_SELF_* env (test seam — these are
+# written verbatim into the sidecar and only ever string-compared, never eval'd;
+# liveness ALWAYS uses real tmux). Echoes: host|session|session_id|session_created|tmux_pid
+_infra_lock_identity() {
+    local host session sid screated tpid
+    host="${FORGE_LOCK_SELF_HOST:-$(hostname 2>/dev/null)}"
+    if [ -n "${FORGE_LOCK_SELF_SESSION_ID:-}" ]; then
+        session="${FORGE_LOCK_SELF_SESSION:-unknown}"
+        sid="$FORGE_LOCK_SELF_SESSION_ID"
+        screated="${FORGE_LOCK_SELF_SESSION_CREATED:-0}"
+        tpid="${FORGE_LOCK_SELF_TMUX_PID:-0}"
+    else
+        local idinfo
+        idinfo=$(tmux display-message -p '#{session_name}|#{session_id}|#{session_created}|#{pid}' 2>/dev/null)
+        if [ -z "$idinfo" ]; then
+            return 1
+        fi
+        session="${idinfo%%|*}"; idinfo="${idinfo#*|}"
+        sid="${idinfo%%|*}";     idinfo="${idinfo#*|}"
+        screated="${idinfo%%|*}"; idinfo="${idinfo#*|}"
+        tpid="${idinfo%%|*}"
+    fi
+    printf '%s|%s|%s|%s|%s' "$host" "$session" "$sid" "$screated" "$tpid"
+}
+
+# Run one infra-lock action in Python under the flock guard. Inputs via env;
+# prints a single `VERDICT=<CODE> k=v …` line. All sidecar I/O is yaml.safe_*
+# (injection-safe); all owner comparisons are Python string ops; liveness shells
+# out to real `tmux list-sessions`. A corrupt/unparseable sidecar yields
+# VERDICT=ESCALATE reason=corrupt-holder, never a traceback.
+_infra_lock_run() {
+    python3 - <<'PYEOF'
+import os, sys, yaml, fcntl, subprocess
+
+anchor   = os.environ["FORGE_IL_ANCHOR"]
+action   = os.environ["FORGE_IL_ACTION"]
+force    = os.environ.get("FORGE_IL_FORCE", "") == "1"
+me = {
+    "host":            os.environ.get("FORGE_IL_HOST", ""),
+    "session":         os.environ.get("FORGE_IL_SESSION", ""),
+    "session_id":      os.environ.get("FORGE_IL_SID", ""),
+    "session_created": os.environ.get("FORGE_IL_SCREATED", ""),
+    "tmux_pid":        os.environ.get("FORGE_IL_TPID", ""),
+    "slug":            os.environ.get("FORGE_IL_SLUG", ""),
+    "stage":           os.environ.get("FORGE_IL_STAGE", ""),
+    "project_root":    os.environ.get("FORGE_IL_ROOT", ""),
+    "pid":             os.environ.get("FORGE_IL_PID", ""),
+    "acquired_at":     os.environ.get("FORGE_IL_AT", ""),
+}
+holder_path = os.path.join(anchor, "infra.holder")
+flock_path  = os.path.join(anchor, "infra.flock")
+os.makedirs(anchor, exist_ok=True)
+
+def emit(verdict, **kw):
+    parts = " ".join("%s=%s" % (k, v) for k, v in kw.items() if v is not None and v != "")
+    sys.stdout.write("VERDICT=%s %s\n" % (verdict, parts))
+
+def write_holder(rec):
+    tmp = holder_path + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        yaml.safe_dump(rec, f, default_flow_style=False, sort_keys=True)
+    os.replace(tmp, holder_path)
+
+def tmux_live(host, sid, created):
+    # Liveness is only verifiable on THIS host (tmux session ids are server-local).
+    if host != me["host"]:
+        return "foreign"
+    try:
+        out = subprocess.run(["tmux", "list-sessions", "-F", "#{session_id} #{session_created}"],
+                             capture_output=True, text=True, timeout=5)
+    except Exception:
+        return "dead"
+    if out.returncode != 0:
+        return "dead"   # no server / no sessions => holder's session is gone
+    want = (str(sid), str(created))
+    for line in out.stdout.splitlines():
+        p = line.split()
+        if len(p) >= 2 and (p[0], p[1]) == want:
+            return "live"
+    return "dead"
+
+def same_session(h):
+    return (h.get("host") == me["host"]
+            and str(h.get("session_id")) == me["session_id"]
+            and str(h.get("session_created")) == me["session_created"])
+
+def full_owner_match(h):
+    # Release / ownership: full owner key (host, session_id, session_created, slug).
+    return same_session(h) and h.get("slug") == me["slug"]
+
+with open(flock_path, "w") as lf:
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    try:
+        try:
+            h = None
+            if os.path.exists(holder_path):
+                with open(holder_path) as f:
+                    h = yaml.safe_load(f)
+                if h is not None and not isinstance(h, dict):
+                    raise ValueError("holder is not a mapping")
+        except Exception as ex:
+            # Corrupt sidecar -> safe escalation, never a traceback.
+            emit("ESCALATE", reason="corrupt-holder")
+            sys.exit(0)
+
+        if action == "try-acquire":
+            if h is None:
+                write_holder(me); emit("ACQUIRED", action="acquired")
+            elif h.get("host") != me["host"]:
+                emit("WAIT", reason="foreign-host", held_host=h.get("host"),
+                     held_by=h.get("slug"), held_session=h.get("session"), held_stage=h.get("stage"))
+            elif same_session(h):
+                # Genuinely THIS live session already holds it.
+                if h.get("slug") == me["slug"]:
+                    if h.get("stage") == me["stage"]:
+                        emit("ALREADY_HELD", slug=h.get("slug"), stage=h.get("stage"))
+                    else:
+                        write_holder(me)  # me carries the new stage + acquired_at
+                        emit("ACQUIRED", action="stage_update", stage=me["stage"],
+                             prev_stage=h.get("stage"))
+                else:
+                    emit("CONFLICT", held_slug=h.get("slug"), held_stage=h.get("stage"),
+                         held_session=h.get("session"))
+            else:
+                # Same host, different session identity -> check real liveness.
+                live = tmux_live(h.get("host"), h.get("session_id"), h.get("session_created"))
+                if live == "dead":
+                    write_holder(me)
+                    emit("ACQUIRED", action="steal", stole_from=h.get("slug"),
+                         stole_session=h.get("session"))
+                else:
+                    emit("WAIT", reason="held-by-live-session", held_by=h.get("slug"),
+                         held_session=h.get("session"), held_stage=h.get("stage"))
+
+        elif action == "release":
+            if h is None:
+                emit("RELEASE_NOOP", reason="not-held")
+            elif force:
+                os.remove(holder_path)
+                emit("FORCE_RELEASED", prev_slug=h.get("slug"), prev_session=h.get("session"))
+            elif full_owner_match(h):
+                os.remove(holder_path)
+                emit("RELEASED", slug=h.get("slug"))
+            else:
+                emit("RELEASE_NOOP", reason="not-owner", held_by=h.get("slug"),
+                     held_host=h.get("host"), held_session=h.get("session"))
+
+        elif action == "status":
+            if h is None:
+                emit("FREE")
+            elif h.get("host") != me["host"]:
+                emit("FOREIGN", held_by=h.get("slug"), held_host=h.get("host"),
+                     held_session=h.get("session"), held_stage=h.get("stage"),
+                     session_id=h.get("session_id"), session_created=h.get("session_created"),
+                     acquired_at=h.get("acquired_at"), project_root=h.get("project_root"),
+                     liveness="foreign-host")
+            else:
+                live = tmux_live(h.get("host"), h.get("session_id"), h.get("session_created"))
+                state = "HELD_LIVE" if live == "live" else "STALE"
+                emit(state, held_by=h.get("slug"), held_host=h.get("host"),
+                     held_session=h.get("session"), held_stage=h.get("stage"),
+                     session_id=h.get("session_id"), session_created=h.get("session_created"),
+                     acquired_at=h.get("acquired_at"), project_root=h.get("project_root"),
+                     liveness=live)
+        else:
+            emit("ESCALATE", reason="unknown-action", action=action)
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+PYEOF
+}
+
+# Parse `k=v` field from a VERDICT line.
+_il_field() { printf '%s\n' "$1" | sed -n "s/.*[[:space:]]$2=\\([^ ]*\\).*/\\1/p" | head -1; }
+
+cmd_infra_lock() {
+    local action="" slug="" stage="" timeout="" interval="" force=false
+    # First positional (not starting with --) is the action.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)     slug="$2";     shift 2 ;;
+            --stage)    stage="$2";    shift 2 ;;
+            --timeout)  timeout="$2";  shift 2 ;;
+            --interval) interval="$2"; shift 2 ;;
+            --force)    force=true;    shift ;;
+            acquire|release|status) [ -z "$action" ] && action="$1"; shift ;;
+            *)          shift ;;
+        esac
+    done
+    if [ -z "$action" ]; then
+        echo "Usage: forge-bridge infra-lock <acquire|release|status> --slug <s> --stage <t> [--timeout N] [--interval I] [--force]" >&2
+        return 1
+    fi
+
+    local anchor
+    anchor=$(_infra_lock_anchor) || {
+        echo "ERROR: infra-lock: cannot resolve git common dir (set FORGE_INFRA_LOCK_DIR or run inside a git repo)." >&2
+        return 1
+    }
+    mkdir -p "$anchor" 2>/dev/null
+
+    local ident host session sid screated tpid
+    ident=$(_infra_lock_identity) || {
+        echo "ERROR: infra-lock: cannot resolve a tmux session identity (must run inside the forge tmux session, or set FORGE_LOCK_SELF_* for tests)." >&2
+        return 1
+    }
+    host="${ident%%|*}";    ident="${ident#*|}"
+    session="${ident%%|*}"; ident="${ident#*|}"
+    sid="${ident%%|*}";     ident="${ident#*|}"
+    screated="${ident%%|*}"; ident="${ident#*|}"
+    tpid="${ident%%|*}"
+
+    # project_root is best-effort (recovery metadata); never fatal.
+    local project_root; project_root=$(_resolve_project_root "" 2>/dev/null || true)
+
+    export FORGE_IL_ANCHOR="$anchor" FORGE_IL_HOST="$host" FORGE_IL_SESSION="$session" \
+           FORGE_IL_SID="$sid" FORGE_IL_SCREATED="$screated" FORGE_IL_TPID="$tpid" \
+           FORGE_IL_SLUG="$slug" FORGE_IL_STAGE="$stage" FORGE_IL_ROOT="$project_root" \
+           FORGE_IL_PID="$$" FORGE_IL_AT="$(timestamp)"
+
+    case "$action" in
+        status)
+            local out; out=$(FORGE_IL_ACTION=status _infra_lock_run)
+            local v; v=$(printf '%s' "$out" | sed -n 's/^VERDICT=\([A-Z_]*\).*/\1/p')
+            case "$v" in
+                FREE)      echo "INFRA_LOCK: FREE" ;;
+                HELD_LIVE) echo "INFRA_LOCK: HELD live by $(_il_field "$out" held_by) stage $(_il_field "$out" held_stage) session $(_il_field "$out" held_session) ($(_il_field "$out" session_id) created $(_il_field "$out" session_created)) since $(_il_field "$out" acquired_at)" ;;
+                STALE)     echo "INFRA_LOCK: STALE dead-session holder by $(_il_field "$out" held_by) session $(_il_field "$out" held_session) (next acquire steals; or 'infra-lock release --force' if intentionally aborting — WARNING: force while the holder still runs can collide)" ;;
+                FOREIGN)   echo "INFRA_LOCK: HELD foreign-host by $(_il_field "$out" held_by) host $(_il_field "$out" held_host) (liveness unverifiable from here)" ;;
+                ESCALATE)  echo "INFRA_LOCK: ESCALATE reason=$(_il_field "$out" reason) (corrupt sidecar at $anchor/infra.holder — inspect/clear manually)" ;;
+                *)         echo "INFRA_LOCK: UNKNOWN ($out)"; return 1 ;;
+            esac
+            return 0
+            ;;
+        release)
+            if [ -z "$slug" ]; then
+                echo "ERROR: infra-lock release requires --slug" >&2; return 1
+            fi
+            local fenv=""; [ "$force" = true ] && fenv="1"
+            local out; out=$(FORGE_IL_ACTION=release FORGE_IL_FORCE="$fenv" _infra_lock_run)
+            local v; v=$(printf '%s' "$out" | sed -n 's/^VERDICT=\([A-Z_]*\).*/\1/p')
+            case "$v" in
+                RELEASED)       _emit_event LOCK "$slug" "action=released stage=$stage session=$session"; echo "INFRA_LOCK: RELEASED slug=$slug stage=$stage" ;;
+                FORCE_RELEASED) _emit_event LOCK "$slug" "action=force_release stage=$stage session=$session prev_slug=$(_il_field "$out" prev_slug)"; echo "INFRA_LOCK: FORCE_RELEASED (was: slug=$(_il_field "$out" prev_slug) session=$(_il_field "$out" prev_session))" ;;
+                RELEASE_NOOP)   _emit_event LOCK "$slug" "action=release_noop stage=$stage reason=$(_il_field "$out" reason)"; echo "INFRA_LOCK: RELEASE_NOOP slug=$slug reason=$(_il_field "$out" reason) (not the holder; nothing removed)" ;;
+                ESCALATE)       _emit_event LOCK "$slug" "action=release_escalate reason=$(_il_field "$out" reason)"; echo "INFRA_LOCK: ESCALATE reason=$(_il_field "$out" reason) (corrupt sidecar; use --force after inspecting $anchor/infra.holder)"; return 1 ;;
+                *)              echo "INFRA_LOCK: UNKNOWN ($out)"; return 1 ;;
+            esac
+            _render_status_file 2>/dev/null || true
+            return 0
+            ;;
+        acquire)
+            if [ -z "$slug" ] || [ -z "$stage" ]; then
+                echo "ERROR: infra-lock acquire requires --slug and --stage" >&2; return 1
+            fi
+            local to_s int_s
+            to_s="${timeout:-${FORGE_INFRA_LOCK_TIMEOUT_S:-1800}}"
+            int_s="${interval:-${FORGE_INFRA_LOCK_INTERVAL_S:-15}}"
+            local started; started=$(date +%s)
+            _emit_event LOCK "$slug" "action=acquire_begin stage=$stage session=$session timeout=${to_s}s"
+            while true; do
+                # Refresh acquired_at each attempt so the recorded time reflects
+                # the actual grant, not the first poll.
+                export FORGE_IL_AT="$(timestamp)"
+                local out; out=$(FORGE_IL_ACTION=try-acquire _infra_lock_run)
+                local v; v=$(printf '%s' "$out" | sed -n 's/^VERDICT=\([A-Z_]*\).*/\1/p')
+                [ -z "$v" ] && v="ESCALATE"
+                case "$v" in
+                    ACQUIRED)
+                        local act; act=$(_il_field "$out" action)
+                        _emit_event LOCK "$slug" "action=$act stage=$stage session=$session held=true"
+                        echo "INFRA_LOCK: ACQUIRED slug=$slug stage=$stage session=$session (action=$act)"
+                        _render_status_file 2>/dev/null || true
+                        return 0 ;;
+                    ALREADY_HELD)
+                        _emit_event LOCK "$slug" "action=already_held stage=$stage session=$session"
+                        echo "INFRA_LOCK: ALREADY_HELD slug=$slug stage=$stage session=$session (reentrant)"
+                        return 0 ;;
+                    CONFLICT)
+                        _emit_event LOCK "$slug" "action=conflict stage=$stage session=$session held_slug=$(_il_field "$out" held_slug)"
+                        {
+                            echo "INFRA_LOCK: CONFLICT — this live session ($session) already holds the infra lock for a DIFFERENT slug:"
+                            echo "    held_slug=$(_il_field "$out" held_slug) held_stage=$(_il_field "$out" held_stage)"
+                            echo "    requested slug=$slug stage=$stage"
+                            echo "  This is not auto-stealable (the other slug's infra worker may still be live)."
+                            echo "  Resolve: release the prior slug's lock first, or abort it. (Do NOT --force blindly.)"
+                        } >&2
+                        return 3 ;;
+                    ESCALATE)
+                        _emit_event LOCK "$slug" "action=acquire_escalate stage=$stage reason=$(_il_field "$out" reason)"
+                        echo "INFRA_LOCK: ESCALATE reason=$(_il_field "$out" reason) — corrupt sidecar at $anchor/infra.holder. Inspect and clear with 'infra-lock release --force' before retrying." >&2
+                        return 4 ;;
+                    WAIT)
+                        local elapsed; elapsed=$(( $(date +%s) - started ))
+                        if [ "$elapsed" -ge "$to_s" ]; then
+                            # Ceiling: dump full holder metadata + liveness for the operator.
+                            local sout; sout=$(FORGE_IL_ACTION=status _infra_lock_run)
+                            _emit_event LOCK "$slug" "action=timeout stage=$stage waited=${elapsed}s held_by=$(_il_field "$out" held_by)"
+                            {
+                                echo "INFRA_LOCK: TIMEOUT — waited ${elapsed}s for the infra lock (slug=$slug stage=$stage)."
+                                echo "  Current holder:"
+                                echo "    held_by        = $(_il_field "$sout" held_by)"
+                                echo "    host           = $(_il_field "$sout" held_host)"
+                                echo "    session        = $(_il_field "$sout" held_session)"
+                                echo "    session_id     = $(_il_field "$sout" session_id)"
+                                echo "    session_created= $(_il_field "$sout" session_created)"
+                                echo "    stage          = $(_il_field "$sout" held_stage)"
+                                echo "    acquired_at    = $(_il_field "$sout" acquired_at)"
+                                echo "    project_root   = $(_il_field "$sout" project_root)"
+                                echo "    liveness       = $(_il_field "$sout" liveness)"
+                                echo "  If the holder is confirmed stopped/abandoned, force-release (WARNING: a force"
+                                echo "  while an infra worker still runs can collide on the shared DB/ports):"
+                                echo "    ~/bin/forge-bridge infra-lock release --slug $(_il_field "$sout" held_by) --stage $(_il_field "$sout" held_stage) --force"
+                            } >&2
+                            return 2
+                        fi
+                        _emit_event LOCK "$slug" "action=wait stage=$stage held_by=$(_il_field "$out" held_by) reason=$(_il_field "$out" reason) waited=${elapsed}s"
+                        sleep "$int_s"
+                        ;;
+                    *)
+                        _emit_event LOCK "$slug" "action=acquire_unknown stage=$stage verdict=$v"
+                        echo "INFRA_LOCK: UNKNOWN verdict ($out)" >&2
+                        return 1 ;;
+                esac
+            done
+            ;;
+        *)
+            echo "ERROR: infra-lock: unknown action '$action' (acquire|release|status)" >&2
+            return 1 ;;
+    esac
 }
 
 # digest — render a digest prompt to disk for ad-hoc use.
@@ -3285,6 +3823,8 @@ case "${1:-help}" in
     status)          shift; cmd_status "$@" ;;
     dispatch)        shift; cmd_dispatch "$@" ;;
     callback)        shift; cmd_callback "$@" ;;
+    callback-consume) shift; cmd_callback_consume "$@" ;;
+    infra-lock)      shift; cmd_infra_lock "$@" ;;
     wait)            shift; cmd_wait "$@" ;;
     digest)          shift; cmd_digest "$@" ;;
     emit)            shift; cmd_emit "$@" ;;
@@ -3331,6 +3871,11 @@ case "${1:-help}" in
         echo "                                Update a pending entry; --to disambiguates when multiple pending"
         echo "  callback --slug <s> --stage <s> --status <DONE|BLOCKED|ERROR> [--message <m>] [--worker <w>] [--quiet]"
         echo "                                Worker-side declarative completion: writes callback file, auto-logs, notifies orchestrator (--quiet suppresses notification)"
+        echo "                                Terminal DONE/ERROR closes the pending FIRST then publishes atomically; non-terminal BLOCKED keeps the pending open"
+        echo "  callback-consume --slug <s> --stage <s> [--status BLOCKED]"
+        echo "                                Archive a consumed non-terminal (BLOCKED) callback AFTER a send --force continuation; structured no-op if none. See infra-lock Shape A."
+        echo "  infra-lock <acquire|release|status> --slug <s> --stage <t> [--timeout N] [--interval I] [--force]"
+        echo "                                Cross-worktree mutex for infra stages {coding,qa,qa-fix,qa-retry,verify}. acquire blocks (default ${FORGE_INFRA_LOCK_TIMEOUT_S:-1800}s ceiling, ${FORGE_INFRA_LOCK_INTERVAL_S:-15}s poll); release on stage terminality; status reports FREE/HELD/STALE/foreign."
         echo "  digest --slug <s> --stage <s> --template <name> [--worker <w>]"
         echo "                                Render digest prompt to .dev/forge-tmp/ for ad-hoc Agent dispatch"
         echo "  emit <TYPE> --slug <s> [--stage <s>] [key=value …]"

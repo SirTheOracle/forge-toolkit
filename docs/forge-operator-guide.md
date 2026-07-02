@@ -336,3 +336,90 @@ Fix:
    the bridge errors loudly with the stale-file hint — delete the file
    or run `forge-start` to recreate the session.
 <!-- docs-refresh:end section=recovery -->
+
+## Multi-Worktree Concurrency
+
+You can run more than one worktree of the same repo through a pipeline at the
+same time. Each worktree has its own `forge-N` tmux session and its own `.dev/`
+state, so the **reasoning stages** (proposal, review, incorporate, implementation,
+impl-review) overlap freely. The catch is the **shared infra stack** — fixed-port
+services + a shared Postgres — which only one pipeline may touch at a time.
+
+A single cross-worktree **infra lock** enforces this automatically (orchestrator
+Hard Rule 23; mechanics in the technical reference). The five infra stages
+(`coding`, `qa`, `qa-fix`, `qa-retry`, `verify`) acquire the lock before running
+and release it when the stage completes. You normally never touch the lock — it
+is held and released for you. The cases where you *do* see it:
+
+### A pipeline is waiting on the lock
+
+While worktree A holds the lock for an infra stage, worktree B's next infra stage
+**waits** (it has not dispatched a worker yet, so it shows as waiting — never a
+false `STALLED`). You'll see `LOCK action=wait …` lines in the heartbeat event log
+and an `Infra lock: HELD live by <slug> …` line in `forge-bridge status`. This is
+normal; B proceeds the moment A releases.
+
+Check who holds it at any time:
+
+```bash
+~/bin/forge-bridge infra-lock status
+```
+
+### A killed worktree releases automatically
+
+If you kill a worktree mid-infra-stage (its tmux session dies), the lock is **not**
+leaked: the next waiter detects the dead session and steals the lock under the
+guard. No manual cleanup. `status` shows such a holder as `STALE dead-session`.
+
+### Lock-wait ceiling (escalation)
+
+`acquire` waits up to `FORGE_INFRA_LOCK_TIMEOUT_S` (default 1800s — infra stages
+legitimately run 20–30 min). On the ceiling the orchestrator surfaces a structured
+`INFRA_LOCK: TIMEOUT` block with the full holder metadata (host, session,
+session_id, session_created, slug, stage, acquired_at, project_root) and a
+**liveness verdict** (`live` / `stale` / `foreign-host`). Decide from that:
+
+- **`liveness = stale`** → the holder's session is dead; the next acquire will
+  steal it. Re-run, or force-release if you want it gone now.
+- **`liveness = live`** → a real pipeline is mid-infra-stage. Let it finish, or see
+  "abandoned holder" below.
+- **`liveness = foreign-host`** → held on another host; liveness can't be verified
+  from here (rare — forge worktrees are same-host in practice).
+
+### Abandoned live holder (recovery)
+
+A `HELD live` holder whose pipeline is abandoned (orchestrator compacted/idle, or
+parked at `PROMPTING`/`STALLED`) does **not** auto-release. Recover deliberately:
+
+1. `~/bin/forge-bridge infra-lock status` → note the holder's slug/session/stage.
+2. Inspect that worktree/session. If the stage should continue, **resume the same
+   `(slug, stage)`** — `acquire` is reentrant, so it re-adopts the lock (you'll see
+   `ALREADY_HELD`). A resume that advanced to the next infra stage updates the
+   holder in place (`stage_update`).
+3. **Only** if the stage is confirmed stopped or you are intentionally aborting it:
+
+   ```bash
+   ~/bin/forge-bridge infra-lock release --slug <held-slug> --stage <held-stage> --force
+   ```
+
+   ⚠️ Force-release while an infra worker is still live can collide on the shared
+   DB/ports. Confirm the stage (and any dev-server/test process it started) is
+   actually stopped first.
+
+### Resume safety
+
+Resuming a pipeline (`/forge resume <slug>`) cannot deadlock against the lock: an
+`acquire` for a `(slug, stage)` the same session already holds returns
+`ALREADY_HELD` reentrantly, and `release` is idempotent. An interrupted pipeline's
+lock is either re-adopted on resume or stolen by another worktree once its session
+dies.
+
+### Fresh-code guarantee
+
+The lock serializes infra access; it does not by itself make the *running* server
+reflect the current worktree. So `qa`, `qa-retry`, and `verify` **restart services
+against their own worktree** before testing (identity-checked: they only stop a
+process matching the project's expected dev-server shape, and **escalate** rather
+than kill an unknown process on a configured port). `coding` relies on Playwright
+autostart (set `reuseExistingServer: false` so its tests start fresh); `qa-fix`
+runs no live tests.

@@ -75,7 +75,8 @@ directory).
 | `focus <pane>` | Switch tmux focus to a pane |
 | `back` | Return focus to the orchestrator pane |
 | `dispatch --slug <s> --stage <s> --worker <w> [--clear] [--dry-run]` | Render stage prompt, write to `.dev/forge-tmp/`, log, send (the primary pipeline interface) |
-| `wait --slug <s> --stage <s> --worker <w> [--timeout <s>] [--digest-template <name>]` | Block until callback or stall classification; emit one structured block |
+| `wait --slug <s> --stage <s> --worker <w> [--timeout <s>] [--digest-template <name>]` | Block until callback or stall classification; emit one structured block. **Read-only** on the callback file (does not consume/archive it) |
+| `infra-lock <acquire\|release\|status> --slug <s> --stage <t> [--timeout N] [--interval I] [--force]` | Cross-worktree mutex for the five infra stages — see [Cross-Worktree Infra Lock](#cross-worktree-infra-lock) |
 | `stall-check [--project-root <p>] <pane>` | Classify pane state (IDLE / ACTIVE / STALLED / PROMPTING / COMPLETED-PENDING-LOG-RESPONSE / DEAD / UNKNOWN) |
 | `health` | Verify all 5 panes exist and run the expected worker process; exits 0 only if all OK |
 
@@ -97,7 +98,8 @@ directory).
 | `set-context --slug <s>` | Manually set the active pipeline (auto-derives state) |
 | `add-note <text>` | Annotate context; persists across sessions in `forge-context.yml` |
 | `usage [<worker>]` | Show the per-worker usage snapshot from `forge-usage.<session>.yml` (read-only; never scrapes a pane) |
-| `callback --slug <s> --stage <s> --status <DONE\|BLOCKED\|ERROR> [--message <m>] [--worker <w>] [--quiet]` | Worker-side declarative completion: writes callback file, auto-logs, notifies orchestrator, **records read-only usage** |
+| `callback --slug <s> --stage <s> --status <DONE\|BLOCKED\|ERROR> [--message <m>] [--worker <w>] [--quiet]` | Worker-side declarative completion: writes callback file, notifies orchestrator, **records read-only usage**. Terminal `DONE`/`ERROR` **closes the pending log entry first, then publishes the callback atomically** (a failed close does NOT publish); non-terminal `BLOCKED` publishes the callback and **keeps the pending open** (does not log-response) |
+| `callback-consume --slug <s> --stage <s> [--status BLOCKED]` | Archive a consumed non-terminal (`BLOCKED`) callback to `callbacks/archive/`; structured no-op if none. Called by the orchestrator **only after** a `send --force` continuation succeeds — see [Cross-Worktree Infra Lock](#cross-worktree-infra-lock) |
 | `digest --slug <s> --stage <s> --template <name> [--worker <w>]` | Render digest prompt to `.dev/forge-tmp/` for ad-hoc Agent dispatch |
 | `emit <TYPE> --slug <s> [--stage <s>] [key=value …]` | Orchestrator-driven heartbeat emit (TYPE: DISPATCH \| WAIT \| CALLBACK \| DIGEST \| STAGE \| STALL \| ERROR \| COMPLETE \| USAGE) |
 | `stall-check-status [--project-root <p>]` | List panes with pending dispatch and stale stall-check coverage |
@@ -138,7 +140,7 @@ tmux-required command, in priority order:
 ## Orchestrator Hard Rules
 
 <!-- docs-refresh:start section=orchestrator-hard-rules -->
-The orchestrator body declares 22 Hard Rules (0–21). One-line summaries
+The orchestrator body declares 24 Hard Rules (0–23). One-line summaries
 below; see `~/.claude/agents/forge-orchestrator.md` for full text and
 rationale.
 
@@ -166,7 +168,8 @@ rationale.
 | 19 | Stall detection lives in `forge-bridge wait` | Don't call `stall-check` directly during a pipeline run |
 | 20 | `dispatch --clear` between same-pane Claude dispatches | Claude panes accumulate context; pass `--clear` when re-using one. Codex panes don't need it |
 | 21 | Worker permission-mode and ident contract | Pane-launch flags fixed; git idents are repo-local only (`git -C ... config` — never `--global`) |
-| 22 | Reasoning-tier routing (bridge-enforced) | HIGH stages (review, incorporate, implementation, impl-review, verify) → codex-a or claude-opus only; THROUGHPUT stages (coding, qa, qa-fix, qa-retry) → claude-sonnet or codex-b. `proposal` is the local pane-1 exception (not dispatchable). `dispatch` rejects illegal stage/worker pairs |
+| 22 | Reasoning-tier routing (bridge-enforced) | HIGH stages (review, incorporate, implementation, impl-review, verify) → codex-a or claude-opus only; THROUGHPUT stages (coding, qa, qa-fix, qa-retry) → claude-sonnet or codex-b. `proposal` is the **primary** local pane-1 exception (not dispatchable); the gated local `qa`/`qa-retry` fallback is the **second** (D2). `dispatch` rejects illegal stage/worker pairs |
+| 23 | Cross-worktree infra lock | The five infra stages (coding, qa, qa-fix, qa-retry, verify) acquire a single global mutex before dispatch and release **on stage terminality** (DONE/ERROR), holding through PROMPTING/STALLED/TIMEOUT/DEAD/BLOCKED. Shapes A (dispatched) / B (local fallback). Reasoning stages never lock. See [Cross-Worktree Infra Lock](#cross-worktree-infra-lock) |
 <!-- docs-refresh:end section=orchestrator-hard-rules -->
 
 ## Stage Routing
@@ -233,6 +236,125 @@ impl-review after incorporate, the implementation fallback after
 incorporate, and the verify fallback after impl-review; pane-4
 (claude-sonnet) reuse is qa-fix after coding.
 <!-- docs-refresh:end section=stage-routing -->
+
+## Cross-Worktree Infra Lock
+
+Forge is share-nothing per worktree (each pipeline has its own `forge-N` tmux
+session and `.dev/` state) **except** all worktrees point at one shared infra
+stack: fixed-port services + a shared Postgres, read from `services.*`/`testing.*`
+in `.claude/forge-project.yml`. To run N worktrees concurrently against that one
+stack, a single **cross-worktree mutex** serializes the infra-touching stages
+while the five reasoning stages stay fully parallel. It is a **lock, not a
+scheduler**; per-worktree DB/port isolation is explicitly deferred.
+
+| Stage set | Stages | Locks? |
+|---|---|---|
+| Infra-touching | `coding`, `qa`, `qa-fix`, `qa-retry`, `verify` | **yes** |
+| Reasoning | `proposal`, `review`, `incorporate`, `implementation`, `impl-review` | **no** |
+
+### Lock files
+
+Anchor: `$(git rev-parse --path-format=absolute --git-common-dir)/forge-infra-lock/`
+— worktrees share `.git` but not `.dev/`, so the git **common dir** is the one
+anchor every worktree resolves identically. Inside `.git` ⇒ untracked ⇒ clean
+revert. Override with `FORGE_INFRA_LOCK_DIR` (tests/debug).
+
+- **`infra.flock`** — flock guard; held only during the brief check-then-act
+  critical section, never across CLI invocations.
+- **`infra.holder`** — sidecar YAML, **present ⟺ lock held** (removed on release).
+  Fields: `host`, `session` (`forge-N`), `session_id` (`#{session_id}`),
+  `session_created` (`#{session_created}` epoch), `tmux_pid`, `slug`, `stage`,
+  `project_root`, `pid`, `acquired_at`. All I/O is `yaml.safe_*` (injection-safe);
+  a corrupt sidecar yields a safe **escalation**, never a traceback.
+
+**Owner key = `(host, session_id, session_created, slug)`** for both acquire
+same-session detection and release match (release omits only `stage`, so a
+stage-update holder still releases cleanly). Liveness uses **real tmux**
+(`tmux_owner_live(host, name, id, created)`): host is compared first (session ids
+are server-local, not globally unique); `session_created` guards against
+tmux-server-restart id reuse. A holder whose session identity is no longer live
+**on this host** is stolen by the next waiter under the flock guard (covers a
+killed worktree). A live-abandoned or foreign-host holder surfaces via `status` +
+the wait-ceiling escalation for operator recovery.
+
+### Command surface
+
+- `infra-lock acquire --slug S --stage T [--timeout N] [--interval I]` — poll loop;
+  emits `LOCK action=wait …` each interval. On grant: `INFRA_LOCK: ACQUIRED …`,
+  exit 0. On the ceiling: a structured `INFRA_LOCK: TIMEOUT` block with full holder
+  metadata + liveness verdict, exit 2. Same live session + different slug →
+  `CONFLICT` (exit 3, no steal). Corrupt sidecar → `ESCALATE` (exit 4).
+- `release --slug S --stage T` — removes the holder iff the full owner key matches;
+  idempotent no-op otherwise. `release --force` removes unconditionally (operator
+  escalation; surfaced only in STALE/timeout guidance — a force while the holder
+  still runs can collide).
+- `status` — read-only liveness verdict: `FREE` / `HELD live` / `STALE dead-session`
+  / `HELD foreign-host`. Rendered into `.dev/forge-status.md` (`Infra lock:` line).
+
+`LOCK` events route through `_emit_event` → `orchestrator-events.log` (internal;
+not part of the public `emit` whitelist). Env: `FORGE_INFRA_LOCK_TIMEOUT_S`
+(default 1800), `FORGE_INFRA_LOCK_INTERVAL_S` (default 15).
+
+### Terminality rule + integration shapes
+
+The orchestrator owns the lock (Hard Rule 23): **acquire before `dispatch`,
+release on stage terminality** (`wait` returns `DONE`/`ERROR`). **Hold** through
+every non-terminal outcome (`PROMPTING`/`STALLED`/`TIMEOUT`/`DEAD`/`BLOCKED`) —
+none prove the worker stopped touching infra. No blanket `trap EXIT` release.
+
+- **Shape A — dispatched stage:** `acquire → dispatch (release+stop on dispatch
+  failure) → wait → release on DONE/ERROR`.
+- **Shape B — local fallback** (`qa` Path B / `qa-retry` inline in pane 1 when
+  codex-b is down): `acquire → log (open pending) → restart-on-entry → run inline →
+  log-response (close on EVERY exit) → release → digest`. Releasing before the
+  digest is intentional (the digest reads disk only).
+
+### Callback lifecycle (BLOCKED hold-and-continue)
+
+The non-terminal `BLOCKED` path lets a stage block, get unblocked, and continue
+**without** releasing the lock or losing the in-flight signal:
+
+1. `callback BLOCKED` publishes the callback atomically and **keeps the dispatch
+   pending (`response: null`) open** — the durable "in-flight under a held lock"
+   signal the stall-classifier and `/forge status` rely on. It does **not**
+   `log-response`. The canonical callback file is the source of truth for the
+   blocked message (`add-note` is best-effort observability only).
+2. `wait` **reads and leaves** the canonical `BLOCKED` callback (read and consume
+   are split). A resume **before** the continuation re-surfaces the same `BLOCKED`
+   — no deadlock.
+3. The orchestrator runs repair (may touch infra — the lock is HELD), then
+   `send --force` the continuation. **Only after the send succeeds** does it call
+   `callback-consume --status BLOCKED`, which atomically archives the canonical
+   callback to `callbacks/archive/{slug}-{stage}.{callback_id}.callback`. A re-`wait`
+   then blocks for the worker's **fresh** callback (no timestamps — purely
+   presence-based). If the send fails / the orchestrator stops first, the canonical
+   `BLOCKED` stays visible and resume re-surfaces it.
+4. Terminal `DONE`/`ERROR`: the pending is **closed first, then** the callback is
+   published atomically — so a polling `wait` can never observe terminal before the
+   pending closes (which would let the lock release and race the next dispatch's
+   open-pending guard). A failed close does **not** publish.
+
+### Restart-on-entry (service staleness)
+
+The lock serializes DB/test-state and eliminates concurrent port-bind races, but
+infra stages don't tear down the servers they start — a left-running server from
+worktree A would serve A's code to B. So **qa / qa-retry / verify** restart
+services against their own worktree before testing (installed
+`adversarial-qa`/`adversarial-verify` SKILLs), using a **config-driven,
+identity-checked** port rule: only stop a process matching the project's expected
+dev-server shape; an unknown process on a configured port → **escalate, don't
+kill**. **coding** is excluded (forge-coder never manages services; relies on
+Playwright autostart). **qa-fix** does no restart by default (no live tests).
+
+### Recovery + clean revert
+
+A `STALE` holder is stolen automatically on the next acquire. A `HELD live` but
+abandoned holder (orchestrator compacted/parked) does not auto-release: inspect
+the worktree via `status`, resume the same `(slug, stage)` to re-adopt it
+reentrantly, or — only if the stage is confirmed stopped/aborted —
+`release --force`. Removal of the whole feature is a clean revert: delete
+`cmd_infra_lock` + the orchestrator wrap + doc/skill edits and
+`rm -rf <git-common-dir>/forge-infra-lock/`. No schema, no migration.
 
 ## Pane Layout and Classifier
 

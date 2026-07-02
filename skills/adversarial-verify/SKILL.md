@@ -22,6 +22,32 @@ Single-agent verification skill that re-runs all tests and screenshots from a QA
 
 Before proceeding, read `.claude/forge-project.yml` and build the placeholder substitution map. All `{{tokens}}` in this skill refer to values from that config. See the adversarial-qa skill's "Config Substitution" section for the full token reference.
 
+### Step 0.5: Restart-on-entry (cross-worktree infra lock — verify)
+
+`verify` runs under the cross-worktree **infra lock** (orchestrator-held; see
+forge-orchestrator Hard Rule 23). All worktrees of this repo share one infra
+stack, so a dev server left running by a *different* worktree would serve **that**
+worktree's code to your verification. Before verifying, **restart the services
+against THIS worktree**. Config-driven and identity-checked — do **not** blindly
+kill whatever holds a port:
+
+1. **Expected service shape:** backend `{{backend_command}}` in `{{backend_working_dir}}/`
+   (URL `{{backend_url}}`); frontend `{{frontend_command}}` in `{{frontend_working_dir}}/`
+   (URL `{{frontend_url}}`). The port is the `:PORT` in each URL.
+2. **Inspect each port:** `lsof -nP -iTCP:<port> -sTCP:LISTEN`; for any listener get
+   command + cwd (`ps -o command= -p <pid>`, `lsof -p <pid> | grep -i cwd`).
+3. **Per listener:** matches the project's expected dev-server shape AND cwd is a
+   worktree of THIS repo → **stop it** (`kill <pid>`; `kill -9` only if it refuses)
+   and **log** pid/command/cwd/port/worktree. **Unknown process** → **STOP and
+   ESCALATE — do NOT kill it** (`INFRA ESCALATION: configured port <port> held by an
+   unknown process …; refusing to kill.`), emit `FORGE_BLOCKED`, wait for a human.
+   Nothing listening → proceed.
+4. **Start THIS worktree's services**, or rely on Playwright `webServer` autostart
+   only if it starts a fresh server (NOT `reuseExistingServer: true`). Confirm the
+   backend URL responds before verifying.
+
+Safe under the lock: exactly one infra stage runs globally at a time.
+
 ## Input
 
 The skill takes a path to a QA output directory:
