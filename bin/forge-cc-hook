@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+# forge-cc-hook — command-center status hook (Phase A).
+#
+# Invoked as: forge-cc-hook <event>  where <event> ∈
+#   userpromptsubmit | stop | permissionrequest | notification
+# Resolves pane/session/root STRUCTURALLY from $TMUX_PANE (the one attribution
+# key present on the live, unstamped forge-1..4 sessions) via a single
+# `tmux display-message` call, so it fires with NO FORGE_ROLE/TMUX_SESSION launch
+# stamp. FORGE_ROLE, when a future spawned session sets it, overrides the
+# structural role. Writes ONE atomic file under <root>/.dev/attention/, exits 0.
+#
+# INVIOLABLE: permissionrequest exits 0 with ZERO stdout so the dialog survives
+# (fail-open). EVERY path exits 0. All four events are gated to the orchestrator
+# (pane 1) per the handoff — a worker pane finishing a turn must not mark the
+# initiative done; worker escalation is the Phase B `forge ask` path.
+import sys, os, json, re, hashlib, datetime, subprocess
+
+def done():
+    sys.exit(0)
+
+event = (sys.argv[1] if len(sys.argv) > 1 else '').lower()
+if event not in ('userpromptsubmit', 'stop', 'permissionrequest', 'notification'):
+    done()
+
+# --- structural resolution (pane_index / session / root) -----------------
+# Test seam: FORGE_CC_PANE_META = "index<TAB>session<TAB>path" bypasses tmux.
+meta = os.environ.get('FORGE_CC_PANE_META')
+if meta is None:
+    pane = os.environ.get('TMUX_PANE', '')
+    if not pane:
+        done()
+    try:
+        meta = subprocess.run(
+            ['tmux', 'display-message', '-p', '-t', pane,
+             '#{pane_index}\t#{session_name}\t#{session_path}'],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        done()
+parts = (meta or '').split('\t')
+if len(parts) != 3:
+    done()
+pane_index, session, root = parts[0], parts[1], os.path.realpath(parts[2])
+
+# role: env override wins (future spawned sessions); else pane 1 == orchestrator.
+role = os.environ.get('FORGE_ROLE') or ('orchestrator' if pane_index == '1' else 'worker')
+if role != 'orchestrator':
+    done()
+if not session or not os.path.isdir(os.path.join(root, '.dev')):
+    done()
+
+# --- payload + write -----------------------------------------------------
+try:
+    data = json.load(sys.stdin)
+    if not isinstance(data, dict):
+        done()
+except Exception:
+    done()
+
+adir = os.path.join(root, '.dev', 'attention')
+try:
+    os.makedirs(adir, exist_ok=True)
+except OSError:
+    done()
+
+NOW = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+SECRETS = re.compile(
+    r"(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|AKIA[0-9A-Z]{12,}|xox[baprs]-[A-Za-z0-9-]{8,}|AIza[0-9A-Za-z_\-]{20,})")
+KV = re.compile(r"(?i)(api[_-]?key|token|secret|password)(\s*[=:]\s*)\S+")
+def redact(s):
+    s = SECRETS.sub("«redacted»", s or "")
+    return KV.sub(r"\1\2«redacted»", s)
+def snip(s, n=280):
+    return redact((s or "").strip().replace("\n", " "))[:n]
+
+def envelope(variant, extra):
+    d = {'schema': 'cc-attention/1', 'event': event, 'variant': variant,
+         'session': session, 'root': root, 'pane_index': pane_index,
+         'role': role, 'tmux_pane': os.environ.get('TMUX_PANE', ''),
+         'emitted_at': NOW}
+    d.update(extra); return d
+
+def atomic(path, obj):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, 'w') as f: json.dump(obj, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        try: os.remove(tmp)
+        except OSError: pass
+
+def tail_transcript(tp):
+    # Fallback for the undocumented, non-contractual last_assistant_message.
+    if not tp or not os.path.exists(tp):
+        return ''
+    try:
+        with open(tp) as f:
+            lines = f.readlines()[-40:]
+    except OSError:
+        return ''
+    for ln in reversed(lines):
+        try:
+            obj = json.loads(ln)
+        except ValueError:
+            continue
+        if obj.get('type') == 'assistant' or obj.get('role') == 'assistant':
+            m = obj.get('message', obj)
+            c = m.get('content') if isinstance(m, dict) else None
+            if isinstance(c, str): return c
+            if isinstance(c, list):
+                return ' '.join(b.get('text', '') for b in c
+                                if isinstance(b, dict) and b.get('type') == 'text')
+    return ''
+
+if event == 'userpromptsubmit':
+    prompt = data.get('prompt', '') or ''
+    m = re.search(r'\[dispatch_id:([A-Za-z0-9._\-]+)\]', prompt)
+    atomic(os.path.join(adir, f'prompt.{session}.json'),
+           envelope('dispatch-accept',
+                    {'dispatch_id': (m.group(1) if m else None),
+                     'prompt_snippet': snip(prompt),
+                     'prompt_sha256': hashlib.sha256(prompt.encode('utf-8', 'replace')).hexdigest()}))
+elif event == 'stop':
+    lam = data.get('last_assistant_message')
+    if lam:
+        src, msg = 'last_assistant_message', lam
+    else:
+        msg, src = tail_transcript(data.get('transcript_path')), 'transcript_tail'
+    body = (msg or '').strip()
+    atomic(os.path.join(adir, f'stop.{session}.json'),
+           envelope('snippet',
+                    {'snippet': snip(body[-400:], 400), 'snippet_source': src,
+                     'looks_like_question': body.endswith('?')}))
+elif event == 'permissionrequest':
+    tn = data.get('tool_name', '') or ''
+    ti = data.get('tool_input') or {}
+    cmd = (ti.get('command') if isinstance(ti, dict) else '') or ''
+    h = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()[:8]
+    atomic(os.path.join(adir, f'perm.{session}.{h}.json'),
+           envelope('permission',
+                    {'state': 'needs-input', 'tool_name': tn,
+                     'command': snip(cmd, 300), 'command_hash': h,
+                     'permission_suggestions': data.get('permission_suggestions') or []}))
+    done()  # explicit: no stdout, dialog left intact
+elif event == 'notification':
+    atomic(os.path.join(adir, f'notify.{session}.json'),
+           envelope('notification',
+                    {'notification_type': data.get('notification_type', ''),
+                     'message': snip(data.get('message', ''), 200)}))
+done()

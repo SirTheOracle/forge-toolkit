@@ -1,0 +1,295 @@
+#!/bin/bash
+# forge — command center facade (Phase A).
+#
+# The bridge (forge-bridge) stays the pipeline primitive with its verbs
+# untouched; the center's user-facing verbs live here.
+#
+# Verbs (Phase A):
+#   forge dispatch @<session> "<instruction>" [--sender S] [--pointer]
+#                  [--allow-api-billing] [--dry-run]
+#   forge preflight [--root PATH] [--allow-api-billing]
+#   forge register <root> [--force]
+#   forge status [--board]          passthrough to forge-watch
+#   forge board                     alias for `status --board`
+#   forge gc [--root PATH] [--days N]
+#
+# Dispatch REUSES `forge-bridge send claude` (the proven 3-step cmd_send split);
+# it never reimplements tmux send-keys. Every write lands under the target root's
+# .dev/attention/ — forge-watch only reads them.
+set -euo pipefail
+
+FORGE_BRIDGE_BIN="${FORGE_BRIDGE_BIN:-$HOME/bin/forge-bridge}"
+FORGE_WATCH_BIN="${FORGE_WATCH_BIN:-$HOME/bin/forge-watch}"
+INLINE_MAX="${FORGE_DISPATCH_INLINE_MAX:-280}"
+TTL_D="${FORGE_ATTENTION_TTL_D:-7}"
+CC_HOOK_MARK="forge-cc-hook"
+
+die() { printf 'forge: %s\n' "$*" >&2; exit 1; }
+
+# Resolve the toolkit root, following symlinks — BSD `readlink` has no -f on
+# macOS (verified), so walk the link chain portably. Locates
+# ../config/claude-cc-hooks.json when `forge` runs as a ~/bin symlink into the repo.
+_toolkit_root() {
+    local src="$0" dir
+    while [ -L "$src" ]; do
+        dir="$(cd "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+    done
+    ( cd "$(dirname "$src")/.." && pwd )
+}
+
+# session_root <session> → prints realpath of the session cwd; nonzero if none.
+# Test seam: FORGE_TMUX_LIST names a 'name<TAB>path' file (forge-watch's convention).
+session_root() {
+    local sess="$1" inject="${FORGE_TMUX_LIST:-}"
+    if [ -n "$inject" ]; then
+        awk -F'\t' -v s="$sess" '$1==s{print $2; f=1} END{exit !f}' "$inject"
+    else
+        tmux list-sessions -F '#{session_name}	#{session_path}' 2>/dev/null \
+            | awk -F'\t' -v s="$sess" '$1==s{print $2; f=1} END{exit !f}'
+    fi
+}
+
+# ── billing preflight (mini-spec 5) ──────────────────────────────────────
+billing_preflight() {   # billing_preflight <root> <allow:0|1>
+    local root="${1:-}" allow="${2:-0}"
+    [ "${FORGE_ALLOW_API_BILLING:-0}" = "1" ] && allow=1
+    FORGE_BILLING_ROOT="$root" FORGE_BILLING_ALLOW="$allow" python3 - <<'PY'
+import os, sys, json
+root  = os.environ.get("FORGE_BILLING_ROOT", "")
+allow = os.environ.get("FORGE_BILLING_ALLOW", "0") == "1"
+hits, lines = [], []
+def note(label, bad, where=""):
+    lines.append(("FAIL" if bad else "OK  ") + "  " + label + (f" ({where})" if bad and where else ""))
+    if bad: hits.append(label + ((" in " + where) if where else ""))
+env = os.environ
+for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+          "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL"):
+    note(f"env {k} unset", bool(env.get(k)), "shell env")
+for k in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"):
+    note(f"env {k} off", env.get(k, "") not in ("", "0", "false", "False"), "shell env")
+files = []
+if root:
+    files += [os.path.join(root, ".claude", "settings.json"),
+              os.path.join(root, ".claude", "settings.local.json")]
+files.append(os.path.expanduser("~/.claude/settings.json"))
+for fp in files:
+    try:
+        with open(fp) as f: d = json.load(f)
+    except (OSError, ValueError):
+        continue
+    if not isinstance(d, dict): continue
+    if d.get("apiKeyHelper"): note("apiKeyHelper unset", True, fp)
+    e = d.get("env") or {}
+    if isinstance(e, dict):
+        for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                  "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"):
+            v = e.get(k)
+            note(f"env.{k} unset", v not in (None, "", "0", "false", "False"), fp)
+print("billing preflight:")
+print("\n".join("  " + l for l in lines))
+if hits:
+    print(f"VERDICT: {'WARN (overridden by --allow-api-billing)' if allow else 'FAIL'} — "
+          f"{len(hits)} issue(s): {', '.join(hits)}")
+    sys.exit(0 if allow else 2)
+print("VERDICT: OK — subscription billing route clean")
+sys.exit(0)
+PY
+}
+
+# ── attention GC (mini-spec 1 retention) — forge owns deletion under .dev/ ─
+gc_root() {   # gc_root <root>
+    local att="$1/.dev/attention"
+    [ -d "$att" ] || return 0
+    find "$att" -maxdepth 2 -type f \( -name '*.json' -o -name '*.txt' \) \
+        -mtime "+$TTL_D" -delete 2>/dev/null || true
+}
+
+cmd_preflight() {
+    local root="" allow=0
+    while [ $# -gt 0 ]; do case "$1" in
+        --root) root="$2"; shift 2 ;;
+        --allow-api-billing) allow=1; shift ;;
+        *) shift ;;
+    esac; done
+    [ -n "$root" ] || root="$(pwd -P)"
+    billing_preflight "$root" "$allow"
+}
+
+# ── dispatch (mini-spec 1) ───────────────────────────────────────────────
+cmd_dispatch() {
+    local session="" instr="" sender="" force_pointer=false allow=0 dry=false
+    [ "${FORGE_DISPATCH_DRY_RUN:-0}" = "1" ] && dry=true
+    while [ $# -gt 0 ]; do case "$1" in
+        @*) session="${1#@}"; shift ;;
+        --sender) sender="$2"; shift 2 ;;
+        --pointer) force_pointer=true; shift ;;
+        --allow-api-billing) allow=1; shift ;;
+        --dry-run) dry=true; shift ;;
+        --*) die "unknown flag $1" ;;
+        *) if [ -z "$instr" ]; then instr="$1"; else instr="$instr $1"; fi; shift ;;
+    esac; done
+    [ -n "$session" ] || die "dispatch requires @<session>"
+    [ -n "$instr" ]   || die "dispatch requires an instruction"
+    [ -n "$sender" ]  || sender="${FORGE_SENDER:-seat}"
+
+    local root
+    root="$(session_root "$session")" || die "no live session '$session' (session_path unresolvable)"
+    root="$(cd "$root" 2>/dev/null && pwd -P)" || die "session '$session' root does not exist"
+
+    # Billing preflight — silent on pass, loud on fail, BEFORE any write/inject.
+    local bp brc
+    bp="$(billing_preflight "$root" "$allow" 2>&1)"; brc=$?
+    if [ "$brc" -ne 0 ]; then
+        printf '%s\n' "$bp" >&2
+        die "billing preflight failed for $root (use --allow-api-billing to override)"
+    fi
+
+    # Write event + (pointer) payload atomically; python emits the inject one-liner.
+    local outf; outf="$(mktemp "${TMPDIR:-/tmp}/forge-dispatch.XXXXXX")"
+    FORGE_CC_INSTR="$instr" python3 - "$root" "$session" "$sender" \
+        "$force_pointer" "$INLINE_MAX" "$outf" <<'PY' || { rm -f "$outf"; die "failed to stage dispatch event"; }
+import os, sys, json, re, hashlib, secrets, datetime
+root, session, sender = sys.argv[1], sys.argv[2], sys.argv[3]
+force_pointer = sys.argv[4] == "true"; inline_max = int(sys.argv[5]); outf = sys.argv[6]
+instr = os.environ.get("FORGE_CC_INSTR", "")
+now = datetime.datetime.now(datetime.timezone.utc)
+ts  = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+did = "cc-" + now.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
+sha = hashlib.sha256(instr.encode("utf-8", "replace")).hexdigest()
+SECRETS = re.compile(
+    r"(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|AKIA[0-9A-Z]{12,}|xox[baprs]-[A-Za-z0-9-]{8,}|AIza[0-9A-Za-z_\-]{20,})")
+KV = re.compile(r"(?i)(api[_-]?key|token|secret|password)(\s*[=:]\s*)\S+")
+def redact(s):
+    s = SECRETS.sub("«redacted»", s or ""); return KV.sub(r"\1\2«redacted»", s)
+adir = os.path.join(root, ".dev", "attention"); os.makedirs(adir, exist_ok=True)
+pointer = force_pointer or ("\n" in instr) or (len(instr.encode("utf-8")) > inline_max)
+rec = {"schema": "cc-dispatch/1", "event": "dispatch", "dispatch_id": did,
+       "session": session, "root": root, "target_pane": 1,
+       "mode": "pointer" if pointer else "inline",
+       "instruction_snippet": redact(instr[:200]).replace("\n", " "),
+       "instruction_sha256": sha, "dispatched_at": ts, "sender": sender,
+       "state": "queued-input", "answers_ask_id": None}
+if pointer:
+    pdir = os.path.join(adir, "payloads"); os.makedirs(pdir, exist_ok=True)
+    rel = os.path.join(".dev", "attention", "payloads", did + ".txt")
+    ppath = os.path.join(root, rel); ptmp = ppath + f".tmp.{os.getpid()}"
+    with open(ptmp, "w") as f: f.write(instr)
+    os.chmod(ptmp, 0o600); os.replace(ptmp, ppath)
+    rec["payload_path"] = rel; rec["payload_bytes"] = len(instr.encode("utf-8"))
+    oneliner = (f"Read and follow the dispatched instruction in {rel} "
+                f"[dispatch_id:{did}] [sha256:{sha[:12]}]")
+else:
+    oneliner = f"{instr} [dispatch_id:{did}]"
+etmp = os.path.join(adir, f".{did}.json.tmp"); epath = os.path.join(adir, f"dispatch-{did}.json")
+with open(etmp, "w") as f: json.dump(rec, f, indent=2)
+os.chmod(etmp, 0o600); os.replace(etmp, epath)
+with open(outf, "w") as f: f.write(oneliner)
+sys.stderr.write(f"dispatch_id={did} mode={'pointer' if pointer else 'inline'}\n")
+PY
+    local oneliner; oneliner="$(cat "$outf")"; rm -f "$outf"
+
+    gc_root "$root"
+
+    # Inject via the bridge's cmd_send 3-step split. TMUX_SESSION is the bridge's
+    # resolution step 1 (trusted unconditionally), so this targets <session>:0.1
+    # from any cwd; pane 1 (claude) is outside cmd_send's worker guard (no --force).
+    if [ "$dry" = true ]; then
+        printf 'DRY-RUN inject → %s:0.1: %s\n' "$session" "$oneliner"
+    else
+        TMUX_SESSION="$session" "$FORGE_BRIDGE_BIN" send claude "$oneliner" \
+            || die "injection failed (forge-bridge send)"
+        printf 'DISPATCHED @%s pane=1 sender=%s\n' "$session" "$sender"
+    fi
+}
+
+# ── register: gitignore gate + hook merge (1.4) + watch-roots ─────────────
+cmd_register() {
+    local root="" force=0
+    while [ $# -gt 0 ]; do case "$1" in
+        --force) force=1; shift ;;
+        *) root="$1"; shift ;;
+    esac; done
+    [ -n "$root" ] || die "register requires <root>"
+    root="$(cd "$root" 2>/dev/null && pwd -P)" || die "no such root '$root'"
+
+    if [ "$force" != 1 ] && ! git -C "$root" check-ignore -q .dev 2>/dev/null; then
+        die ".dev/ is not gitignored in $root — attention files would be committable.
+       Fix: echo '.dev/' >> '$root/.gitignore'  (untrack any tracked .dev paths), then re-run.
+       Override with --force only if you accept the exposure."
+    fi
+
+    local block="$(_toolkit_root)/config/claude-cc-hooks.json"
+    [ -f "$block" ] || block="$HOME/.claude/forge-toolkit/config/claude-cc-hooks.json"
+    [ -f "$block" ] || die "canonical hook block not found ($block)"
+
+    FORGE_HOOK_BLOCK="$block" FORGE_HOOK_ROOT="$root" FORGE_HOOK_MARK="$CC_HOOK_MARK" python3 - <<'PY'
+import os, sys, json, tempfile
+block_fp = os.environ["FORGE_HOOK_BLOCK"]; root = os.environ["FORGE_HOOK_ROOT"]
+MARK = os.environ["FORGE_HOOK_MARK"]
+sdir = os.path.join(root, ".claude"); os.makedirs(sdir, exist_ok=True)
+spath = os.path.join(sdir, "settings.json")
+with open(block_fp) as f: block = json.load(f)
+if os.path.exists(spath):
+    try:
+        with open(spath) as f: data = json.load(f)
+    except ValueError as e:
+        sys.exit(f"forge: REFUSE — {spath} is not valid JSON ({e}); not touched")
+    if not isinstance(data, dict):
+        sys.exit(f"forge: REFUSE — {spath} root is not an object; not touched")
+else:
+    data = {}
+hooks = data.setdefault("hooks", {})
+if not isinstance(hooks, dict): sys.exit("forge: REFUSE — .hooks is not an object")
+def is_cc(entry):
+    return any(MARK in (h.get("command", "") or "")
+               for h in (entry or {}).get("hooks", []) or [])
+for event, entries in block.items():
+    arr = hooks.setdefault(event, [])
+    if not isinstance(arr, list): sys.exit(f"forge: REFUSE — .hooks.{event} is not a list")
+    arr[:] = [e for e in arr if not is_cc(e)]   # drop stale CC (idempotent/upgrade)
+    arr.extend(entries)                          # append canonical CC
+assert isinstance(data.get("hooks"), dict)
+for event in block:
+    lst = data["hooks"][event]; assert isinstance(lst, list)
+    for e in lst:
+        for h in e.get("hooks", []):
+            assert h.get("type") == "command" and isinstance(h.get("command"), str)
+fd, tmp = tempfile.mkstemp(dir=sdir, suffix=".tmp")
+with os.fdopen(fd, "w") as f: json.dump(data, f, indent=2); f.write("\n")
+with open(tmp) as f: json.load(f)     # re-parse validation
+os.replace(tmp, spath)
+print(f"registered CC hooks in {spath}")
+PY
+
+    local wr="$HOME/.config/forge/watch-roots"
+    mkdir -p "$(dirname "$wr")"; touch "$wr"
+    if ! grep -qxF "$root" "$wr"; then echo "$root" >> "$wr"; echo "added $root to $wr"; fi
+}
+
+cmd_gc() {
+    local root="" days="$TTL_D"
+    while [ $# -gt 0 ]; do case "$1" in
+        --root) root="$2"; shift 2 ;;
+        --days) days="$2"; shift 2 ;;
+        *) shift ;;
+    esac; done
+    TTL_D="$days"
+    if [ -n "$root" ]; then gc_root "$(cd "$root" && pwd -P)"; return; fi
+    tmux list-sessions -F '#{session_path}' 2>/dev/null | sort -u | while read -r r; do
+        [ -d "$r/.dev" ] && gc_root "$r"
+    done
+}
+
+case "${1:-help}" in
+    dispatch)  shift; cmd_dispatch "$@" ;;
+    preflight) shift; cmd_preflight "$@" ;;
+    register)  shift; cmd_register "$@" ;;
+    status)    shift; if [ "${1:-}" = "--board" ]; then exec "$FORGE_WATCH_BIN" status --board; else exec "$FORGE_WATCH_BIN" status; fi ;;
+    board)     exec "$FORGE_WATCH_BIN" status --board ;;
+    gc)        shift; cmd_gc "$@" ;;
+    -h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown verb '$1' (try: dispatch preflight register status board gc)" ;;
+esac

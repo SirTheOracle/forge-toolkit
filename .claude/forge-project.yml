@@ -1,0 +1,13 @@
+# forge-project.yml — forge-toolkit (the toolkit repo itself)
+# Minimal config: pure bash/python-script repo; no services, no migrations.
+project:
+  name: forge-toolkit
+testing:
+  backend:
+    command: "bash tests/forge-watch/run.sh && bash tests/forge-cc/run.sh"
+    activate_venv: null
+services:
+  backend:
+    working_dir: "."
+database:
+  migration_system: none
