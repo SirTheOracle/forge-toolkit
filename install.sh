@@ -24,6 +24,16 @@ SKILL_NAMES=(
     adversarial-implementation adversarial-qa adversarial-verify docs-refresh
     proposal-reviewer command-center
 )
+# NOTE: proposal-reviewer ships via codex-skills/ ONLY (no skills/ counterpart);
+# the Claude-side uninstall loop no-ops on it by the -d guard. Kept in the list
+# so the Codex-side uninstall removes it.
+
+# Operator files symlinked into ~/.claude (same anti-drift pattern as bins):
+# "<repo-relative-src>:<dst-under-$HOME/.claude>"
+OPERATOR_FILES=(
+    "commands/forge.md:commands/forge.md"
+    "agents/forge-orchestrator.md:agents/forge-orchestrator.md"
+)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -65,6 +75,15 @@ if [ "${1:-}" = "--uninstall" ]; then
         if [ -d "$CLAUDE_SKILLS_DIR/$skill" ]; then
             rm -rf "$CLAUDE_SKILLS_DIR/$skill"
             ok "  Removed ~/.claude/skills/$skill"
+        fi
+    done
+
+    # Remove operator-file symlinks (never a regular file — those are unmanaged)
+    for pair in "${OPERATOR_FILES[@]}"; do
+        dst="$HOME/.claude/${pair##*:}"
+        if [ -L "$dst" ]; then
+            rm "$dst"
+            ok "  Removed $dst"
         fi
     done
 
@@ -180,6 +199,43 @@ fi
 
 echo ""
 
+# ── Step 3.5: Operator files (command + agent definition) ─
+# ~/.claude/commands/forge.md and ~/.claude/agents/forge-orchestrator.md were
+# long-standing UNTRACKED operator state; the toolkit now owns them. Symlink
+# with the same regular-file guard the bins use.
+
+info "Step 3.5: Symlinking operator files into ~/.claude/"
+
+for pair in "${OPERATOR_FILES[@]}"; do
+    src="$SCRIPT_DIR/${pair%%:*}"
+    dst="$HOME/.claude/${pair##*:}"
+    mkdir -p "$(dirname "$dst")"
+
+    if [ -L "$dst" ]; then
+        existing="$(readlink "$dst")"
+        if [ "$existing" = "$src" ]; then
+            ok "  ${pair##*:} — already linked"
+            continue
+        else
+            warn "  ${pair##*:} — updating symlink (was: $existing)"
+            rm "$dst"
+        fi
+    elif [ -f "$dst" ]; then
+        if cmp -s "$src" "$dst"; then
+            rm "$dst"   # byte-identical regular file → safe to converge to a symlink
+        else
+            warn "  ${pair##*:} — exists as a DIFFERENT regular file, skipping"
+            warn "    Diff/merge it into $src, then re-run"
+            continue
+        fi
+    fi
+
+    ln -s "$src" "$dst"
+    ok "  ${pair##*:} — linked"
+done
+
+echo ""
+
 # ── Step 4: Hooks config ─────────────────────────────────
 
 info "Step 4: Claude Code hooks setup"
@@ -239,5 +295,5 @@ echo "  /adversarial-implementation  # Implementation from plan"
 echo "  /adversarial-qa          # Adversarial QA testing"
 echo "  /adversarial-verify      # Verification of QA findings"
 echo "  /docs-refresh            # Living documentation refresh"
-echo "  /proposal-reviewer       # Independent proposal review"
+echo "  /proposal-reviewer       # Independent proposal review (Codex only)"
 echo ""
