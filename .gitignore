@@ -2,3 +2,9 @@
 .DS_Store
 *.swp
 *.swo
+
+# Session scratch — pipeline artifacts belong under .dev/proposals/<slug>/ (already ignored)
+.tmpFiles/
+
+# Local git worktrees created by Claude Code sessions
+.claude/worktrees/
