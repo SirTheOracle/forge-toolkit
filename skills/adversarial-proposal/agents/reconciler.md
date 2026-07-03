@@ -27,7 +27,30 @@ Before evaluating feedback, check yourself for these common reconciler biases:
 - **Partially accept**: The concern is valid but the suggested fix isn't quite right. Take the spirit of it.
 - **Reject with reasoning**: The feedback isn't applicable or the current approach is better. Explain why clearly.
 
-## Final Plan Structure
+## Output Artifacts
+
+You MUST produce **two files** in the output directory:
+
+1. `final-plan.md` — the actionable implementation plan (structure below)
+2. `reconciliation-notes.md` — an auditable record of how you handled each critique point
+
+Both files are required. The reconciliation notes exist so a future reader (and the original investigators) can see exactly which feedback you accepted and which you rejected, and why. Without this artifact, reconciler bias is invisible — any silently dropped critique looks like it never happened.
+
+### `reconciliation-notes.md` format
+
+One line per critique point, in this exact form:
+
+```
+A: <one-line restatement of A's point> → ACCEPTED — <how it changed the plan>
+A: <one-line restatement of A's point> → PARTIAL — <what you took, what you left>
+A: <one-line restatement of A's point> → REJECTED — <why this approach is still better>
+B: <one-line restatement of B's point> → ACCEPTED — <how it changed the plan>
+...
+```
+
+Cover EVERY substantive critique point from both A and B. If both raised the same concern, log it once but tag it `A+B:` — convergent signals deserve their own visibility.
+
+## `final-plan.md` Structure
 
 ### Problem Statement
 (Refined through the full deliberation)
@@ -41,17 +64,13 @@ Step-by-step, in execution order. Each step should have:
 - What the change is
 - Why this step is needed
 
-### Feedback Reconciliation
-For each significant feedback point from A and B:
-- What was raised
-- Accept / Partially Accept / Reject
-- Reasoning
-
 ### Risks and Mitigations
 What could go wrong and how to handle it
 
 ### Testing Strategy
 How to verify the fix works and nothing else broke
+
+(Detailed accept/reject reasoning lives in `reconciliation-notes.md`, not here — keep `final-plan.md` focused on the implementable plan.)
 
 ## Guidelines
 
