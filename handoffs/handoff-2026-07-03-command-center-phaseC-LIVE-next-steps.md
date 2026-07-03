@@ -28,8 +28,16 @@ Pipeline: adversarial-implementation (impl-A surgical / impl-B coverage → synt
 
 ## Next steps (in recommended order)
 1. **Real-use shakedown** (unchanged from Phase B handoff, now covering spawn too): run normal pipelines; first real worker `forge ask` self-verifies stage-mode; first genuinely-new project spawn (`forge spawn --root <new>`) exercises hook install + registry + populate end-to-end. Watch for: double notifications, rows that don't clear, orchestrator re-consuming callbacks.
-2. **Two-worktree infra-lock live check** (still gated on live services): two worktrees of a real project, concurrent pipelines — reasoning stages overlap, infra stages serialize; B's qa hits B's code.
-3. Possible small hardening (non-blocking, from coder-report): `mkdir -p .dev` before the register gitignore gate (a `.dev/` gitignore pattern can't match a not-yet-existing dir — new roots currently need `mkdir .dev` first; error is loud and self-explanatory); registry shape-check adopts any valid-YAML dict (only `repos` is validated).
+2. **Two-worktree infra-lock — pipeline-level run only** (mechanism half DONE, see below): two worktrees of a real product repo, concurrent pipelines — reasoning stages overlap, infra stages serialize; B's qa hits B's code. Needs real workloads; folds into the shakedown.
+
+## Also completed same session, after the Phase C ship (continuation stretch)
+- **`mkdir -p .dev` gate fix landed** (`8104a6e`) — brand-new roots register cleanly now (spawn.sh 29).
+- **Two-worktree infra-lock MECHANISM half verified LIVE** on the toolkit's own two real worktrees + real tmux sessions (no FORGE_INFRA_LOCK_DIR override — the real `.git/forge-infra-lock` anchor): identical anchor from both worktrees; live-holder (forge-1) blocks worktree-B's acquire (poll → TIMEOUT rc 2 with holder dump, liveness=live); release→acquire handoff; dead-session holder reads STALE and is stolen at next acquire (`action=steal`); anchor removed cleanly after.
+- **goparent-ai ZOMBIE-ACTIVE cleared** — and the FIRST real-root spawn happened by accident of it: `forge spawn --root goparent-ai` discovered tmux `forge-3` already sitting at that root (it had moved off feedforge) and correctly ENSURE-no-op'd on it (identity=session_path proven live); the close-out was then dispatched to @forge-3, which retired the stale forge-4 pipeline context. **Board hot list is now EMPTY.**
+- **Operator files tracked** (`ab4d988`): `commands/forge.md` + `agents/forge-orchestrator.md` now live in the repo; install.sh Step 3.5 symlinks them (regular-file guard, auto-converges byte-identical copies); live files converged. proposal-reviewer "phantom" documented (ships via codex-skills only; claude-side uninstall no-ops).
+- **`install.sh --check-drift` shipped** (`a5cdf48`, v1 addendum 8): read-only repo↔installed divergence report, exit 1 on drift; bin manifest deduplicated into `BIN_SCRIPTS` + gains forge-stall-install-regex (was unmanaged). First run found REAL two-way codex-skills drift, reconciled per-file in the correct directions (adversarial-implementation agents pushed out; adversarial-qa SKILL.md pulled in — it carried the Jun 29 infra-lock restart-on-entry block that existed installed-side only; qa agents pushed out). **Machine reports zero drift.**
+
+3. Remaining small hardening (non-blocking): registry shape-check adopts any valid-YAML dict (only `repos` is validated).
 
 ## Facts the next session must not violate
 - Everything in the Phase A + B handoff lists still holds (bridge verbs untouched; forge-watch read-only; hook fail-open; subscription-only billing; `--answers` owns callback consumption; `cc-*/1` schemas additive-only; attention GC 7d/-maxdepth 2 is intended retention).
