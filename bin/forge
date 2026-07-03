@@ -7,6 +7,8 @@
 # Verbs (Phase A):
 #   forge dispatch @<session> "<instruction>" [--sender S] [--pointer]
 #                  [--allow-api-billing] [--dry-run] [--answers <ask-id>]
+#   forge spawn [name] [--root PATH] [--allow-api-billing] [--no-populate] [--force]
+#                  ensure-semantics 5-pane session (single-root invariant)
 #   forge ask  --session-scope "<question>"                 (called BY workers)
 #   forge ask  --slug S --stage T --worker W "<question>"
 #   forge preflight [--root PATH] [--allow-api-billing]
@@ -647,6 +649,184 @@ PY
     registry_write "$rid" "$alias" "$root"
 }
 
+# _spawn_session_at_root <root> → first live session NAME whose session_path==root
+# (single-root invariant, identity=session_path). Test seam: FORGE_TMUX_LIST.
+_spawn_session_at_root() {
+    local root="$1" inject="${FORGE_TMUX_LIST:-}"
+    { if [ -n "$inject" ]; then cat "$inject"
+      else "$FORGE_TMUX_BIN" list-sessions -F '#{session_name}	#{session_path}' 2>/dev/null || true; fi
+    } | awk -F'\t' -v r="$root" '
+        { p=""; cmd="cd \x27" $2 "\x27 2>/dev/null && pwd -P"
+          if ((cmd | getline p) <= 0) p=""; close(cmd)
+          if (p == r) { print $1; exit } }' || true
+}
+
+_spawn_pane_count() {
+    "$FORGE_TMUX_BIN" list-panes -t "$1" -F '#{pane_index}' 2>/dev/null | grep -c . || true
+}
+
+# _spawn_on_spawn_cmd <root> → on_spawn argv (one token/line) or nothing. LOUD on
+# a malformed non-null value.
+_spawn_on_spawn_cmd() {
+    python3 - "$1" <<'PY'
+import os, sys
+fp = os.path.join(sys.argv[1], ".claude", "forge-project.yml")
+if not os.path.exists(fp): sys.exit(0)
+try:
+    import yaml
+    with open(fp) as f: d = yaml.safe_load(f) or {}
+except Exception as e:
+    sys.exit(f"forge: spawn — {fp} is unreadable/invalid ({e})")
+try:
+    cmd = ((d.get("forge") or {}).get("control_center") or {}).get("on_spawn")
+except Exception:
+    cmd = None
+if cmd is None: sys.exit(0)
+if not (isinstance(cmd, list) and cmd and all(isinstance(x, str) for x in cmd)):
+    sys.exit(f"forge: spawn — forge.control_center.on_spawn in {fp} must be a non-empty list of strings")
+print("\n".join(cmd))
+PY
+}
+
+# ── spawn (mini-spec 5) — ensure-semantics 5-pane session for a root ──────────
+# Positional NAME overrides the derived session name; identity is session_path,
+# the name is cosmetic. Substrate first (detached, session-wide -e stamps); tmux's
+# duplicate-session error is the mutex. Then the project's on_spawn populates the
+# EXISTING session (per-pane roles injected by forge-start). Population failure is
+# recorded + rendered — never a kill.
+cmd_spawn() {
+    local name="" root="" allow=0 dry=false no_populate=false force=0
+    if [ "${FORGE_SPAWN_DRY_RUN:-0}" = "1" ]; then dry=true; fi
+    while [ $# -gt 0 ]; do case "$1" in
+        --root)   root="$2"; shift 2 ;;
+        --name)   name="$2"; shift 2 ;;
+        --allow-api-billing) allow=1; shift ;;
+        --dry-run) dry=true; shift ;;
+        --no-populate) no_populate=true; shift ;;
+        --force)  force=1; shift ;;
+        --*) die "spawn: unknown flag $1" ;;
+        *) if [ -z "$name" ]; then name="$1"; else die "spawn: unexpected extra arg '$1'"; fi; shift ;;
+    esac; done
+    if [ -z "$root" ]; then root="$(pwd -P)"; fi
+    root="$(cd "$root" 2>/dev/null && pwd -P)" || die "spawn: no such root '$root'"
+
+    # 1. Billing preflight gates every spawn (P1e), BEFORE any mutation. In
+    #    --dry-run the verdict is REPORTED in the plan (rc 2 on FAIL); the real
+    #    path dies on it.
+    local bp="" brc=0
+    bp="$(billing_preflight "$root" "$allow" 2>&1)" || brc=$?
+    if [ "$brc" -ne 0 ] && [ "$dry" = false ]; then
+        printf '%s\n' "$bp" >&2
+        die "spawn: billing preflight failed for $root (use --allow-api-billing to override)"
+    fi
+
+    # 2. Register: gitignore gate + hook MERGE (P5) + watch-roots + registry (P3).
+    #    Mutating — SKIPPED in --dry-run (naming below only READS the registry).
+    if [ "$dry" = false ]; then
+        if [ "$force" = 1 ]; then cmd_register "$root" --force >/dev/null
+        else cmd_register "$root" >/dev/null || die "spawn: register failed for $root (see above)"; fi
+    fi
+
+    # 3. Name: default forge-<alias>-<worktree-dirname>, sanitized (P4).
+    if [ -z "$name" ]; then name="forge-$(registry_alias_for "$root")-$(basename "$root")"; fi
+    name="$(sanitize_name "$name")"
+    [ -n "$name" ] || die "spawn: name sanitized to empty; pass an explicit ascii --name"
+
+    # 4. ENSURE by session_path IDENTITY (P1a/b): a live session already at this
+    #    root IS the initiative (no-op) regardless of name. Unhealthy (wrong pane
+    #    count) → needs-repair: recorded, never reused, never killed.
+    local at_root="" pc=""
+    at_root="$(_spawn_session_at_root "$root")"
+    if [ -n "$at_root" ]; then
+        pc="$(_spawn_pane_count "$at_root")"
+        if [ "${pc:-0}" -ge 5 ]; then
+            if [ "$dry" = true ]; then
+                printf 'PLAN ATTACH session=%s root=%s billing=%s\n' "$at_root" "$root" \
+                    "$([ "$brc" -eq 0 ] && echo OK || echo FAIL)"
+                if [ "$brc" -eq 0 ]; then return 0; else return 2; fi
+            fi
+            rm -f "$root/.dev/attention/spawn-$at_root-needs-repair.json" \
+                  "$root/.dev/attention/spawn-$at_root-population-failure.json" 2>/dev/null || true
+            echo "ENSURE @$at_root (already active at $root, ${pc} panes) — no-op"; return 0
+        fi
+        if [ "$dry" = true ]; then
+            printf 'PLAN NEEDS-REPAIR session=%s root=%s panes=%s\n' "$at_root" "$root" "${pc:-?}"
+            return 3
+        fi
+        spawn_state_event "$root" "$at_root" "needs-repair" "session at root has ${pc:-?} panes (expected 5)"
+        die "spawn: session '$at_root' at $root is unhealthy (${pc:-?} panes, need 5) — needs-repair (recorded to the board), NOT reused/killed. Repair it, or kill it and re-spawn."
+    fi
+
+    # 5. Dry-run: report the CREATE plan (billing verdict included), mutate nothing.
+    if [ "$dry" = true ]; then
+        printf 'DRY-RUN new-session -d -s %s -c %s -e TMUX_SESSION=%s -e FORGE_INITIATIVE=%s -e FORGE_ROOT=%s billing=%s\n' \
+            "$name" "$root" "$name" "$name" "$root" "$([ "$brc" -eq 0 ] && echo OK || echo FAIL)"
+        if [ "$no_populate" = false ]; then
+            printf 'DRY-RUN on_spawn: %s %s\n' "$(_spawn_on_spawn_cmd "$root" | tr '\n' ' ')" "$name"
+        fi
+        if [ "$brc" -eq 0 ]; then return 0; else return 2; fi
+    fi
+
+    # 6. Name-mutex CREATE (P1a/c). tmux duplicate-session error IS the mutex.
+    #    Substrate first: detached, session-wide stamps via -e (reach every pane).
+    if ! "$FORGE_TMUX_BIN" new-session -d -s "$name" -c "$root" \
+            -e "TMUX_SESSION=$name" -e "FORGE_INITIATIVE=$name" -e "FORGE_ROOT=$root" 2>/dev/null; then
+        local other=""
+        other="$(session_root "$name" 2>/dev/null || true)"
+        other="$(cd "$other" 2>/dev/null && pwd -P || true)"
+        if [ "$other" = "$root" ]; then echo "ENSURE @$name (raced; now active at $root) — no-op"; return 0; fi
+        die "spawn: name '$name' already exists at a DIFFERENT root ($other, not $root) — COLLISION, refusing (identity is session_path; pass a distinct --name)."
+    fi
+
+    # 7. First-launch (P1f) — keyed to the CREATE itself: trust lives in Claude
+    #    Code's own store, so .forge-session presence is a false proxy. The
+    #    folder-trust dialog is a STARTUP prompt no Phase A hook sees; this
+    #    once-only nudge (policy 'once' in forge-watch) keeps a fresh pane from
+    #    parking silently. NOT cleared on populate success.
+    spawn_state_event "$root" "$name" "first-launch" "new session — if a pane shows a folder-trust dialog, approve it in the tab"
+
+    # 8. on_spawn / populate (P1g). Per-pane roles live in forge-start (P1d).
+    #    Session name appended as final argv. Exit recorded; failure rendered,
+    #    session left alive, no rollback.
+    if [ "$no_populate" = false ]; then
+        local osf; osf="$(mktemp "${TMPDIR:-/tmp}/forge-onspawn.XXXXXX")"
+        _spawn_on_spawn_cmd "$root" > "$osf" || { rm -f "$osf"; die "spawn: on_spawn is malformed (see above)"; }
+        local -a on_spawn=()
+        if [ -s "$osf" ]; then mapfile -t on_spawn < "$osf"; fi
+        rm -f "$osf"
+        if [ "${#on_spawn[@]}" -eq 0 ]; then on_spawn=("$FORGE_START_BIN" --populate-existing); fi
+        if ( cd "$root" && TMUX_SESSION="$name" "${on_spawn[@]}" "$name" ); then :; else
+            local prc=$?
+            spawn_state_event "$root" "$name" "population-failure" "on_spawn exited $prc (session left alive)"
+            printf 'forge: spawn — on_spawn FAILED (exit %s) for %s; the headless session is ALIVE and recorded to the board.\n' "$prc" "$name" >&2
+            return 4
+        fi
+    fi
+
+    # 9. Verify (P1h), then clear-on-PASS only. Order is load-bearing: clearing
+    #    before/without verification would delete the needs-repair this very
+    #    block may need to write. Per-pane CHILD role is by construction +
+    #    proven in tests; tmux exposes no read of a running child's env.
+    local stamp="" fpc="" vok=1
+    stamp="$("$FORGE_TMUX_BIN" show-environment -t "$name" TMUX_SESSION 2>/dev/null | sed 's/^TMUX_SESSION=//' || true)"
+    if [ "$stamp" != "$name" ]; then
+        vok=0; printf 'forge: spawn — WARNING: TMUX_SESSION stamp missing/mismatched on %s.\n' "$name" >&2
+    fi
+    if [ "$no_populate" = false ]; then
+        fpc="$(_spawn_pane_count "$name")"
+        if [ "${fpc:-0}" -lt 5 ]; then
+            vok=0; printf 'forge: spawn — WARNING: %s has %s panes after populate (expected 5).\n' "$name" "${fpc:-?}" >&2
+        fi
+    fi
+    if [ "$vok" = 1 ]; then
+        rm -f "$root/.dev/attention/spawn-$name-needs-repair.json" \
+              "$root/.dev/attention/spawn-$name-population-failure.json" 2>/dev/null || true
+    else
+        spawn_state_event "$root" "$name" "needs-repair" "post-spawn verify: stamp='$stamp' panes=${fpc:-?}"
+    fi
+    echo "SPAWNED @$name root=$root (stamps set; board via forge-watch)"
+}
+
 cmd_gc() {
     local root="" days="$TTL_D" action=""
     while [ $# -gt 0 ]; do case "$1" in
@@ -722,9 +902,10 @@ case "${1:-help}" in
     ask)       shift; cmd_ask "$@" ;;
     preflight) shift; cmd_preflight "$@" ;;
     register)  shift; cmd_register "$@" ;;
+    spawn)     shift; cmd_spawn "$@" ;;
     status)    shift; if [ "${1:-}" = "--board" ]; then exec "$FORGE_WATCH_BIN" status --board; else exec "$FORGE_WATCH_BIN" status; fi ;;
     board)     exec "$FORGE_WATCH_BIN" status --board ;;
     gc)        shift; cmd_gc "$@" ;;
-    -h|--help|help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown verb '$1' (try: dispatch ask preflight register status board gc)" ;;
+    -h|--help|help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown verb '$1' (try: dispatch spawn ask preflight register status board gc)" ;;
 esac

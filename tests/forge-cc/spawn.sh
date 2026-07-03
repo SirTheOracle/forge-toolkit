@@ -79,6 +79,112 @@ PY
 echo "$out" | grep -q "skip (not a git repo)" && ok "T5 non-git line skipped with warning" || bad "T5 non-git skip warning missing: $out"
 test ! -e "$S1/.claude/settings.json" && ok "T5 seed bypasses hook merge (no settings.json)" || bad "T5 seed installed hooks"
 
+# ── spawn decision logic (T6-T14): fake tmux via FORGE_TMUX_BIN ────────────
+# Recording fake: logs argv; behavior tuned via FAKE_NEW_RC (new-session exit)
+# and FAKE_PANES (list-panes line count). list-sessions always fails (the
+# at-root listing goes through FORGE_TMUX_LIST when a session should be seen).
+FAKE="$WORK/faketmux"; cat > "$FAKE" <<'SH'
+#!/bin/bash
+echo "$@" >> "${TMUX_LOG:?}"
+case "$1" in
+  list-sessions) exit 1 ;;
+  new-session)   exit "${FAKE_NEW_RC:-0}" ;;
+  list-panes)    n="${FAKE_PANES:-5}"; i=0; while [ "$i" -lt "$n" ]; do echo "$i"; i=$((i+1)); done ;;
+  show-environment) shift; while [ "${1:-}" != "-t" ] && [ $# -gt 0 ]; do shift; done; echo "TMUX_SESSION=${2:-}" ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$FAKE"
+TL(){ TMUX_LOG="$WORK/tmux.$1.log"; : > "$TMUX_LOG"; }
+
+echo "── spawn: sanitize + default name + dry-run billing=OK (T6) ──"
+new_repo "my app"
+TL t6
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" --dry-run 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && echo "$out" | grep -q 'new-session -d -s forge-my-app-my-app' && echo "$out" | grep -q 'billing=OK'; } \
+  && ok "T6 sanitized default name + billing=OK in dry-run" || bad "T6 wrong (rc=$rc): $out"
+echo "$out" | grep -q 'forge-my app' && bad "T6 unsanitized space leaked" || ok "T6 no raw space in the tmux target"
+
+echo "── spawn: name collision at a different root (T7) ──"
+new_repo colroot; CR="$R"; new_repo otherroot; OR="$R"
+printf 'colname\t%s\n' "$OR" > "$WORK/t7.tsv"
+TL t7
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" FAKE_NEW_RC=1 FORGE_TMUX_LIST="$WORK/t7.tsv" spawn colname --root "$CR" --no-populate 2>&1); rc=$?
+{ [ "$rc" -ne 0 ] && echo "$out" | grep -q 'COLLISION'; } \
+  && ok "T7 same-name/other-root refused loud" || bad "T7 collision not refused (rc=$rc): $out"
+
+echo "── spawn: ensure no-op + stale-event clear (T8) ──"
+new_repo ensroot
+printf 'sess-at-root\t%s\n' "$R" > "$WORK/t8.tsv"
+mkdir -p "$R/.dev/attention"
+echo '{}' > "$R/.dev/attention/spawn-sess-at-root-needs-repair.json"
+TL t8
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" FAKE_PANES=5 FORGE_TMUX_LIST="$WORK/t8.tsv" spawn --root "$R" 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && echo "$out" | grep -q 'no-op'; } && ok "T8 healthy session at root → ensure no-op" || bad "T8 ensure failed (rc=$rc): $out"
+test ! -f "$R/.dev/attention/spawn-sess-at-root-needs-repair.json" \
+  && ok "T8 stale needs-repair cleared on ATTACH" || bad "T8 stale event kept"
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" FAKE_PANES=5 FORGE_TMUX_LIST="$WORK/t8.tsv" spawn --root "$R" --dry-run 2>&1)
+echo "$out" | grep -q 'PLAN ATTACH session=sess-at-root' && ok "T8 dry-run reports PLAN ATTACH" || bad "T8 dry-run plan wrong: $out"
+
+echo "── spawn: unhealthy session → needs-repair, never killed (T9) ──"
+new_repo reproot
+printf 'sick-sess\t%s\n' "$R" > "$WORK/t9.tsv"
+TL t9
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" FAKE_PANES=1 FORGE_TMUX_LIST="$WORK/t9.tsv" spawn --root "$R" 2>&1); rc=$?
+{ [ "$rc" -ne 0 ] && echo "$out" | grep -q 'needs-repair'; } && ok "T9 unhealthy → refused with needs-repair" || bad "T9 (rc=$rc): $out"
+grep -q 'kill-session' "$TMUX_LOG" && bad "T9 kill-session was invoked" || ok "T9 kill-session never invoked"
+python3 -c 'import json,sys;e=json.load(open(sys.argv[1]));assert e["schema"]=="cc-spawn/1" and e["event"]=="spawn-state" and e["state"]=="needs-repair" and e["session"]=="sick-sess"' \
+  "$R/.dev/attention/spawn-sick-sess-needs-repair.json" 2>/dev/null \
+  && ok "T9 needs-repair event written (cc-spawn/1)" || bad "T9 event missing/wrong"
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" FAKE_PANES=1 FORGE_TMUX_LIST="$WORK/t9.tsv" spawn --root "$R" --dry-run 2>&1); rc=$?
+{ [ "$rc" -eq 3 ] && echo "$out" | grep -q 'PLAN NEEDS-REPAIR'; } && ok "T9 dry-run PLAN NEEDS-REPAIR rc=3" || bad "T9 dry-run (rc=$rc): $out"
+
+echo "── spawn: billing gates; dry-run reports the verdict (T10) ──"
+new_repo billroot
+TL t10
+out=$(ANTHROPIC_API_KEY=sk-x TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" 2>&1); rc=$?
+{ [ "$rc" -ne 0 ] && echo "$out" | grep -q 'billing preflight'; } && ok "T10 real spawn refused with API key" || bad "T10 (rc=$rc): $out"
+test ! -e "$R/.claude/settings.json" && ok "T10 refused before register (no mutation)" || bad "T10 mutated before billing gate"
+out=$(ANTHROPIC_API_KEY=sk-x TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" --dry-run 2>&1); rc=$?
+{ [ "$rc" -eq 2 ] && echo "$out" | grep -q 'billing=FAIL' && echo "$out" | grep -q 'DRY-RUN new-session'; } \
+  && ok "T10 dry-run still prints the plan with billing=FAIL, rc=2" || bad "T10 dry verdict (rc=$rc): $out"
+
+echo "── spawn: on_spawn parse — valid and malformed (T11) ──"
+new_repo osroot
+mkdir -p "$R/.claude"
+printf 'forge:\n  control_center:\n    on_spawn: ["echo", "POPULATED"]\n' > "$R/.claude/forge-project.yml"
+TL t11
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" --dry-run 2>&1)
+echo "$out" | grep -q 'DRY-RUN on_spawn: echo POPULATED  *forge-' && ok "T11 declared on_spawn parsed + name appended" || bad "T11 parse: $out"
+printf 'forge:\n  control_center:\n    on_spawn: "not-a-list"\n' > "$R/.claude/forge-project.yml"
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" 2>&1); rc=$?
+{ [ "$rc" -ne 0 ] && echo "$out" | grep -q 'must be a non-empty list'; } && ok "T11 malformed on_spawn dies loud" || bad "T11 malformed (rc=$rc): $out"
+
+echo "── spawn: gitignore gate + --force (T12) ──"
+UG="$WORK/ungit"; mkdir -p "$UG/.dev"; git -C "$UG" init -q; : > "$UG/.gitignore"; UG="$(cd "$UG" && pwd -P)"
+TL t12
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$UG" --no-populate 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "T12 non-gitignored .dev refused" || bad "T12 accepted ungitignored root"
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$UG" --no-populate --force 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && echo "$out" | grep -q 'SPAWNED'; } && ok "T12 --force proceeds to SPAWNED" || bad "T12 --force (rc=$rc): $out"
+
+echo "── spawn: stale .forge-session does not block CREATE (T13) ──"
+new_repo staleroot
+echo "dead-session-name" > "$R/.dev/.forge-session"
+TL t13
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" --dry-run 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && echo "$out" | grep -q 'DRY-RUN new-session'; } \
+  && ok "T13 stale .forge-session ignored (identity is session_path)" || bad "T13 (rc=$rc): $out"
+
+echo "── spawn: dry-run mutates nothing (T14) ──"
+new_repo dryroot
+TL t14
+rm -f "$REG"; : > "$FHOME/.config/forge/watch-roots"
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" --dry-run 2>&1)
+{ test ! -e "$R/.claude/settings.json" && test ! -s "$FHOME/.config/forge/watch-roots" \
+  && test ! -e "$REG" && [ -z "$(ls "$R/.dev/attention" 2>/dev/null)" ]; } \
+  && ok "T14 dry-run wrote nothing (hooks/watch-roots/registry/events)" || bad "T14 dry-run mutated state"
+
 echo
 echo "═══════════════════════════════════════"
 printf 'PASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"
