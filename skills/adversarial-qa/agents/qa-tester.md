@@ -122,6 +122,33 @@ pytest tests/unit/test_audio.py -v 2>&1 | \
    - Investigate any failures
 4. **Test cross-component data flow** -- Verify data flows correctly between application areas
 
+## Pre-Feature Regression Sweep (MANDATORY)
+
+In addition to your assigned strategy, you MUST run a pre-feature regression sweep. Many features touch shared code paths whose changes only surface for projects that pre-date the feature. The regression sweep is how those silent breakages get caught.
+
+### How to run it
+
+1. **Identify affected surfaces.** Read `implementation.md` and enumerate:
+   - Every DB table whose schema or data the migration touches.
+   - Every route whose handler was modified, OR whose handler calls a helper that was modified.
+   - Every page/component that hits one of those routes.
+
+2. **Exercise each surface with pre-feature data.** For each affected surface, find or seed a project whose data was created before this feature existed (no rows touched by the new code paths). Then:
+   - Load the page WITHOUT first interacting with the new feature. Confirm rendering, counts, and status match origin/main behavior.
+   - Re-run any flow the feature did NOT explicitly modify (auto-build, the background poller, batch operations, standard generation passes) on that pre-feature data.
+
+3. **For every shared helper the implementation extends:** hit each OUT-OF-SCOPE caller (per impl-review's Shared Helper Impact Matrix) and confirm it still produces the same output as origin/main.
+
+4. **Save evidence per check** to `{output_dir}/evidence/regression/{check-id}-{slug}.{png|json|txt}`.
+
+### Severity routing for regression-sweep findings
+
+Findings from the regression sweep are CRITICAL or MAJOR — they are regressions of pre-existing behavior, not gaps in the new feature. They go in `findings:`, never `checks:`.
+
+### Skipped surfaces are themselves a finding
+
+If you cannot exercise a surface (no pre-feature data available, the surface depends on infrastructure that's not seeded, etc.), record a finding with severity MAJOR titled "Regression sweep skipped — {surface}" and explain why. Do not silently omit.
+
 ## Per-Tester Manifest (MANDATORY)
 
 At the end of your QA report, you MUST include a YAML manifest block. This is consumed by the synthesizer (to merge with the other tester's manifest) and ultimately by the verification skill (to re-run all tests).

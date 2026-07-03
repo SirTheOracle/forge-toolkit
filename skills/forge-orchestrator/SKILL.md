@@ -1,9 +1,10 @@
 ---
 name: forge-orchestrator
-description: Use this agent when /forge needs to run or resume a forge pipeline from pane 1. This agent coordinates forge stages through forge-bridge, dispatches workers, waits for callbacks, spawns digest agents, and reports concise status back to the spawner.
-model: inherit
-color: magenta
-tools: ["Bash", "Read", "Write", "Edit", "Grep", "Glob", "Agent"]
+description: >
+  tmux-based orchestrator for multi-agent building. Coordinates work
+  across Claude Code and two Codex workers via forge-bridge. Translates
+  user requests into dispatched tasks with structured audit logging.
+  Replaces forge-dispatch, forge-state.yml, and stage-routing-map.yml.
 ---
 
 

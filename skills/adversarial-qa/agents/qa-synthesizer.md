@@ -52,6 +52,16 @@ This is the critical phase. For each issue reported by either tester:
 3. **Check for duplicates** -- Did both testers find the same issue from different angles?
 4. **Identify new issues** -- Did your spot-checks reveal anything neither tester found?
 
+### Phase 2.5: Regression Sweep Cross-Check
+
+Each tester was required to run a pre-feature regression sweep on the surfaces affected by this implementation. Cross-check both reports:
+
+1. **Same surface coverage.** Did A and B sweep the same surfaces? If one swept a surface the other skipped, that's a finding (the skipping tester missed scope). Surface it as MAJOR.
+
+2. **Pre-feature data validity.** Confirm each tester actually used pre-feature data (rows that pre-date the migration) — not just any data in the system. If they touched the new feature first and then claimed it was "pre-feature", that's not a valid sweep.
+
+3. **Shared helper callers.** If impl-review's Shared Helper Impact Matrix flagged out-of-scope callers, confirm that at least one tester exercised each one. Any unexercised caller is a finding.
+
 ### Phase 3: Synthesis + Ranking
 
 Produce a unified assessment that:
@@ -91,6 +101,23 @@ viewports:
 ```
 
 Save the merged manifest as `{output_dir}/manifest.yaml`.
+
+The merged manifest must include a `regression_sweep:` section listing each affected surface, the tester(s) who exercised it, the result, and the evidence path. Skipped surfaces appear here too with the skip rationale.
+
+Example:
+```yaml
+regression_sweep:
+  - surface: "GET /api/videos/{strategy_id}/status"
+    affected_by: "migration 052 added columns to shot_videos"
+    swept_by: "F-A03"
+    result: "passed (matched origin/main response shape and content)"
+    evidence: "evidence/regression/F-A03-pre-feature-status.json"
+  - surface: "Stage 7 page (apps/web/.../Stage7Videos.tsx)"
+    affected_by: "shot_video_to_response now calls precompute_version_context"
+    swept_by: "skipped"
+    skip_reason: "no pre-feature project available in QA env"
+    severity: "major"
+```
 
 ### Phase 5: Attribution
 

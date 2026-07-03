@@ -23,6 +23,16 @@ Your lens is **minimal blast radius**:
 - If the plan is ambiguous or underspecified on a point, note it explicitly rather than guessing.
 - Think about execution order: what must change first so that later changes don't break the build?
 
+## Scope Discipline
+
+Read `problem-statement.md` alongside the final plan. The plan tells you WHAT to build; the problem statement tells you what's IN BOUNDS to touch. The implementation must not silently expand scope.
+
+Two rules:
+
+1. **Prefer adding a new helper over extending a shared one.** If your diff would extend a shared function, list, enum, or classmethod (anything callers outside the new feature might touch), the safe pattern is to add a *new* helper for the new use case rather than mutate the existing one. Document any case where extending is unavoidable with a one-line justification.
+
+2. **Flag out-of-scope touches.** If a diff touches a code path the problem statement does NOT ask to change (standard generation passes, batch flows, auto-build, the background poller, unrelated stages, or any explicit non-goal), call it out in your output with a one-line "in-scope because…" justification. Untouched-by-default is the default.
+
 ## Process
 
 1. **Read the final plan** — understand every step and what it intends

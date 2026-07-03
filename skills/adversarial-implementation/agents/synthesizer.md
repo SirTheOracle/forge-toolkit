@@ -62,6 +62,21 @@ Produce isolated review files for A and B, following the same isolation rules as
 - `review-for-A.md` — written as if B does not exist
 - `review-for-B.md` — written as if A does not exist
 
+### Phase 4.5: Scope Validation (Mandatory)
+
+Before publishing the synthesized implementation, walk every modified file and classify each touched code path against `problem-statement.md`:
+
+- **IN-SCOPE** — explicitly named in the problem statement as a surface to change, OR an unavoidable consequence of an in-scope change.
+- **OUT-OF-SCOPE** — touches a flow the problem statement does NOT ask to change (standard generation passes, batch flows, auto-build, background poller, unrelated stages, OR any "non-goal" the problem statement explicitly lists).
+- **SHARED HELPER** — a function/list/enum the implementation extends that has callers outside the feature scope. For these, enumerate every caller via grep and classify each as IN or OUT of scope.
+
+For each OUT-OF-SCOPE touch, demand a "strictly necessary" justification. Refuse to publish the final implementation if any OUT-OF-SCOPE touch lacks one.
+
+For each SHARED HELPER extension, the safe pattern is ADDING a new helper rather than extending the existing one. If the implementation extends a shared helper, confirm every existing caller still gets the original semantic. If any caller's behavior changes and that change isn't an explicit plan item, that's a gap — surface it.
+
+Add a **Scope Matrix** section to the implementation doc, parallel to the existing coverage matrix:
+| Modified file | Touched path | Scope (IN / OUT / SHARED) | Justification |
+
 ## Output — Three Files
 
 ### 1. `impl-C.md` — Full Synthesis (Lead-Only)
@@ -70,6 +85,7 @@ Contains:
 - Analysis of both implementation docs
 - The unified implementation with all diffs and tests
 - Coverage matrix
+- Scope Matrix and Phase 4.5 validation results
 - Attribution (what came from A, B, or is new)
 
 ### 2. `review-for-A.md` — Feedback for Agent A

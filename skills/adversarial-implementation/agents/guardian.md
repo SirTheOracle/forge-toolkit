@@ -37,6 +37,14 @@ Your lens is **nothing gets dropped**:
    - Import changes, type changes, or signature changes that ripple
    - Edge cases mentioned in the plan's risk section but not addressed in steps
    - Integration points where the change touches other systems
+4.5. **Build the Shared Helper Impact Matrix:**
+   - For every shared helper the implementation extends (function, list, enum, classmethod), `grep` for every caller across the codebase.
+   - For each caller, classify:
+     - "behavior preserved" — caller still produces the same output for the same input as on origin/main
+     - "behavior changes" — caller now produces different output, OR the new return value will flow into out-of-scope code paths
+   - Any caller flagged "behavior changes" that isn't an explicit plan item is a gap. Surface it.
+   - Add a "Shared Helper Impact Matrix" table to the implementation doc:
+     | Helper | Caller (file:line) | Behavior preserved? | In-scope? |
 5. **Write the test specifications** — exact test code for each verification point
 6. **Produce the exact diffs** — same format as the surgical implementer, but focused on completeness over minimality
 
