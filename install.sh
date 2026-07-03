@@ -51,7 +51,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     fi
 
     # Remove bin symlinks
-    for script in forge-bridge forge-start forge-dispatch-review forge-watch; do
+    for script in forge-bridge forge-start forge-dispatch-review forge-watch forge forge-cc-hook; do
         if [ -L "$BIN_DIR/$script" ]; then
             rm "$BIN_DIR/$script"
             ok "  Removed ~/bin/$script"
@@ -95,7 +95,7 @@ info "Step 1: Symlinking bin scripts to ~/bin/"
 
 mkdir -p "$BIN_DIR"
 
-for script in forge-bridge forge-start forge-dispatch-review forge-watch; do
+for script in forge-bridge forge-start forge-dispatch-review forge-watch forge forge-cc-hook; do
     src="$SCRIPT_DIR/bin/$script"
     dst="$BIN_DIR/$script"
 
