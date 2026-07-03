@@ -96,7 +96,7 @@ evlog_touch() { : > "$(evlog "$1")"; }        # empty file to baseline against
 evlog_append() { echo "$2" >> "$(evlog "$1")"; }
 
 run_check()  { "$WATCH" check  2>&1; }
-run_status() { "$WATCH" status 2>&1; }
+run_status() { "$WATCH" status "$@" 2>&1; }
 notified()   { grep -q "$1" "$CAP"; }
 
 assert_notified()     { if notified "$1"; then ok "notified: $2"; else bad "expected notify [$1]: $2"; fi; }
@@ -601,6 +601,116 @@ unset FORGE_WATCH_TMUX_LIST     # engine will try real tmux; harness has none gu
 export FORGE_WATCH_TMUX_LIST="$TDIR/empty.tsv"; : > "$TDIR/empty.tsv"
 : > "$FORGE_WATCH_CONFIG_DIR/watch-roots"
 if "$WATCH" status >/dev/null 2>&1; then ok "empty session map exits 0 cleanly"; else bad "empty session map errored"; fi
+
+# ── attention helpers (command center) ──
+attn(){ mkdir -p "$1/.dev/attention/payloads"; echo "$1/.dev/attention"; }
+disp(){  # disp <root> <session> <ageSec> <id> [snippet]
+  local a; a="$(attn "$1")"; cat > "$a/dispatch-$4.json" <<JSON
+{"schema":"cc-dispatch/1","event":"dispatch","dispatch_id":"$4","session":"$2","root":"$1","target_pane":1,"mode":"inline","instruction_snippet":"${5:-do the thing}","instruction_sha256":"abc","dispatched_at":"$(iso_ago "$3")","sender":"seat","state":"queued-input","answers_ask_id":null}
+JSON
+}
+promptf(){ local a; a="$(attn "$1")"; cat > "$a/prompt.$2.json" <<JSON
+{"schema":"cc-attention/1","event":"userpromptsubmit","variant":"dispatch-accept","session":"$2","root":"$1","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago "$3")","dispatch_id":"${4:-null}","prompt_snippet":"x"}
+JSON
+}
+stopf(){ local a; a="$(attn "$1")"; cat > "$a/stop.$2.json" <<JSON
+{"schema":"cc-attention/1","event":"stop","variant":"snippet","session":"$2","root":"$1","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago "$3")","snippet":"${4:-all done}","snippet_source":"last_assistant_message","looks_like_question":false}
+JSON
+}
+permf(){ local a; a="$(attn "$1")"; cat > "$a/perm.$2.$3.json" <<JSON
+{"schema":"cc-attention/1","event":"permissionrequest","variant":"permission","session":"$2","root":"$1","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago "${5:-30}")","state":"needs-input","tool_name":"${4:-Bash}","command":"run something","command_hash":"$3","permission_suggestions":[]}
+JSON
+}
+
+echo "── attention: idle dispatch → accepted (working) ──"
+new_env att1
+R=$(mk_root proj); live_session forge-1 "$R"
+disp "$R" forge-1 120 cc-x-idle
+promptf "$R" forge-1 60 cc-x-idle          # UserPromptSubmit AFTER dispatch, id match
+assert_status_has "forge-1 — working" "idle dispatch accepted via UserPromptSubmit id → SESSION-WORKING"
+assert_status_missing "queued-input" "no longer queued once accepted"
+
+echo "── attention: mid-turn dispatch stays queued until next Stop (absorption) ──"
+new_env att2
+R=$(mk_root proj); live_session forge-1 "$R"
+stopf "$R" forge-1 300 "prev turn"          # Stop predating the dispatch
+disp  "$R" forge-1 120 cc-x-mid             # lands after that Stop, no new prompt
+assert_status_has "forge-1 — queued-input" "mid-turn dispatch, no newer activity → SESSION-QUEUED"
+stopf "$R" forge-1 30 "absorbed answer"     # closing Stop, newer than dispatch
+assert_status_has "forge-1 — done" "next Stop after dispatch closes the absorbed dispatch"
+assert_status_missing "queued-input" "queued-input cleared by the closing Stop"
+
+echo "── attention: exactly one lifecycle state (no queued+done contradiction) ──"
+new_env att1b
+R=$(mk_root proj); live_session forge-1 "$R"
+disp "$R" forge-1 120 cc-open               # unclosed dispatch
+stopf "$R" forge-1 300 "older stop"         # an OLDER stop also present
+n=$(run_status | grep -c "forge-1 — ")
+[ "$n" -eq 1 ] && ok "exactly one lifecycle row per session (unclosed dispatch wins → queued)" || bad "got $n lifecycle rows"
+assert_status_has "forge-1 — queued-input" "unclosed dispatch outranks the older stop"
+
+echo "── attention: NEEDS-PERMISSION enters notify/debounce/ack ──"
+new_env att3
+R=$(mk_root proj); live_session forge-1 "$R"
+permf "$R" forge-1 deadbeef Bash 30
+run_check >/dev/null
+assert_notified "permission needed" "PermissionRequest attention fires a notification"
+: > "$CAP"; run_check >/dev/null
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "NEEDS-PERMISSION debounced on immediate re-scan" || bad "re-notified within backoff"
+: > "$CAP"; "$WATCH" ack forge-1 >/dev/null; run_check >/dev/null
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "ack silences NEEDS-PERMISSION" || bad "ack did not silence permission"
+
+echo "── attention: later Stop supersedes an answered permission + malformed json ──"
+new_env att4
+R=$(mk_root proj); live_session forge-1 "$R"
+permf "$R" forge-1 cafe Bash 300             # old permission
+stopf "$R" forge-1 60 "ok"                   # a Stop after it → answered
+assert_status_missing "permission needed" "a later Stop supersedes the answered permission"
+printf 'not json{' > "$R/.dev/attention/perm.forge-1.bad.json"
+assert_status_has "unparseable" "malformed attention json fires STATE-UNPARSEABLE"
+
+echo "── board: classes + maintenance collapse (2 actionable surface) ──"
+new_env bd
+R=$(mk_root proj); live_session forge-1 "$R"
+ctx "$R" forge-1 <<EOF
+active_pipeline: p-dec
+last_stage_completed: qa
+last_stage_status: done
+next_stage: pending-orchestrator-decision
+updated_at: "$(iso_ago 900)"
+EOF
+disp "$R" forge-1 120 cc-b; promptf "$R" forge-1 60 cc-b     # SESSION-WORKING (active)
+pending_log "$R" p-old coding codex-a "$(iso_ago 6000000)"   # STALE-PENDING (maintenance)
+cat > "$R/.dev/forge-context.yml" <<EOF
+active_pipeline: p-leg
+last_stage_completed: implementation
+last_stage_status: done
+next_stage: impl-review
+updated_at: "$(iso_ago 90000)"
+EOF
+RB=$(mk_root projZ); live_session forge-9 "$RB"
+ctx "$RB" forge-8 <<EOF
+active_pipeline: p-zed
+last_stage_completed: implementation
+last_stage_status: done
+next_stage: impl-review
+updated_at: "$(iso_ago 7200)"
+EOF
+run_status --board > "$TDIR/board.json"
+python3 - "$TDIR/board.json" <<'PY' && ok "board buckets hot/active/maintenance; nothing leaks; state field present" || bad "board classification wrong"
+import json,sys
+b=json.load(open(sys.argv[1]))
+assert b["schema"]=="cc-board/1"
+hot={r["condition"] for r in b["hot"]}
+assert "NEEDS-DECISION" in hot and "ZOMBIE-ACTIVE" in hot, hot
+work=[r for r in b["active"] if r["condition"]=="SESSION-WORKING"]
+assert work and work[0]["state"]=="working", "working row / state missing"
+assert b["maintenance"]["collapsed"] is True and b["maintenance"]["count"] >= 1
+mc={r["condition"] for r in b["maintenance"]["rows"]}
+assert "STALE-PENDING" in mc or "LEGACY-CONTEXT" in mc
+assert not (mc & hot)
+PY
+"$WATCH" status | grep -q "^\[NEEDS-DECISION\]" && ok "non-board status output preserved" || bad "status format regressed"
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""

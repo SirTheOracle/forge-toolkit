@@ -76,6 +76,7 @@ ACK_TARGET = sys.argv[3] if len(sys.argv) > 3 else ''
 # Only `check` may mutate persistent state (event offsets, debounce timestamps).
 # `status` is a pure read; `ack` persists ONLY the acked flags it sets.
 PERSIST    = (MODE == 'check')
+BOARD      = os.environ.get('FORGE_WATCH_BOARD') == '1'
 
 HOME       = os.path.expanduser('~')
 CACHE_DIR  = os.environ.get('FORGE_WATCH_CACHE_DIR',  os.path.join(HOME, '.cache', 'forge-watch'))
@@ -619,12 +620,105 @@ def _eval_context(root, label, cp, embedded, is_live,
         add_finding('ZOMBIE-STALE-CONTEXT', root, slug, msg, policy=policy,
                     session=embedded, slug=slug, stage=last)
 
+# ── attention ingestion (command center; READ-ONLY) ─────────────────────
+def _load_att(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (ValueError, OSError):
+        return None
+
+def scan_attention(root, label):
+    """Read <root>/.dev/attention/*.json (written by bin/forge + forge-cc-hook)
+    and add findings. READ-ONLY — never writes or deletes. The live queued/
+    working/done state is DERIVED by pairing the newest dispatch event against the
+    rolling prompt/stop activity files; no file is ever mutated. Exactly ONE
+    lifecycle state per session (queued > done > working by priority)."""
+    adir = os.path.join(root, '.dev', 'attention')
+    if not os.path.isdir(adir):
+        return
+    latest_disp, prompt_ev, stop_ev = {}, {}, {}
+    perms = {}
+    for fp in sorted(glob.glob(os.path.join(adir, '*.json'))):
+        rec = _load_att(fp)
+        if rec is None:
+            note_unparseable(root, fp)
+            continue
+        ev = rec.get('event') or ''
+        sess = rec.get('session')
+        if not sess:
+            continue
+        if ev == 'dispatch':
+            if age_s(rec.get('dispatched_at')) is None:
+                continue
+            cur = latest_disp.get(sess)
+            if cur is None or (age_s(rec.get('dispatched_at')) <
+                               (age_s(cur.get('dispatched_at')) or 1e18)):
+                latest_disp[sess] = rec        # newest = smallest age
+        elif ev == 'userpromptsubmit':
+            prompt_ev[sess] = rec              # rolling: last-writer-wins
+        elif ev == 'stop':
+            stop_ev[sess] = rec
+        elif ev == 'permissionrequest':
+            perms.setdefault(sess, []).append(rec)
+    sessions = set(latest_disp) | set(prompt_ev) | set(stop_ev) | set(perms)
+    for sess in sessions:
+        s_stop = stop_ev.get(sess)
+        stop_at = parse_iso(s_stop.get('emitted_at')) if s_stop else None
+        # NEEDS-PERMISSION (hot, notifies): a later Stop supersedes it (turn moved
+        # on / answered); a request past the recency window is residue.
+        for pr in perms.get(sess, []):
+            pat = parse_iso(pr.get('emitted_at'))
+            if stop_at is not None and pat is not None and stop_at > pat:
+                continue
+            a = age_s(pr.get('emitted_at'))
+            if a is not None and a > ZOMBIE_AGE_S:
+                continue
+            tool = pr.get('tool_name') or 'tool'
+            cmd = (pr.get('command') or '').strip()
+            msg = f"{label} · {sess} — permission needed: {tool}"
+            if cmd:
+                msg += f" ({cmd[:60]})"
+            add_finding('NEEDS-PERMISSION', root, f"{sess}\t{pr.get('command_hash','')}",
+                        msg, session=sess)
+        # lifecycle: EXACTLY ONE of queued-input / working / done per session.
+        d = latest_disp.get(sess)
+        accepted = False
+        if d is not None:
+            did = d.get('dispatch_id'); disp_at = parse_iso(d.get('dispatched_at'))
+            p = prompt_ev.get(sess)
+            if p is not None and p.get('dispatch_id') and p.get('dispatch_id') == did:
+                accepted = True                # idle-landing: UserPromptSubmit id match
+            elif stop_at is not None and disp_at is not None and stop_at >= disp_at:
+                accepted = True                # absorption: next Stop after dispatch
+        if d is not None and not accepted:
+            snip = (d.get('instruction_snippet') or '')[:60]
+            add_finding('SESSION-QUEUED', root, sess,
+                        f"{label} · {sess} — queued-input: {snip}",
+                        policy='never', session=sess)
+        else:
+            p = prompt_ev.get(sess)
+            p_at = parse_iso(p.get('emitted_at')) if p else None
+            if stop_at is not None and (p_at is None or stop_at >= p_at):
+                snip = (s_stop.get('snippet') or '')
+                add_finding('SESSION-DONE', root, sess,
+                            f"{label} · {sess} — done" + (f": {snip}" if snip else ""),
+                            policy='never', session=sess)
+            elif p_at is not None:
+                add_finding('SESSION-WORKING', root, sess,
+                            f"{label} · {sess} — working", policy='never', session=sess)
+
 # ── run the scan ─────────────────────────────────────────────────────────
 for root in discover_roots():
     try:
         scan_root(root)
     except Exception as e:
         config_warnings.append(f"scan error in {root_label(root)}: {e}")
+    try:
+        scan_attention(root, root_label(root))
+    except Exception as e:
+        config_warnings.append(f"attention scan error in {root_label(root)}: {e}")
 
 # STATE-UNPARSEABLE (keyed by path + mtime/size so a changed file re-fires).
 for root, path in unparseable:
@@ -727,12 +821,41 @@ if MODE == 'check':
     save_state(state)
 
 # ── output ───────────────────────────────────────────────────────────────
-NOTIFY = ['NEEDS-DECISION', 'WORKER-BLOCKED', 'STAGE-ERROR', 'PIPELINE-ERROR',
-          'WORKER-STALLED', 'WORKER-STALL-EVENT', 'PIPELINE-COMPLETE',
-          'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE']
+NOTIFY = ['NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION', 'STAGE-ERROR',
+          'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
+          'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE']
 order = {c: i for i, c in enumerate(
-    NOTIFY + ['ZOMBIE-STALE-CONTEXT', 'STALE-PENDING', 'LEGACY-CONTEXT'])}
+    NOTIFY + ['SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE',
+              'ZOMBIE-STALE-CONTEXT', 'STALE-PENDING', 'LEGACY-CONTEXT'])}
 findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
+
+if BOARD:
+    HOT = {'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION', 'STAGE-ERROR',
+           'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
+           'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE'}
+    ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE'}
+    STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
+                'SESSION-DONE': 'done', 'NEEDS-PERMISSION': 'needs-input',
+                'NEEDS-DECISION': 'needs-input'}
+    def _cls(c):
+        return 'hot' if c in HOT else 'active' if c in ACTIVE else 'maintenance'
+    def _row(f):
+        c = f['condition']
+        return {'condition': c, 'class': _cls(c), 'session': f.get('session'),
+                'root': f['root'], 'label': root_label(f['root']),
+                'slug': f.get('slug'), 'stage': f.get('stage'),
+                'state': STATE_OF.get(c), 'msg': f['msg'],
+                'acked': bool(conds.get(f['key'], {}).get('acked'))}
+    hot, active, maint = [], [], []
+    for f in findings:
+        r = _row(f)
+        (hot if r['class'] == 'hot' else active if r['class'] == 'active' else maint).append(r)
+    board = {'schema': 'cc-board/1',
+             'generated_at': NOW.strftime('%Y-%m-%dT%H:%M:%SZ'),
+             'hot': hot, 'active': active,
+             'maintenance': {'collapsed': True, 'count': len(maint), 'rows': maint}}
+    print(json.dumps(board, indent=2))
+    sys.exit(0)
 
 for w in config_warnings:
     print(f"! {w}")
@@ -765,7 +888,11 @@ cmd_check() {
     rm -f "$nout"
 }
 
-cmd_status() { run_engine status "-" ""; }
+cmd_status() {
+    local board=0
+    [ "${1:-}" = "--board" ] && board=1
+    FORGE_WATCH_BOARD="$board" run_engine status "-" ""
+}
 
 cmd_ack() {
     if [ -z "${1:-}" ]; then
@@ -822,6 +949,14 @@ PLISTEOF
         echo "Seeded $WATCH_ENV"
     fi
 
+    # The engine supports a roots registry but it does not exist live — create it
+    # (empty) so `forge register` and manual edits have a home. Live sessions are
+    # discovered from tmux directly, so this is only for roots without a session.
+    if [ ! -f "$WATCH_ROOTS" ]; then
+        echo "# forge-watch roots — one absolute project path per line." > "$WATCH_ROOTS"
+        echo "Created $WATCH_ROOTS"
+    fi
+
     launchctl unload "$PLIST" 2>/dev/null || true
     launchctl load "$PLIST"
     echo "Loaded launchd agent $LABEL (30s interval)."
@@ -857,7 +992,7 @@ EOF
 
 case "${1:-status}" in
     check)     cmd_check ;;
-    status)    cmd_status ;;
+    status)    cmd_status "${2:-}" ;;
     ack)       shift; cmd_ack "${1:-}" ;;
     install)   cmd_install ;;
     uninstall) cmd_uninstall ;;
