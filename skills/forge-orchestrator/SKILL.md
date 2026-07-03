@@ -440,6 +440,31 @@ already ran a prior stage in this pipeline (claude-opus running impl-review
 after incorporate, claude-sonnet running qa-fix after coding, etc.). The
 bridge handles `/clear` + wait. Codex panes do not need `--clear`.
 
+**Stage templates must surface the ask ids (Command Center v2).** Each
+`~/.config/forge/prompts/{stage}.txt` should carry, near its top, a line the
+worker can cite when it escalates a blocking decision:
+
+```
+Your forge identity — cite these if you must escalate:
+  slug={slug}  stage={stage}  worker={worker}
+Blocking human decision? Run:
+  forge ask --slug {slug} --stage {stage} --worker {worker} "<question>"
+```
+
+The `{slug}`/`{stage}`/`{worker}` tokens are already substituted by the bridge's
+template renderer.
+
+**Answering an escalation — the exact sequence (do NOT double-consume).** A
+worker's stage-mode `forge ask` writes a `NEEDS-ASK` row on the seat's board AND a
+BLOCKED callback; your `wait` returns `STATUS: BLOCKED`. The operator answers with
+`forge dispatch @<session> "<answer>" --answers <ask-id>`. That dispatch does two
+things, in this order: (1) it **consumes** the BLOCKED callback (archives it) and
+(2) injects the answer into your pane. So when the answer text arrives, the
+callback is already consumed — relay the answer to the worker with `send --force`
+and continue. Do NOT run your own `callback-consume` for that stage as part of the
+continuation; it is at best a harmless no-op and reasoning about it as a required
+step invites a double-consume race.
+
 Use `--dry-run` to inspect the rendered prompt without writing/logging/sending:
 ```bash
 ~/bin/forge-bridge dispatch --slug X --stage Y --worker Z --dry-run

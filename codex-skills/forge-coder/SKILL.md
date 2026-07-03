@@ -278,6 +278,29 @@ The caller is responsible for providing the slug and for any coordination
 signaling. This skill focuses solely on executing the implementation and
 producing the report.
 
+## Escalation: forge ask
+
+When you hit a **blocking human decision** — an irreversible action (dropping
+data, force-pushing, deleting resources), a genuinely ambiguous requirement the
+plan does not settle, or a credential/billing surprise — STOP and escalate
+instead of guessing:
+
+```
+forge ask --slug {slug} --stage {stage} --worker {worker} "<your question>"
+```
+
+`{slug}`, `{stage}`, and `{worker}` are surfaced in the stage prompt the
+orchestrator dispatched to you — cite them verbatim. This keeps your pipeline
+pending open and puts your question on the operator's board; their answer is
+routed back to you. If those ids are unavailable, use
+`forge ask --session-scope "<question>"`. Either way `forge ask` never blocks or
+fails your run.
+
+Do NOT ask for things you can resolve and note: a reasonable default, a naming
+choice, a locally-decidable assumption. Log those in `coder-report.md` under an
+"Assumptions" note and proceed. Ask-worthy = a human must decide before it is
+safe to continue; proceed-and-note = you can continue and the report records it.
+
 ## Error Recovery
 
 | Error | Action |

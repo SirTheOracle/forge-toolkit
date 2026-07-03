@@ -22,7 +22,7 @@ SETTINGS_FILE="$HOME/.claude/settings.json"
 SKILL_NAMES=(
     forge-orchestrator forge-coder adversarial-proposal adversarial-lite
     adversarial-implementation adversarial-qa adversarial-verify docs-refresh
-    proposal-reviewer
+    proposal-reviewer command-center
 )
 
 RED='\033[0;31m'

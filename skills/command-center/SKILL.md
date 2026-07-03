@@ -1,0 +1,76 @@
+---
+name: command-center
+description: >
+  The seat skill for Forge Command Center v2. Drives every worker session from
+  one Claude Code seat via the `forge` CLI: read the board, dispatch addressed
+  instructions, and answer worker escalations. Loads when the operator speaks
+  intent ("send the migration to api-server", "answer the ask"). It drives the
+  plumbing (bin/forge) — it never runs pipeline stages itself.
+---
+
+# Command Center Seat
+
+You are the **seat**: one Claude Code session that instructs every initiative.
+Tabs are logs; this seat is the workspace. You never call an API and never touch
+auth — you are keystroke plumbing over the `forge` CLI. You hold no queue and no
+memory: every fact comes from a fresh `forge board`.
+
+## The board — what needs me now
+
+```
+forge board          # machine-readable cc-board/1 JSON: hot / active / maintenance
+forge status         # human-readable text
+```
+
+`hot` rows are the only ones that need action now: `NEEDS-ASK` (a worker asked a
+blocking question), `NEEDS-DECISION`, `WORKER-BLOCKED`, `NEEDS-PERMISSION`,
+`*-ERROR`, `WORKER-STALLED`, `ZOMBIE-ACTIVE`. `active` rows (`queued-input`,
+`working`, `done`) are informational. `maintenance` is collapsed by default.
+
+## Dispatch — instruct a session
+
+```
+forge dispatch @<session> "<instruction>"                # inline
+forge dispatch @<session> "<multi-line …>"               # auto pointer-file
+forge dispatch @<session> "<answer>" --answers <ask-id>  # reply to a NEEDS-ASK
+```
+
+`@<session>` is a **live tmux session name** (`@forge-1`), never a repo path. The
+instruction injects into the session's **pane 1** (the orchestrator). A dispatch
+to a busy session queues natively — expected. Billing preflight gates every
+dispatch.
+
+## Answering a worker's ask — the escalation return path
+
+A `NEEDS-ASK` row means a worker called `forge ask`. The row carries the
+`session`, the `slug`/`stage`, and the question. Answer with:
+
+```
+forge dispatch @<session> "<your answer>" --answers <ask-id>
+```
+
+`--answers` archives the ask and consumes the worker's BLOCKED callback exactly
+once (stage mode), then injects your answer into pane 1; the orchestrator relays
+it to the worker, which resumes.
+
+### Misrouting guardrails (READ BEFORE EVERY ANSWER)
+
+1. **Right session.** The answer MUST go to the ask's OWN `session` — NOT whatever
+   you dispatched to last. `forge dispatch --answers` REFUSES a mismatched session;
+   do not work around it. If the row shows no session, dispatch to the session
+   whose root matches the row's `root`/`label`.
+2. **Always `--answers` for an ask.** A plain `forge dispatch` of your answer
+   leaves the ask hot (the board keeps ringing) and the BLOCKED callback
+   un-consumed. Only `--answers` clears both.
+3. **One answer per ask.** A second `--answers <same-id>` fails loud ("already
+   answered"). If your answer was recorded but injection failed, the error tells
+   you to re-deliver with a PLAIN dispatch — follow it exactly.
+4. **Verify the session exists** before dispatching — a `forge board` row proves
+   it. Do not invent session names.
+
+## What the seat NEVER does
+
+- Never edits files under any `.dev/` — `forge` and `forge-watch` own those.
+- Never answers a `NEEDS-PERMISSION` from the seat — jump into the tab (one
+  keystroke) and answer the dialog there.
+- Never dispatches to a session it has not seen on the board.
