@@ -10,7 +10,10 @@ PASS=0; FAIL=0
 # register writes ~/.config/forge/watch-roots — isolate HOME so test runs never
 # pollute the real registry. _toolkit_root resolves via $0, unaffected.
 FHOME="$WORK/home"; mkdir -p "$FHOME"
-reg(){ HOME="$FHOME" "$FORGE" register "$@"; }
+# PyYAML lives in the REAL user-site (derived from HOME); pin it or register's
+# registry write sees ModuleNotFoundError under the fake HOME (Phase C).
+USERSITE="$(python3 -c 'import site; print(site.getusersitepackages())')"
+reg(){ HOME="$FHOME" PYTHONPATH="$USERSITE" "$FORGE" register "$@"; }
 STUB="$WORK/fake-bridge"; cat > "$STUB" <<'SH'
 #!/bin/bash
 echo "$@" >> "${BRIDGE_LOG:?}"

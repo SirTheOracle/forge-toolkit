@@ -26,6 +26,9 @@ FORGE_WATCH_BIN="${FORGE_WATCH_BIN:-$HOME/bin/forge-watch}"
 INLINE_MAX="${FORGE_DISPATCH_INLINE_MAX:-280}"
 TTL_D="${FORGE_ATTENTION_TTL_D:-7}"
 CC_HOOK_MARK="forge-cc-hook"
+REGISTRY_FILE="${FORGE_REGISTRY_FILE:-$HOME/.config/forge/registry.yml}"
+FORGE_TMUX_BIN="${FORGE_TMUX_BIN:-tmux}"
+FORGE_START_BIN="${FORGE_START_BIN:-$HOME/bin/forge-start}"
 
 die() { printf 'forge: %s\n' "$*" >&2; exit 1; }
 
@@ -52,6 +55,144 @@ session_root() {
         tmux list-sessions -F '#{session_name}	#{session_path}' 2>/dev/null \
             | awk -F'\t' -v s="$sess" '$1==s{print $2; f=1} END{exit !f}'
     fi
+}
+
+# ── naming: sanitize BY TRANSFORMATION (P4) ──────────────────────────────
+# The bridge charset guard (^[A-Za-z0-9_.-]+$) REJECTS-TO-EMPTY, so sanitize
+# BEFORE any name reaches it: map disallowed → '-', collapse runs, trim.
+sanitize_name() {
+    printf '%s' "$1" | LC_ALL=C sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+}
+
+# repo identity (P3a): realpath of the git COMMON dir — shared across all
+# worktrees of a clone, distinct per clone/fork. "" (nonzero) if not a git repo.
+repo_identity() {   # repo_identity <root>
+    local cd
+    cd="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+    [ -n "$cd" ] || return 1
+    ( cd "$cd" 2>/dev/null && pwd -P )
+}
+
+# ── registry (mini-spec 1 / P3) — durable per-REPO declaration ────────────
+# ~/.config/forge/registry.yml. MAP keyed by repo_id (natural unit + dedup).
+# flock-guarded atomic write mirroring the bridge's infra-lock fcntl.flock
+# pattern, with a re-parse-before-publish guard (precedent: the hook-merge at
+# cmd_register). LOUD (never silent sys.exit(0)) on corrupt YAML / unexpected
+# shape / dup-alias-for-a-different-repo. Missing path RECORDED, not fatal.
+registry_write() {   # registry_write <repo_id> <alias> <path>
+    FORGE_REG_ID="$1" FORGE_REG_ALIAS="$2" FORGE_REG_PATH="$3" \
+    FORGE_REG_FILE="$REGISTRY_FILE" python3 - <<'PY'
+import os, sys, fcntl, datetime
+try:
+    import yaml
+except ImportError:
+    sys.exit("forge: registry requires PyYAML (python3 -m pip install pyyaml)")
+fp = os.environ["FORGE_REG_FILE"]; rid = os.environ["FORGE_REG_ID"]
+alias = os.environ["FORGE_REG_ALIAS"]; path = os.environ["FORGE_REG_PATH"]
+if not rid:
+    sys.exit("forge: registry — empty repo_id (not a git repo?)")
+os.makedirs(os.path.dirname(fp), exist_ok=True)
+with open(fp + ".lock", "w") as lf:
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    try:
+        data = {"schema": "cc-registry/1", "repos": {}}
+        if os.path.exists(fp):
+            try:
+                with open(fp) as f: loaded = yaml.safe_load(f)
+            except Exception as e:
+                sys.exit(f"forge: REFUSE — registry {fp} is corrupt YAML ({e}); not touched")
+            if loaded is not None:
+                if not isinstance(loaded, dict) or not isinstance(loaded.get("repos", {}), dict):
+                    sys.exit(f"forge: REFUSE — registry {fp} has an unexpected shape; not touched")
+                data = loaded
+        repos = data.setdefault("repos", {}); data["schema"] = "cc-registry/1"
+        for k, v in repos.items():
+            if k != rid and isinstance(v, dict) and v.get("alias") == alias:
+                sys.exit(f"forge: REFUSE — alias '{alias}' already registered to a different repo "
+                         f"({k}); pass a distinct --alias")
+        entry = repos.get(rid) if isinstance(repos.get(rid), dict) else {}
+        # color_slot / port_range are RESERVED for a future chrome/ports pass —
+        # declaration, not allocation (nothing consumes them yet; the merge-
+        # upsert admits new keys later with zero migration).
+        entry.setdefault("color_slot", None)
+        entry.setdefault("port_range", None)
+        entry.setdefault("registered_at", datetime.datetime.now(datetime.timezone.utc)
+                         .strftime("%Y-%m-%dT%H:%M:%SZ"))
+        entry.update({"alias": alias, "path": path, "repo_id": rid,
+                      "path_exists": os.path.isdir(path)})
+        repos[rid] = entry
+        tmp = fp + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
+        with open(tmp) as f:                                  # re-parse before publish
+            if not isinstance(yaml.safe_load(f), dict):
+                os.remove(tmp); sys.exit("forge: REFUSE — serialized registry failed re-parse; not published")
+        os.replace(tmp, fp)
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+print(f"registry: {alias} -> {path} [{rid}]")
+PY
+}
+
+# registry_alias_for <root> → alias for this root's repo, else sanitized dirname.
+# READ-ONLY (safe in --dry-run).
+registry_alias_for() {
+    local root="$1"
+    FORGE_REG_ROOT="$root" FORGE_REG_FILE="$REGISTRY_FILE" python3 - <<'PY' 2>/dev/null \
+        || sanitize_name "$(basename "$root")"
+import os, sys, subprocess
+root, fp = os.environ["FORGE_REG_ROOT"], os.environ["FORGE_REG_FILE"]
+try:
+    import yaml
+except ImportError:
+    raise SystemExit(1)
+if not os.path.exists(fp):
+    raise SystemExit(1)
+with open(fp) as f: reg = yaml.safe_load(f) or {}
+cd = subprocess.run(["git", "-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    capture_output=True, text=True)
+rid = os.path.realpath(cd.stdout.strip()) if cd.returncode == 0 and cd.stdout.strip() else None
+for k, v in (reg.get("repos") or {}).items():
+    if isinstance(v, dict) and (k == rid or v.get("repo_id") == rid) and v.get("alias"):
+        print(v["alias"]); raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# One-time migration: seed the registry from the live watch-roots list (P3c).
+# Registry-only — skips the gitignore gate + hook merge (those roots came
+# through the normal register path already, or will).
+registry_seed() {
+    local wr="$HOME/.config/forge/watch-roots"
+    [ -f "$wr" ] || { echo "no watch-roots to seed ($wr)"; return 0; }
+    local r rid
+    grep -v '^[[:space:]]*#' "$wr" | sed '/^[[:space:]]*$/d' | while read -r r; do
+        [ -d "$r" ] || { echo "skip (missing path): $r" >&2; continue; }
+        rid="$(repo_identity "$r")" || { echo "skip (not a git repo): $r" >&2; continue; }
+        registry_write "$rid" "$(sanitize_name "$(basename "$r")")" "$r" \
+            || echo "skip (registry refused): $r" >&2
+    done
+}
+
+# spawn-state attention event (P6) — cc-spawn/1, event=spawn-state. Keyed
+# spawn-<session>-<state>.json so a re-run OVERWRITES (forge-watch dedups
+# findings by key; the real reason for keyed filenames is that a RESOLVED
+# state must be removable and files must not accumulate). Swept by the same
+# 7d/-maxdepth 2 attention GC (HC6). Never fails the caller.
+spawn_state_event() {   # spawn_state_event <root> <session> <state> <detail>
+    FORGE_SS_ROOT="$1" FORGE_SS_SESS="$2" FORGE_SS_STATE="$3" FORGE_SS_DET="${4:-}" \
+    python3 - <<'PY' || true
+import os, json, datetime
+root = os.environ["FORGE_SS_ROOT"]; sess = os.environ["FORGE_SS_SESS"]
+st   = os.environ["FORGE_SS_STATE"]; det = os.environ.get("FORGE_SS_DET", "")
+now  = datetime.datetime.now(datetime.timezone.utc)
+adir = os.path.join(root, ".dev", "attention"); os.makedirs(adir, exist_ok=True)
+rec  = {"schema": "cc-spawn/1", "event": "spawn-state", "session": sess, "root": root,
+        "state": st, "detail": det, "emitted_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+path = os.path.join(adir, f"spawn-{sess}-{st}.json"); tmp = path + f".tmp.{os.getpid()}"
+with open(tmp, "w") as f: json.dump(rec, f, indent=2)
+os.chmod(tmp, 0o600); os.replace(tmp, path)
+PY
 }
 
 # ── billing preflight (mini-spec 5) ──────────────────────────────────────
@@ -434,11 +575,14 @@ PY
 
 # ── register: gitignore gate + hook merge (1.4) + watch-roots ─────────────
 cmd_register() {
-    local root="" force=0
+    local root="" force=0 alias="" seed=0
     while [ $# -gt 0 ]; do case "$1" in
         --force) force=1; shift ;;
+        --alias) alias="$(sanitize_name "$2")"; shift 2 ;;
+        --seed)  seed=1; shift ;;
         *) root="$1"; shift ;;
     esac; done
+    if [ "$seed" = 1 ]; then registry_seed; return; fi
     [ -n "$root" ] || die "register requires <root>"
     root="$(cd "$root" 2>/dev/null && pwd -P)" || die "no such root '$root'"
 
@@ -494,6 +638,13 @@ PY
     local wr="$HOME/.config/forge/watch-roots"
     mkdir -p "$(dirname "$wr")"; touch "$wr"
     if ! grep -qxF "$root" "$wr"; then echo "$root" >> "$wr"; echo "added $root to $wr"; fi
+
+    # Durable per-repo declaration (P3). LAST — a hook-merge refuse or the
+    # gitignore gate above aborts BEFORE any registry write.
+    local rid; rid="$(repo_identity "$root")" \
+        || die "register: '$root' is not a git repo (repo identity requires git)"
+    [ -n "$alias" ] || alias="$(sanitize_name "$(basename "$root")")"
+    registry_write "$rid" "$alias" "$root"
 }
 
 cmd_gc() {
