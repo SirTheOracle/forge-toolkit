@@ -588,6 +588,11 @@ cmd_register() {
     [ -n "$root" ] || die "register requires <root>"
     root="$(cd "$root" 2>/dev/null && pwd -P)" || die "no such root '$root'"
 
+    # A `.dev/` (trailing-slash) gitignore pattern can only match an EXISTING
+    # directory — create it first or a brand-new root fails the gate below
+    # despite a correct .gitignore (found on the Phase C live smoke).
+    mkdir -p "$root/.dev"
+
     if [ "$force" != 1 ] && ! git -C "$root" check-ignore -q .dev 2>/dev/null; then
         die ".dev/ is not gitignored in $root — attention files would be committable.
        Fix: echo '.dev/' >> '$root/.gitignore'  (untrack any tracked .dev paths), then re-run.

@@ -188,6 +188,12 @@ out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" --dry-run 2>
   && test ! -e "$REG" && [ -z "$(ls "$R/.dev/attention" 2>/dev/null)" ]; } \
   && ok "T14 dry-run wrote nothing (hooks/watch-roots/registry/events)" || bad "T14 dry-run mutated state"
 
+echo "── register: brand-new root without an existing .dev dir (T15) ──"
+NR="$WORK/newroot"; mkdir -p "$NR"; git -C "$NR" init -q; echo '.dev/' > "$NR/.gitignore"; NR="$(cd "$NR" && pwd -P)"
+out=$(reg "$NR" 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && [ -d "$NR/.dev" ]; } \
+  && ok "T15 gate creates .dev so the trailing-slash pattern can match" || bad "T15 fresh root refused (rc=$rc): $out"
+
 echo
 echo "═══════════════════════════════════════"
 printf 'PASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"
