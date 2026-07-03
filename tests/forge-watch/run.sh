@@ -768,6 +768,62 @@ assert_notified "worker asks" "ask fires a notification on first scan"
 : > "$CAP"; "$WATCH" ack forge-1 >/dev/null; run_check >/dev/null
 [ "$(wc -l < "$CAP")" -eq 0 ] && ok "ack silences NEEDS-ASK" || bad "ack did not silence the ask"
 
+# ── spawn-state ingestion (Phase C) ──────────────────────────────────────
+spawnf() {  # spawnf <root> <session> <state> <age-s> <detail>
+    local a; a="$(attn "$1")"
+    cat > "$a/spawn-$2-$3.json" <<JSON
+{"schema":"cc-spawn/1","event":"spawn-state","session":"$2","root":"$1","state":"$3","detail":"$5","emitted_at":"$(iso_ago "$4")"}
+JSON
+}
+
+echo "── spawn-state: needs-repair + population-failure render HOT/needs-input ──"
+new_env cspawn1
+R=$(mk_root proj); live_session forge-1 "$R"
+spawnf "$R" forge-1 needs-repair 60 "3 panes (expected 5)"
+spawnf "$R" forge-1 population-failure 60 "on_spawn exited 3"
+assert_status_has "spawn needs-repair" "needs-repair renders"
+assert_status_has "population FAILED" "population-failure renders"
+run_status --board | python3 -c '
+import json,sys
+b=json.load(sys.stdin)
+hot={r["condition"]: r for r in b["hot"]}
+assert "SPAWN-NEEDS-REPAIR" in hot and "SPAWN-POPULATE-FAILED" in hot
+assert hot["SPAWN-NEEDS-REPAIR"]["state"]=="needs-input"
+assert hot["SPAWN-POPULATE-FAILED"]["state"]=="needs-input"
+assert hot["SPAWN-NEEDS-REPAIR"]["session"]=="forge-1"
+' && ok "board: both spawn states hot with needs-input" || bad "board spawn rows wrong"
+
+echo "── spawn-state: notify / debounce / ack ──"
+new_env cspawn2
+R=$(mk_root proj); live_session forge-1 "$R"
+spawnf "$R" forge-1 population-failure 30 "on_spawn exited 3"
+run_check >/dev/null
+assert_notified "population FAILED" "population-failure notifies on first scan"
+: > "$CAP"; run_check >/dev/null
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "spawn-state debounced on immediate re-scan" || bad "re-notified within backoff"
+: > "$CAP"; "$WATCH" ack forge-1 >/dev/null; run_check >/dev/null
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "ack silences spawn-state" || bad "ack did not silence"
+
+echo "── spawn-state: first-launch notifies ONCE (policy once) ──"
+new_env cspawn3
+R=$(mk_root proj); live_session forge-1 "$R"
+spawnf "$R" forge-1 first-launch 30 "approve the folder-trust dialog"
+run_check >/dev/null
+assert_notified "first launch" "first-launch notifies"
+: > "$CAP"; FORGE_WATCH_RENOTIFY_S=1 run_check >/dev/null; sleep 2; FORGE_WATCH_RENOTIFY_S=1 run_check >/dev/null
+grep -q "first launch" "$CAP" && bad "first-launch re-notified (policy once violated)" || ok "first-launch never re-notifies"
+
+echo "── spawn-state: ancient event is residue; removed file clears (T-WATCH-SPAWN-CLEAR) ──"
+new_env cspawn4
+R=$(mk_root proj); live_session forge-1 "$R"
+spawnf "$R" forge-1 needs-repair 9999999 "ancient"
+assert_status_missing "spawn needs-repair" "past ZOMBIE_AGE_S → residue dropped"
+spawnf "$R" forge-1 needs-repair 60 "3 panes"
+n=$(run_status | grep -c "spawn needs-repair")
+[ "$n" = 1 ] && ok "single needs-repair row (overwrite-keyed file, dedup by key)" || bad "got $n needs-repair rows"
+rm -f "$(attn "$R")/spawn-forge-1-needs-repair.json"   # what spawn's clear-on-PASS does
+assert_status_missing "spawn needs-repair" "resolved needs-repair clears from the board"
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "═══════════════════════════════════════"
