@@ -25,9 +25,60 @@
 
 set -e
 
-DIR="$(pwd)"
+# One behavior-preserving seam: the bridge binary (default = the real one) so
+# hermetic tests can stub the alias self-test. tmux calls stay bare — the manual
+# path's call sites are byte-identical (proven by the golden identity test).
+BRIDGE_BIN="${FORGE_BRIDGE_BIN:-$HOME/bin/forge-bridge}"
 
-if [ -n "$1" ]; then
+DIR="$(pwd)"
+POPULATE=0
+
+# Test hook (addendum 4): force a mid-layout failure ONLY in populate mode so the
+# error-trap's partial-split contract is exercisable. No-op in manual mode.
+_maybe_fail() {
+    [ "$POPULATE" = 1 ] || return 0
+    if [ "${FORGE_START_FAIL_AFTER:-}" = "$1" ]; then
+        echo "forge-start: INJECTED failure after step '$1' (FORGE_START_FAIL_AFTER)" >&2
+        false
+    fi
+}
+
+# Tear down ONLY what this run created: panes split off pane 0 (index >= 1).
+# Never kill the session. Never touch .dev/.forge-session: a file this run wrote
+# names the still-alive session and is valid even on failure — removing it would
+# be the regression the v1 debt contract warns about.
+_populate_teardown() {
+    tmux list-panes -t "$SESSION" -F '#{pane_index}' 2>/dev/null | sort -rn | while read -r _i; do
+        if [ "$_i" -ge 1 ]; then tmux kill-pane -t "$SESSION:.$_i" 2>/dev/null || true; fi
+    done
+}
+
+# EXIT trap + success sentinel: catches every abort path INCLUDING explicit
+# `exit 1` branches (an ERR trap would not fire on those). Reports the partial
+# split, tears down added panes, exits nonzero.
+_POPULATE_OK=0
+_populate_trap() {
+    if [ "$_POPULATE_OK" = 1 ]; then return 0; fi
+    local now
+    now="$(tmux list-panes -t "$SESSION" -F '#{pane_index}' 2>/dev/null | grep -c . || echo '?')"
+    echo "ERROR: forge-start --populate-existing failed mid-layout for '$SESSION' — partial-split state: $now pane(s)." >&2
+    echo "       Session left ALIVE (never killed); tearing down only the panes this run added." >&2
+    _populate_teardown
+    exit 1
+}
+
+if [ "${1:-}" = "--populate-existing" ]; then
+    POPULATE=1
+    SESSION="${2:-}"
+    [ -n "$SESSION" ] || { echo "ERROR: --populate-existing requires <session>" >&2; exit 2; }
+    tmux has-session -t "$SESSION" 2>/dev/null \
+        || { echo "ERROR: --populate-existing: session '$SESSION' does not exist" >&2; exit 2; }
+    _pc=$(tmux list-panes -t "$SESSION" -F '#{pane_index}' 2>/dev/null | grep -c .)
+    [ "$_pc" = 1 ] \
+        || { echo "ERROR: --populate-existing requires a 1-pane session ('$SESSION' has $_pc)" >&2; exit 2; }
+    DIR="$(tmux display-message -p -t "$SESSION" '#{session_path}')"
+    trap _populate_trap EXIT
+elif [ -n "${1:-}" ]; then
     SESSION="$1"
 else
     COUNT=1
@@ -37,22 +88,34 @@ else
     SESSION="forge-$COUNT"
 fi
 
-# 5-pane split sequence (verified by Phase 2 Step 0 V6).
-tmux new-session -d -s "$SESSION" -c "$DIR"
-tmux split-window -h -t "$SESSION:.0" -c "$DIR" -p 50
-tmux split-window -v -t "$SESSION:.0" -c "$DIR" -p 50
-tmux split-window -v -t "$SESSION:.2" -c "$DIR" -p 66
-tmux split-window -v -t "$SESSION:.3" -c "$DIR" -p 50
+# Per-pane role stamps (P1d) — ONLY in populate mode; plain mode keeps the
+# byte-identical launch strings (HC4/HC5: forge-1..4 stay stamp-free, structural).
+if [ "$POPULATE" = 1 ]; then
+    _RP0="FORGE_ROLE=worker "; _RP1="FORGE_ROLE=orchestrator "; _RP4="FORGE_ROLE=worker "
+else
+    _RP0=""; _RP1=""; _RP4=""
+fi
+
+# 5-pane split sequence (verified by Phase 2 Step 0 V6). Populate mode inherits
+# the existing detached 1-pane session (spawn created it with -c <root>); plain
+# mode creates it. Everything from the first split on is identical.
+if [ "$POPULATE" = 0 ]; then tmux new-session -d -s "$SESSION" -c "$DIR"; fi
+tmux split-window -h -t "$SESSION:.0" -c "$DIR" -p 50; _maybe_fail 1
+tmux split-window -v -t "$SESSION:.0" -c "$DIR" -p 50; _maybe_fail 2
+tmux split-window -v -t "$SESSION:.2" -c "$DIR" -p 66; _maybe_fail 3
+tmux split-window -v -t "$SESSION:.3" -c "$DIR" -p 50; _maybe_fail 4
 
 # Enable mouse
 tmux set -g mouse on
 
-# Launch CLIs in each pane (verified by Phase 2 Step 0 V7).
-tmux send-keys -t "$SESSION:.0" "claude --model claude-opus-4-8 --permission-mode acceptEdits" Enter
-tmux send-keys -t "$SESSION:.1" "claude --model claude-opus-4-8" Enter
+# Launch CLIs in each pane (verified by Phase 2 Step 0 V7). ${_RP*} are EMPTY in
+# plain mode (byte-identical to the historical strings); populate mode prepends the
+# per-pane FORGE_ROLE stamp (P1d). Codex panes 2/3 are hook-invisible → no role.
+tmux send-keys -t "$SESSION:.0" "${_RP0}claude --model claude-opus-4-8 --permission-mode acceptEdits" Enter
+tmux send-keys -t "$SESSION:.1" "${_RP1}claude --model claude-opus-4-8" Enter
 tmux send-keys -t "$SESSION:.2" "codex -m gpt-5.5 -c model_reasoning_effort=xhigh -c service_tier=fast" Enter
 tmux send-keys -t "$SESSION:.3" "codex -m gpt-5.5 -c model_reasoning_effort=medium -c service_tier=fast" Enter
-tmux send-keys -t "$SESSION:.4" "claude --model claude-sonnet-5 --permission-mode acceptEdits" Enter
+tmux send-keys -t "$SESSION:.4" "${_RP4}claude --model claude-sonnet-5 --permission-mode acceptEdits" Enter
 
 # Layout invariant assertion: panes 0/1 left, panes 2/3/4 right.
 _actual=$(tmux list-panes -t "$SESSION" -F '#{pane_index} #{pane_left}' | sort -n)
@@ -61,6 +124,9 @@ _right_idx=$(echo "$_actual" | awk '$2!=0 {print $1}' | tr '\n' ',' | sed 's/,$/
 if [ "$_left_idx" != "0,1" ] || [ "$_right_idx" != "2,3,4" ]; then
     echo "ERROR: forge-start layout invariant failed (left={$_left_idx} right={$_right_idx})" >&2
     tmux list-panes -t "$SESSION" -F '#{pane_index} L=#{pane_left} T=#{pane_top}' >&2
+    if [ "$POPULATE" = 1 ]; then
+        exit 1          # EXIT trap reports partial-split + tears down; never kill/rm
+    fi
     tmux kill-session -t "$SESSION" 2>/dev/null
     rm -f "$DIR/.dev/.forge-session"
     exit 1
@@ -81,7 +147,9 @@ mkdir -p "$DIR/.dev"
 echo "$SESSION" > "$DIR/.dev/.forge-session"
 
 # Defensive alias drift check; WARN-not-halt.
-~/bin/forge-bridge alias-self-test --strict || echo "WARN: forge-bridge alias maps drifted or parser skipped entries; investigate before running pipelines" >&2
+"$BRIDGE_BIN" alias-self-test --strict || echo "WARN: forge-bridge alias maps drifted or parser skipped entries; investigate before running pipelines" >&2
+
+if [ "$POPULATE" = 1 ]; then _POPULATE_OK=1; fi   # populate succeeded — disarm the failure trap
 
 echo ""
 echo "Session '$SESSION' ready."
