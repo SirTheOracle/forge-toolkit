@@ -35,6 +35,10 @@ OPERATOR_FILES=(
     "agents/forge-orchestrator.md:agents/forge-orchestrator.md"
 )
 
+# Single bin manifest (was duplicated across install/uninstall/drift).
+BIN_SCRIPTS=(forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review
+             forge-stall-install-regex forge-watch forge forge-cc-hook)
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -45,6 +49,54 @@ info()  { printf "${CYAN}%s${NC}\n" "$1"; }
 ok()    { printf "${GREEN}%s${NC}\n" "$1"; }
 warn()  { printf "${YELLOW}%s${NC}\n" "$1"; }
 err()   { printf "${RED}%s${NC}\n" "$1"; }
+
+# ── Drift check (read-only) ────────────────────────────────
+# Reports every divergence between the repo and the installed state without
+# touching anything. Exit 0 = fully converged, exit 1 = drift found.
+
+if [ "${1:-}" = "--check-drift" ]; then
+    info "Checking repo ↔ installed drift (read-only)..."
+    DRIFT=0
+
+    for script in "${BIN_SCRIPTS[@]}"; do
+        src="$SCRIPT_DIR/bin/$script"; dst="$BIN_DIR/$script"
+        if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
+            ok "  bin/$script — linked"
+        elif [ -L "$dst" ]; then
+            err "  bin/$script — symlink points elsewhere: $(readlink "$dst")"; DRIFT=1
+        elif [ -f "$dst" ]; then
+            if cmp -s "$src" "$dst"; then warn "  bin/$script — regular file (byte-identical; re-run install to converge)"; DRIFT=1
+            else err "  bin/$script — regular file, CONTENT DIFFERS"; DRIFT=1; fi
+        else
+            err "  bin/$script — not installed"; DRIFT=1
+        fi
+    done
+
+    for skill_dir in "$SCRIPT_DIR"/skills/*/; do
+        skill_name="$(basename "$skill_dir")"; dst="$CLAUDE_SKILLS_DIR/$skill_name"
+        if [ ! -d "$dst" ]; then err "  skills/$skill_name — not installed (claude)"; DRIFT=1
+        elif diff -rq --exclude=.DS_Store "$skill_dir" "$dst" >/dev/null 2>&1; then ok "  skills/$skill_name — identical (claude)"
+        else err "  skills/$skill_name — DIFFERS from installed (claude):"; diff -rq --exclude=.DS_Store "$skill_dir" "$dst" 2>&1 | sed 's/^/      /'; DRIFT=1; fi
+    done
+    for skill_dir in "$SCRIPT_DIR"/codex-skills/*/; do
+        [ -d "$skill_dir" ] || continue
+        skill_name="$(basename "$skill_dir")"; dst="$CODEX_SKILLS_DIR/$skill_name"
+        if [ ! -d "$dst" ]; then err "  codex-skills/$skill_name — not installed (codex)"; DRIFT=1
+        elif diff -rq --exclude=.DS_Store "$skill_dir" "$dst" >/dev/null 2>&1; then ok "  codex-skills/$skill_name — identical (codex)"
+        else err "  codex-skills/$skill_name — DIFFERS from installed (codex):"; diff -rq --exclude=.DS_Store "$skill_dir" "$dst" 2>&1 | sed 's/^/      /'; DRIFT=1; fi
+    done
+
+    for pair in "${OPERATOR_FILES[@]}"; do
+        src="$SCRIPT_DIR/${pair%%:*}"; dst="$HOME/.claude/${pair##*:}"
+        if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then ok "  ${pair##*:} — linked"
+        elif [ -e "$dst" ]; then err "  ${pair##*:} — not a toolkit symlink"; DRIFT=1
+        else err "  ${pair##*:} — not installed"; DRIFT=1; fi
+    done
+
+    echo ""
+    if [ "$DRIFT" -eq 0 ]; then ok "No drift — repo and installed state converged."; exit 0
+    else err "Drift found (see above). Re-run ./install.sh to converge, or reconcile by hand."; exit 1; fi
+fi
 
 # ── Uninstall ──────────────────────────────────────────────
 
@@ -63,7 +115,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     done
 
     # Remove bin symlinks
-    for script in forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review forge-watch forge forge-cc-hook; do
+    for script in "${BIN_SCRIPTS[@]}"; do
         if [ -L "$BIN_DIR/$script" ]; then
             rm "$BIN_DIR/$script"
             ok "  Removed ~/bin/$script"
@@ -116,7 +168,7 @@ info "Step 1: Symlinking bin scripts to ~/bin/"
 
 mkdir -p "$BIN_DIR"
 
-for script in forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review forge-watch forge forge-cc-hook; do
+for script in "${BIN_SCRIPTS[@]}"; do
     src="$SCRIPT_DIR/bin/$script"
     dst="$BIN_DIR/$script"
 
