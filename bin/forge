@@ -6,7 +6,9 @@
 #
 # Verbs (Phase A):
 #   forge dispatch @<session> "<instruction>" [--sender S] [--pointer]
-#                  [--allow-api-billing] [--dry-run]
+#                  [--allow-api-billing] [--dry-run] [--answers <ask-id>]
+#   forge ask  --session-scope "<question>"                 (called BY workers)
+#   forge ask  --slug S --stage T --worker W "<question>"
 #   forge preflight [--root PATH] [--allow-api-billing]
 #   forge register <root> [--force]
 #   forge status [--board]          passthrough to forge-watch
@@ -118,9 +120,20 @@ cmd_preflight() {
     billing_preflight "$root" "$allow"
 }
 
+# _dispatch_fail <msg> — die; but if this dispatch is an --answers reply the ask
+# is already claimed (archived + BLOCKED callback consumed), so ANY post-claim
+# failure must tell the operator the answer is recorded and how to re-deliver.
+# Reads the caller's $answers/$session (cmd_dispatch locals) via bash dynamic scope.
+_dispatch_fail() {
+    if [ -n "${answers:-}" ]; then
+        die "$1 AFTER the answer was recorded (ask $answers archived + callback consumed). Re-deliver with a PLAIN dispatch (no --answers): forge dispatch @$session \"<answer>\""
+    fi
+    die "$1"
+}
+
 # ── dispatch (mini-spec 1) ───────────────────────────────────────────────
 cmd_dispatch() {
-    local session="" instr="" sender="" force_pointer=false allow=0 dry=false
+    local session="" instr="" sender="" force_pointer=false allow=0 dry=false answers=""
     [ "${FORGE_DISPATCH_DRY_RUN:-0}" = "1" ] && dry=true
     while [ $# -gt 0 ]; do case "$1" in
         @*) session="${1#@}"; shift ;;
@@ -128,6 +141,7 @@ cmd_dispatch() {
         --pointer) force_pointer=true; shift ;;
         --allow-api-billing) allow=1; shift ;;
         --dry-run) dry=true; shift ;;
+        --answers) answers="$2"; shift 2 ;;
         --*) die "unknown flag $1" ;;
         *) if [ -z "$instr" ]; then instr="$1"; else instr="$instr $1"; fi; shift ;;
     esac; done
@@ -147,10 +161,60 @@ cmd_dispatch() {
         die "billing preflight failed for $root (use --allow-api-billing to override)"
     fi
 
+    # ── answer lifecycle (Phase B, mini-spec 3) ──────────────────────────────
+    # Claim the ask by ATOMIC archive (the exactly-once gate), enforce the session
+    # guard, then consume its BLOCKED callback. AFTER billing (billing gates every
+    # dispatch incl. --answers) and BEFORE the event write/inject, so a
+    # double-answer fails loud before anything is injected and a billing failure
+    # never orphans an ask. The <ask-id> is charset-guarded against path traversal.
+    local ans_mode="" ans_slug="" ans_stage=""
+    if [ -n "$answers" ]; then
+        local af; af="$(mktemp "${TMPDIR:-/tmp}/forge-answers.XXXXXX")"
+        FORGE_ANS_SESSION="$session" python3 - "$root" "$answers" "$af" <<'PY' \
+            || { rm -f "$af"; exit 1; }
+import os, sys, json, re
+root, ask_id, af = sys.argv[1], sys.argv[2], sys.argv[3]
+want_session = os.environ.get("FORGE_ANS_SESSION", "")
+if not re.fullmatch(r"ask-[0-9A-Za-z-]+", ask_id):
+    sys.exit(f"forge: answer: '{ask_id}' is not a valid ask-id (ask-<ts>-<hex>)")
+adir = os.path.join(root, ".dev", "attention")
+src = os.path.join(adir, ask_id + ".json")
+arch_dir = os.path.join(adir, "archive"); arch = os.path.join(arch_dir, ask_id + ".json")
+if not os.path.exists(src):
+    if os.path.exists(arch):
+        sys.exit(f"forge: answer: ask {ask_id} already answered (archived)")
+    sys.exit(f"forge: answer: unknown ask-id {ask_id} (no such ask under {root})")
+try:
+    with open(src) as f: rec = json.load(f)
+except (OSError, ValueError):
+    sys.exit(f"forge: answer: ask {ask_id} is unreadable or corrupt")
+ask_sess = rec.get("session") or ""
+if ask_sess and want_session and ask_sess != want_session:
+    sys.exit(f"forge: answer: ask {ask_id} belongs to session '{ask_sess}', not '@{want_session}' "
+             f"— dispatch --answers to the right session")
+os.makedirs(arch_dir, exist_ok=True)
+try:
+    os.replace(src, arch)          # atomic exactly-once claim (archive-not-delete)
+except OSError:
+    sys.exit(f"forge: answer: ask {ask_id} could not be claimed (already answered / race)")
+with open(af, "w") as f:
+    f.write("\t".join(str(rec.get(k) or "") for k in ("mode", "slug", "stage")))
+PY
+        IFS=$'\t' read -r ans_mode ans_slug ans_stage < "$af" || true
+        rm -f "$af"
+        # Consume the worker's BLOCKED callback EXACTLY ONCE (stage-mode asks only).
+        # Idempotent structured no-op if already consumed (e.g. by the orchestrator).
+        if [ "$ans_mode" = "stage" ] && [ -n "$ans_slug" ] && [ -n "$ans_stage" ]; then
+            ( cd "$root" && "$FORGE_BRIDGE_BIN" callback-consume \
+                --slug "$ans_slug" --stage "$ans_stage" --status BLOCKED >/dev/null 2>&1 ) \
+              || printf 'forge: warning: callback-consume failed for %s (answer still recorded).\n' "$answers" >&2
+        fi
+    fi
+
     # Write event + (pointer) payload atomically; python emits the inject one-liner.
     local outf; outf="$(mktemp "${TMPDIR:-/tmp}/forge-dispatch.XXXXXX")"
-    FORGE_CC_INSTR="$instr" python3 - "$root" "$session" "$sender" \
-        "$force_pointer" "$INLINE_MAX" "$outf" <<'PY' || { rm -f "$outf"; die "failed to stage dispatch event"; }
+    FORGE_CC_INSTR="$instr" FORGE_CC_ANSWERS="$answers" python3 - "$root" "$session" "$sender" \
+        "$force_pointer" "$INLINE_MAX" "$outf" <<'PY' || { rm -f "$outf"; _dispatch_fail "failed to stage dispatch event"; }
 import os, sys, json, re, hashlib, secrets, datetime
 root, session, sender = sys.argv[1], sys.argv[2], sys.argv[3]
 force_pointer = sys.argv[4] == "true"; inline_max = int(sys.argv[5]); outf = sys.argv[6]
@@ -172,7 +236,8 @@ rec = {"schema": "cc-dispatch/1", "event": "dispatch", "dispatch_id": did,
        "mode": "pointer" if pointer else "inline",
        "instruction_snippet": redact(instr[:200]).replace("\n", " "),
        "instruction_sha256": sha, "dispatched_at": ts, "sender": sender,
-       "state": "queued-input", "answers_ask_id": None}
+       "state": "queued-input",
+       "answers_ask_id": (os.environ.get("FORGE_CC_ANSWERS") or None)}
 if pointer:
     pdir = os.path.join(adir, "payloads"); os.makedirs(pdir, exist_ok=True)
     rel = os.path.join(".dev", "attention", "payloads", did + ".txt")
@@ -200,10 +265,171 @@ PY
     if [ "$dry" = true ]; then
         printf 'DRY-RUN inject → %s:0.1: %s\n' "$session" "$oneliner"
     else
-        TMUX_SESSION="$session" "$FORGE_BRIDGE_BIN" send claude "$oneliner" \
-            || die "injection failed (forge-bridge send)"
-        printf 'DISPATCHED @%s pane=1 sender=%s\n' "$session" "$sender"
+        if ! TMUX_SESSION="$session" "$FORGE_BRIDGE_BIN" send claude "$oneliner"; then
+            _dispatch_fail "injection failed (forge-bridge send)"
+        fi
+        printf 'DISPATCHED @%s pane=1 sender=%s%s\n' "$session" "$sender" \
+            "$([ -n "$answers" ] && printf ' answers=%s' "$answers")"
     fi
+}
+
+# ── ask (mini-spec 3) — called BY WORKERS to escalate a blocking question. ──
+# Explicit CLI call from ANY pane (not a hook) → no pane/role gating. Writes ONE
+# ask attention event (event="ask"; extends the reserved cc-attention/1 ask
+# envelope with an additive ask_id) to the calling root's .dev/attention/. Stage
+# mode ALSO rides forge-bridge's existing `callback --status BLOCKED --quiet` so
+# the orchestrator's `wait` unblocks and the pipeline pending stays open. NEVER
+# fails the worker: every non-usage path exits 0. Resolution: $TMUX_PANE → tmux
+# (production; session_path is the key forge-watch scans on); --root forces
+# hermetic/override mode (session from $TMUX_SESSION); cwd walk-up to
+# .claude/forge-project.yml is the out-of-tmux fallback.
+cmd_ask() {
+    local scope="" slug="" stage="" worker="" root_override="" question=""
+    while [ $# -gt 0 ]; do case "$1" in
+        --session-scope) scope="session"; shift ;;
+        --slug)   slug="$2";   shift 2 ;;
+        --stage)  stage="$2";  shift 2 ;;
+        --worker) worker="$2"; shift 2 ;;
+        --root)   root_override="$2"; shift 2 ;;
+        --*) die "ask: unknown flag $1" ;;
+        *) if [ -z "$question" ]; then question="$1"; else question="$question $1"; fi; shift ;;
+    esac; done
+    [ -n "$question" ] || die "ask requires a question"
+    local want_stage=0
+    if [ "$scope" != "session" ] && [ -n "$slug$stage$worker" ]; then
+        { [ -n "$slug" ] && [ -n "$stage" ] && [ -n "$worker" ]; } \
+            || die "ask: stage mode requires --slug, --stage, and --worker together (or use --session-scope)"
+        want_stage=1
+    fi
+
+    # Resolve session/root/pane, pre-check the open pending (stage mode), and write
+    # the ask event atomically — all in one python. Reports id/mode/session/root/
+    # snippet back via <outf>.
+    local outf; outf="$(mktemp "${TMPDIR:-/tmp}/forge-ask.XXXXXX")"
+    FORGE_ASK_Q="$question" python3 - "$want_stage" "$slug" "$stage" "$worker" "$root_override" "$outf" <<'PY' \
+        || { rm -f "$outf"; die "ask: failed to write the ask event"; }
+import os, sys, json, re, hashlib, secrets, datetime, subprocess
+want_stage = sys.argv[1] == "1"
+slug, stage, worker, root_override, outf = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+q = os.environ.get("FORGE_ASK_Q", "")
+
+# ── resolve pane_index / session / root ──────────────────────────────────────
+# Production: the calling pane via $TMUX_PANE → tmux. --root forces
+# hermetic/override mode (skip tmux; session from $TMUX_SESSION). Fallback: cwd
+# walk-up to .claude/forge-project.yml (out-of-tmux ask).
+meta = None
+tmux_pane = os.environ.get("TMUX_PANE", "")
+pane_index = ""; session = ""; root = ""
+if not root_override and tmux_pane:
+    try:
+        meta = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", tmux_pane,
+             "#{pane_index}\t#{session_name}\t#{session_path}"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        meta = None
+if meta:
+    p = meta.split("\t")
+    if len(p) == 3:
+        pane_index, session, root = p[0], p[1], os.path.realpath(p[2])
+if root_override:
+    root = os.path.realpath(root_override)
+if not root:
+    d = os.getcwd()
+    while d != "/" and not os.path.isfile(os.path.join(d, ".claude", "forge-project.yml")):
+        d = os.path.dirname(d)
+    root = os.path.realpath(d)
+if not session:
+    session = os.environ.get("TMUX_SESSION", "")
+if not session:
+    sys.stderr.write("forge ask: no tmux session resolved — this ask is board-visible only and "
+                     "cannot be answered via `forge dispatch @<session> --answers`. Run forge ask "
+                     "from inside the initiative's tmux session (or pass --root with TMUX_SESSION).\n")
+
+SECRETS = re.compile(
+    r"(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|AKIA[0-9A-Z]{12,}|xox[baprs]-[A-Za-z0-9-]{8,}|AIza[0-9A-Za-z_\-]{20,})")
+KV = re.compile(r"(?i)(api[_-]?key|token|secret|password)(\s*[=:]\s*)\S+")
+def redact(s):
+    s = SECRETS.sub("«redacted»", s or ""); return KV.sub(r"\1\2«redacted»", s)
+snippet = redact(q.strip().replace("\n", " "))[:280]   # redact BEFORE truncating
+
+# ── no-pending pre-check (faithful to forge-watch pending_entries) ───────────
+def has_open_pending():
+    logp = os.path.join(root, ".dev", "proposals", slug, "forge-log.yml")
+    try:
+        with open(logp) as f: raw = f.read()
+    except OSError:
+        return False
+    entries = None
+    try:
+        import yaml
+        entries = (yaml.safe_load(raw) or {}).get("entries", []) or []
+    except Exception:
+        entries = None
+    if entries is not None:
+        return any(isinstance(e, dict) and e.get("stage") == stage
+                   and e.get("response") is None for e in entries)
+    # Regex fallback (port of the bridge/forge-watch fallback) for legacy logs.
+    block_re = re.compile(r'^\s*-\s+timestamp:\s*"([^"]+)"', re.MULTILINE)
+    starts = [m.start() for m in block_re.finditer(raw)]
+    for i, off in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(raw)
+        blk = raw[off:end]
+        st = re.search(r'^\s+stage:\s*(.*?)\s*$', blk, re.MULTILINE)
+        rp = re.search(r'^\s+response:\s*(null|")', blk, re.MULTILINE)
+        if st and st.group(1).strip() == stage and rp and rp.group(1) == 'null':
+            return True
+    return False
+
+mode = "session-scope"
+if want_stage:
+    if has_open_pending():
+        mode = "stage"
+    else:
+        sys.stderr.write(f"forge ask: no open pending for slug={slug} stage={stage} in {root} "
+                         f"— falling back to session-scope (question still escalated).\n")
+
+now = datetime.datetime.now(datetime.timezone.utc)
+ask_id = "ask-" + now.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
+role = os.environ.get("FORGE_ROLE") or ("orchestrator" if pane_index == "1" else "worker")
+rec = {"schema": "cc-attention/1", "event": "ask", "variant": "ask",
+       "session": session or None, "root": root,
+       "pane_index": pane_index or None, "role": role, "tmux_pane": tmux_pane,
+       "emitted_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+       "ask_id": ask_id, "mode": mode,
+       "question_snippet": snippet,
+       "question_sha256": hashlib.sha256(q.encode("utf-8", "replace")).hexdigest(),
+       "slug": slug or None, "stage": stage or None, "worker": worker or None}
+adir = os.path.join(root, ".dev", "attention")
+try:
+    os.makedirs(adir, exist_ok=True)
+except OSError:
+    sys.exit(1)
+path = os.path.join(adir, ask_id + ".json"); tmp = path + f".tmp.{os.getpid()}"
+with open(tmp, "w") as f: json.dump(rec, f, indent=2)
+os.chmod(tmp, 0o600); os.replace(tmp, path)
+with open(outf, "w") as f: f.write("\t".join([ask_id, mode, session, root, snippet]))
+sys.stderr.write(f"ask_id={ask_id} mode={mode}\n")
+PY
+    local a_id a_mode a_sess a_root a_snip
+    # `read` returns 1 at EOF-without-newline (python writes no trailing \n) but
+    # still assigns — don't let set -e kill the ask here.
+    IFS=$'\t' read -r a_id a_mode a_sess a_root a_snip < "$outf" || true
+    rm -f "$outf"
+
+    # Stage mode → ALSO raise a quiet BLOCKED callback. --quiet: the attention path
+    # notifies the human; don't double-notify pane 1. --message is the REDACTED
+    # snippet (one redaction pass feeds both the event and the callback file). A
+    # bridge failure NEVER fails the worker — the attention event already carries it.
+    if [ "$a_mode" = "stage" ]; then
+        ( cd "$a_root" && TMUX_SESSION="$a_sess" "$FORGE_BRIDGE_BIN" callback \
+            --slug "$slug" --stage "$stage" --worker "$worker" \
+            --status BLOCKED --message "$a_snip" --quiet >/dev/null 2>&1 ) \
+          || printf 'forge ask: bridge BLOCKED callback failed (ask %s still escalated via attention).\n' "$a_id" >&2
+    fi
+    printf 'ASKED %s mode=%s session=%s\n' "$a_id" "$a_mode" "$a_sess"
+    return 0
 }
 
 # ── register: gitignore gate + hook merge (1.4) + watch-roots ─────────────
@@ -342,11 +568,12 @@ gc_launchd_uninstall() {
 
 case "${1:-help}" in
     dispatch)  shift; cmd_dispatch "$@" ;;
+    ask)       shift; cmd_ask "$@" ;;
     preflight) shift; cmd_preflight "$@" ;;
     register)  shift; cmd_register "$@" ;;
     status)    shift; if [ "${1:-}" = "--board" ]; then exec "$FORGE_WATCH_BIN" status --board; else exec "$FORGE_WATCH_BIN" status; fi ;;
     board)     exec "$FORGE_WATCH_BIN" status --board ;;
     gc)        shift; cmd_gc "$@" ;;
-    -h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown verb '$1' (try: dispatch preflight register status board gc)" ;;
+    -h|--help|help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown verb '$1' (try: dispatch ask preflight register status board gc)" ;;
 esac

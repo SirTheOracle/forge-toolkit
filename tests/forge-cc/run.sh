@@ -11,6 +11,12 @@ PASS=0; FAIL=0
 # pollute the real registry. _toolkit_root resolves via $0, unaffected.
 FHOME="$WORK/home"; mkdir -p "$FHOME"
 reg(){ HOME="$FHOME" "$FORGE" register "$@"; }
+STUB="$WORK/fake-bridge"; cat > "$STUB" <<'SH'
+#!/bin/bash
+echo "$@" >> "${BRIDGE_LOG:?}"
+exit "${BRIDGE_RC:-0}"
+SH
+chmod +x "$STUB"
 ok(){ PASS=$((PASS+1)); printf '  ok: %s\n' "$1"; }
 bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 new_root(){ R="$WORK/$1"; mkdir -p "$R/.dev"; git -C "$R" init -q 2>/dev/null; echo '.dev/' > "$R/.gitignore"; TSV="$WORK/$1.tsv"; printf 'forge-x\t%s\n' "$R" > "$TSV"; }
@@ -154,5 +160,89 @@ test ! -f "$G2/.dev/attention/stop-old.json" && ok "tmux-only root also swept (u
 echo '{}' > "$G/.dev/attention/dispatch-mid.json"; touch -t "$(date -v-3d +%Y%m%d%H%M 2>/dev/null || date -d '3 days ago' +%Y%m%d%H%M)" "$G/.dev/attention/dispatch-mid.json"
 FORGE_WATCH_ROOTS_FILE="$GRF" FORGE_TMUX_LIST="$GTSV" "$FORGE" gc --days 1
 test ! -f "$G/.dev/attention/dispatch-mid.json" && ok "--days overrides TTL" || bad "--days ignored"
+
+echo "── forge ask: session-scope event + secret redaction ──"
+new_root a1
+BRIDGE_LOG="$WORK/bl1"; : > "$BRIDGE_LOG"
+BRIDGE_LOG="$BRIDGE_LOG" FORGE_BRIDGE_BIN="$STUB" TMUX_SESSION=forge-x \
+  "$FORGE" ask --session-scope "leak sk-abcdef1234567890 token" --root "$R" >/dev/null 2>&1 \
+  && ok "ask --session-scope exits 0" || bad "session-scope ask nonzero"
+ak=$(ls "$R"/.dev/attention/ask-*.json 2>/dev/null | head -1)
+[ -n "$ak" ] && ok "session-scope ask wrote an event" || bad "no ask event"
+grep -q 'sk-abcdef' "$ak" && bad "secret leaked in ask snippet" || ok "ask snippet redacted"
+python3 -c 'import json,sys;e=json.load(open(sys.argv[1]));assert e["event"]=="ask" and e["variant"]=="ask" and e["mode"]=="session-scope" and e["slug"] is None and e["session"]=="forge-x" and e["ask_id"].startswith("ask-")' "$ak" && ok "session-scope fields (ask-* id, null slug, session)" || bad "session-scope schema wrong"
+[ ! -s "$BRIDGE_LOG" ] && ok "session-scope fires NO bridge callback" || bad "session-scope called the bridge"
+
+echo "── forge ask: stage mode (open pending) → event + BLOCKED --quiet callback ──"
+new_root a2
+mkdir -p "$R/.dev/proposals/p-x"
+printf 'entries:\n  - timestamp: "2026-07-03T00:00:00Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$R/.dev/proposals/p-x/forge-log.yml"
+BRIDGE_LOG="$WORK/bl2"; : > "$BRIDGE_LOG"
+BRIDGE_LOG="$BRIDGE_LOG" FORGE_BRIDGE_BIN="$STUB" TMUX_SESSION=forge-x \
+  "$FORGE" ask --slug p-x --stage coding --worker codex-a "delete the old table too?" --root "$R" >/dev/null 2>&1
+ak=$(ls "$R"/.dev/attention/ask-*.json | head -1)
+python3 -c 'import json,sys;e=json.load(open(sys.argv[1]));assert e["mode"]=="stage" and e["slug"]=="p-x" and e["stage"]=="coding" and e["worker"]=="codex-a" and "delete the old table" in e["question_snippet"]' "$ak" && ok "stage-mode ask fields" || bad "stage schema wrong"
+{ grep -q -- 'callback .*--slug p-x .*--stage coding .*--status BLOCKED' "$BRIDGE_LOG" && grep -q -- '--quiet' "$BRIDGE_LOG"; } && ok "stage mode raised a quiet BLOCKED callback" || bad "callback args wrong: $(cat "$BRIDGE_LOG")"
+
+echo "── forge ask: NO matching pending → session-scope fallback, warns, no callback ──"
+new_root a3
+BRIDGE_LOG="$WORK/bl3"; : > "$BRIDGE_LOG"
+warn=$(BRIDGE_LOG="$BRIDGE_LOG" FORGE_BRIDGE_BIN="$STUB" TMUX_SESSION=forge-x \
+  "$FORGE" ask --slug nope --stage coding --worker codex-a "q?" --root "$R" 2>&1 >/dev/null); rc=$?
+[ "$rc" -eq 0 ] && ok "no-pending ask still exits 0 (never fails the worker)" || bad "no-pending ask nonzero"
+echo "$warn" | grep -qi 'falling back to session-scope' && ok "warned on fallback" || bad "no fallback warning"
+ak=$(ls "$R"/.dev/attention/ask-*.json | head -1)
+python3 -c 'import json,sys;assert json.load(open(sys.argv[1]))["mode"]=="session-scope"' "$ak" && ok "fallback event mode=session-scope" || bad "did not downgrade"
+[ ! -s "$BRIDGE_LOG" ] && ok "fallback fires no callback" || bad "callback fired without a pending"
+
+echo "── forge ask: bridge callback error still exits 0, event still written ──"
+new_root a4
+mkdir -p "$R/.dev/proposals/p-x"
+printf 'entries:\n  - timestamp: "2026-07-03T00:00:00Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$R/.dev/proposals/p-x/forge-log.yml"
+BRIDGE_LOG="$WORK/bl4"; : > "$BRIDGE_LOG"
+BRIDGE_LOG="$BRIDGE_LOG" BRIDGE_RC=7 FORGE_BRIDGE_BIN="$STUB" TMUX_SESSION=forge-x \
+  "$FORGE" ask --slug p-x --stage coding --worker codex-a "q?" --root "$R" >/dev/null 2>&1 \
+  && ok "ask exits 0 despite a failing bridge callback" || bad "ask propagated bridge failure"
+ls "$R"/.dev/attention/ask-*.json >/dev/null 2>&1 && ok "ask event written on bridge failure" || bad "no event on bridge failure"
+
+echo "── dispatch --answers: archive + consume-once + answers_ask_id ──"
+new_root ans1
+mkdir -p "$R/.dev/proposals/p-x"
+printf 'entries:\n  - timestamp: "2026-07-03T00:00:00Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$R/.dev/proposals/p-x/forge-log.yml"
+BRIDGE_LOG="$WORK/blA"; : > "$BRIDGE_LOG"
+AID=$(BRIDGE_LOG="$BRIDGE_LOG" FORGE_BRIDGE_BIN="$STUB" TMUX_SESSION=forge-x \
+  "$FORGE" ask --slug p-x --stage coding --worker codex-a "which table?" --root "$R" 2>/dev/null | awk '/^ASKED/{print $2}')
+: > "$BRIDGE_LOG"
+out=$(FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BRIDGE_LOG" \
+  "$FORGE" dispatch @forge-x "use users" --answers "$AID" --allow-api-billing 2>&1)
+{ test ! -f "$R/.dev/attention/$AID.json" && test -f "$R/.dev/attention/archive/$AID.json"; } && ok "ask archived (not deleted)" || bad "ask not archived: $out"
+grep -q "callback-consume .*--slug p-x .*--stage coding .*--status BLOCKED" "$BRIDGE_LOG" && ok "consumed the BLOCKED callback once" || bad "no callback-consume: $(cat "$BRIDGE_LOG")"
+ev=$(ls "$R"/.dev/attention/dispatch-*.json | head -1)
+python3 -c 'import json,sys;assert json.load(open(sys.argv[1]))["answers_ask_id"]==sys.argv[2]' "$ev" "$AID" && ok "dispatch event answers_ask_id set" || bad "answers_ask_id not set"
+
+echo "── dispatch --answers: double-answer fails loud, no re-consume, no inject ──"
+: > "$BRIDGE_LOG"
+out2=$(FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BRIDGE_LOG" \
+  "$FORGE" dispatch @forge-x "again" --answers "$AID" --allow-api-billing 2>&1); rc2=$?
+{ [ "$rc2" -ne 0 ] && echo "$out2" | grep -qi 'already answered'; } && ok "second --answers fails loud" || bad "double-answer not rejected (rc=$rc2)"
+[ ! -s "$BRIDGE_LOG" ] && ok "no re-consume on the rejected double-answer" || bad "consume ran on double-answer"
+
+echo "── dispatch --answers: session-mismatch refused, ask untouched ──"
+new_root ans2
+T2="$WORK/ans2.tsv"; printf 'forge-y\t%s\n' "$R" > "$T2"     # forge-y → this root
+AID=$(FORGE_BRIDGE_BIN=/bin/true TMUX_SESSION=forge-x \
+  "$FORGE" ask --session-scope "whose session?" --root "$R" 2>/dev/null | awk '/^ASKED/{print $2}')  # ask.session=forge-x
+FORGE_TMUX_LIST="$T2" FORGE_DISPATCH_DRY_RUN=1 FORGE_BRIDGE_BIN=/bin/true \
+  "$FORGE" dispatch @forge-y "x" --answers "$AID" --allow-api-billing >/dev/null 2>&1 \
+  && bad "answered the wrong session" || ok "session-mismatch answer refused"
+test -f "$R/.dev/attention/$AID.json" && ok "refused answer left the ask live (not archived)" || bad "ask archived on refusal"
+
+echo "── dispatch --answers: unknown / traversal ask-id fails loud ──"
+FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 FORGE_BRIDGE_BIN=/bin/true \
+  "$FORGE" dispatch @forge-x "x" --answers ask-does-not-exist --allow-api-billing >/dev/null 2>&1 \
+  && bad "unknown ask-id accepted" || ok "unknown ask-id fails loud"
+FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 FORGE_BRIDGE_BIN=/bin/true \
+  "$FORGE" dispatch @forge-x "x" --answers 'ask-../../etc/passwd' --allow-api-billing >/dev/null 2>&1 \
+  && bad "path-traversal ask-id accepted" || ok "path-traversal ask-id rejected"
 
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]
