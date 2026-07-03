@@ -5,6 +5,14 @@ project:
   name: "My Project"
   description: "Brief description of the project"
 
+# Command Center v2 — how `forge spawn` populates a freshly-created session.
+# on_spawn runs against the EXISTING detached session (spawn appends the session
+# name as the final argv); it splits panes and launches CLIs but never creates,
+# renames, or kills the session. Default if omitted: forge-start --populate-existing.
+forge:
+  control_center:
+    on_spawn: ["forge-start", "--populate-existing"]
+
 services:
   backend:
     command: "uvicorn src.app.main:app --reload --port 8000"
