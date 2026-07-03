@@ -51,7 +51,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     fi
 
     # Remove bin symlinks
-    for script in forge-bridge forge-start forge-dispatch-review forge-watch forge forge-cc-hook; do
+    for script in forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review forge-watch forge forge-cc-hook; do
         if [ -L "$BIN_DIR/$script" ]; then
             rm "$BIN_DIR/$script"
             ok "  Removed ~/bin/$script"
@@ -95,7 +95,7 @@ info "Step 1: Symlinking bin scripts to ~/bin/"
 
 mkdir -p "$BIN_DIR"
 
-for script in forge-bridge forge-start forge-dispatch-review forge-watch forge forge-cc-hook; do
+for script in forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review forge-watch forge forge-cc-hook; do
     src="$SCRIPT_DIR/bin/$script"
     dst="$BIN_DIR/$script"
 
@@ -184,7 +184,7 @@ info "Step 4: Claude Code hooks setup"
 echo ""
 
 if [ -f "$SETTINGS_FILE" ]; then
-    if grep -q "forge-dispatch-review" "$SETTINGS_FILE" 2>/dev/null; then
+    if grep -q "forge-dispatch-pr-review" "$SETTINGS_FILE" 2>/dev/null; then
         ok "  PostToolUse hook already configured in settings.json"
     else
         warn "  You already have a ~/.claude/settings.json."

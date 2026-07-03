@@ -6,9 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "if": "Bash(git commit *)",
-            "command": "$HOME/bin/forge-dispatch-review",
-            "timeout": 10
+            "command": "$HOME/bin/forge-dispatch-pr-review",
+            "timeout": 15
           }
         ]
       }
