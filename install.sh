@@ -43,12 +43,14 @@ if [ "${1:-}" = "--uninstall" ]; then
 
     # Unload the forge-watch launchd agent before removing its symlink, else it
     # keeps firing every 30s against a now-dangling path.
-    FW_PLIST="$HOME/Library/LaunchAgents/com.forge.watch.plist"
-    if [ -f "$FW_PLIST" ]; then
-        launchctl unload "$FW_PLIST" 2>/dev/null || true
-        rm -f "$FW_PLIST"
-        ok "  Unloaded and removed com.forge.watch launchd agent"
-    fi
+    for agent in com.forge.watch com.forge.gc; do
+        AGENT_PLIST="$HOME/Library/LaunchAgents/$agent.plist"
+        if [ -f "$AGENT_PLIST" ]; then
+            launchctl unload "$AGENT_PLIST" 2>/dev/null || true
+            rm -f "$AGENT_PLIST"
+            ok "  Unloaded and removed $agent launchd agent"
+        fi
+    done
 
     # Remove bin symlinks
     for script in forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review forge-watch forge forge-cc-hook; do
@@ -228,6 +230,7 @@ echo "  forge-bridge help        # See all forge-bridge commands"
 echo "  forge-bridge context     # Show current forge context"
 echo "  forge-watch status       # One-shot scan for blocked pipelines"
 echo "  forge-watch install      # Enable background blocked-on-you notifications"
+echo "  forge gc --install       # Enable the daily attention-GC launchd backstop"
 echo ""
 info "Skills available (Claude Code + Codex):"
 echo "  /adversarial-proposal    # 4-round adversarial planning (Opus)"

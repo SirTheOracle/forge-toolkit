@@ -12,6 +12,7 @@
 #   forge status [--board]          passthrough to forge-watch
 #   forge board                     alias for `status --board`
 #   forge gc [--root PATH] [--days N]
+#   forge gc --install | --uninstall    daily launchd backstop (com.forge.gc)
 #
 # Dispatch REUSES `forge-bridge send claude` (the proven 3-step cmd_send split);
 # it never reimplements tmux send-keys. Every write lands under the target root's
@@ -270,17 +271,73 @@ PY
 }
 
 cmd_gc() {
-    local root="" days="$TTL_D"
+    local root="" days="$TTL_D" action=""
     while [ $# -gt 0 ]; do case "$1" in
         --root) root="$2"; shift 2 ;;
         --days) days="$2"; shift 2 ;;
+        --install) action="install"; shift ;;
+        --uninstall) action="uninstall"; shift ;;
         *) shift ;;
     esac; done
+    if [ -n "$action" ]; then "gc_launchd_$action"; return; fi
     TTL_D="$days"
     if [ -n "$root" ]; then gc_root "$(cd "$root" && pwd -P)"; return; fi
-    tmux list-sessions -F '#{session_path}' 2>/dev/null | sort -u | while read -r r; do
-        [ -d "$r/.dev" ] && gc_root "$r"
+    # Backstop sweep (the com.forge.gc tick lands here): registered watch-roots
+    # ∪ live tmux session paths, so roots whose session is gone still age out.
+    local wr="${FORGE_WATCH_ROOTS_FILE:-$HOME/.config/forge/watch-roots}"
+    {
+        { [ -f "$wr" ] && grep -v '^[[:space:]]*#' "$wr"; } || true
+        if [ -n "${FORGE_TMUX_LIST:-}" ]; then
+            cut -f2 "$FORGE_TMUX_LIST"
+        else
+            tmux list-sessions -F '#{session_path}' 2>/dev/null || true
+        fi
+    } | sed '/^[[:space:]]*$/d' | sort -u | while read -r r; do
+        { [ -d "$r/.dev" ] && gc_root "$r"; } || true
     done
+    return 0
+}
+
+# ── gc launchd backstop — GC otherwise only runs when `forge` runs; forge-watch
+# is read-only by invariant and must never delete. Mirrors forge-watch install.
+GC_LABEL="com.forge.gc"
+GC_PLIST="$HOME/Library/LaunchAgents/$GC_LABEL.plist"
+
+gc_launchd_install() {
+    local cache="$HOME/.cache/forge-gc"
+    mkdir -p "$cache" "$(dirname "$GC_PLIST")"
+    cat > "$GC_PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$GC_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/bin/forge</string>
+    <string>gc</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>17</integer></dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>$cache/launchd.err</string>
+  <key>StandardOutPath</key><string>$cache/launchd.out</string>
+</dict>
+</plist>
+PLISTEOF
+    launchctl unload "$GC_PLIST" 2>/dev/null || true
+    launchctl load "$GC_PLIST"
+    echo "Loaded launchd agent $GC_LABEL (daily 03:17 + once at load)."
+}
+
+gc_launchd_uninstall() {
+    launchctl unload "$GC_PLIST" 2>/dev/null || true
+    rm -f "$GC_PLIST"
+    echo "Unloaded and removed launchd agent $GC_LABEL."
 }
 
 case "${1:-help}" in
