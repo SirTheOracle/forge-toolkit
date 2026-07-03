@@ -621,6 +621,17 @@ permf(){ local a; a="$(attn "$1")"; cat > "$a/perm.$2.$3.json" <<JSON
 {"schema":"cc-attention/1","event":"permissionrequest","variant":"permission","session":"$2","root":"$1","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago "${5:-30}")","state":"needs-input","tool_name":"${4:-Bash}","command":"run something","command_hash":"$3","permission_suggestions":[]}
 JSON
 }
+askf(){  # askf <root> <session> <ask_id> <slug> <stage> [ageSec] [question]
+  local a; a="$(attn "$1")"
+  python3 - "$a/$3.json" "$2" "$1" "$3" "${4:-}" "${5:-}" "$(iso_ago "${6:-60}")" "${7:-migrate users too or only orders?}" <<'PY'
+import json,sys
+p,sess,root,aid,slug,stage,ts,q=sys.argv[1:9]
+json.dump({"schema":"cc-attention/1","event":"ask","variant":"ask","session":sess,"root":root,
+  "pane_index":"4","role":"worker","tmux_pane":"%4","emitted_at":ts,"ask_id":aid,
+  "mode":"stage" if slug else "session-scope","slug":slug or None,"stage":stage or None,
+  "worker":"codex-a","question_snippet":q,"question_sha256":"deadbeef"},open(p,"w"),indent=2)
+PY
+}
 
 echo "── attention: idle dispatch → accepted (working) ──"
 new_env att1
@@ -711,6 +722,51 @@ assert "STALE-PENDING" in mc or "LEGACY-CONTEXT" in mc
 assert not (mc & hot)
 PY
 "$WATCH" status | grep -q "^\[NEEDS-DECISION\]" && ok "non-board status output preserved" || bad "status format regressed"
+
+echo "── ask: NEEDS-ASK hot row carries the question ──"
+new_env cask1
+R=$(mk_root proj); live_session forge-1 "$R"
+askf "$R" forge-1 ask-1 "" "" 60 "drop the column or keep it?"
+assert_status_has "worker asks: drop the column" "ask event → NEEDS-ASK with question snippet"
+run_status --board > "$TDIR/b.json"
+python3 -c 'import json,sys;b=json.load(open(sys.argv[1]));r=[x for x in b["hot"] if x["condition"]=="NEEDS-ASK"];assert r and r[0]["state"]=="needs-input"' "$TDIR/b.json" && ok "NEEDS-ASK is hot, state=needs-input" || bad "ask not hot/needs-input"
+
+echo "── ask precedence: stage-mode ask suppresses the WORKER-BLOCKED twin ──"
+new_env cask2
+R=$(mk_root proj); live_session forge-1 "$R"
+pending_log "$R" p-mig coding codex-a "$(iso_ago 120)"
+callback "$R" p-mig coding BLOCKED codex-a
+askf "$R" forge-1 ask-2 p-mig coding 60
+n=$(run_status | grep -c "p-mig")
+[ "$n" -eq 1 ] && ok "exactly one row for the asked slug/stage (no ask+blocked double)" || bad "got $n rows for p-mig"
+assert_status_has "NEEDS-ASK" "the surviving row is the richer NEEDS-ASK"
+assert_status_missing "worker BLOCKED at coding" "WORKER-BLOCKED twin suppressed by the ask"
+
+echo "── ask is NOT superseded by a later Stop (unlike NEEDS-PERMISSION) ──"
+new_env cask3
+R=$(mk_root proj); live_session forge-1 "$R"
+askf "$R" forge-1 ask-3 "" "" 300 "which region?"
+stopf "$R" forge-1 30 "moving on"
+assert_status_has "worker asks: which region" "ask stays hot despite a newer Stop"
+
+echo "── archived/answered ask produces nothing ──"
+new_env cask4
+R=$(mk_root proj); live_session forge-1 "$R"
+mkdir -p "$R/.dev/attention/archive"
+askf "$R" forge-1 ask-4 "" "" 60 "should be gone"
+mv "$R/.dev/attention/ask-4.json" "$R/.dev/attention/archive/ask-4.json"
+assert_status_missing "should be gone" "an ask under archive/ is invisible to ingestion"
+
+echo "── NEEDS-ASK enters notify / debounce / ack ──"
+new_env cask5
+R=$(mk_root proj); live_session forge-1 "$R"
+askf "$R" forge-1 ask-5 "" "" 30 "credentials rotated — proceed?"
+run_check >/dev/null
+assert_notified "worker asks" "ask fires a notification on first scan"
+: > "$CAP"; run_check >/dev/null
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "NEEDS-ASK debounced on immediate re-scan" || bad "re-notified within backoff"
+: > "$CAP"; "$WATCH" ack forge-1 >/dev/null; run_check >/dev/null
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "ack silences NEEDS-ASK" || bad "ack did not silence the ask"
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""

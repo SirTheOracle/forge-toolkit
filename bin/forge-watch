@@ -640,6 +640,7 @@ def scan_attention(root, label):
         return
     latest_disp, prompt_ev, stop_ev = {}, {}, {}
     perms = {}
+    asks = []
     for fp in sorted(glob.glob(os.path.join(adir, '*.json'))):
         rec = _load_att(fp)
         if rec is None:
@@ -647,6 +648,9 @@ def scan_attention(root, label):
             continue
         ev = rec.get('event') or ''
         sess = rec.get('session')
+        if ev == 'ask':
+            asks.append(rec)          # session OPTIONAL: an ask stays surfaced
+            continue                  # even when fired outside tmux
         if not sess:
             continue
         if ev == 'dispatch':
@@ -708,6 +712,27 @@ def scan_attention(root, label):
             elif p_at is not None:
                 add_finding('SESSION-WORKING', root, sess,
                             f"{label} · {sess} — working", policy='never', session=sess)
+    # NEEDS-ASK (hot, notifies): a worker's explicit escalation via `forge ask`.
+    # Keyed by ask_id so each ask is a distinct escalation. An ask is NOT
+    # superseded by a later Stop — it stays hot until answered (dispatch --answers
+    # archives it out of this depth-1 glob). A very old ask is abandoned residue
+    # (same ZOMBIE_AGE_S cutoff the permission feed uses). Precedence ask > BLOCKED
+    # is enforced by the WORKER-BLOCKED suppression at the run-scan level below.
+    for rec in asks:
+        aid = rec.get('ask_id')
+        if not aid:
+            continue
+        a = age_s(rec.get('emitted_at'))
+        if a is not None and a > ZOMBIE_AGE_S:
+            continue
+        sess = rec.get('session')
+        slug = rec.get('slug'); stage = rec.get('stage'); worker = rec.get('worker')
+        q = (rec.get('question_snippet') or '').strip()
+        who = sess or label
+        tag = f" ({slug}/{stage})" if slug and stage else ""
+        msg = f"{label} · {who} — worker asks{tag}: {q[:80]}" if q \
+            else f"{label} · {who} — worker asks{tag} (see tab)"
+        add_finding('NEEDS-ASK', root, aid, msg, session=sess, slug=slug, stage=stage)
 
 # ── run the scan ─────────────────────────────────────────────────────────
 for root in discover_roots():
@@ -740,6 +765,17 @@ if zombie_slugs:
     findings = [f for f in findings
                 if not (f['condition'] in ('WORKER-STALLED', 'STALE-PENDING')
                         and (f['root'], f['slug']) in zombie_slugs)]
+
+# Precedence ask > open BLOCKED callback: a stage-mode `forge ask` writes BOTH an
+# ask event (NEEDS-ASK) AND a BLOCKED callback (WORKER-BLOCKED via scan_root) for
+# the same (root,slug,stage). Keep only the richer NEEDS-ASK (it carries the
+# question) so one escalation is not notified twice.
+ask_stage_keys = {(f['root'], f['slug'], f['stage']) for f in findings
+                  if f['condition'] == 'NEEDS-ASK' and f['slug'] and f['stage']}
+if ask_stage_keys:
+    findings = [f for f in findings
+                if not (f['condition'] == 'WORKER-BLOCKED'
+                        and (f['root'], f['slug'], f['stage']) in ask_stage_keys)]
 
 # ── dedup findings by key (context+event may agree) ──────────────────────
 by_key = {}
@@ -821,8 +857,8 @@ if MODE == 'check':
     save_state(state)
 
 # ── output ───────────────────────────────────────────────────────────────
-NOTIFY = ['NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION', 'STAGE-ERROR',
-          'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
+NOTIFY = ['NEEDS-ASK', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
+          'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE']
 order = {c: i for i, c in enumerate(
     NOTIFY + ['SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE',
@@ -830,13 +866,13 @@ order = {c: i for i, c in enumerate(
 findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
 
 if BOARD:
-    HOT = {'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION', 'STAGE-ERROR',
-           'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
+    HOT = {'NEEDS-ASK', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
+           'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
            'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE'}
     ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE'}
     STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
                 'SESSION-DONE': 'done', 'NEEDS-PERMISSION': 'needs-input',
-                'NEEDS-DECISION': 'needs-input'}
+                'NEEDS-DECISION': 'needs-input', 'NEEDS-ASK': 'needs-input'}
     def _cls(c):
         return 'hot' if c in HOT else 'active' if c in ACTIVE else 'maintenance'
     def _row(f):
