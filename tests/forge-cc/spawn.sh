@@ -156,6 +156,9 @@ printf 'forge:\n  control_center:\n    on_spawn: ["echo", "POPULATED"]\n' > "$R/
 TL t11
 out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" --dry-run 2>&1)
 echo "$out" | grep -q 'DRY-RUN on_spawn: echo POPULATED  *forge-' && ok "T11 declared on_spawn parsed + name appended" || bad "T11 parse: $out"
+out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && echo "$out" | grep -q 'SPAWNED'; } \
+  && ok "T11 real path runs declared on_spawn (portable argv read)" || bad "T11 real on_spawn (rc=$rc): $out"
 printf 'forge:\n  control_center:\n    on_spawn: "not-a-list"\n' > "$R/.claude/forge-project.yml"
 out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" 2>&1); rc=$?
 { [ "$rc" -ne 0 ] && echo "$out" | grep -q 'must be a non-empty list'; } && ok "T11 malformed on_spawn dies loud" || bad "T11 malformed (rc=$rc): $out"

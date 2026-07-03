@@ -792,7 +792,10 @@ cmd_spawn() {
         local osf; osf="$(mktemp "${TMPDIR:-/tmp}/forge-onspawn.XXXXXX")"
         _spawn_on_spawn_cmd "$root" > "$osf" || { rm -f "$osf"; die "spawn: on_spawn is malformed (see above)"; }
         local -a on_spawn=()
-        if [ -s "$osf" ]; then mapfile -t on_spawn < "$osf"; fi
+        if [ -s "$osf" ]; then
+            # portable read (mapfile needs bash 4; /bin/bash on macOS is 3.2)
+            while IFS= read -r _tok; do on_spawn+=("$_tok"); done < "$osf"
+        fi
         rm -f "$osf"
         if [ "${#on_spawn[@]}" -eq 0 ]; then on_spawn=("$FORGE_START_BIN" --populate-existing); fi
         if ( cd "$root" && TMUX_SESSION="$name" "${on_spawn[@]}" "$name" ); then :; else
