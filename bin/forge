@@ -13,8 +13,9 @@
 #   forge ask  --slug S --stage T --worker W "<question>"
 #   forge preflight [--root PATH] [--allow-api-billing]
 #   forge register <root> [--force]
-#   forge status [--board]          passthrough to forge-watch
-#   forge board                     alias for `status --board`
+#   forge board [--all]             human board (--all lists maintenance residue)
+#   forge board --json              machine cc-board/1 JSON
+#   forge status [--board]          alias for board (--board = the JSON)
 #   forge gc [--root PATH] [--days N]
 #   forge gc --install | --uninstall    daily launchd backstop (com.forge.gc)
 #
@@ -921,8 +922,10 @@ case "${1:-help}" in
     preflight) shift; cmd_preflight "$@" ;;
     register)  shift; cmd_register "$@" ;;
     spawn)     shift; cmd_spawn "$@" ;;
-    status)    shift; if [ "${1:-}" = "--board" ]; then exec "$FORGE_WATCH_BIN" status --board; else exec "$FORGE_WATCH_BIN" status; fi ;;
-    board)     exec "$FORGE_WATCH_BIN" status --board ;;
+    # Human board by default; --json (or legacy status --board) = cc-board/1
+    # JSON for machines. Raw findings remain at `forge-watch status`.
+    status)    shift; if [ "${1:-}" = "--board" ]; then exec "$FORGE_WATCH_BIN" status --board; else exec "$FORGE_WATCH_BIN" status --pretty "$@"; fi ;;
+    board)     shift; if [ "${1:-}" = "--json" ]; then exec "$FORGE_WATCH_BIN" status --board; else exec "$FORGE_WATCH_BIN" status --pretty "$@"; fi ;;
     gc)        shift; cmd_gc "$@" ;;
     -h|--help|help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown verb '$1' (try: dispatch spawn ask preflight register status board gc)" ;;

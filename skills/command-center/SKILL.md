@@ -18,8 +18,9 @@ memory: every fact comes from a fresh `forge board`.
 ## The board — what needs me now
 
 ```
-forge board          # machine-readable cc-board/1 JSON: hot / active / maintenance
-forge status         # human-readable text
+forge board --json   # machine-readable cc-board/1 JSON: hot / active / maintenance
+forge board          # human board (NEEDS YOU / SESSIONS / hidden maintenance)
+forge board --all    # human board with maintenance residue expanded
 ```
 
 `hot` rows are the only ones that need action now: `NEEDS-ASK` (a worker asked a

@@ -76,7 +76,11 @@ ACK_TARGET = sys.argv[3] if len(sys.argv) > 3 else ''
 # Only `check` may mutate persistent state (event offsets, debounce timestamps).
 # `status` is a pure read; `ack` persists ONLY the acked flags it sets.
 PERSIST    = (MODE == 'check')
+# FORGE_WATCH_BOARD: '1' = machine JSON (cc-board/1, contract unchanged),
+# '2' = pretty human board. FORGE_WATCH_SHOWALL expands maintenance in pretty.
 BOARD      = os.environ.get('FORGE_WATCH_BOARD') == '1'
+PRETTY     = os.environ.get('FORGE_WATCH_BOARD') == '2'
+SHOWALL    = os.environ.get('FORGE_WATCH_SHOWALL') == '1'
 
 HOME       = os.path.expanduser('~')
 CACHE_DIR  = os.environ.get('FORGE_WATCH_CACHE_DIR',  os.path.join(HOME, '.cache', 'forge-watch'))
@@ -897,19 +901,20 @@ order = {c: i for i, c in enumerate(
               'ZOMBIE-STALE-CONTEXT', 'STALE-PENDING', 'LEGACY-CONTEXT'])}
 findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
 
+HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
+       'NEEDS-ASK', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
+       'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
+       'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE'}
+ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE'}
+STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
+            'SESSION-DONE': 'done', 'NEEDS-PERMISSION': 'needs-input',
+            'NEEDS-DECISION': 'needs-input', 'NEEDS-ASK': 'needs-input',
+            'SPAWN-NEEDS-REPAIR': 'needs-input', 'SPAWN-POPULATE-FAILED': 'needs-input',
+            'SPAWN-FIRST-LAUNCH': 'needs-input'}
+def _cls(c):
+    return 'hot' if c in HOT else 'active' if c in ACTIVE else 'maintenance'
+
 if BOARD:
-    HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
-           'NEEDS-ASK', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
-           'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
-           'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE'}
-    ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE'}
-    STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
-                'SESSION-DONE': 'done', 'NEEDS-PERMISSION': 'needs-input',
-                'NEEDS-DECISION': 'needs-input', 'NEEDS-ASK': 'needs-input',
-                'SPAWN-NEEDS-REPAIR': 'needs-input', 'SPAWN-POPULATE-FAILED': 'needs-input',
-                'SPAWN-FIRST-LAUNCH': 'needs-input'}
-    def _cls(c):
-        return 'hot' if c in HOT else 'active' if c in ACTIVE else 'maintenance'
     def _row(f):
         c = f['condition']
         return {'condition': c, 'class': _cls(c), 'session': f.get('session'),
@@ -926,6 +931,116 @@ if BOARD:
              'hot': hot, 'active': active,
              'maintenance': {'collapsed': True, 'count': len(maint), 'rows': maint}}
     print(json.dumps(board, indent=2))
+    sys.exit(0)
+
+if PRETTY:
+    # Human board: NEEDS YOU first, one line per live session, residue hidden.
+    # Pure rendering over the same findings — no new detection, no writes.
+    import shutil
+    width = max(60, min(shutil.get_terminal_size((100, 24)).columns, 120))
+    use_color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+    def paint(code, s):
+        return f"\033[{code}m{s}\033[0m" if use_color else s
+    def flat(s):
+        return ' '.join((s or '').split())
+    def clip(s, w):
+        s = flat(s)
+        return s if len(s) <= w else s[:max(1, w - 1)].rstrip() + '…'
+    def detail_of(f):
+        m = flat(f['msg'])                    # msg is "label · who — <detail>"
+        return m.split(' — ', 1)[1] if ' — ' in m else m
+    hot    = [f for f in findings if _cls(f['condition']) == 'hot']
+    active = [f for f in findings if _cls(f['condition']) == 'active']
+    maint  = [f for f in findings if _cls(f['condition']) == 'maintenance']
+
+    for w in config_warnings:
+        print(paint('33', f"! {w}"))
+    sess_map = {s: p for s, p in SESSIONS.items()
+                if os.path.isdir(os.path.join(p, '.dev'))}
+    stamp = datetime.datetime.now().strftime('%a %H:%M')
+    print(paint('1', 'FORGE BOARD')
+          + paint('2', f"  ·  {stamp}  ·  {len(sess_map)} session(s) live"))
+
+    print()
+    if not hot:
+        print(paint('1;32', 'NEEDS YOU — nothing.')
+              + paint('2', '  All sessions are self-sufficient.'))
+    else:
+        print(paint('1;31', f'NEEDS YOU ({len(hot)})'))
+        for f in hot:
+            who = f.get('session') or root_label(f['root'])
+            tag = f" ({f['slug']}/{f['stage']})" if f.get('slug') and f.get('stage') else ''
+            ack = paint('2', '  [acked]') if conds.get(f['key'], {}).get('acked') else ''
+            print('  ' + paint('1;31', '! ')
+                  + paint('1', f"{who} · {root_label(f['root'])} — {f['condition']}{tag}") + ack)
+            print('    ' + clip(detail_of(f), width - 4))
+            if f['condition'] == 'NEEDS-ASK':
+                aid = f['key'].split('\t')[2]
+                at = f"@{f['session']}" if f.get('session') \
+                    else f"@<session at {root_label(f['root'])}>"
+                print('    ' + paint('36',
+                      f'-> answer with: forge dispatch {at} "<answer>" --answers {aid}'))
+
+    if sess_map:
+        print()
+        print(paint('1', 'SESSIONS'))
+        by_sess = {}
+        for f in findings:
+            if f.get('session'):
+                by_sess.setdefault(f['session'], []).append(f)
+        GLYPH = {'hot': ('! needs you', '1;31'), 'queued': ('~ queued', '33'),
+                 'working': ('~ working', '33'), 'done': ('+ done', '32'),
+                 'idle': ('- idle', '2')}
+        wname = max(len(s) for s in sess_map)
+        wlab = min(max(len(root_label(p)) for p in sess_map.values()), 24)
+        nat = lambda s: [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', s)]
+        for s in sorted(sess_map, key=nat):
+            fs = by_sess.get(s, [])
+            state, det = 'idle', ''
+            hf = [f for f in fs if _cls(f['condition']) == 'hot']
+            if hf:
+                state, det = 'hot', hf[0]['condition']
+            else:
+                for cond, st in (('SESSION-QUEUED', 'queued'), ('SESSION-DONE', 'done'),
+                                 ('SESSION-WORKING', 'working')):
+                    m = [f for f in fs if f['condition'] == cond]
+                    if m:
+                        state = st
+                        det = re.sub(r'^(done|queued-input|working):?\s*', '',
+                                     detail_of(m[0]))
+                        break
+            g, col = GLYPH[state]
+            line = (f"  {s:<{wname}}  {clip(root_label(sess_map[s]), wlab):<{wlab}}  "
+                    + paint(col, f'{g:<12}'))
+            room = width - (wname + wlab + 20)
+            if det and room > 10:
+                line += '  ' + paint('2', clip(det, room))
+            print(line)
+
+    pipes = [f for f in active if f['condition'] == 'PIPELINE-COMPLETE']
+    if pipes:
+        print()
+        print(paint('1', 'PIPELINES'))
+        for f in pipes:
+            print('  ' + paint('32', '+ ') + clip(flat(f['msg']), width - 4))
+
+    if maint:
+        print()
+        counts = {}
+        for f in maint:
+            counts[f['condition']] = counts.get(f['condition'], 0) + 1
+        summary = ', '.join(f"{n} {c}" for c, n in sorted(counts.items()))
+        if SHOWALL:
+            print(paint('1', f'MAINTENANCE ({len(maint)})') + paint('2', f'  {summary}'))
+            for f in maint:
+                print(paint('2', f"  [{f['condition']}] {clip(flat(f['msg']), width - 4)}"))
+        else:
+            print(paint('2', f"MAINTENANCE — {len(maint)} old item(s) hidden ({summary})"
+                             " · `forge board --all` to list"))
+
+    if not findings and not sess_map:
+        print(paint('2', 'all clear — no live forge sessions, nothing pending'
+                         + ('' if SESSIONS else ' (no tmux server)')))
     sys.exit(0)
 
 for w in config_warnings:
@@ -960,9 +1075,17 @@ cmd_check() {
 }
 
 cmd_status() {
-    local board=0
-    [ "${1:-}" = "--board" ] && board=1
-    FORGE_WATCH_BOARD="$board" run_engine status "-" ""
+    # --board = machine JSON (cc-board/1, unchanged contract);
+    # --pretty = human board; --all expands maintenance in pretty mode.
+    local board=0 showall=0 a
+    for a in "$@"; do
+        case "$a" in
+            --board)  board=1 ;;
+            --pretty) board=2 ;;
+            --all)    showall=1 ;;
+        esac
+    done
+    FORGE_WATCH_BOARD="$board" FORGE_WATCH_SHOWALL="$showall" run_engine status "-" ""
 }
 
 cmd_ack() {
@@ -1054,7 +1177,9 @@ forge-watch — blocked-on-you notifications for forge pipelines
 
 Usage:
   forge-watch check       one scan; print findings and deliver notifications
-  forge-watch status      one scan; print findings only (no notifications)
+  forge-watch status      one scan; print raw findings only (no notifications)
+  forge-watch status --pretty [--all]   human board (--all lists maintenance)
+  forge-watch status --board            machine JSON (cc-board/1)
   forge-watch ack <t>     silence current conditions for <t> (session|slug|dir)
   forge-watch install     write+load the launchd agent (30s interval)
   forge-watch uninstall   unload+remove the launchd agent
@@ -1063,7 +1188,7 @@ EOF
 
 case "${1:-status}" in
     check)     cmd_check ;;
-    status)    cmd_status "${2:-}" ;;
+    status)    shift; cmd_status "$@" ;;
     ack)       shift; cmd_ack "${1:-}" ;;
     install)   cmd_install ;;
     uninstall) cmd_uninstall ;;

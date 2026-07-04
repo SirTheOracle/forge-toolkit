@@ -824,6 +824,31 @@ n=$(run_status | grep -c "spawn needs-repair")
 rm -f "$(attn "$R")/spawn-forge-1-needs-repair.json"   # what spawn's clear-on-PASS does
 assert_status_missing "spawn needs-repair" "resolved needs-repair clears from the board"
 
+echo "── pretty board: NEEDS YOU + sessions table + hidden maintenance ──"
+new_env cpretty1
+R=$(mk_root proj); live_session forge-1 "$R"
+R2=$(mk_root proj2); live_session forge-2 "$R2"
+R3=$(mk_root proj3); live_session forge-3 "$R3"          # live, no events → idle
+askf "$R" forge-1 ask-p1 "" "" 60 "prod or staging config?"
+stopf "$R2" forge-2 120 "shipped the widget"             # → done w/ snippet
+pending_log "$R" p-ancient coding codex "$(iso_ago 6000000)"   # STALE-PENDING residue
+run_status --pretty > "$TDIR/pretty.txt" 2>&1
+grep -q "FORGE BOARD" "$TDIR/pretty.txt" && ok "pretty: header renders" || bad "pretty: no header"
+grep -q "NEEDS YOU (1)" "$TDIR/pretty.txt" && ok "pretty: hot section counts the ask" || bad "pretty: hot section wrong: $(cat "$TDIR/pretty.txt")"
+grep -q -- '--answers ask-p1' "$TDIR/pretty.txt" && grep -q "@forge-1" "$TDIR/pretty.txt" \
+  && ok "pretty: ask row carries a paste-ready answer command" || bad "pretty: answer hint missing"
+grep -q "forge-2.*done.*shipped the widget" "$TDIR/pretty.txt" && ok "pretty: done session shows its snippet" || bad "pretty: done snippet missing"
+grep -q "forge-3.*idle" "$TDIR/pretty.txt" && ok "pretty: eventless live session listed as idle" || bad "pretty: idle session missing"
+grep -q "needs you" "$TDIR/pretty.txt" && ok "pretty: asked session flagged in table" || bad "pretty: session flag missing"
+grep -q "1 STALE-PENDING" "$TDIR/pretty.txt" && ! grep -q "\[STALE-PENDING\]" "$TDIR/pretty.txt" \
+  && ok "pretty: maintenance summarized, rows hidden" || bad "pretty: maintenance leak/missing"
+run_status --pretty --all | grep -q "\[STALE-PENDING\]" && ok "pretty --all: maintenance rows listed" || bad "pretty --all: rows missing"
+rm -f "$(attn "$R")/ask-p1.json"
+run_status --pretty | grep -q "NEEDS YOU — nothing" && ok "pretty: empty hot reads all-clear" || bad "pretty: all-clear line missing"
+run_status --board > "$TDIR/pb.json"
+python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); assert b["schema"]=="cc-board/1"' "$TDIR/pb.json" \
+  && ok "pretty mode leaves the JSON contract untouched" || bad "board JSON broke"
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "═══════════════════════════════════════"
