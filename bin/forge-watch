@@ -100,6 +100,7 @@ ALLOWED_KEYS = {
     'FORGE_STALL_THRESHOLD_S', 'FORGE_WATCH_DWELL_S', 'FORGE_WATCH_RENOTIFY_S',
     'FORGE_WATCH_ZOMBIE_AGE_D', 'FORGE_WATCH_NOTIFY_COMPLETE',
     'FORGE_WATCH_NOTIFY_STALE_ZOMBIE', 'FORGE_WATCH_ROOTS_FILE',
+    'FORGE_WATCH_NOTIFY_REPLY', 'FORGE_WATCH_NOTIFY_DONE',
 }
 # Conservative value grammar: allow path-ish chars (incl. space and ~ for real
 # paths) but no shell metacharacters, substitutions, or quotes. Values are only
@@ -161,6 +162,9 @@ BACKOFF_CAP_S   = 4 * 3600
 ZOMBIE_AGE_S    = cfg_int('FORGE_WATCH_ZOMBIE_AGE_D', 7) * 86400
 NOTIFY_COMPLETE = cfg_bool('FORGE_WATCH_NOTIFY_COMPLETE', True)
 NOTIFY_STALE_ZOMBIE = cfg_bool('FORGE_WATCH_NOTIFY_STALE_ZOMBIE', False)
+# Return-path knobs (default OFF; the board row is unconditional — only the bell is opt-in).
+NOTIFY_REPLY    = cfg_bool('FORGE_WATCH_NOTIFY_REPLY', False)
+NOTIFY_DONE     = cfg_bool('FORGE_WATCH_NOTIFY_DONE', False)
 
 # ── time helpers ─────────────────────────────────────────────────────────
 def parse_iso(ts):
@@ -643,6 +647,7 @@ def scan_attention(root, label):
     if not os.path.isdir(adir):
         return
     latest_disp, prompt_ev, stop_ev = {}, {}, {}
+    dispatch_by_id = {}
     perms = {}
     asks = []
     spawn_states = []
@@ -668,6 +673,9 @@ def scan_attention(root, label):
             if cur is None or (age_s(rec.get('dispatched_at')) <
                                (age_s(cur.get('dispatched_at')) or 1e18)):
                 latest_disp[sess] = rec        # newest = smallest age
+            rid = rec.get('dispatch_id')
+            if rid:
+                dispatch_by_id[rid] = rec      # keyed by id for the answered-did gate
         elif ev == 'userpromptsubmit':
             prompt_ev[sess] = rec              # rolling: last-writer-wins
         elif ev == 'stop':
@@ -714,9 +722,32 @@ def scan_attention(root, label):
             p_at = parse_iso(p.get('emitted_at')) if p else None
             if stop_at is not None and (p_at is None or stop_at >= p_at):
                 snip = (s_stop.get('snippet') or '')
-                add_finding('SESSION-DONE', root, sess,
-                            f"{label} · {sess} — done" + (f": {snip}" if snip else ""),
-                            policy='never', session=sess)
+                # NEEDS-REPLY: this done turn is a seat-correlated counter-question.
+                # Gate on the dispatch the stop event RECORDS it answered
+                # (response_dispatch_ids[0]), NOT latest_disp (newest-by-time = the
+                # wrong dispatch mid-turn). Old events w/o the field degrade to
+                # latest_disp, back-filling aid so the ack key is never `sess\tNone`.
+                aid = (s_stop.get('response_dispatch_ids') or [None])[0]
+                dr = dispatch_by_id.get(aid) if aid else None
+                if dr is None:
+                    dr = latest_disp.get(sess)
+                    if aid is None and dr is not None:
+                        aid = dr.get('dispatch_id')
+                dstop = age_s(s_stop.get('emitted_at'))
+                if (s_stop.get('looks_like_question')
+                        and dr is not None and dr.get('sender') == 'seat'
+                        and dstop is not None and dstop <= ZOMBIE_AGE_S):
+                    qs = (s_stop.get('question_snippet') or snip or '').strip()
+                    add_finding('NEEDS-REPLY', root, f"{sess}\t{aid}",
+                                f"{label} · {sess} — awaiting reply: {qs[:100]}" if qs
+                                else f"{label} · {sess} — awaiting reply (worker waiting; see tab)",
+                                policy=('standard' if NOTIFY_REPLY else 'never'),
+                                session=sess)
+                else:
+                    add_finding('SESSION-DONE', root, sess,
+                                f"{label} · {sess} — done" + (f": {snip}" if snip else ""),
+                                policy=('standard' if NOTIFY_DONE else 'never'),
+                                session=sess)
             elif p_at is not None:
                 add_finding('SESSION-WORKING', root, sess,
                             f"{label} · {sess} — working", policy='never', session=sess)
@@ -812,6 +843,16 @@ if ask_stage_keys:
                 if not (f['condition'] == 'WORKER-BLOCKED'
                         and (f['root'], f['slug'], f['stage']) in ask_stage_keys)]
 
+# Precedence NEEDS-ASK > NEEDS-REPLY: a stage-mode `forge ask` ends its turn on a
+# '?' too, so the same session can raise both. Keep only the richer NEEDS-ASK.
+# Keyed (root, session) so same-named sessions in different roots never cross-suppress.
+ask_sessions = {(f['root'], f['session']) for f in findings
+                if f['condition'] == 'NEEDS-ASK' and f.get('session')}
+if ask_sessions:
+    findings = [f for f in findings
+                if not (f['condition'] == 'NEEDS-REPLY'
+                        and (f['root'], f['session']) in ask_sessions)]
+
 # ── dedup findings by key (context+event may agree) ──────────────────────
 by_key = {}
 for f in findings:
@@ -892,7 +933,7 @@ if MODE == 'check':
     save_state(state)
 
 # ── output ───────────────────────────────────────────────────────────────
-NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'NEEDS-ASK',
+NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'NEEDS-ASK', 'NEEDS-REPLY',
           'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
           'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'STATE-UNPARSEABLE']
@@ -902,13 +943,14 @@ order = {c: i for i, c in enumerate(
 findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
 
 HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
-       'NEEDS-ASK', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
+       'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
        'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE'}
 ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE'}
 STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
             'SESSION-DONE': 'done', 'NEEDS-PERMISSION': 'needs-input',
             'NEEDS-DECISION': 'needs-input', 'NEEDS-ASK': 'needs-input',
+            'NEEDS-REPLY': 'needs-input',
             'SPAWN-NEEDS-REPAIR': 'needs-input', 'SPAWN-POPULATE-FAILED': 'needs-input',
             'SPAWN-FIRST-LAUNCH': 'needs-input'}
 def _cls(c):
@@ -980,6 +1022,11 @@ if PRETTY:
                     else f"@<session at {root_label(f['root'])}>"
                 print('    ' + paint('36',
                       f'-> answer with: forge dispatch {at} "<answer>" --answers {aid}'))
+            elif f['condition'] == 'NEEDS-REPLY':
+                at = f"@{f['session']}" if f.get('session') \
+                    else f"@<session at {root_label(f['root'])}>"
+                print('    ' + paint('36',
+                      f'-> reply with: forge dispatch {at} "<your reply>"'))
 
     if sess_map:
         print()

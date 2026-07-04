@@ -604,17 +604,24 @@ if "$WATCH" status >/dev/null 2>&1; then ok "empty session map exits 0 cleanly";
 
 # ── attention helpers (command center) ──
 attn(){ mkdir -p "$1/.dev/attention/payloads"; echo "$1/.dev/attention"; }
-disp(){  # disp <root> <session> <ageSec> <id> [snippet]
+disp(){  # disp <root> <session> <ageSec> <id> [snippet] [sender]
   local a; a="$(attn "$1")"; cat > "$a/dispatch-$4.json" <<JSON
-{"schema":"cc-dispatch/1","event":"dispatch","dispatch_id":"$4","session":"$2","root":"$1","target_pane":1,"mode":"inline","instruction_snippet":"${5:-do the thing}","instruction_sha256":"abc","dispatched_at":"$(iso_ago "$3")","sender":"seat","state":"queued-input","answers_ask_id":null}
+{"schema":"cc-dispatch/1","event":"dispatch","dispatch_id":"$4","session":"$2","root":"$1","target_pane":1,"mode":"inline","instruction_snippet":"${5:-do the thing}","instruction_sha256":"abc","dispatched_at":"$(iso_ago "$3")","sender":"${6:-seat}","state":"queued-input","answers_ask_id":null}
 JSON
 }
 promptf(){ local a; a="$(attn "$1")"; cat > "$a/prompt.$2.json" <<JSON
 {"schema":"cc-attention/1","event":"userpromptsubmit","variant":"dispatch-accept","session":"$2","root":"$1","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago "$3")","dispatch_id":"${4:-null}","prompt_snippet":"x"}
 JSON
 }
-stopf(){ local a; a="$(attn "$1")"; cat > "$a/stop.$2.json" <<JSON
-{"schema":"cc-attention/1","event":"stop","variant":"snippet","session":"$2","root":"$1","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago "$3")","snippet":"${4:-all done}","snippet_source":"last_assistant_message","looks_like_question":false}
+stopf(){ # stopf <root> <session> <ageSec> [snippet] [is_q] [question_snippet] [response_did]
+  local a; a="$(attn "$1")"; local isq="${5:-false}" extra=""
+  if [ -n "${7:-}" ]; then
+    extra=",\"question_snippet\":\"${6:-a question?}\",\"response_paths\":[\".dev/attention/payloads/response.$7.txt\"],\"response_dispatch_ids\":[\"$7\"],\"truncated\":false,\"full_bytes\":120"
+  elif [ -n "${6:-}" ]; then
+    extra=",\"question_snippet\":\"$6\""
+  fi
+  cat > "$a/stop.$2.json" <<JSON
+{"schema":"cc-attention/1","event":"stop","variant":"snippet","session":"$2","root":"$1","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago "$3")","snippet":"${4:-all done}","snippet_source":"last_assistant_message","looks_like_question":$isq$extra}
 JSON
 }
 permf(){ local a; a="$(attn "$1")"; cat > "$a/perm.$2.$3.json" <<JSON
@@ -767,6 +774,103 @@ assert_notified "worker asks" "ask fires a notification on first scan"
 [ "$(wc -l < "$CAP")" -eq 0 ] && ok "NEEDS-ASK debounced on immediate re-scan" || bad "re-notified within backoff"
 : > "$CAP"; "$WATCH" ack forge-1 >/dev/null; run_check >/dev/null
 [ "$(wc -l < "$CAP")" -eq 0 ] && ok "ack silences NEEDS-ASK" || bad "ack did not silence the ask"
+
+echo "── return-path: W1 correlated question → NEEDS-REPLY (no bell) ──"
+new_env wreply1
+R=$(mk_root proj); live_session forge-1 "$R"
+disp  "$R" forge-1 120 cc-a
+stopf "$R" forge-1 30 "head preview" true "so, A or B?" cc-a
+assert_status_has "awaiting reply: so, A or B?" "correlated question → NEEDS-REPLY w/ question_snippet"
+run_status --board > "$TDIR/b.json"
+python3 -c 'import json,sys;b=json.load(open(sys.argv[1]));r=[x for x in b["hot"] if x["condition"]=="NEEDS-REPLY"];assert r and r[0]["state"]=="needs-input"' "$TDIR/b.json" \
+  && ok "W1 NEEDS-REPLY is hot, state=needs-input" || bad "W1 not hot/needs-input"
+pout=$(run_status --pretty)
+echo "$pout" | grep -q 'reply with: forge dispatch @forge-1' && ok "W1 pretty prints paste-ready PLAIN dispatch" || bad "W1 no plain dispatch hint"
+if echo "$pout" | grep -q -- '--answers'; then bad "W1 NEEDS-REPLY hint used --answers"; else ok "W1 hint is plain (never --answers)"; fi
+: > "$CAP"; run_check >/dev/null
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "W1 no bell by default (policy=never)" || bad "W1 rang without opt-in"
+
+echo "── return-path: W2 no seat dispatch → stays SESSION-DONE ──"
+new_env wreply2
+R=$(mk_root proj); live_session forge-1 "$R"
+stopf "$R" forge-1 30 "done" true "trailing question?" cc-x
+assert_status_has "forge-1 — done" "no correlated dispatch → SESSION-DONE"
+assert_status_missing "awaiting reply" "no NEEDS-REPLY without a seat-correlated dispatch"
+
+echo "── return-path: W3 non-question stop → no NEEDS-REPLY ──"
+new_env wreply3
+R=$(mk_root proj); live_session forge-1 "$R"
+disp  "$R" forge-1 120 cc-a
+stopf "$R" forge-1 30 "just done" false "" cc-a
+assert_status_has "forge-1 — done" "non-question stop → SESSION-DONE"
+assert_status_missing "awaiting reply" "no NEEDS-REPLY when looks_like_question is false"
+
+echo "── return-path: W4 superseded NEEDS-REPLY clears ──"
+new_env wreply4
+R=$(mk_root proj); live_session forge-1 "$R"
+disp    "$R" forge-1 120 cc-a
+stopf   "$R" forge-1 60 "q" true "reply now?" cc-a
+promptf "$R" forge-1 20 cc-a          # newer prompt → session working again
+assert_status_has "forge-1 — working" "newer prompt supersedes → SESSION-WORKING"
+assert_status_missing "awaiting reply" "NEEDS-REPLY drops once superseded"
+
+echo "── return-path: W5 NEEDS-REPLY bell opt-in ──"
+new_env wreply5
+R=$(mk_root proj); live_session forge-1 "$R"
+disp  "$R" forge-1 120 cc-a
+stopf "$R" forge-1 30 "q" true "ring me?" cc-a
+: > "$CAP"; FORGE_WATCH_NOTIFY_REPLY=1 "$WATCH" check >/dev/null 2>&1
+assert_notified "awaiting reply" "NEEDS-REPLY rings when FORGE_WATCH_NOTIFY_REPLY=1"
+: > "$CAP"; FORGE_WATCH_NOTIFY_REPLY=1 "$WATCH" check >/dev/null 2>&1
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "W5 debounced on immediate re-scan" || bad "W5 re-notified within backoff"
+: > "$CAP"; "$WATCH" ack forge-1 >/dev/null 2>&1; FORGE_WATCH_NOTIFY_REPLY=1 "$WATCH" check >/dev/null 2>&1
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "W5 ack silences NEEDS-REPLY" || bad "W5 ack did not silence"
+
+echo "── return-path: W6 NEEDS-ASK outranks NEEDS-REPLY ──"
+new_env wreply6
+R=$(mk_root proj); live_session forge-1 "$R"
+askf  "$R" forge-1 ask-1 "" "" 60 "explicit ask?"
+disp  "$R" forge-1 120 cc-a
+stopf "$R" forge-1 30 "q" true "counter question?" cc-a
+run_status --board > "$TDIR/b.json"
+python3 -c 'import json,sys;b=json.load(open(sys.argv[1]));c=sorted(x["condition"] for x in b["hot"]);assert c==["NEEDS-ASK"], c' "$TDIR/b.json" \
+  && ok "W6 exactly one hot row and it is NEEDS-ASK" || bad "W6 precedence wrong"
+
+echo "── return-path: W7 enriched stop events do not disturb lifecycle ──"
+new_env wreply7
+R=$(mk_root proj); live_session forge-1 "$R"
+stopf "$R" forge-1 300 "prev turn"
+disp  "$R" forge-1 120 cc-mid
+stopf "$R" forge-1 30 "absorbed answer" false "" cc-mid
+assert_status_has "forge-1 — done" "W7 enriched closing Stop still resolves absorbed dispatch → done"
+n=$(run_status | grep -c "forge-1 — ")
+[ "$n" -eq 1 ] && ok "W7 exactly one lifecycle row with enriched events" || bad "W7 got $n rows"
+
+echo "── return-path: W8 gate on the answered dispatch's sender ──"
+new_env wreply8
+R=$(mk_root proj); live_session forge-1 "$R"
+disp  "$R" forge-1 200 cc-a "" seat        # older, seat-sent
+disp  "$R" forge-1 60  cc-b "" auto        # newer, non-seat
+stopf "$R" forge-1 30 "q" true "which one?" cc-a     # stop RECORDS it answered cc-a
+assert_status_has "awaiting reply: which one?" "W8 fires on the answered did's seat sender, not the newest disp"
+new_env wreply8b
+R=$(mk_root proj); live_session forge-1 "$R"
+disp  "$R" forge-1 200 cc-a "" auto        # older, non-seat
+disp  "$R" forge-1 60  cc-b "" seat        # newer, seat
+stopf "$R" forge-1 30 "q" true "which one?" cc-a     # answered did is the non-seat cc-a
+assert_status_missing "awaiting reply" "W8 inverse: answered did non-seat → no NEEDS-REPLY"
+assert_status_has "forge-1 — done" "W8 inverse falls back to SESSION-DONE"
+
+echo "── return-path: W9 FORGE_WATCH_NOTIFY_REPLY via watch.env ──"
+new_env wreply9
+R=$(mk_root proj); live_session forge-1 "$R"
+disp  "$R" forge-1 120 cc-a
+stopf "$R" forge-1 30 "q" true "via config?" cc-a
+printf 'FORGE_WATCH_NOTIFY_REPLY=1\nFORGE_WATCH_BOGUS=1\n' > "$FORGE_WATCH_CONFIG_DIR/watch.env"
+: > "$CAP"; out=$(run_check)
+echo "$out" | grep -q "unknown key 'FORGE_WATCH_BOGUS'" && ok "W9 unknown key still warns" || bad "W9 unknown key not warned"
+if echo "$out" | grep -q "unknown key 'FORGE_WATCH_NOTIFY_REPLY'"; then bad "W9 REPLY key wrongly rejected"; else ok "W9 FORGE_WATCH_NOTIFY_REPLY accepted (allowlisted, no warning)"; fi
+notified "awaiting reply" && ok "W9 config-set knob fires the bell" || bad "W9 config knob did not ring"
 
 # ── spawn-state ingestion (Phase C) ──────────────────────────────────────
 spawnf() {  # spawnf <root> <session> <state> <age-s> <detail>
