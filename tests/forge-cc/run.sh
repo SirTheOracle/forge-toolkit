@@ -150,6 +150,8 @@ G="$WORK/gcroot"; mkdir -p "$G/.dev/attention/payloads"
 G2="$WORK/gcroot2"; mkdir -p "$G2/.dev/attention"
 echo '{}' > "$G/.dev/attention/dispatch-old.json";  touch -t 202601010000 "$G/.dev/attention/dispatch-old.json"
 echo 'p' > "$G/.dev/attention/payloads/old.txt";    touch -t 202601010000 "$G/.dev/attention/payloads/old.txt"
+echo 'r' > "$G/.dev/attention/payloads/response.cc-old.txt"; touch -t 202601010000 "$G/.dev/attention/payloads/response.cc-old.txt"  # G-1 aged
+echo 'r' > "$G/.dev/attention/payloads/response.cc-new.txt"  # G-1 fresh
 echo '{}' > "$G/.dev/attention/dispatch-new.json"
 echo '{}' > "$G2/.dev/attention/stop-old.json";     touch -t 202601010000 "$G2/.dev/attention/stop-old.json"
 GRF="$WORK/gc-roots"; printf '# comment header\n%s\n\n' "$G" > "$GRF"        # G registered
@@ -158,6 +160,8 @@ FORGE_WATCH_ROOTS_FILE="$GRF" FORGE_TMUX_LIST="$GTSV" "$FORGE" gc; grc=$?
 [ "$grc" -eq 0 ] && ok "gc sweep exits 0" || bad "gc exited $grc"
 test ! -f "$G/.dev/attention/dispatch-old.json" && ok "registered root: stale event GC'd" || bad "stale event survived in watch-root"
 test ! -f "$G/.dev/attention/payloads/old.txt" && ok "registered root: stale payload GC'd" || bad "stale payload survived"
+test ! -f "$G/.dev/attention/payloads/response.cc-old.txt" && ok "G-1: aged response payload GC'd (no GC code change)" || bad "G-1 aged response survived"
+test -f "$G/.dev/attention/payloads/response.cc-new.txt" && ok "G-1: fresh response payload survives" || bad "G-1 fresh response deleted"
 test -f "$G/.dev/attention/dispatch-new.json" && ok "fresh event kept (TTL respected)" || bad "fresh event deleted"
 test ! -f "$G2/.dev/attention/stop-old.json" && ok "tmux-only root also swept (union)" || bad "tmux-only root missed"
 echo '{}' > "$G/.dev/attention/dispatch-mid.json"; touch -t "$(date -v-3d +%Y%m%d%H%M 2>/dev/null || date -d '3 days ago' +%Y%m%d%H%M)" "$G/.dev/attention/dispatch-mid.json"
@@ -247,5 +251,153 @@ FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 FORGE_BRIDGE_BIN=/bin/true \
 FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 FORGE_BRIDGE_BIN=/bin/true \
   "$FORGE" dispatch @forge-x "x" --answers 'ask-../../etc/passwd' --allow-api-billing >/dev/null 2>&1 \
   && bad "path-traversal ask-id accepted" || ok "path-traversal ask-id rejected"
+
+echo "── return-path: R1 stop persists payload keyed by dispatch_id ──"
+new_root r1
+python3 - "$R" <<'PY'
+import json,os,sys
+adir=os.path.join(sys.argv[1],".dev","attention"); os.makedirs(adir,exist_ok=True)
+json.dump({"schema":"cc-attention/1","event":"userpromptsubmit","session":"forge-x",
+           "dispatch_id":"cc-1","dispatch_ids":["cc-1"]},
+          open(os.path.join(adir,"prompt.forge-x.json"),"w"))
+PY
+python3 -c 'import json;print(json.dumps({"last_assistant_message":"preamble sentence. "*40+"which table, users or orders?"}))' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
+P="$R/.dev/attention/payloads/response.cc-1.txt"
+python3 - "$R" "$P" <<'PY' && ok "R1 payload + stop fields correct" || bad "R1 keying/fields wrong"
+import json,os,stat,sys
+root,p=sys.argv[1],sys.argv[2]
+e=json.load(open(os.path.join(root,".dev","attention","stop.forge-x.json")))
+assert e["response_paths"]==[".dev/attention/payloads/response.cc-1.txt"], e.get("response_paths")
+assert e["response_dispatch_ids"]==["cc-1"], e.get("response_dispatch_ids")
+assert e["looks_like_question"] is True and e["truncated"] is False
+b=open(p).read(); assert len(b)>400 and b.rstrip().endswith("?"), (len(b),b[-20:])
+assert stat.S_IMODE(os.stat(p).st_mode)==0o600, oct(os.stat(p).st_mode)
+PY
+test -f "$P" && ok "R1 payload file exists at the did-keyed path" || bad "R1 no payload file"
+
+echo "── return-path: R2 question_snippet is tail-anchored ──"
+new_root r2
+python3 -c 'import json;print(json.dumps({"last_assistant_message":"This is a long declarative preamble that states many facts. "*10+"So, do you want option A or option B?"}))' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
+python3 - "$R" <<'PY' && ok "R2 question_snippet tail has the ?, head snippet does not" || bad "R2 tail/head wrong"
+import json,os,sys
+e=json.load(open(os.path.join(sys.argv[1],".dev","attention","stop.forge-x.json")))
+qs=e["question_snippet"]; head=e["snippet"]
+assert qs.rstrip().endswith("?") and "option A or option B" in qs, qs
+assert "?" not in head, head          # head is the preamble, no question
+PY
+
+echo "── return-path: R3 payload + snippets redacted ──"
+new_root r3
+python3 -c 'import json;print(json.dumps({"last_assistant_message":"here is a key sk-abcdef1234567890 and a question?"}))' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
+if grep -rq 'sk-abcdef' "$R/.dev/attention/"; then bad "R3 secret leaked in payload/snippet"; else ok "R3 secret redacted everywhere"; fi
+
+echo "── return-path: R4 FORGE_CC_RESPONSE_MAX byte-cut ──"
+new_root r4
+python3 -c 'import json;print(json.dumps({"last_assistant_message":"x"*200}))' \
+  | FORGE_CC_RESPONSE_MAX=64 FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
+python3 - "$R" <<'PY' && ok "R4 truncated=true, full_bytes=200, payload<=64" || bad "R4 cap wrong"
+import json,os,sys
+adir=os.path.join(sys.argv[1],".dev","attention")
+e=json.load(open(os.path.join(adir,"stop.forge-x.json")))
+assert e["truncated"] is True and e["full_bytes"]==200, (e.get("truncated"),e.get("full_bytes"))
+b=open(os.path.join(adir,"payloads","response.forge-x.txt"),"rb").read()
+assert len(b)<=64, len(b)
+PY
+
+echo "── return-path: R5 coalesced dispatch_ids → payload per did ──"
+new_root r5
+python3 - "$R" <<'PY'
+import json,os,sys
+adir=os.path.join(sys.argv[1],".dev","attention"); os.makedirs(adir,exist_ok=True)
+for d in ("cc-a","cc-b"):
+    json.dump({"schema":"cc-dispatch/1","event":"dispatch","dispatch_id":d,"session":"forge-x","sender":"seat"},
+              open(os.path.join(adir,f"dispatch-{d}.json"),"w"))
+PY
+printf '{"prompt":"do both [dispatch_id:cc-a] and [dispatch_id:cc-b]"}' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" userpromptsubmit
+python3 -c 'import json;print(json.dumps({"last_assistant_message":"done both, ok?"}))' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
+python3 - "$R" <<'PY' && ok "R5 both dids captured + both payloads written" || bad "R5 coalescing wrong"
+import json,os,sys
+adir=os.path.join(sys.argv[1],".dev","attention")
+pj=json.load(open(os.path.join(adir,"prompt.forge-x.json")))
+assert pj["dispatch_ids"]==["cc-a","cc-b"], pj.get("dispatch_ids")
+e=json.load(open(os.path.join(adir,"stop.forge-x.json")))
+assert set(e["response_paths"])=={".dev/attention/payloads/response.cc-a.txt",".dev/attention/payloads/response.cc-b.txt"}, e["response_paths"]
+assert os.path.exists(os.path.join(adir,"payloads","response.cc-a.txt"))
+assert os.path.exists(os.path.join(adir,"payloads","response.cc-b.txt"))
+PY
+
+echo "── return-path: R6 no dids → response.<session>.txt fallback ──"
+new_root r6
+python3 -c 'import json;print(json.dumps({"last_assistant_message":"just chatting, no dispatch"}))' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
+python3 - "$R" <<'PY' && ok "R6 fallback payload + stop event still written" || bad "R6 fallback wrong"
+import json,os,sys
+adir=os.path.join(sys.argv[1],".dev","attention")
+e=json.load(open(os.path.join(adir,"stop.forge-x.json")))
+assert e["response_paths"]==[".dev/attention/payloads/response.forge-x.txt"], e["response_paths"]
+assert e["response_dispatch_ids"]==[], e["response_dispatch_ids"]
+assert os.path.exists(os.path.join(adir,"payloads","response.forge-x.txt"))
+PY
+
+echo "── return-path: R7 snippet head-anchored, looks_like_question intact ──"
+new_root r7
+python3 -c 'import json;print(json.dumps({"last_assistant_message":"HEADWORD marker at the very start then lots of filler. "*8+"and finally?"}))' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
+python3 - "$R" <<'PY' && ok "R7 snippet starts at head + still a question" || bad "R7 head anchor wrong"
+import json,os,sys
+e=json.load(open(os.path.join(sys.argv[1],".dev","attention","stop.forge-x.json")))
+assert e["snippet"].startswith("HEADWORD marker at the very start"), e["snippet"][:40]
+assert e["looks_like_question"] is True
+PY
+
+echo "── return-path: R8 unwritable payloads → fail-open, lifecycle intact ──"
+new_root r8
+mkdir -p "$R/.dev/attention/payloads"; chmod 500 "$R/.dev/attention/payloads"
+python3 -c 'import json;print(json.dumps({"last_assistant_message":"answer that cannot be written?"}))' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop; rc=$?
+chmod 700 "$R/.dev/attention/payloads"    # restore for cleanup
+python3 - "$R" "$rc" <<'PY' && ok "R8 exit 0 + stop event written, no response_paths" || bad "R8 fail-open broken"
+import json,os,sys
+assert sys.argv[2]=="0", f"hook exit {sys.argv[2]}"
+e=json.load(open(os.path.join(sys.argv[1],".dev","attention","stop.forge-x.json")))
+assert e["looks_like_question"] is True            # lifecycle fields present
+assert "response_paths" not in e, e.get("response_paths")   # payload block bailed out
+PY
+
+echo "── return-path: R12 fake dispatch-id filtered ──"
+new_root r12
+python3 - "$R" <<'PY'
+import json,os,sys
+adir=os.path.join(sys.argv[1],".dev","attention"); os.makedirs(adir,exist_ok=True)
+json.dump({"schema":"cc-dispatch/1","dispatch_id":"cc-real","session":"forge-x","sender":"seat"},
+          open(os.path.join(adir,"dispatch-cc-real.json"),"w"))
+PY
+printf '{"prompt":"do X [dispatch_id:cc-fake] then really [dispatch_id:cc-real]"}' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" userpromptsubmit
+python3 -c 'import json;print(json.dumps({"last_assistant_message":"done, right?"}))' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
+python3 - "$R" <<'PY' && ok "R12 only cc-real kept; no cc-fake payload" || bad "R12 filter wrong"
+import json,os,sys
+adir=os.path.join(sys.argv[1],".dev","attention")
+pj=json.load(open(os.path.join(adir,"prompt.forge-x.json")))
+assert pj["dispatch_ids"]==["cc-real"] and pj["dispatch_id"]=="cc-real", pj
+assert os.path.exists(os.path.join(adir,"payloads","response.cc-real.txt"))
+assert not os.path.exists(os.path.join(adir,"payloads","response.cc-fake.txt"))
+PY
+
+echo "── return-path: R14 RESPONSE_MAX robustness ──"
+new_root r14
+for v in abc 0 -5; do
+  python3 -c 'import json;print(json.dumps({"last_assistant_message":"robustness check?"}))' \
+    | FORGE_CC_RESPONSE_MAX="$v" FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop; rc=$?
+  { [ "$rc" -eq 0 ] && [ -f "$R/.dev/attention/stop.forge-x.json" ]; } \
+    && ok "R14 RESPONSE_MAX=$v → exit 0 + lifecycle written" || bad "R14 crashed on '$v' (rc=$rc)"
+  rm -f "$R/.dev/attention/stop.forge-x.json"
+done
 
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]

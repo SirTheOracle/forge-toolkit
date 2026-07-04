@@ -72,6 +72,8 @@ def redact(s):
     return KV.sub(r"\1\2«redacted»", s)
 def snip(s, n=280):
     return redact((s or "").strip().replace("\n", " "))[:n]
+def snip_tail(s, n=200):
+    return redact((s or "").strip().replace("\n", " "))[-n:]   # redact BEFORE slicing; keeps the trailing '?'
 
 def envelope(variant, extra):
     d = {'schema': 'cc-attention/1', 'event': event, 'variant': variant,
@@ -115,10 +117,15 @@ def tail_transcript(tp):
 
 if event == 'userpromptsubmit':
     prompt = data.get('prompt', '') or ''
-    m = re.search(r'\[dispatch_id:([A-Za-z0-9._\-]+)\]', prompt)
+    raw = re.findall(r'\[dispatch_id:([A-Za-z0-9._\-]+)\]', prompt)
+    try:    # keep only ids backed by a real dispatch-<id>.json in this root (fail-open)
+        ids = [i for i in raw if os.path.exists(os.path.join(adir, f'dispatch-{i}.json'))]
+    except OSError:
+        ids = list(raw)
     atomic(os.path.join(adir, f'prompt.{session}.json'),
            envelope('dispatch-accept',
-                    {'dispatch_id': (m.group(1) if m else None),
+                    {'dispatch_id': (ids[0] if ids else (raw[0] if raw else None)),
+                     'dispatch_ids': ids,
                      'prompt_snippet': snip(prompt),
                      'prompt_sha256': hashlib.sha256(prompt.encode('utf-8', 'replace')).hexdigest()}))
 elif event == 'stop':
@@ -128,10 +135,52 @@ elif event == 'stop':
     else:
         msg, src = tail_transcript(data.get('transcript_path')), 'transcript_tail'
     body = (msg or '').strip()
+    is_q = body.endswith('?')
+    # response payload(s), keyed by the dispatch_id(s) this turn answers. Fail-open:
+    # a new cross-event read of prompt.<session>.json + payload writes, all wrapped;
+    # any failure -> omit pointers, still write the lifecycle event, exit 0.
+    resp = {}
+    try:
+        try:
+            RMAX = int(os.environ.get('FORGE_CC_RESPONSE_MAX', '65536'))
+        except (TypeError, ValueError):
+            RMAX = 65536
+        if RMAX < 0:
+            RMAX = 0
+        full = redact(body)
+        enc = full.encode('utf-8')
+        truncated = len(enc) > RMAX
+        if truncated:
+            full = enc[:RMAX].decode('utf-8', 'ignore')
+        # recover correlation from the sibling prompt file (same LWW file --wait reads)
+        dids = []
+        try:
+            with open(os.path.join(adir, f'prompt.{session}.json')) as f:
+                pj = json.load(f)
+            dids = pj.get('dispatch_ids') or ([pj['dispatch_id']] if pj.get('dispatch_id') else [])
+        except (OSError, ValueError, KeyError):
+            dids = []
+        pdir = os.path.join(adir, 'payloads'); os.makedirs(pdir, exist_ok=True)
+        targets = [f'response.{d}.txt' for d in dids] or [f'response.{session}.txt']
+        rels = []
+        for name in targets:
+            rel = os.path.join('.dev', 'attention', 'payloads', name)
+            ppath = os.path.join(root, rel); ptmp = f"{ppath}.tmp.{os.getpid()}"
+            with open(ptmp, 'w') as f: f.write(full)
+            os.chmod(ptmp, 0o600); os.replace(ptmp, ppath)
+            rels.append(rel)
+        resp = {'response_paths': rels,
+                'response_dispatch_ids': dids,
+                'truncated': truncated,
+                'full_bytes': len(body.encode('utf-8'))}
+    except Exception:
+        resp = {}
     atomic(os.path.join(adir, f'stop.{session}.json'),
            envelope('snippet',
-                    {'snippet': snip(body[-400:], 400), 'snippet_source': src,
-                     'looks_like_question': body.endswith('?')}))
+                    {'snippet': snip(body, 400), 'snippet_source': src,
+                     'looks_like_question': is_q,
+                     'question_snippet': (snip_tail(body, 200) if is_q else None),
+                     **resp}))
 elif event == 'permissionrequest':
     tn = data.get('tool_name', '') or ''
     ti = data.get('tool_input') or {}
