@@ -80,7 +80,9 @@ repo_identity() {   # repo_identity <root>
 # flock-guarded atomic write mirroring the bridge's infra-lock fcntl.flock
 # pattern, with a re-parse-before-publish guard (precedent: the hook-merge at
 # cmd_register). LOUD (never silent sys.exit(0)) on corrupt YAML / unexpected
-# shape / dup-alias-for-a-different-repo. Missing path RECORDED, not fatal.
+# shape (non-empty files must carry schema cc-registry/1 — foreign YAML dicts
+# are never adopted) / dup-alias-for-a-different-repo. Missing path RECORDED,
+# not fatal.
 registry_write() {   # registry_write <repo_id> <alias> <path>
     FORGE_REG_ID="$1" FORGE_REG_ALIAS="$2" FORGE_REG_PATH="$3" \
     FORGE_REG_FILE="$REGISTRY_FILE" python3 - <<'PY'
@@ -104,8 +106,16 @@ with open(fp + ".lock", "w") as lf:
             except Exception as e:
                 sys.exit(f"forge: REFUSE — registry {fp} is corrupt YAML ({e}); not touched")
             if loaded is not None:
-                if not isinstance(loaded, dict) or not isinstance(loaded.get("repos", {}), dict):
-                    sys.exit(f"forge: REFUSE — registry {fp} has an unexpected shape; not touched")
+                # Adopt an existing non-empty file ONLY if it self-identifies as
+                # ours: an arbitrary valid-YAML dict (a misdirected forge-project.yml,
+                # say) must not be silently repurposed and rewritten as a registry.
+                # A future-schema file is refused too — this writer would downgrade it.
+                if (not isinstance(loaded, dict)
+                        or loaded.get("schema") != "cc-registry/1"
+                        or not isinstance(loaded.get("repos", {}), dict)
+                        or not all(isinstance(v, dict) for v in (loaded.get("repos") or {}).values())):
+                    sys.exit(f"forge: REFUSE — registry {fp} has an unexpected shape "
+                             f"(not a cc-registry/1 map); not touched")
                 data = loaded
         repos = data.setdefault("repos", {}); data["schema"] = "cc-registry/1"
         for k, v in repos.items():

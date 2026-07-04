@@ -49,6 +49,24 @@ out=$(reg "$R" 2>&1); rc=$?
 after=$(md5 -q "$REG" 2>/dev/null || md5sum "$REG" | cut -d' ' -f1)
 { [ "$rc" -ne 0 ] && echo "$out" | grep -qi "corrupt" && [ "$before" = "$after" ]; } \
   && ok "T3 corrupt registry: loud refuse, file untouched" || bad "T3 corrupt handling wrong (rc=$rc): $out"
+
+echo "── registry: foreign YAML dict never adopted (T3b) ──"
+printf 'forge:\n  workers: 2\nname: some-project\n' > "$REG"   # valid YAML dict, not a registry
+before=$(md5 -q "$REG" 2>/dev/null || md5sum "$REG" | cut -d' ' -f1)
+out=$(reg "$R" 2>&1); rc=$?
+after=$(md5 -q "$REG" 2>/dev/null || md5sum "$REG" | cut -d' ' -f1)
+{ [ "$rc" -ne 0 ] && echo "$out" | grep -qi "unexpected shape" && [ "$before" = "$after" ]; } \
+  && ok "T3b foreign dict (no cc-registry/1 schema): loud refuse, file untouched" \
+  || bad "T3b foreign dict adopted (rc=$rc): $out"
+
+echo "── registry: non-dict repos entry refused (T3c) ──"
+printf 'schema: cc-registry/1\nrepos:\n  /some/repo/.git: "not a map"\n' > "$REG"
+before=$(md5 -q "$REG" 2>/dev/null || md5sum "$REG" | cut -d' ' -f1)
+out=$(reg "$R" 2>&1); rc=$?
+after=$(md5 -q "$REG" 2>/dev/null || md5sum "$REG" | cut -d' ' -f1)
+{ [ "$rc" -ne 0 ] && echo "$out" | grep -qi "unexpected shape" && [ "$before" = "$after" ]; } \
+  && ok "T3c non-dict repos entry: loud refuse, file untouched" \
+  || bad "T3c non-dict entry silently rewritten (rc=$rc): $out"
 cp "$WORK/reg.bak" "$REG"
 
 echo "── registry: concurrent writes flock-serialized (T4) ──"
