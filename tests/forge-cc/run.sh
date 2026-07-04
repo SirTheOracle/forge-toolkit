@@ -369,6 +369,67 @@ assert e["looks_like_question"] is True            # lifecycle fields present
 assert "response_paths" not in e, e.get("response_paths")   # payload block bailed out
 PY
 
+echo "── return-path: R9 forge reply reads persisted payloads ──"
+new_root r9
+a="$R/.dev/attention"; mkdir -p "$a/payloads"
+printf 'the full worker answer, ending in a question?' > "$a/payloads/response.cc-1.txt"
+python3 - "$a" <<'PY'
+import json,os,sys
+json.dump({"schema":"cc-attention/1","event":"stop","session":"forge-x","emitted_at":"2026-07-04T00:00:00Z",
+           "snippet":"HEAD preview","looks_like_question":True,"response_paths":[".dev/attention/payloads/response.cc-1.txt"],
+           "response_dispatch_ids":["cc-1"],"truncated":False,"full_bytes":45},
+          open(os.path.join(sys.argv[1],"stop.forge-x.json"),"w"))
+PY
+FORGE_TMUX_LIST="$TSV" "$FORGE" reply @forge-x       | grep -q 'ending in a question?' && ok "R9 bare @session prints latest payload" || bad "R9 bare reply wrong"
+FORGE_TMUX_LIST="$TSV" "$FORGE" reply @forge-x cc-1   | grep -q 'ending in a question?' && ok "R9 @session <did> reads did-keyed file" || bad "R9 did reply wrong"
+FORGE_TMUX_LIST="$TSV" "$FORGE" reply @forge-x        | grep -q 'ends in a question' && ok "R9 header flags the question" || bad "R9 header missing question flag"
+FORGE_TMUX_LIST="$TSV" "$FORGE" reply @forge-x --snippet | grep -q 'HEAD preview' && ok "R9 --snippet prints the head" || bad "R9 snippet wrong"
+FORGE_TMUX_LIST="$TSV" "$FORGE" reply @forge-x --json | python3 -c 'import json,sys;j=json.load(sys.stdin);assert j["response_dispatch_ids"]==["cc-1"]' && ok "R9 --json emits the stop event" || bad "R9 json wrong"
+FORGE_TMUX_LIST="$TSV" "$FORGE" reply @forge-x cc-nope >/dev/null 2>&1; [ $? -eq 3 ] && ok "R9 unknown did → exit 3" || bad "R9 unknown did not exit 3"
+python3 - "$a" <<'PY'
+import json,os,sys
+e=json.load(open(os.path.join(sys.argv[1],"stop.forge-x.json"))); e["truncated"]=True; e["full_bytes"]=9999
+json.dump(e,open(os.path.join(sys.argv[1],"stop.forge-x.json"),"w"))
+PY
+FORGE_TMUX_LIST="$TSV" "$FORGE" reply @forge-x | grep -q 'truncated; .* of 9999 bytes' && ok "R9 truncated event → note appended" || bad "R9 truncated note missing"
+
+echo "── return-path: R10 dispatch --wait timeout ──"
+new_root r10
+BL="$WORK/bl-r10"; : > "$BL"
+out=$(FORGE_TMUX_LIST="$TSV" FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BL" TMUX_SESSION=forge-x \
+      FORGE_DISPATCH_WAIT_TIMEOUT=1 FORGE_DISPATCH_WAIT_POLL_S=1 \
+      "$FORGE" dispatch @forge-x "an open question?" --allow-api-billing --sender seat --wait 2>&1); rc=$?
+[ "$rc" -eq 124 ] && ok "R10 --wait timeout → exit 124" || bad "R10 exit=$rc"
+echo "$out" | grep -q 'forge reply @forge-x' && ok "R10 timeout prints the reply hint" || bad "R10 no reply hint"
+echo "$out" | grep -qi 'absorbed' && ok "R10 timeout hint names absorption" || bad "R10 no absorption note"
+[ -s "$BL" ] && ok "R10 dispatch was injected before waiting (bridge logged)" || bad "R10 not injected"
+ls "$R"/.dev/attention/dispatch-*.json >/dev/null 2>&1 && ok "R10 dispatch event written (not lost on timeout)" || bad "R10 event lost"
+# --timeout as a CLI arg (not the env default) also reaches the poll deadline → exit 124.
+out2=$(FORGE_TMUX_LIST="$TSV" FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BL" TMUX_SESSION=forge-x \
+       FORGE_DISPATCH_WAIT_POLL_S=1 \
+       "$FORGE" dispatch @forge-x "q?" --allow-api-billing --sender seat --wait --timeout 1 2>&1); rc2=$?
+[ "$rc2" -eq 124 ] && ok "R10 --timeout CLI arg honored (exit 124)" || bad "R10 --timeout arg not honored (rc=$rc2)"
+
+echo "── return-path: R11 dispatch --wait success ──"
+new_root r11
+BL="$WORK/bl-r11"; : > "$BL"
+( for i in $(seq 1 60); do
+    ev=$(ls "$R"/.dev/attention/dispatch-*.json 2>/dev/null | head -1)
+    if [ -n "$ev" ]; then
+      did=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["dispatch_id"])' "$ev")
+      mkdir -p "$R/.dev/attention/payloads"
+      printf 'the deterministic worker reply' > "$R/.dev/attention/payloads/response.$did.txt"
+      exit 0
+    fi
+    sleep 0.1
+  done ) &
+out=$(FORGE_TMUX_LIST="$TSV" FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BL" TMUX_SESSION=forge-x \
+      FORGE_DISPATCH_WAIT_TIMEOUT=10 FORGE_DISPATCH_WAIT_POLL_S=1 \
+      "$FORGE" dispatch @forge-x "status?" --allow-api-billing --sender seat --wait 2>&1); rc=$?
+wait
+[ "$rc" -eq 0 ] && ok "R11 --wait success → exit 0" || bad "R11 exit=$rc"
+echo "$out" | grep -q 'the deterministic worker reply' && ok "R11 --wait prints the response" || bad "R11 response not printed"
+
 echo "── return-path: R12 fake dispatch-id filtered ──"
 new_root r12
 python3 - "$R" <<'PY'
@@ -390,6 +451,14 @@ assert os.path.exists(os.path.join(adir,"payloads","response.cc-real.txt"))
 assert not os.path.exists(os.path.join(adir,"payloads","response.cc-fake.txt"))
 PY
 
+echo "── return-path: R13 reply id-guard exit 2 ──"
+new_root r13
+mkdir -p "$R/.dev/attention/payloads"
+python3 -c 'import json,os,sys;json.dump({"event":"stop","session":"forge-x","response_paths":[]},open(os.path.join(sys.argv[1],".dev","attention","stop.forge-x.json"),"w"))' "$R"
+FORGE_TMUX_LIST="$TSV" "$FORGE" reply @forge-x '../../etc/passwd' >/dev/null 2>&1; [ $? -eq 2 ] && ok "R13 traversal id → exit 2" || bad "R13 traversal not rejected"
+out=$(FORGE_TMUX_LIST="$TSV" "$FORGE" reply @forge-x 'a/b' 2>&1); rc=$?
+{ [ "$rc" -eq 2 ] && echo "$out" | grep -qi 'not a valid dispatch-id'; } && ok "R13 slash id → exit 2 + message" || bad "R13 slash not rejected"
+
 echo "── return-path: R14 RESPONSE_MAX robustness ──"
 new_root r14
 for v in abc 0 -5; do
@@ -399,5 +468,19 @@ for v in abc 0 -5; do
     && ok "R14 RESPONSE_MAX=$v → exit 0 + lifecycle written" || bad "R14 crashed on '$v' (rc=$rc)"
   rm -f "$R/.dev/attention/stop.forge-x.json"
 done
+
+echo "── return-path: R15 --wait composes with --answers ──"
+new_root r15
+mkdir -p "$R/.dev/proposals/p-x"
+printf 'entries:\n  - timestamp: "2026-07-03T00:00:00Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$R/.dev/proposals/p-x/forge-log.yml"
+BL="$WORK/bl-r15"; : > "$BL"
+AID=$(FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BL" TMUX_SESSION=forge-x \
+  "$FORGE" ask --slug p-x --stage coding --worker codex-a "which env?" --root "$R" 2>/dev/null | awk '/^ASKED/{print $2}')
+: > "$BL"
+FORGE_TMUX_LIST="$TSV" FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BL" TMUX_SESSION=forge-x \
+  FORGE_DISPATCH_WAIT_TIMEOUT=1 FORGE_DISPATCH_WAIT_POLL_S=1 \
+  "$FORGE" dispatch @forge-x "prod" --answers "$AID" --allow-api-billing --sender seat --wait >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 124 ] && ok "R15 --wait --answers → answer injects, then wait times out (124)" || bad "R15 compose exit=$rc"
+test -f "$R/.dev/attention/archive/$AID.json" && ok "R15 --answers consumed the ask (archived) despite --wait" || bad "R15 ask not archived under --wait"
 
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]

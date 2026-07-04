@@ -6,7 +6,8 @@
 #
 # Verbs (Phase A):
 #   forge dispatch @<session> "<instruction>" [--sender S] [--pointer]
-#                  [--allow-api-billing] [--dry-run] [--answers <ask-id>]
+#                  [--allow-api-billing] [--dry-run] [--answers <ask-id>] [--wait [--timeout N]]
+#   forge reply @<session> [<dispatch-id>] [--json|--snippet]   print a worker's answer
 #   forge spawn [name] [--root PATH] [--allow-api-billing] [--no-populate] [--force]
 #                  ensure-semantics 5-pane session (single-root invariant)
 #   forge ask  --session-scope "<question>"                 (called BY workers)
@@ -288,6 +289,7 @@ _dispatch_fail() {
 # ── dispatch (mini-spec 1) ───────────────────────────────────────────────
 cmd_dispatch() {
     local session="" instr="" sender="" force_pointer=false allow=0 dry=false answers=""
+    local wait=false timeout="${FORGE_DISPATCH_WAIT_TIMEOUT:-180}"
     [ "${FORGE_DISPATCH_DRY_RUN:-0}" = "1" ] && dry=true
     while [ $# -gt 0 ]; do case "$1" in
         @*) session="${1#@}"; shift ;;
@@ -296,6 +298,8 @@ cmd_dispatch() {
         --allow-api-billing) allow=1; shift ;;
         --dry-run) dry=true; shift ;;
         --answers) answers="$2"; shift 2 ;;
+        --wait) wait=true; shift ;;
+        --timeout) timeout="$2"; shift 2 ;;
         --*) die "unknown flag $1" ;;
         *) if [ -z "$instr" ]; then instr="$1"; else instr="$instr $1"; fi; shift ;;
     esac; done
@@ -406,10 +410,12 @@ else:
 etmp = os.path.join(adir, f".{did}.json.tmp"); epath = os.path.join(adir, f"dispatch-{did}.json")
 with open(etmp, "w") as f: json.dump(rec, f, indent=2)
 os.chmod(etmp, 0o600); os.replace(etmp, epath)
-with open(outf, "w") as f: f.write(oneliner)
+with open(outf, "w") as f: f.write(oneliner + "\n" + did + "\n")
 sys.stderr.write(f"dispatch_id={did} mode={'pointer' if pointer else 'inline'}\n")
 PY
-    local oneliner; oneliner="$(cat "$outf")"; rm -f "$outf"
+    local oneliner="" did=""
+    { IFS= read -r oneliner; IFS= read -r did || true; } < "$outf"
+    rm -f "$outf"
 
     gc_root "$root"
 
@@ -424,6 +430,22 @@ PY
         fi
         printf 'DISPATCHED @%s pane=1 sender=%s%s\n' "$session" "$sender" \
             "$([ -n "$answers" ] && printf ' answers=%s' "$answers")"
+        # --wait (opt-in): block until THIS dispatch's answer lands, then print it.
+        # The dispatch is recorded + injected ABOVE, so a timeout never loses it.
+        if [ "$wait" = true ]; then
+            local rpath="$root/.dev/attention/payloads/response.$did.txt"
+            local poll="${FORGE_DISPATCH_WAIT_POLL_S:-2}" nows deadline
+            deadline=$(( $(date +%s) + timeout ))
+            while :; do
+                if [ -f "$rpath" ]; then cat "$rpath"; exit 0; fi
+                nows=$(date +%s)
+                if [ "$nows" -ge "$deadline" ]; then break; fi
+                sleep "$poll"
+            done
+            printf 'still working; your dispatch may have been absorbed into a running turn — its answer is usually in `forge reply @%s`. Retrieve this specific one later: forge reply @%s %s\n' \
+                "$session" "$session" "$did" >&2
+            exit 124
+        fi
     fi
 }
 
@@ -916,8 +938,89 @@ gc_launchd_uninstall() {
     echo "Unloaded and removed launchd agent $GC_LABEL."
 }
 
+# ── reply (return path) — print a worker's answer to a seat dispatch ──────
+# Reads the persisted payload keyed by dispatch_id (or the session's latest via
+# the stop event's response_paths[0]). Never scrapes panes. Exit codes: 2 = the
+# dispatch-id argument failed the charset guard; 3 = no response payload yet.
+cmd_reply() {
+    local session="" did="" mode="text"
+    while [ $# -gt 0 ]; do case "$1" in
+        @*) session="${1#@}"; shift ;;
+        --json) mode="json"; shift ;;
+        --snippet) mode="snippet"; shift ;;
+        --*) die "reply: unknown flag $1" ;;
+        *) if [ -z "$did" ]; then did="$1"; else die "reply: unexpected extra arg '$1'"; fi; shift ;;
+    esac; done
+    [ -n "$session" ] || die "reply requires @<session>"
+    local root
+    root="$(session_root "$session")" || die "no live session '$session' (session_path unresolvable)"
+    root="$(cd "$root" 2>/dev/null && pwd -P)" || die "session '$session' root does not exist"
+    FORGE_REPLY_DID="$did" FORGE_REPLY_MODE="$mode" python3 - "$root" "$session" <<'PY'
+import os, sys, json, re
+root, session = sys.argv[1], sys.argv[2]
+did  = os.environ.get("FORGE_REPLY_DID", "")
+mode = os.environ.get("FORGE_REPLY_MODE", "text")
+adir = os.path.join(root, ".dev", "attention")
+def fail(code, msg):
+    sys.stderr.write("forge: reply: %s\n" % msg); sys.exit(code)
+# Validate the id FIRST — before any path is built (mirrors the ask-id guard).
+if did and not re.fullmatch(r"[A-Za-z0-9._-]+", did):
+    fail(2, "'%s' is not a valid dispatch-id (charset [A-Za-z0-9._-])" % did)
+stop = None
+try:
+    with open(os.path.join(adir, "stop.%s.json" % session)) as f:
+        stop = json.load(f)
+    if not isinstance(stop, dict):
+        stop = None
+except (OSError, ValueError):
+    stop = None
+if mode == "json":
+    if stop is None:
+        fail(3, "no stop event recorded for @%s yet" % session)
+    print(json.dumps(stop, indent=2)); sys.exit(0)
+if mode == "snippet":
+    if stop is None:
+        fail(3, "no stop event recorded for @%s yet" % session)
+    print(stop.get("snippet") or ""); sys.exit(0)
+# text mode: resolve the payload path
+if did:
+    rel = os.path.join(".dev", "attention", "payloads", "response.%s.txt" % did)
+else:
+    paths = (stop or {}).get("response_paths") or []
+    if not paths:
+        fail(3, "no response recorded for @%s (no stop event / no payload pointer yet)" % session)
+    rel = paths[0]
+try:
+    with open(os.path.join(root, rel)) as f:
+        payload = f.read()
+except OSError:
+    if did:
+        fail(3, "no response yet for %s (retrieve later once the worker answers)" % did)
+    fail(3, "response payload missing for @%s" % session)
+# one-line header from the recorded facts, then the payload (already redacted).
+if stop is not None:
+    dids = stop.get("response_dispatch_ids") or []
+    hdr = "%s · %s" % (session, stop.get("emitted_at") or "?")
+    if dids:
+        hdr += " · " + ",".join(dids)
+    if stop.get("looks_like_question"):
+        hdr += " · [ends in a question]"
+    print(hdr)
+sys.stdout.write(payload)
+if not payload.endswith("\n"):
+    sys.stdout.write("\n")
+# truncated note APPENDED after the body (plan wording: "append"), so the payload stays
+# contiguous under the header for a clean relay.
+if stop is not None and stop.get("truncated"):
+    print("(truncated; %d of %s bytes — full text in the session tab)"
+          % (len(payload.encode("utf-8")), stop.get("full_bytes")))
+sys.exit(0)
+PY
+}
+
 case "${1:-help}" in
     dispatch)  shift; cmd_dispatch "$@" ;;
+    reply)     shift; cmd_reply "$@" ;;
     ask)       shift; cmd_ask "$@" ;;
     preflight) shift; cmd_preflight "$@" ;;
     register)  shift; cmd_register "$@" ;;
@@ -927,6 +1030,6 @@ case "${1:-help}" in
     status)    shift; if [ "${1:-}" = "--board" ]; then exec "$FORGE_WATCH_BIN" status --board; else exec "$FORGE_WATCH_BIN" status --pretty "$@"; fi ;;
     board)     shift; if [ "${1:-}" = "--json" ]; then exec "$FORGE_WATCH_BIN" status --board; else exec "$FORGE_WATCH_BIN" status --pretty "$@"; fi ;;
     gc)        shift; cmd_gc "$@" ;;
-    -h|--help|help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown verb '$1' (try: dispatch spawn ask preflight register status board gc)" ;;
+    -h|--help|help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register status board gc)" ;;
 esac
