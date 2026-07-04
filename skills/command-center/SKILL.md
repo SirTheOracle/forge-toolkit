@@ -41,6 +41,26 @@ instruction injects into the session's **pane 1** (the orchestrator). A dispatch
 to a busy session queues natively — expected. Billing preflight gates every
 dispatch.
 
+## Getting the answer back — the return path
+
+The worker's response is persisted to a file; you never scrape panes to read it.
+
+- **Blocking Q&A:** `forge dispatch @<session> "<instruction>" --wait` blocks and prints
+  the worker's full answer inline (opt-in; a plain `forge dispatch` still returns
+  immediately). Use it whenever you want the answer, and **relay** the printed response. If
+  the answer ends in a question, that question is in the printed text — answer it with the
+  next `forge dispatch @<session> "<answer>" --wait`.
+- **After a fire-and-forget dispatch:** `forge reply @<session>` prints the latest answer;
+  `forge reply @<session> <dispatch-id>` prints a specific earlier dispatch's answer;
+  `--json` for a structured relay, `--snippet` for the head preview.
+- **If `--wait` times out:** a mid-turn dispatch is usually *absorbed* into the worker's
+  running turn, so its own `--wait` times out even though the work was done — the answer is
+  then available via `forge reply @<session>`.
+- A **`NEEDS-REPLY`** board row = the worker's answer ended in a question and it is waiting.
+  Reply with a **plain** `forge dispatch @<session> "<reply>"` — **not** `--answers`.
+  Contrast `NEEDS-ASK` (an explicit `forge ask`, answered with `--answers`, which owns the
+  ask/callback lifecycle). NEEDS-REPLY never touches `--answers`.
+
 ## Answering a worker's ask — the escalation return path
 
 A `NEEDS-ASK` row means a worker called `forge ask`. The row carries the
