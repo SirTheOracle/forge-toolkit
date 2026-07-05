@@ -1061,6 +1061,17 @@ disp "$R" forge-1 120 cc-1; disp "$R2" forge-2 120 cc-2
 run_status --tasks @forge-1 | grep -q "cc-2" && bad "@session filter not applied (cc-2 leaked)" || ok "--tasks @forge-1 filters to that session (cc-2 absent)"
 run_status --tasks --json | python3 -c 'import json,sys;a=json.load(sys.stdin);assert isinstance(a,list) and any(t["task_id"]=="cc-1" for t in a)' && ok "--tasks --json emits the task array" || bad "--tasks --json not a JSON array"
 
+echo "── TASK-STUCK: unterminated dispatch past the stall window → hot ──"              # +3
+new_env tstuck
+R=$(mk_root proj); live_session forge-1 "$R"
+export FORGE_WATCH_TASK_STUCK_S=60
+disp "$R" forge-1 3600 cc-stuck
+assert_status_has "TASK-STUCK" "unanswered dispatch older than TASK_STUCK → TASK-STUCK"
+run_status --board | python3 -c 'import json,sys;r=[x for x in json.load(sys.stdin)["hot"] if x["condition"]=="TASK-STUCK"];assert r and r[0]["state"]=="needs-input"' && ok "TASK-STUCK is hot/needs-input" || bad "TASK-STUCK not hot"
+printf 'a' > "$(attn "$R")/payloads/response.cc-stuck.txt"
+assert_status_missing "TASK-STUCK" "an answered task is not stuck"
+unset FORGE_WATCH_TASK_STUCK_S
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "═══════════════════════════════════════"

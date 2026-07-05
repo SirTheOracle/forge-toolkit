@@ -210,28 +210,42 @@ reg "$W" >/dev/null 2>&1 && bad "accepted non-object .hooks" || ok "refuses non-
 w1=$(md5 -q "$W/.claude/settings.json" 2>/dev/null || md5sum "$W/.claude/settings.json")
 [ "$w0" = "$w1" ] && ok "non-object file bytes unchanged (no clobber)" || bad "clobbered non-object file"
 
-echo "── gc: watch-roots ∪ tmux sweep, TTL, exit 0 (hermetic) ──"
+echo "── gc: task-aware sweep (unterminated EXEMPT), TTL, exit 0 (hermetic) ──"
 G="$WORK/gcroot"; mkdir -p "$G/.dev/attention/payloads"
 G2="$WORK/gcroot2"; mkdir -p "$G2/.dev/attention"
-echo '{}' > "$G/.dev/attention/dispatch-old.json";  touch -t 202601010000 "$G/.dev/attention/dispatch-old.json"
-echo 'p' > "$G/.dev/attention/payloads/old.txt";    touch -t 202601010000 "$G/.dev/attention/payloads/old.txt"
-echo 'r' > "$G/.dev/attention/payloads/response.cc-old.txt"; touch -t 202601010000 "$G/.dev/attention/payloads/response.cc-old.txt"  # G-1 aged
-echo 'r' > "$G/.dev/attention/payloads/response.cc-new.txt"  # G-1 fresh
-echo '{}' > "$G/.dev/attention/dispatch-new.json"
-echo '{}' > "$G2/.dev/attention/stop-old.json";     touch -t 202601010000 "$G2/.dev/attention/stop-old.json"
-GRF="$WORK/gc-roots"; printf '# comment header\n%s\n\n' "$G" > "$GRF"        # G registered
-GTSV="$WORK/gc.tsv"; printf 'gc-sess\t%s\n' "$G2" > "$GTSV"                  # G2 live-session only
+OLD=202601010000
+D3="$(date -v-3d +%Y%m%d%H%M 2>/dev/null || date -d '3 days ago' +%Y%m%d%H%M)"
+echo '{}' > "$G/.dev/attention/dispatch-old.json";  touch -t $OLD "$G/.dev/attention/dispatch-old.json"   # unterminated
+echo '{}' > "$G/.dev/attention/dispatch-term.json"; touch -t $OLD "$G/.dev/attention/dispatch-term.json"  # terminated
+echo 'r' > "$G/.dev/attention/payloads/response.term.txt"; touch -t $OLD "$G/.dev/attention/payloads/response.term.txt"
+echo 'p' > "$G/.dev/attention/payloads/misc.txt";   touch -t $OLD "$G/.dev/attention/payloads/misc.txt"
+echo 'r' > "$G/.dev/attention/payloads/response.cc-old.txt"; touch -t $OLD "$G/.dev/attention/payloads/response.cc-old.txt"
+echo 'r' > "$G/.dev/attention/payloads/response.cc-new.txt"  # fresh
+echo '{}' > "$G/.dev/attention/dispatch-new.json"           # fresh
+printf '{"task_id":"ptask-t"}' > "$G/.dev/attention/wprompt.forge-x.p0.json"; touch -t $OLD "$G/.dev/attention/wprompt.forge-x.p0.json"
+echo '{}' > "$G/.dev/attention/wstop.forge-x.p0.ptask-t.json"; touch -t $OLD "$G/.dev/attention/wstop.forge-x.p0.ptask-t.json"
+printf '{"task_id":"ptask-open"}' > "$G/.dev/attention/wprompt.forge-x.p2.json"; touch -t $OLD "$G/.dev/attention/wprompt.forge-x.p2.json"
+echo '{}' > "$G2/.dev/attention/stop-old.json";     touch -t $OLD "$G2/.dev/attention/stop-old.json"
+GRF="$WORK/gc-roots"; printf '# comment header\n%s\n\n' "$G" > "$GRF"
+GTSV="$WORK/gc.tsv"; printf 'gc-sess\t%s\n' "$G2" > "$GTSV"
 FORGE_WATCH_ROOTS_FILE="$GRF" FORGE_TMUX_LIST="$GTSV" "$FORGE" gc; grc=$?
 [ "$grc" -eq 0 ] && ok "gc sweep exits 0" || bad "gc exited $grc"
-test ! -f "$G/.dev/attention/dispatch-old.json" && ok "registered root: stale event GC'd" || bad "stale event survived in watch-root"
-test ! -f "$G/.dev/attention/payloads/old.txt" && ok "registered root: stale payload GC'd" || bad "stale payload survived"
-test ! -f "$G/.dev/attention/payloads/response.cc-old.txt" && ok "G-1: aged response payload GC'd (no GC code change)" || bad "G-1 aged response survived"
-test -f "$G/.dev/attention/payloads/response.cc-new.txt" && ok "G-1: fresh response payload survives" || bad "G-1 fresh response deleted"
+test -f "$G/.dev/attention/dispatch-old.json" && ok "UNTERMINATED aged dispatch RETAINED (stuck task never vanishes)" || bad "unterminated dispatch deleted"
+test ! -f "$G/.dev/attention/dispatch-term.json" && ok "terminated aged dispatch GC'd" || bad "terminated dispatch survived"
+test ! -f "$G/.dev/attention/payloads/response.term.txt" && ok "terminated response payload GC'd" || bad "term response survived"
+test ! -f "$G/.dev/attention/payloads/misc.txt" && ok "stale generic payload GC'd" || bad "stale payload survived"
+test ! -f "$G/.dev/attention/payloads/response.cc-old.txt" && ok "aged bare response payload GC'd" || bad "aged response survived"
+test -f "$G/.dev/attention/payloads/response.cc-new.txt" && ok "fresh response payload survives" || bad "fresh response deleted"
 test -f "$G/.dev/attention/dispatch-new.json" && ok "fresh event kept (TTL respected)" || bad "fresh event deleted"
+test ! -f "$G/.dev/attention/wstop.forge-x.p0.ptask-t.json" && ok "terminated worker turn (wprompt+wstop) GC'd" || bad "terminated worker turn survived"
+test -f "$G/.dev/attention/wprompt.forge-x.p2.json" && ok "UNTERMINATED worker prompt (no wstop) RETAINED" || bad "unterminated wprompt deleted"
 test ! -f "$G2/.dev/attention/stop-old.json" && ok "tmux-only root also swept (union)" || bad "tmux-only root missed"
-echo '{}' > "$G/.dev/attention/dispatch-mid.json"; touch -t "$(date -v-3d +%Y%m%d%H%M 2>/dev/null || date -d '3 days ago' +%Y%m%d%H%M)" "$G/.dev/attention/dispatch-mid.json"
+echo '{}' > "$G/.dev/attention/dispatch-mid.json";  touch -t "$D3" "$G/.dev/attention/dispatch-mid.json"
+echo 'r' > "$G/.dev/attention/payloads/response.mid.txt"; touch -t "$D3" "$G/.dev/attention/payloads/response.mid.txt"
+echo '{}' > "$G/.dev/attention/dispatch-stuck.json"; touch -t "$D3" "$G/.dev/attention/dispatch-stuck.json"
 FORGE_WATCH_ROOTS_FILE="$GRF" FORGE_TMUX_LIST="$GTSV" "$FORGE" gc --days 1
-test ! -f "$G/.dev/attention/dispatch-mid.json" && ok "--days overrides TTL" || bad "--days ignored"
+test ! -f "$G/.dev/attention/dispatch-mid.json" && ok "--days overrides TTL for a TERMINATED dispatch" || bad "--days ignored"
+test -f "$G/.dev/attention/dispatch-stuck.json" && ok "--days still EXEMPTS an unterminated dispatch" || bad "--days deleted a stuck task"
 
 echo "── forge ask: session-scope event + secret redaction ──"
 new_root a1

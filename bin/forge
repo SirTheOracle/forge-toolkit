@@ -260,8 +260,52 @@ PY
 gc_root() {   # gc_root <root>
     local att="$1/.dev/attention"
     [ -d "$att" ] || return 0
-    find "$att" -maxdepth 2 -type f \( -name '*.json' -o -name '*.txt' \) \
-        -mtime "+$TTL_D" -delete 2>/dev/null || true
+    # Task-aware 7d sweep (P17). Same reach as the old
+    # `find -maxdepth 2 -name '*.json'/'*.txt' -mtime +TTL -delete`, but a record whose task
+    # never reached a terminal state is EXEMPT: a dispatch-<id>.json with no response.<id>.txt
+    # (+ its instruction payload payloads/<id>.txt), and a wprompt.* whose task_id has no
+    # matching wstop.*. A genuinely stuck task stays visible (TASK-STUCK) instead of vanishing on
+    # day 7. Fail-open: any error → leave files in place (never a broad delete).
+    FORGE_GC_ATT="$att" FORGE_GC_TTL="$TTL_D" python3 - <<'PY' 2>/dev/null || true
+import os, glob, json, time
+att = os.environ["FORGE_GC_ATT"]; ttl = int(os.environ["FORGE_GC_TTL"])
+cutoff = time.time() - ttl * 86400
+pdir = os.path.join(att, "payloads")
+def old(p):
+    try: return os.path.getmtime(p) < cutoff
+    except OSError: return False
+exempt = set()   # realpaths never deleted regardless of age
+# unterminated dispatched tasks: dispatch-<id>.json with no response.<id>.txt
+for dp in glob.glob(os.path.join(att, "dispatch-*.json")):
+    did = os.path.basename(dp)[len("dispatch-"):-len(".json")]
+    if not os.path.exists(os.path.join(pdir, f"response.{did}.txt")):
+        exempt.add(os.path.realpath(dp))
+        ip = os.path.join(pdir, f"{did}.txt")          # keep its instruction payload too
+        if os.path.exists(ip): exempt.add(os.path.realpath(ip))
+# unterminated worker turns: wprompt whose task_id has no matching wstop (task_id read from the
+# JSON body — robust to a dot in the id, which filename-splitting is not).
+wstop_tids = set()
+for wsp in glob.glob(os.path.join(att, "wstop.*.json")):
+    try: wstop_tids.add((json.load(open(wsp)) or {}).get("task_id"))
+    except Exception: pass
+for wpp in glob.glob(os.path.join(att, "wprompt.*.json")):
+    try: tid = (json.load(open(wpp)) or {}).get("task_id")
+    except Exception: tid = None
+    if tid is None or tid not in wstop_tids:
+        exempt.add(os.path.realpath(wpp))
+# sweep depth<=2 (.json/.txt): everything aged out except the exempt set
+bases = [att] + [os.path.join(att, d) for d in os.listdir(att)
+                 if os.path.isdir(os.path.join(att, d))]
+for base in bases:
+    for name in os.listdir(base):
+        p = os.path.join(base, name)
+        if not os.path.isfile(p): continue
+        if not (name.endswith(".json") or name.endswith(".txt")): continue
+        if os.path.realpath(p) in exempt: continue
+        if old(p):
+            try: os.remove(p)
+            except OSError: pass
+PY
 }
 
 cmd_preflight() {
