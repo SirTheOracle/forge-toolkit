@@ -13,7 +13,7 @@
 # (fail-open). EVERY path exits 0. All four events are gated to the orchestrator
 # (pane 1) per the handoff — a worker pane finishing a turn must not mark the
 # initiative done; worker escalation is the Phase B `forge ask` path.
-import sys, os, json, re, hashlib, datetime, subprocess
+import sys, os, json, re, hashlib, secrets, datetime, subprocess
 
 def done():
     sys.exit(0)
@@ -42,9 +42,13 @@ if len(parts) != 3:
 pane_index, session, root = parts[0], parts[1], os.path.realpath(parts[2])
 
 # role: env override wins (future spawned sessions); else pane 1 == orchestrator.
+# Emission is now OPEN to every pane — the gate that used to DISCARD worker signal is gone.
+# Workers write NAMESPACED per-turn files (the worker branch below); the canonical
+# stop.<session>.json stays the orchestrator's alone, so a worker turn can never mark the
+# initiative done (§5). `agent` rides ONLY on worker records, so the orchestrator envelope —
+# and stop.<session>.json — stays byte-identical. Step 7 makes `agent` codex-aware.
 role = os.environ.get('FORGE_ROLE') or ('orchestrator' if pane_index == '1' else 'worker')
-if role != 'orchestrator':
-    done()
+agent = 'claude'
 if not session or not os.path.isdir(os.path.join(root, '.dev')):
     done()
 
@@ -114,6 +118,99 @@ def tail_transcript(tp):
                 return ' '.join(b.get('text', '') for b in c
                                 if isinstance(b, dict) and b.get('type') == 'text')
     return ''
+
+def mint_ptask():
+    return ('ptask-' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            + '-' + secrets.token_hex(3))
+
+def safe_tid(tid):
+    # task_id may be an EXTERNAL codex turn_id (Step 7) → sanitize before it reaches a filename
+    # (path-traversal guard). Empty/None degrades to a fresh ptask stamp.
+    s = re.sub(r'[^A-Za-z0-9._-]', '-', str(tid or ''))[:80]
+    return s or mint_ptask()
+
+def fire_watch_check(ev):
+    # Step 6: after a hot-eligible turn-end, kick a DETACHED, fail-open `forge-watch check` so the
+    # board/ambient surface update at ~1s instead of the 30s launchd floor. MUST return immediately
+    # (hooks have a ~10s timeout) — fully detached, never waited on. The watcher's non-blocking
+    # flock coalesces concurrent triggers. FORGE_WATCH_TRIGGER=0 disables it (tests); FORGE_WATCH_BIN
+    # overrides the target (tests point it at a sleeping stub to prove fast return).
+    if ev not in ('stop', 'permissionrequest'):
+        return
+    if os.environ.get('FORGE_WATCH_TRIGGER', '1') != '1':
+        return
+    fw = os.environ.get('FORGE_WATCH_BIN') or os.path.join(os.path.expanduser('~'), 'bin', 'forge-watch')
+    try:
+        if os.path.exists(fw):
+            subprocess.Popen([fw, 'check'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+# --- worker branch: NAMESPACED per-turn emission -------------------------------------------
+# Handled here and RETURNED, so the orchestrator handlers below stay byte-identical (a worker
+# never reaches the canonical stop.<session>.json writer). Per-TURN keying
+# (wstop.<session>.p<pane>.<task_id>.json) is load-bearing: N turns in one pane render as N task
+# rows; a per-pane filename would reintroduce the LWW collapse. agent is 'claude' here; the
+# --codex adapter (Step 7) sets it to 'codex' and supplies turn_id for native correlation.
+if role != 'orchestrator':
+    native_tid = data.get('turn_id') if (agent == 'codex' and data.get('turn_id')) else None
+    if event == 'userpromptsubmit':
+        prompt = data.get('prompt', '') or ''
+        raw = re.findall(r'\[dispatch_id:([A-Za-z0-9._\-]+)\]', prompt)
+        try:   # keep only ids backed by a real dispatch-<id>.json in this root (fail-open)
+            ids = [i for i in raw if os.path.exists(os.path.join(adir, f'dispatch-{i}.json'))]
+        except OSError:
+            ids = list(raw)
+        # per-turn task_id: codex turn_id (native) > relayed dispatch_id > synthetic ptask.
+        # LOAD-BEARING: the wprompt sibling is per-pane last-writer-wins, safe ONLY because turns
+        # are SEQUENTIAL per pane — a pane's next UserPromptSubmit cannot fire until this turn's
+        # Stop has (same assumption the dispatch correlation at :155-160 already relies on).
+        task_id = safe_tid(native_tid or (ids[0] if ids else None) or mint_ptask())
+        atomic(os.path.join(adir, f'wprompt.{session}.p{pane_index}.json'),
+               envelope('worker-prompt',
+                        {'agent': agent, 'task_id': task_id,
+                         'dispatch_id': (ids[0] if ids else None), 'dispatch_ids': ids,
+                         'prompt_snippet': snip(prompt),
+                         'prompt_sha256': hashlib.sha256(prompt.encode('utf-8', 'replace')).hexdigest()}))
+    elif event == 'stop':
+        lam = data.get('last_assistant_message')
+        if lam:
+            src, msg = 'last_assistant_message', lam
+        else:
+            msg, src = tail_transcript(data.get('transcript_path')), 'transcript_tail'
+        body = (msg or '').strip()
+        is_q = body.endswith('?')
+        # recover task_id + prompt snippet from the sibling wprompt (else a Stop-time ptask).
+        task_id, prompt_snip = native_tid, ''
+        try:
+            with open(os.path.join(adir, f'wprompt.{session}.p{pane_index}.json')) as f:
+                wp = json.load(f)
+            prompt_snip = wp.get('prompt_snippet') or ''
+            if not task_id:
+                task_id = wp.get('task_id')
+        except (OSError, ValueError):
+            pass
+        task_id = safe_tid(task_id)   # Stop-time fallback mints a ptask when no sibling
+        atomic(os.path.join(adir, f'wstop.{session}.p{pane_index}.{task_id}.json'),
+               envelope('worker-snippet',
+                        {'agent': agent, 'task_id': task_id, 'prompt_snippet': prompt_snip,
+                         'snippet': snip(body, 400), 'snippet_source': src,
+                         'looks_like_question': is_q,
+                         'question_snippet': (snip_tail(body, 200) if is_q else None)}))
+    elif event == 'permissionrequest':
+        tn = data.get('tool_name', '') or ''
+        ti = data.get('tool_input') or {}
+        cmd = (ti.get('command') if isinstance(ti, dict) else '') or ''
+        h = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()[:8]
+        atomic(os.path.join(adir, f'wperm.{session}.p{pane_index}.{h}.json'),
+               envelope('worker-permission',
+                        {'agent': agent, 'state': 'needs-input', 'tool_name': tn,
+                         'command': snip(cmd, 300), 'command_hash': h,
+                         'permission_suggestions': data.get('permission_suggestions') or []}))
+    # notification: intentionally NO-OP for workers (would collide on notify.<session>.json).
+    fire_watch_check(event)
+    done()
 
 if event == 'userpromptsubmit':
     prompt = data.get('prompt', '') or ''

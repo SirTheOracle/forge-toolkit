@@ -7,6 +7,7 @@ FORGE="$ROOT/bin/forge"; HOOK="$ROOT/bin/forge-cc-hook"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fc.XXXXXX")"; SESS="fctest-$$"
 trap 'tmux kill-session -t "$SESS" 2>/dev/null; rm -rf "$WORK"' EXIT
 PASS=0; FAIL=0
+export FORGE_WATCH_TRIGGER=0     # Step 6: no test spawns a background forge-watch check
 # register writes ~/.config/forge/watch-roots — isolate HOME so test runs never
 # pollute the real registry. _toolkit_root resolves via $0, unaffected.
 FHOME="$WORK/home"; mkdir -p "$FHOME"
@@ -83,9 +84,10 @@ grep -q 'ghp_ABCDEF' "$R/.dev/attention/stop.forge-x.json" && bad "secret leaked
 printf '{"last_assistant_message":"which table, users or orders?"}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
 python3 -c 'import json;assert json.load(open("'"$R"'/.dev/attention/stop.forge-x.json"))["looks_like_question"] is True' && ok "trailing ? → looks_like_question" || bad "question flag missed"
 # pane 0 (worker) writes nothing; non-forge root inert
-rm -f "$R"/.dev/attention/stop.* 2>/dev/null
+rm -f "$R"/.dev/attention/stop.* "$R"/.dev/attention/wstop.* 2>/dev/null
 printf '{"last_assistant_message":"worker done"}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" stop
-test ! -f "$R/.dev/attention/stop.forge-x.json" && ok "pane-0 (worker) Stop ignored by role gate" || bad "worker Stop leaked"
+{ ls "$R"/.dev/attention/wstop.forge-x.p0.*.json >/dev/null 2>&1 && test ! -f "$R/.dev/attention/stop.forge-x.json"; } \
+  && ok "pane-0 worker Stop → namespaced wstop; canonical stop.<session> never created" || bad "worker Stop wrong (leaked to canonical or no wstop)"
 N="$WORK/notforge"; mkdir -p "$N"
 printf '{"prompt":"hi"}' | FORGE_CC_PANE_META="$(meta 1 "$N")" "$HOOK" userpromptsubmit
 test ! -d "$N/.dev" && ok "hook inert in non-forge root (no .dev)" || bad "hook wrote into non-forge root"
@@ -98,13 +100,76 @@ if command -v tmux >/dev/null 2>&1; then
   p0=$(tmux list-panes -t "$SESS" -F '#{pane_index} #{pane_id}' | awk '$1==0{print $2}')
   printf '{"last_assistant_message":"done here"}' | env -u FORGE_ROLE -u TMUX_SESSION TMUX_PANE="$p1" "$HOOK" stop
   test -f "$R/.dev/attention/stop.$SESS.json" && ok "pane-1 structural fire wrote event (no FORGE_ROLE)" || bad "structural pane-1 silent"
-  rm -f "$R/.dev/attention/"stop.*.json 2>/dev/null
+  rm -f "$R/.dev/attention/"stop.*.json "$R/.dev/attention/"wstop.*.json 2>/dev/null
   printf '{"last_assistant_message":"worker done"}' | env -u FORGE_ROLE -u TMUX_SESSION TMUX_PANE="$p0" "$HOOK" stop
-  test ! -f "$R/.dev/attention/stop.$SESS.json" && ok "pane-0 structural gate wrote nothing" || bad "pane-0 wrote (worker leaked)"
+  { ls "$R/.dev/attention/"wstop."$SESS".p0.*.json >/dev/null 2>&1 && test ! -f "$R/.dev/attention/stop.$SESS.json"; } \
+    && ok "pane-0 structural → namespaced wstop; canonical untouched" || bad "pane-0 structural wrong"
   tmux kill-session -t "$SESS" 2>/dev/null
 else
   echo "  (skip: no tmux)"
 fi
+
+echo "── forge-cc-hook: worker emission (namespaced per-turn) ──"
+new_root w1
+printf '{"prompt":"do the thing"}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" userpromptsubmit
+python3 - "$R" <<'PY' && ok "worker UserPromptSubmit → wprompt (ptask, role=worker, agent=claude)" || bad "worker prompt wrong"
+import json,os,sys
+e=json.load(open(os.path.join(sys.argv[1],".dev","attention","wprompt.forge-x.p0.json")))
+assert e["role"]=="worker" and e["agent"]=="claude" and e["event"]=="userpromptsubmit", e
+assert e["task_id"].startswith("ptask-"), e["task_id"]
+assert e["prompt_snippet"]=="do the thing" and e["variant"]=="worker-prompt"
+PY
+printf '{"last_assistant_message":"worker finished the thing"}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" stop
+python3 - "$R" <<'PY' && ok "worker Stop → wstop keyed by recovered task_id; canonical stop.<sess> UNTOUCHED" || bad "worker stop wrong"
+import json,os,sys,glob
+adir=os.path.join(sys.argv[1],".dev","attention")
+ws=glob.glob(os.path.join(adir,"wstop.forge-x.p0.ptask-*.json")); assert len(ws)==1, ws
+e=json.load(open(ws[0]))
+assert e["role"]=="worker" and e["agent"]=="claude" and e["variant"]=="worker-snippet"
+assert e["prompt_snippet"]=="do the thing"                  # copied from the sibling wprompt
+assert "worker finished" in e["snippet"]
+assert not os.path.exists(os.path.join(adir,"stop.forge-x.json"))   # HARD CONSTRAINT
+PY
+new_root w2
+for m in one two; do
+  printf '{"prompt":"turn %s"}' "$m" | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" userpromptsubmit
+  printf '{"last_assistant_message":"answer %s"}' "$m" | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" stop
+done
+n=$(ls "$R"/.dev/attention/wstop.forge-x.p0.*.json 2>/dev/null | wc -l | tr -d ' ')
+[ "$n" -eq 2 ] && ok "two worker Stops in one pane → two distinct wstop files (no LWW collapse)" || bad "got $n wstop (LWW collapse!)"
+new_root w3
+out=$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"permission_suggestions":["allow-once"]}' | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" permissionrequest)
+[ -z "$out" ] && ok "worker PermissionRequest: zero stdout (fail-open)" || bad "worker perm printed: $out"
+wpm=$(ls "$R"/.dev/attention/wperm.forge-x.p2.*.json 2>/dev/null | head -1)
+python3 -c 'import json,sys;e=json.load(open(sys.argv[1]));assert e["role"]=="worker" and e["tool_name"]=="Bash" and e["state"]=="needs-input"' "$wpm" && ok "wperm row structured (role=worker)" || bad "wperm wrong"
+
+echo "── forge-cc-hook: pane-1 canonical path unchanged ──"
+new_root h1d
+printf '{"last_assistant_message":"orchestrator answer?"}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
+python3 -c 'import json,sys;e=json.load(open(sys.argv[1]));assert e["role"]=="orchestrator" and e["variant"]=="snippet" and e["looks_like_question"] is True and "agent" not in e' "$R/.dev/attention/stop.forge-x.json" \
+  && ok "pane-1 stop canonical (no agent field; byte-shape preserved)" || bad "pane-1 canonical drifted"
+ls "$R"/.dev/attention/wstop.* >/dev/null 2>&1 && bad "pane-1 wrote a wstop" || ok "pane-1 writes NO wstop"
+
+echo "── forge-cc-hook: worker prompt carrying a backed [dispatch_id] keys the task ──"
+new_root h1e
+python3 - "$R" <<'PY'
+import json,os,sys
+adir=os.path.join(sys.argv[1],".dev","attention"); os.makedirs(adir,exist_ok=True)
+json.dump({"schema":"cc-dispatch/1","dispatch_id":"cc-relay-1","session":"forge-x"},open(os.path.join(adir,"dispatch-cc-relay-1.json"),"w"))
+PY
+printf '{"prompt":"do X [dispatch_id:cc-fake] then subtask [dispatch_id:cc-relay-1]"}' | FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" userpromptsubmit
+python3 -c 'import json;assert json.load(open("'"$R"'/.dev/attention/wprompt.forge-x.p4.json"))["task_id"]=="cc-relay-1"' \
+  && ok "backed relayed dispatch_id is the task_id (unbacked cc-fake filtered)" || bad "task_id not the relayed id"
+
+echo "── forge-cc-hook: Step 6 worker trigger detaches AND fires (sentinel) ──"
+new_root tg1
+SENT="$WORK/fired.$$"; rm -f "$SENT"
+STUBFW="$WORK/slowwatch"; printf '#!/bin/bash\ntouch %q\nsleep 30\n' "$SENT" > "$STUBFW"; chmod +x "$STUBFW"
+start=$(date +%s)
+printf '{"last_assistant_message":"done"}' | FORGE_WATCH_TRIGGER=1 FORGE_WATCH_BIN="$STUBFW" FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" stop
+elapsed=$(( $(date +%s) - start ))
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$SENT" ] && break; sleep 0.3; done
+{ [ "$elapsed" -lt 5 ] && [ -f "$SENT" ]; } && ok "worker Stop trigger detaches (<5s) AND fires (sentinel touched)" || bad "trigger blocked ${elapsed}s or never fired"
 
 echo "── hook merge tool (on COPIES of live settings) ──"
 for pair in "headless_factory:PostToolUse" "feedforge:PreToolUse" "goparent-ai:__nohooks__"; do
