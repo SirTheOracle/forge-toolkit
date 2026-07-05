@@ -1072,6 +1072,48 @@ printf 'a' > "$(attn "$R")/payloads/response.cc-stuck.txt"
 assert_status_missing "TASK-STUCK" "an answered task is not stuck"
 unset FORGE_WATCH_TASK_STUCK_S
 
+echo "── delivery: stub notifier nonzero → delivered.log rc!=0 → DELIVERY-UNVERIFIED ──"  # +2
+new_env tdel
+R=$(mk_root proj); live_session forge-1 "$R"
+askf "$R" forge-1 ask-d "" "" 30 "ring me?"
+STUBN="$WORK/failnotify"; printf '#!/bin/bash\nexit 3\n' > "$STUBN"; chmod +x "$STUBN"
+FORGE_WATCH_NOTIFIER_BIN="$STUBN" "$WATCH" check >/dev/null 2>&1
+python3 -c 'import json,sys;rec=json.loads(open(sys.argv[1]).read().splitlines()[-1]);assert rec["rc"]==3 and rec["channel"]=="stub"' "$FORGE_WATCH_CACHE_DIR/delivered.log" && ok "failed ring logged with rc!=0 in delivered.log" || bad "delivered.log rc wrong"
+run_status | grep -q "DELIVERY-UNVERIFIED" && ok "next scan surfaces DELIVERY-UNVERIFIED (failure itself surfaced)" || bad "DELIVERY-UNVERIFIED not raised"
+
+echo "── freshness: stale heartbeat → board prints the staleness line ──"                # +2
+new_env tfresh
+R=$(mk_root proj); live_session forge-1 "$R"
+printf '{"event_offsets":{},"conditions":{},"last_tick":"%s"}' "$(iso_ago 600)" > "$FORGE_WATCH_CACHE_DIR/state.json"
+run_status --pretty | grep -q "forge-watch last ran" && ok "stale heartbeat → freshness line on the board" || bad "no freshness line"
+run_status --board | python3 -c 'import json,sys;assert json.load(sys.stdin)["stale"] is True' && ok "cc-board/1 stale flag set" || bad "stale flag missing"
+
+echo "── selftest: sentinel → DELIVERY-UNVERIFIED banner until --confirm ──"              # +4
+new_env tself
+R=$(mk_root proj); live_session forge-1 "$R"
+id=$("$WATCH" selftest | awk '/^sent sentinel/{print $3}')
+notified "sentinel" && ok "selftest fired a (captured) notification" || bad "selftest did not notify"
+[ -n "$id" ] && ok "selftest emitted a sentinel id" || bad "no sentinel id"
+run_status | grep -q "DELIVERY-UNVERIFIED" && ok "unconfirmed selftest → DELIVERY-UNVERIFIED banner" || bad "no selftest banner"
+"$WATCH" selftest --confirm "$id" >/dev/null 2>&1
+run_status | grep -q "$id" && bad "banner persists after confirm" || ok "confirmed selftest clears the banner"
+
+echo "── SwiftBar plugin: renders counts + staleness from cc-board/1 JSON (hermetic) ──"   # +3
+new_env tsb
+PLUGIN="$(cd "$(dirname "$WATCH")/.." && pwd)/swiftbar/forge-board.5s.sh"
+if [ -f "$PLUGIN" ]; then
+  STUBF="$WORK/fakeforge"
+  printf '#!/bin/bash\ncat <<JSON\n{"schema":"cc-board/1","hot":[{"condition":"NEEDS-ASK","session":"forge-1","acked":false}],"active":[],"tasks":[{"task_id":"cc-a"}],"maintenance":{"collapsed":true,"count":0,"rows":[]},"stale":false}\nJSON\n' > "$STUBF"; chmod +x "$STUBF"
+  out=$(FORGE_BIN="$STUBF" bash "$PLUGIN")
+  echo "$out" | head -1 | grep -q "forge 1!" && ok "SwiftBar menubar shows unseen hot count" || bad "swiftbar title wrong: $(echo "$out" | head -1)"
+  echo "$out" | grep -q "1 task(s)" && ok "SwiftBar dropdown shows task count" || bad "swiftbar task count missing"
+  STUBF2="$WORK/fakeforge2"
+  printf '#!/bin/bash\ncat <<JSON\n{"schema":"cc-board/1","hot":[],"active":[],"tasks":[],"maintenance":{"collapsed":true,"count":0,"rows":[]},"stale":true,"heartbeat_age_s":300}\nJSON\n' > "$STUBF2"; chmod +x "$STUBF2"
+  FORGE_BIN="$STUBF2" bash "$PLUGIN" | grep -q "watcher stale" && ok "SwiftBar self-reports watcher staleness" || bad "swiftbar staleness missing"
+else
+  echo "  (skip: plugin not found)"; ok "swiftbar plugin present"; ok "swiftbar task count (skipped)"; ok "swiftbar staleness (skipped)"
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "═══════════════════════════════════════"

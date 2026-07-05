@@ -53,13 +53,44 @@ mkdir -p "$CACHE_DIR" "$CONFIG_DIR" 2>/dev/null || true
 # exercised without real notifications.
 fw_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
+# Append a delivery-audit line to forge-watch's OWN cache (read-only-under-.dev preserved).
+# The engine reads the LAST line → DELIVERY-UNVERIFIED when it returned nonzero.
+_fw_log_delivery() {   # _fw_log_delivery <title> <body> <channel> <rc>
+    FW_T="$1" FW_B="$2" FW_CH="$3" FW_RC="$4" FW_LOG="$CACHE_DIR/delivered.log" \
+    python3 - <<'PY' 2>/dev/null || true
+import os, json, datetime
+rec = {"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+       "title": os.environ.get("FW_T", ""), "body": os.environ.get("FW_B", "")[:200],
+       "channel": os.environ.get("FW_CH", ""), "rc": int(os.environ.get("FW_RC", "0") or 0)}
+with open(os.environ["FW_LOG"], "a") as f:
+    f.write(json.dumps(rec) + "\n")
+PY
+}
+
 fw_notify() {
-    local title="$1" body="$2"
-    if [ -n "${FORGE_WATCH_SINK_CAPTURE:-}" ]; then
+    local title="$1" body="$2" channel rc=0 nb="${FORGE_WATCH_NOTIFIER_BIN:-}"
+    # SINK_CAPTURE short-circuits UNLESS a stub notifier is wired (FORGE_WATCH_NOTIFIER_BIN) to
+    # exercise the rc/audit path. Every branch logs an audit line and returns 0 (fail-open). A
+    # notifier with its own grantable identity (terminal-notifier) returns nonzero when it cannot
+    # deliver; osascript (attributed to Script Editor) cannot self-report and stays the fallback.
+    if [ -z "$nb" ] && [ -n "${FORGE_WATCH_SINK_CAPTURE:-}" ]; then
         printf '%s\t%s\n' "$title" "$body" >> "$FORGE_WATCH_SINK_CAPTURE"
+        _fw_log_delivery "$title" "$body" sink 0
         return 0
     fi
-    osascript -e "display notification \"$(fw_escape "$body")\" with title \"$(fw_escape "$title")\"" >/dev/null 2>&1 || true
+    # `|| rc=$?` (not `; rc=$?`): this script runs under set -e — a bare failing notifier
+    # would abort the whole scan before the audit line is written (the failure tdel proves).
+    if [ -n "$nb" ]; then
+        channel=stub; "$nb" "$title" "$body" >/dev/null 2>&1 || rc=$?
+    elif command -v terminal-notifier >/dev/null 2>&1; then
+        channel=terminal-notifier
+        terminal-notifier -title "$title" -message "$body" >/dev/null 2>&1 || rc=$?
+    else
+        channel=osascript
+        osascript -e "display notification \"$(fw_escape "$body")\" with title \"$(fw_escape "$title")\"" >/dev/null 2>&1 || rc=$?
+    fi
+    _fw_log_delivery "$title" "$body" "$channel" "$rc"
+    return 0
 }
 
 # ── The engine: scan → evaluate → debounce → emit ────────────────────────
@@ -949,6 +980,43 @@ for root in discover_roots():
     except Exception as e:
         config_warnings.append(f"attention scan error in {root_label(root)}: {e}")
 
+# ── delivery audit → DELIVERY-UNVERIFIED (Step 5) ─────────────────────────
+# Read the LAST delivered.log line: a nonzero rc means the ring is unverified. A later
+# successful delivery appends an rc:0 line → the finding self-clears. Machine-scoped (keyed to
+# CACHE_DIR → root_label 'forge-watch'), not per-root. policy='never' — a board/ambient row, not
+# a bell.
+def _last_delivery():
+    try:
+        with open(os.path.join(CACHE_DIR, 'delivered.log')) as f:
+            lines = f.readlines()[-20:]
+    except OSError:
+        return None
+    for ln in reversed(lines):
+        try:
+            return json.loads(ln)
+        except ValueError:
+            continue
+    return None
+_dl = _last_delivery()
+if _dl and _dl.get('rc', 0) != 0:
+    a = age_s(_dl.get('ts'))
+    if a is None or a <= ZOMBIE_AGE_S:
+        add_finding('DELIVERY-UNVERIFIED', CACHE_DIR, f"delivery\t{_dl.get('ts')}",
+                    f"forge-watch — last notification FAILED (channel {_dl.get('channel')}, "
+                    f"rc {_dl.get('rc')}); the ring is unverified — run `forge-watch selftest`",
+                    policy='never', session=None)
+# selftest sentinel sent but not yet confirmed → DELIVERY-UNVERIFIED banner (P22).
+try:
+    with open(os.path.join(CACHE_DIR, 'selftest.json')) as f:
+        _st = json.load(f)
+except (OSError, ValueError):
+    _st = None
+if isinstance(_st, dict) and _st.get('id') and not _st.get('confirmed'):
+    add_finding('DELIVERY-UNVERIFIED', CACHE_DIR, f"selftest\t{_st.get('id')}",
+                f"forge-watch — delivery self-test {_st.get('id')} sent but not confirmed; run "
+                f"`forge-watch selftest --confirm {_st.get('id')}` when you see the notification",
+                policy='never', session=None)
+
 # STATE-UNPARSEABLE (keyed by path + mtime/size so a changed file re-fires).
 for root, path in unparseable:
     try:
@@ -1360,6 +1428,40 @@ cmd_ack() {
     run_engine ack "-" "$1"
 }
 
+# Channel proof (P22). `selftest` fires ONE sentinel with a monotonic id + a pending marker; the
+# board shows DELIVERY-UNVERIFIED until `selftest --confirm <id>`. Re-run daily to catch a later
+# permission revocation. LIVE-FIRE — operator-gated per §5.
+cmd_selftest() {
+    if [ "${1:-}" = "--confirm" ]; then
+        FW_ID="${2:-}" FW_CACHE="$CACHE_DIR" python3 - <<'PY'
+import os, sys, json, datetime
+p = os.path.join(os.environ["FW_CACHE"], "selftest.json")
+try:
+    st = json.load(open(p))
+except (OSError, ValueError):
+    sys.exit("forge-watch: no pending self-test to confirm")
+if st.get("id") != os.environ.get("FW_ID"):
+    sys.exit(f"forge-watch: id mismatch (pending: {st.get('id')})")
+st["confirmed"] = True
+st["confirmed_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(st, open(p, "w"))
+print(f"confirmed delivery of sentinel {st['id']}")
+PY
+        return
+    fi
+    local id; id="st-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    FW_ID="$id" FW_CACHE="$CACHE_DIR" python3 - <<'PY'
+import os, json, datetime
+p = os.path.join(os.environ["FW_CACHE"], "selftest.json"); os.makedirs(os.path.dirname(p), exist_ok=True)
+json.dump({"id": os.environ["FW_ID"],
+           "sent_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "confirmed": False}, open(p, "w"))
+PY
+    fw_notify "forge-watch selftest" "sentinel $id — confirm with: forge-watch selftest --confirm $id"
+    echo "sent sentinel $id"
+    echo "if you saw the notification, run: forge-watch selftest --confirm $id"
+}
+
 cmd_install() {
     # launchd runs with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin) that does
     # NOT include Homebrew — where tmux and (often) python3 live. Without this,
@@ -1454,6 +1556,7 @@ case "${1:-status}" in
     check)     cmd_check ;;
     status)    shift; cmd_status "$@" ;;
     ack)       shift; cmd_ack "${1:-}" ;;
+    selftest)  shift; cmd_selftest "$@" ;;
     install)   cmd_install ;;
     uninstall) cmd_uninstall ;;
     -h|--help|help) usage ;;
