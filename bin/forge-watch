@@ -101,6 +101,8 @@ ALLOWED_KEYS = {
     'FORGE_WATCH_ZOMBIE_AGE_D', 'FORGE_WATCH_NOTIFY_COMPLETE',
     'FORGE_WATCH_NOTIFY_STALE_ZOMBIE', 'FORGE_WATCH_ROOTS_FILE',
     'FORGE_WATCH_NOTIFY_REPLY', 'FORGE_WATCH_NOTIFY_DONE',
+    'FORGE_WATCH_NOTIFY_PANE_DONE', 'FORGE_WATCH_TASK_WINDOW_S',
+    'FORGE_WATCH_TASK_STUCK_S',
 }
 # Conservative value grammar: allow path-ish chars (incl. space and ~ for real
 # paths) but no shell metacharacters, substitutions, or quotes. Values are only
@@ -165,6 +167,13 @@ NOTIFY_STALE_ZOMBIE = cfg_bool('FORGE_WATCH_NOTIFY_STALE_ZOMBIE', False)
 # Return-path knobs (default OFF; the board row is unconditional — only the bell is opt-in).
 NOTIFY_REPLY    = cfg_bool('FORGE_WATCH_NOTIFY_REPLY', False)
 NOTIFY_DONE     = cfg_bool('FORGE_WATCH_NOTIFY_DONE', False)
+# Task-visibility knobs. PANE-DONE ring default OFF (code default stays 0 — the rollout flip to
+# 1 is watch.env config, per operator decision). TASK_WINDOW bounds the live tasks[]/PANE-DONE
+# view; TASK_STUCK is when an unanswered dispatched task becomes a loud, hot TASK-STUCK.
+NOTIFY_PANE_DONE = cfg_bool('FORGE_WATCH_NOTIFY_PANE_DONE', False)
+TASK_WINDOW_S    = cfg_int('FORGE_WATCH_TASK_WINDOW_S', 86400)   # 24h live-task window
+TASK_STUCK_S     = cfg_int('FORGE_WATCH_TASK_STUCK_S', 21600)    # 6h → TASK-STUCK
+STALE_TICK_S     = 3 * 30    # board/ambient freshness: ~3x the 30s launchd interval
 
 # ── time helpers ─────────────────────────────────────────────────────────
 def parse_iso(ts):
@@ -396,6 +405,7 @@ def parse_callback(path):
 # ── findings ─────────────────────────────────────────────────────────────
 # policy: 'standard' (backoff), 'daily' (>=24h), 'never' (status-only)
 findings = []  # dict: condition, root, key, policy, session, slug, stage, msg
+TASKS = []     # cc-board/1 tasks[] projection (Step 3): read-time fold, no ledger
 
 def add_finding(condition, root, key, msg, policy='standard',
                 session=None, slug=None, stage=None):
@@ -651,11 +661,26 @@ def scan_attention(root, label):
     perms = {}
     asks = []
     spawn_states = []
+    worker_prompts, worker_stops, worker_perms = {}, [], []   # namespaced per-turn files
     for fp in sorted(glob.glob(os.path.join(adir, '*.json'))):
         rec = _load_att(fp)
         if rec is None:
             note_unparseable(root, fp)
             continue
+        base = os.path.basename(fp)
+        # Worker hook files are namespaced per-turn and MUST NOT reach the canonical
+        # session-lifecycle structures below — routed by FILENAME (robust even if the `role`
+        # field is ever missing; a wstop carries event="stop" and would otherwise set
+        # stop_ev[sess] and mark the SESSION done — the forbidden behavior).
+        if base.startswith('wprompt.'):
+            s = rec.get('session')
+            if s:
+                worker_prompts[(s, rec.get('pane_index'))] = rec   # per-pane LWW (turns sequential)
+            continue
+        if base.startswith('wstop.'):
+            worker_stops.append(rec); continue
+        if base.startswith('wperm.'):
+            worker_perms.append(rec); continue
         ev = rec.get('event') or ''
         sess = rec.get('session')
         if ev == 'ask':
@@ -800,6 +825,119 @@ def scan_attention(root, label):
                         f"{label} · {sess} — first launch" + (f": {det}" if det else ""),
                         policy='once', session=sess)
 
+    # ── worker per-turn ingestion (Step 2/3): NEVER touches the session lifecycle ──
+    adir_p = os.path.join(adir, 'payloads')
+    # latest worker Stop per (session, pane) — SESSIONS latest-per-pane + perm supersession.
+    latest_wstop = {}
+    for ws in worker_stops:
+        k = (ws.get('session'), ws.get('pane_index'))
+        a = age_s(ws.get('emitted_at'))
+        if a is None:
+            continue
+        cur = latest_wstop.get(k)
+        if cur is None or a < (age_s(cur.get('emitted_at')) or 1e18):
+            latest_wstop[k] = ws
+    # a pane that started a newer turn (wprompt after its last wstop) is WORKING again.
+    now_working = set()
+    for (sess, pane), wp in worker_prompts.items():
+        ws = latest_wstop.get((sess, pane))
+        wp_at = parse_iso(wp.get('emitted_at'))
+        ws_at = parse_iso(ws.get('emitted_at')) if ws else None
+        if ws is None or (wp_at is not None and ws_at is not None and wp_at > ws_at):
+            now_working.add((sess, pane))
+    # worker NEEDS-PERMISSION (reuses the hot condition); a later worker Stop supersedes it.
+    for pr in worker_perms:
+        sess = pr.get('session'); pane = pr.get('pane_index')
+        a = age_s(pr.get('emitted_at'))
+        if a is None or a > ZOMBIE_AGE_S:
+            continue
+        ws = latest_wstop.get((sess, pane))
+        pat = parse_iso(pr.get('emitted_at'))
+        wat = parse_iso(ws.get('emitted_at')) if ws else None
+        if wat is not None and pat is not None and wat > pat:
+            continue
+        tool = pr.get('tool_name') or 'tool'; cmd = (pr.get('command') or '').strip()
+        msg = f"{label} · {sess} p{pane} — permission needed: {tool}"
+        if cmd:
+            msg += f" ({cmd[:60]})"
+        add_finding('NEEDS-PERMISSION', root, f"{sess}\tp{pane}\t{pr.get('command_hash','')}",
+                    msg, session=sess)
+    # PANE-DONE (active): latest done turn per pane, within the window, not working again.
+    # policy 'never' by default (board row, no ring); FORGE_WATCH_NOTIFY_PANE_DONE arms it.
+    for (sess, pane), ws in latest_wstop.items():
+        if (sess, pane) in now_working:
+            continue
+        a = age_s(ws.get('emitted_at'))
+        if a is None or a > TASK_WINDOW_S:
+            continue
+        sn = (ws.get('snippet') or '')
+        add_finding('PANE-DONE', root, f"{sess}\tp{pane}\t{ws.get('task_id')}",
+                    f"{label} · {sess} p{pane} — pane done ({ws.get('agent','?')})"
+                    + (f": {sn[:80]}" if sn else ""),
+                    policy=('standard' if NOTIFY_PANE_DONE else 'never'), session=sess)
+    # older worker-done turns (beyond the window) collapse into ONE maintenance count.
+    old_done = sum(1 for ws in worker_stops if (age_s(ws.get('emitted_at')) or 0) > TASK_WINDOW_S)
+    if old_done:
+        add_finding('PANE-DONE-RESIDUE', root, f"{label}\told-worker-done",
+                    f"{label} — {old_done} older worker-done turn(s) (see `forge tasks`)",
+                    policy='never')
+    # ── tasks[] projection: dispatched (queued/accepted/answered) + worker (working/done) ──
+    def _mtime_iso(p):
+        try:
+            return datetime.datetime.fromtimestamp(os.path.getmtime(p), UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+        except OSError:
+            return None
+    for did, d in dispatch_by_id.items():
+        resp = os.path.join(adir_p, f'response.{did}.txt')
+        answered = os.path.exists(resp)
+        p = prompt_ev.get(d.get('session'))
+        accepted = bool(p and p.get('dispatch_id') == did)
+        state = 'answered' if answered else ('accepted' if accepted else 'queued')
+        disp_at = d.get('dispatched_at')
+        if state == 'answered' and (age_s(disp_at) or 0) > TASK_WINDOW_S:
+            continue                       # terminal + old → out of the live view
+        TASKS.append({'task_id': did, 'session': d.get('session'), 'root': root, 'label': label,
+                      'agent': 'claude', 'pane': d.get('target_pane', 1), 'state': state,
+                      'dispatched_at': disp_at, 'started_at': None,
+                      'answered_at': (_mtime_iso(resp) if answered else None),
+                      'response_path': (os.path.join('.dev', 'attention', 'payloads', f'response.{did}.txt') if answered else None),
+                      'prompt_snippet': d.get('instruction_snippet'), 'snippet': None})
+    for (sess, pane) in now_working:
+        wp = worker_prompts[(sess, pane)]
+        if (age_s(wp.get('emitted_at')) or 0) > TASK_WINDOW_S:
+            continue
+        TASKS.append({'task_id': wp.get('task_id'), 'session': sess, 'root': root, 'label': label,
+                      'agent': wp.get('agent', 'claude'), 'pane': pane, 'state': 'working',
+                      'dispatched_at': None, 'started_at': wp.get('emitted_at'), 'answered_at': None,
+                      'response_path': None, 'prompt_snippet': wp.get('prompt_snippet'), 'snippet': None})
+    for ws in worker_stops:
+        if (age_s(ws.get('emitted_at')) or 1e18) > TASK_WINDOW_S:
+            continue
+        TASKS.append({'task_id': ws.get('task_id'), 'session': ws.get('session'), 'root': root,
+                      'label': label, 'agent': ws.get('agent', 'claude'), 'pane': ws.get('pane_index'),
+                      'state': 'done', 'dispatched_at': None, 'started_at': None,
+                      'answered_at': ws.get('emitted_at'), 'response_path': None,
+                      'prompt_snippet': ws.get('prompt_snippet'), 'snippet': ws.get('snippet')})
+    # ── TASK-STUCK (Step 4 partner): a dispatched task unterminated past the stall window ──
+    for did, d in dispatch_by_id.items():
+        if os.path.exists(os.path.join(adir_p, f'response.{did}.txt')):
+            continue
+        a = age_s(d.get('dispatched_at'))
+        if a is not None and a > TASK_STUCK_S:
+            add_finding('TASK-STUCK', root, f"{d.get('session')}\t{did}",
+                        f"{label} · {d.get('session')} — task {did} unanswered for {human_age(a)} "
+                        f"(dispatched, never returned)", session=d.get('session'))
+    # ── CODEX-EMISSION-OFF (Step 7): codex hooks installed but no codex signal seen yet ──
+    # Observational trust proxy: the register marker is present but no codex-tagged worker file
+    # has appeared. Clears on the first codex emission. GC-bounded (7d) — see §7 limitations.
+    if os.path.isfile(os.path.join(adir, 'codex-register.json')):
+        seen_codex = (any(ws.get('agent') == 'codex' for ws in worker_stops)
+                      or any(wp.get('agent') == 'codex' for wp in worker_prompts.values()))
+        if not seen_codex:
+            add_finding('CODEX-EMISSION-OFF', root, f"{label}\tcodex",
+                        f"{label} — codex hooks installed but no codex emission seen; complete the "
+                        f"one-time `/hooks` trust review in a codex pane at this root", policy='never')
+
 # ── run the scan ─────────────────────────────────────────────────────────
 for root in discover_roots():
     try:
@@ -930,31 +1068,67 @@ if MODE == 'check':
         if key not in current_keys:
             del conds[key]
 
+    state['last_tick'] = NOW.isoformat()   # heartbeat for the board/ambient freshness line
     save_state(state)
 
 # ── output ───────────────────────────────────────────────────────────────
-NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'NEEDS-ASK', 'NEEDS-REPLY',
-          'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
-          'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
+NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
+          'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
+          'TASK-STUCK', 'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'STATE-UNPARSEABLE']
 order = {c: i for i, c in enumerate(
-    NOTIFY + ['SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE',
-              'ZOMBIE-STALE-CONTEXT', 'STALE-PENDING', 'LEGACY-CONTEXT'])}
+    NOTIFY + ['SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PANE-DONE',
+              'ZOMBIE-STALE-CONTEXT', 'STALE-PENDING', 'PANE-DONE-RESIDUE',
+              'CODEX-EMISSION-OFF', 'LEGACY-CONTEXT'])}
 findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
 
 HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
        'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
+       'TASK-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
        'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE'}
-ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE'}
+ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE', 'PANE-DONE'}
 STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
-            'SESSION-DONE': 'done', 'NEEDS-PERMISSION': 'needs-input',
+            'SESSION-DONE': 'done', 'PANE-DONE': 'done', 'NEEDS-PERMISSION': 'needs-input',
             'NEEDS-DECISION': 'needs-input', 'NEEDS-ASK': 'needs-input',
-            'NEEDS-REPLY': 'needs-input',
+            'NEEDS-REPLY': 'needs-input', 'TASK-STUCK': 'needs-input',
+            'DELIVERY-UNVERIFIED': 'needs-input',
             'SPAWN-NEEDS-REPAIR': 'needs-input', 'SPAWN-POPULATE-FAILED': 'needs-input',
             'SPAWN-FIRST-LAUNCH': 'needs-input'}
 def _cls(c):
     return 'hot' if c in HOT else 'active' if c in ACTIVE else 'maintenance'
+
+def _task_ts(t):
+    return t.get('answered_at') or t.get('dispatched_at') or t.get('started_at') or ''
+
+if os.environ.get('FORGE_WATCH_TASKS') == '1':
+    # `forge tasks [@<session>] [--json]` — the operator projection. Optional @session filter
+    # and a --json machine path (both threaded from cmd_status; see Diff 3f). Reconcile B-C1.
+    want = os.environ.get('FORGE_WATCH_TASKS_SESSION') or ''
+    tsorted = sorted((t for t in TASKS if not want or t.get('session') == want),
+                     key=_task_ts, reverse=True)
+    if os.environ.get('FORGE_WATCH_TASKS_JSON') == '1':
+        print(json.dumps(tsorted, indent=2)); sys.exit(0)
+    import shutil
+    width = max(60, min(shutil.get_terminal_size((100, 24)).columns, 120))
+    use_color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+    def paint(code, s): return f"\033[{code}m{s}\033[0m" if use_color else s
+    def clip(s, w):
+        s = ' '.join((s or '').split())
+        return s if len(s) <= w else s[:max(1, w - 1)].rstrip() + '…'
+    print(paint('1', 'FORGE TASKS') + paint('2', f"  ·  {len(tsorted)} task(s)"))
+    if not tsorted:
+        print(paint('2', '  no tasks in the current window'))
+    COL = {'answered': '32', 'done': '32', 'working': '33', 'accepted': '33', 'queued': '2'}
+    for t in tsorted[:40]:
+        st = t['state']; who = t.get('session') or t['label']
+        pane = f"p{t['pane']}" if t.get('pane') is not None else ''
+        desc = t.get('prompt_snippet') or t.get('snippet') or ''
+        print('  ' + paint(COL.get(st, '2'), f"{st:<9}")
+              + f" {who} {pane} [{t.get('agent')}]  " + clip(desc, width - 40))
+        if st == 'answered' and t.get('session'):
+            print('    ' + paint('36', f"-> forge reply @{t['session']} {t['task_id']}"))
+    sys.exit(0)
 
 if BOARD:
     def _row(f):
@@ -968,10 +1142,16 @@ if BOARD:
     for f in findings:
         r = _row(f)
         (hot if r['class'] == 'hot' else active if r['class'] == 'active' else maint).append(r)
+    tick = state.get('last_tick'); tick_age = age_s(tick) if tick else None
+    task_rows = sorted(TASKS, key=_task_ts, reverse=True)[:200]
     board = {'schema': 'cc-board/1',
              'generated_at': NOW.strftime('%Y-%m-%dT%H:%M:%SZ'),
+             'heartbeat': tick,
+             'heartbeat_age_s': (int(tick_age) if tick_age is not None else None),
+             'stale': (tick_age is None or tick_age > STALE_TICK_S),
              'hot': hot, 'active': active,
-             'maintenance': {'collapsed': True, 'count': len(maint), 'rows': maint}}
+             'maintenance': {'collapsed': True, 'count': len(maint), 'rows': maint},
+             'tasks': task_rows}
     print(json.dumps(board, indent=2))
     sys.exit(0)
 
@@ -1002,6 +1182,11 @@ if PRETTY:
     stamp = datetime.datetime.now().strftime('%a %H:%M')
     print(paint('1', 'FORGE BOARD')
           + paint('2', f"  ·  {stamp}  ·  {len(sess_map)} session(s) live"))
+    _tick = state.get('last_tick'); _tage = age_s(_tick) if _tick else None
+    if _tage is None or _tage > STALE_TICK_S:
+        print(paint('33', "! forge-watch last ran "
+                    + ((human_age(_tage) + ' ago') if _tage is not None else 'never')
+                    + " — reload with `forge-watch install`"))
 
     print()
     if not hot:
@@ -1064,6 +1249,30 @@ if PRETTY:
                 line += '  ' + paint('2', clip(det, room))
             print(line)
 
+    # TASKS — the operator's unit of thought; N turns in one pane are N rows. Recency-bounded
+    # (older worker-done already collapsed to a PANE-DONE-RESIDUE maintenance count); queued/
+    # accepted/working dispatched tasks always show.
+    tsorted = sorted(TASKS, key=_task_ts, reverse=True)
+    def _trecent(t):
+        a = age_s(_task_ts(t))
+        return (a is None) or (a <= TASK_WINDOW_S) or t['state'] in ('queued', 'accepted', 'working')
+    trecent = [t for t in tsorted if _trecent(t)]
+    if trecent:
+        print()
+        print(paint('1', 'TASKS') + paint('2', f'  ({len(trecent)})'))
+        TCOL = {'answered': '32', 'done': '32', 'working': '33', 'accepted': '33', 'queued': '2'}
+        for t in trecent[:20]:
+            st = t['state']; who = t.get('session') or root_label(t['root'])
+            pane = f"p{t['pane']}" if t.get('pane') is not None else ''
+            desc = flat(t.get('prompt_snippet') or t.get('snippet') or '')
+            print('  ' + paint(TCOL.get(st, '2'), f"{st:<9}")
+                  + f" {who} {pane} [{t.get('agent')}]  " + clip(desc, width - 40))
+            if st == 'answered' and t.get('session'):
+                print('    ' + paint('36', f"-> forge reply @{t['session']} {t['task_id']}"))
+        older = len(tsorted) - len(trecent)
+        if older > 0:
+            print(paint('2', f"  … {older} older task(s) in maintenance"))
+
     pipes = [f for f in active if f['condition'] == 'PIPELINE-COMPLETE']
     if pipes:
         print()
@@ -1123,16 +1332,24 @@ cmd_check() {
 
 cmd_status() {
     # --board = machine JSON (cc-board/1, unchanged contract);
-    # --pretty = human board; --all expands maintenance in pretty mode.
-    local board=0 showall=0 a
+    # --pretty = human board; --all expands maintenance in pretty mode;
+    # --tasks = the read-only task projection (FORGE_WATCH_TASKS render), with an optional
+    # @<session> filter and --json (both honored only under --tasks — `forge board --json`
+    # execs `status --board`, which never sets FORGE_WATCH_TASKS).
+    local board=0 showall=0 tasks=0 tsession="" tjson=0 a
     for a in "$@"; do
         case "$a" in
             --board)  board=1 ;;
             --pretty) board=2 ;;
             --all)    showall=1 ;;
+            --tasks)  tasks=1 ;;
+            --json)   tjson=1 ;;
+            @*)       tsession="${a#@}" ;;
         esac
     done
-    FORGE_WATCH_BOARD="$board" FORGE_WATCH_SHOWALL="$showall" run_engine status "-" ""
+    FORGE_WATCH_BOARD="$board" FORGE_WATCH_SHOWALL="$showall" FORGE_WATCH_TASKS="$tasks" \
+        FORGE_WATCH_TASKS_SESSION="$tsession" FORGE_WATCH_TASKS_JSON="$tjson" \
+        run_engine status "-" ""
 }
 
 cmd_ack() {

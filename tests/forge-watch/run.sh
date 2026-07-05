@@ -639,6 +639,23 @@ json.dump({"schema":"cc-attention/1","event":"ask","variant":"ask","session":ses
   "worker":"codex-a","question_snippet":q,"question_sha256":"deadbeef"},open(p,"w"),indent=2)
 PY
 }
+wpromptf(){ # <root> <session> <pane> <ageSec> <task_id> [agent] [snippet]
+  local a; a="$(attn "$1")"; cat > "$a/wprompt.$2.p$3.json" <<JSON
+{"schema":"cc-attention/1","event":"userpromptsubmit","variant":"worker-prompt","session":"$2","root":"$1","pane_index":"$3","role":"worker","agent":"${6:-claude}","tmux_pane":"%$3","emitted_at":"$(iso_ago "$4")","task_id":"$5","dispatch_id":null,"dispatch_ids":[],"prompt_snippet":"${7:-typed work}","prompt_sha256":"abc"}
+JSON
+}
+wstopf(){ # <root> <session> <pane> <ageSec> <task_id> [agent] [snippet] [is_q] [qsnip]
+  local a; a="$(attn "$1")"; local isq="${8:-false}" extra=""
+  [ -n "${9:-}" ] && extra=",\"question_snippet\":\"$9\""
+  cat > "$a/wstop.$2.p$3.$5.json" <<JSON
+{"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"$2","root":"$1","pane_index":"$3","role":"worker","agent":"${6:-claude}","tmux_pane":"%$3","emitted_at":"$(iso_ago "$4")","task_id":"$5","prompt_snippet":"p","snippet":"${7:-worker done}","snippet_source":"last_assistant_message","looks_like_question":$isq$extra}
+JSON
+}
+wpermf(){ # <root> <session> <pane> <hash> [ageSec]
+  local a; a="$(attn "$1")"; cat > "$a/wperm.$2.p$3.$4.json" <<JSON
+{"schema":"cc-attention/1","event":"permissionrequest","variant":"worker-permission","session":"$2","root":"$1","pane_index":"$3","role":"worker","agent":"claude","tmux_pane":"%$3","emitted_at":"$(iso_ago "${5:-30}")","state":"needs-input","tool_name":"Bash","command":"do x","command_hash":"$4","permission_suggestions":[]}
+JSON
+}
 
 echo "── attention: idle dispatch → accepted (working) ──"
 new_env att1
@@ -952,6 +969,97 @@ run_status --pretty | grep -q "NEEDS YOU — nothing" && ok "pretty: empty hot r
 run_status --board > "$TDIR/pb.json"
 python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); assert b["schema"]=="cc-board/1"' "$TDIR/pb.json" \
   && ok "pretty mode leaves the JSON contract untouched" || bad "board JSON broke"
+
+echo "── worker ingestion: canonical session lifecycle UNTOUCHED (regression) ──"   # +2
+new_env twork1
+R=$(mk_root proj); live_session forge-1 "$R"
+disp "$R" forge-1 120 cc-a; promptf "$R" forge-1 60 cc-a       # canonical → SESSION-WORKING
+wpromptf "$R" forge-1 0 30 ptask-x; wstopf "$R" forge-1 0 60 ptask-old
+assert_status_has "forge-1 — working" "canonical SESSION-WORKING intact despite worker files"
+assert_status_missing "forge-1 — done" "worker Stop did NOT flip the session to done (P11)"
+
+echo "── PANE-DONE: board row, no ring default; ring only with the knob ──"            # +4
+new_env tpd
+R=$(mk_root proj); live_session forge-1 "$R"
+wstopf "$R" forge-1 0 30 ptask-1 claude "finished the widget"
+assert_status_has "p0 — pane done" "wstop → PANE-DONE row"
+run_status --board | python3 -c 'import json,sys;b=json.load(sys.stdin);r=[x for x in b["active"] if x["condition"]=="PANE-DONE"];assert r and r[0]["state"]=="done"' && ok "PANE-DONE is active/state=done in cc-board/1" || bad "board PANE-DONE wrong"
+: > "$CAP"; run_check >/dev/null
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "PANE-DONE does not ring by default (policy=never)" || bad "PANE-DONE rang without opt-in"
+: > "$CAP"; FORGE_WATCH_NOTIFY_PANE_DONE=1 "$WATCH" check >/dev/null 2>&1
+notified "pane done" && ok "PANE-DONE rings when FORGE_WATCH_NOTIFY_PANE_DONE=1" || bad "knob did not arm the ring"
+
+echo "── tasks[]: dispatched queued/accepted/answered + worker working/done ──"         # +1
+new_env ttasks
+R=$(mk_root proj); live_session forge-1 "$R"
+disp "$R" forge-1 120 cc-q
+disp "$R" forge-1 120 cc-acc; promptf "$R" forge-1 60 cc-acc
+disp "$R" forge-1 300 cc-ans; printf 'ans' > "$(attn "$R")/payloads/response.cc-ans.txt"
+wpromptf "$R" forge-1 2 30 ptask-w
+wstopf   "$R" forge-1 3 30 ptask-d claude "did the thing"
+run_status --board > "$TDIR/t.json"
+python3 - "$TDIR/t.json" <<'PY' && ok "tasks[] carries all five states with fields" || bad "tasks[] states wrong"
+import json,sys
+t={x["task_id"]:x for x in json.load(open(sys.argv[1]))["tasks"]}
+assert t["cc-q"]["state"]=="queued", t.get("cc-q")
+assert t["cc-acc"]["state"]=="accepted"
+assert t["cc-ans"]["state"]=="answered" and t["cc-ans"]["response_path"].endswith("response.cc-ans.txt")
+assert t["ptask-w"]["state"]=="working" and t["ptask-w"]["agent"]=="claude"
+assert t["ptask-d"]["state"]=="done" and t["ptask-d"]["pane"]=="3", t["ptask-d"]
+PY
+
+echo "── board-noise: old worker-done collapses to maintenance; latest in window ──"    # +3
+new_env twin
+R=$(mk_root proj); live_session forge-1 "$R"
+export FORGE_WATCH_TASK_WINDOW_S=3600
+wstopf "$R" forge-1 0 30   ptask-recent claude "recent turn"
+wstopf "$R" forge-1 0 7200 ptask-old    claude "old turn"
+assert_status_has "p0 — pane done" "recent worker-done surfaces as PANE-DONE"
+run_status --board | python3 -c 'import json,sys;b=json.load(sys.stdin);ids={x["task_id"] for x in b["tasks"] if x["state"]=="done"};assert "ptask-recent" in ids and "ptask-old" not in ids, ids' && ok "tasks[] bounded to the window (old turn excluded)" || bad "window not applied"
+run_status | grep -q "older worker-done" && ok "old worker-done collapses to a maintenance count" || bad "residue not collapsed"
+unset FORGE_WATCH_TASK_WINDOW_S
+
+echo "── worker NEEDS-PERMISSION: wperm → hot; superseded by a later worker Stop ──"    # +2
+new_env twperm
+R=$(mk_root proj); live_session forge-1 "$R"
+wpermf "$R" forge-1 0 abcd 30
+assert_status_has "forge-1 p0 — permission needed" "wperm → NEEDS-PERMISSION (hot)"
+wstopf "$R" forge-1 0 10 ptask-after
+assert_status_missing "permission needed" "a later worker Stop supersedes the worker permission"
+
+echo "── graceful degradation: everything empty → valid cc-board/1, no crash ──"        # +2
+new_env tgrace
+: > "$FORGE_WATCH_CONFIG_DIR/watch-roots"; : > "$FORGE_WATCH_TMUX_LIST"
+run_status --board | python3 -c 'import json,sys;b=json.load(sys.stdin);assert b["schema"]=="cc-board/1" and b["hot"]==[] and b["tasks"]==[] and "maintenance" in b' && ok "empty everything → valid cc-board/1 (tasks[] present, no crash)" || bad "board degraded ungracefully"
+run_status --pretty | grep -q "all clear\|FORGE BOARD" && ok "pretty board renders with nothing installed" || bad "pretty board crashed empty"
+
+echo "── cc-board/1 additive contract regression ──"                                    # +1
+new_env tadd
+R=$(mk_root proj); live_session forge-1 "$R"
+disp "$R" forge-1 120 cc-a; promptf "$R" forge-1 60 cc-a
+run_status --board | python3 -c '
+import json,sys
+b=json.load(sys.stdin); assert b["schema"]=="cc-board/1"
+for k in ("hot","active","maintenance","tasks","heartbeat","heartbeat_age_s","stale"): assert k in b, k
+assert isinstance(b["tasks"],list) and isinstance(b["maintenance"],dict)
+' && ok "cc-board/1 carries additive tasks[]/heartbeat; hot/active/maintenance intact" || bad "additive contract broke"
+
+echo "── forge --tasks projection renders + pretty TASKS section ──"                     # +4
+new_env tview
+R=$(mk_root proj); live_session forge-1 "$R"
+disp "$R" forge-1 120 cc-v; printf 'x' > "$(attn "$R")/payloads/response.cc-v.txt"
+run_status --tasks | grep -q "answered" && ok "--tasks renders the projection" || bad "--tasks view missing state"
+run_status --tasks | grep -q "forge reply @forge-1 cc-v" && ok "--tasks shows the reply hint for answered tasks" || bad "--tasks reply hint missing"
+# N1 reconcile: also exercise the inline pretty-board TASKS section (Diff 3e / P15), not just --tasks.
+run_status --pretty | grep -q "TASKS" && ok "pretty board renders the inline TASKS section (P15)" || bad "pretty TASKS section missing"
+run_status --pretty | grep -q "forge reply @forge-1 cc-v" && ok "pretty TASKS shows the reply hint for answered tasks" || bad "pretty TASKS reply hint missing"
+
+echo "── forge --tasks @session filter + --json machine path ──"                         # +2
+new_env tview2
+R=$(mk_root proj); live_session forge-1 "$R"; R2=$(mk_root proj2); live_session forge-2 "$R2"
+disp "$R" forge-1 120 cc-1; disp "$R2" forge-2 120 cc-2
+run_status --tasks @forge-1 | grep -q "cc-2" && bad "@session filter not applied (cc-2 leaked)" || ok "--tasks @forge-1 filters to that session (cc-2 absent)"
+run_status --tasks --json | python3 -c 'import json,sys;a=json.load(sys.stdin);assert isinstance(a,list) and any(t["task_id"]=="cc-1" for t in a)' && ok "--tasks --json emits the task array" || bad "--tasks --json not a JSON array"
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
