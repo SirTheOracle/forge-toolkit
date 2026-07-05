@@ -1,0 +1,8 @@
+{
+  "UserPromptSubmit": [
+    { "matcher": "", "hooks": [ { "type": "command", "command": "$HOME/bin/forge-cc-hook --codex userpromptsubmit", "timeout": 10 } ] }
+  ],
+  "Stop": [
+    { "matcher": "", "hooks": [ { "type": "command", "command": "$HOME/bin/forge-cc-hook --codex stop", "timeout": 10 } ] }
+  ]
+}

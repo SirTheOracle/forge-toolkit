@@ -18,7 +18,15 @@ import sys, os, json, re, hashlib, secrets, datetime, subprocess
 def done():
     sys.exit(0)
 
-event = (sys.argv[1] if len(sys.argv) > 1 else '').lower()
+# `--codex` (first arg) selects the codex adapter: SAME body, agent='codex' (Diff 7c), role
+# forced worker by pane math, task_id correlated on the native turn_id. Codex stdin keys
+# (`prompt`, `last_assistant_message`, `transcript_path`) already match the internal shape
+# (Gate 2) — no key remap, only the flag.
+argv = sys.argv[1:]
+codex = bool(argv) and argv[0] == '--codex'
+if codex:
+    argv = argv[1:]
+event = (argv[0] if argv else '').lower()
 if event not in ('userpromptsubmit', 'stop', 'permissionrequest', 'notification'):
     done()
 
@@ -27,19 +35,35 @@ if event not in ('userpromptsubmit', 'stop', 'permissionrequest', 'notification'
 meta = os.environ.get('FORGE_CC_PANE_META')
 if meta is None:
     pane = os.environ.get('TMUX_PANE', '')
-    if not pane:
+    if pane:
+        try:
+            meta = subprocess.run(
+                ['tmux', 'display-message', '-p', '-t', pane,
+                 '#{pane_index}\t#{session_name}\t#{session_path}'],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            meta = None
+if meta:
+    parts = meta.split('\t')
+    if len(parts) != 3:
         done()
-    try:
-        meta = subprocess.run(
-            ['tmux', 'display-message', '-p', '-t', pane,
-             '#{pane_index}\t#{session_name}\t#{session_path}'],
-            capture_output=True, text=True, timeout=5).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        done()
-parts = (meta or '').split('\t')
-if len(parts) != 3:
+    pane_index, session, root = parts[0], parts[1], os.path.realpath(parts[2])
+elif codex:
+    # Codex fail-open (Gate 3: $TMUX_PANE is normally inherited; this covers when it is not).
+    # Pane precision is NOT required — the agent tag classifies it. Root from cwd walk-up to .dev;
+    # session best-effort. pane_index '' is never '1', so role resolves to worker.
+    # NOTE (best-effort session name): when neither $TMUX_PANE nor $TMUX_SESSION is set, the
+    # synthetic 'codex-<root-basename>' matches no live tmux session, so such a task appears in
+    # tasks[]/PANE-DONE (agent-tagged) but not in the SESSIONS table. This is a rare, fail-open
+    # degradation the plan accepts ("agent tag classifies without pane precision"), not a bug.
+    d = os.getcwd()
+    while d != '/' and not os.path.isdir(os.path.join(d, '.dev')):
+        d = os.path.dirname(d)
+    pane_index = ''
+    root = os.path.realpath(d)
+    session = os.environ.get('TMUX_SESSION', '') or ('codex-' + (os.path.basename(root) or 'root'))
+else:
     done()
-pane_index, session, root = parts[0], parts[1], os.path.realpath(parts[2])
 
 # role: env override wins (future spawned sessions); else pane 1 == orchestrator.
 # Emission is now OPEN to every pane — the gate that used to DISCARD worker signal is gone.
@@ -48,7 +72,7 @@ pane_index, session, root = parts[0], parts[1], os.path.realpath(parts[2])
 # initiative done (§5). `agent` rides ONLY on worker records, so the orchestrator envelope —
 # and stop.<session>.json — stays byte-identical. Step 7 makes `agent` codex-aware.
 role = os.environ.get('FORGE_ROLE') or ('orchestrator' if pane_index == '1' else 'worker')
-agent = 'claude'
+agent = 'codex' if codex else 'claude'
 if not session or not os.path.isdir(os.path.join(root, '.dev')):
     done()
 

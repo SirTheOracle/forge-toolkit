@@ -1114,6 +1114,14 @@ else
   echo "  (skip: plugin not found)"; ok "swiftbar plugin present"; ok "swiftbar task count (skipped)"; ok "swiftbar staleness (skipped)"
 fi
 
+echo "── CODEX-EMISSION-OFF: marker + no codex signal → maintenance; codex fire clears ──"  # +2
+new_env tcodex
+R=$(mk_root proj); live_session forge-1 "$R"
+printf '{"schema":"cc-codex-register/1","hook_sha256":"abc","hooks_path":"x"}' > "$(attn "$R")/codex-register.json"
+assert_status_has "CODEX-EMISSION-OFF" "installed codex hooks + no codex emission → CODEX-EMISSION-OFF"
+wstopf "$R" forge-1 2 30 turn-1 codex "codex answered"
+assert_status_missing "CODEX-EMISSION-OFF" "a codex-tagged wstop suppresses the row (trust proven observationally)"
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "═══════════════════════════════════════"

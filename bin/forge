@@ -730,6 +730,55 @@ os.replace(tmp, spath)
 print(f"registered CC hooks in {spath}")
 PY
 
+    # ── codex parity (Step 7): merge the codex CC block into <root>/.codex/hooks.json ──
+    # Non-managed /hooks path (Gate 1): repo-level hooks.json; one-time per-hash /hooks trust
+    # review per root; trust re-required if the block changes (the marker records the hash).
+    # Idempotent merge mirroring the .claude/settings.json merge above.
+    local cblock="$(_toolkit_root)/config/codex-cc-hooks.json"
+    [ -f "$cblock" ] || cblock="$HOME/.claude/forge-toolkit/config/codex-cc-hooks.json"
+    if [ -f "$cblock" ]; then
+        FORGE_CODEX_BLOCK="$cblock" FORGE_HOOK_ROOT="$root" FORGE_HOOK_MARK="$CC_HOOK_MARK" python3 - <<'PY'
+import os, sys, json, tempfile, hashlib, datetime
+block_fp = os.environ["FORGE_CODEX_BLOCK"]; root = os.environ["FORGE_HOOK_ROOT"]
+MARK = os.environ["FORGE_HOOK_MARK"]
+cdir = os.path.join(root, ".codex"); os.makedirs(cdir, exist_ok=True)
+hpath = os.path.join(cdir, "hooks.json")
+with open(block_fp) as f: block = json.load(f)      # {"UserPromptSubmit":[...],"Stop":[...]}
+data = {}
+if os.path.exists(hpath):
+    try:
+        with open(hpath) as f: data = json.load(f)
+    except ValueError as e:
+        sys.exit(f"forge: REFUSE — {hpath} is not valid JSON ({e}); not touched")
+    if not isinstance(data, dict):
+        sys.exit(f"forge: REFUSE — {hpath} root is not an object; not touched")
+hooks = data.setdefault("hooks", {})                # codex hooks.json wraps events under "hooks"
+if not isinstance(hooks, dict): sys.exit("forge: REFUSE — codex .hooks is not an object")
+def is_cc(entry):
+    return any(MARK in (h.get("command", "") or "")
+               for h in (entry or {}).get("hooks", []) or [])
+for event, entries in block.items():
+    arr = hooks.setdefault(event, [])
+    if not isinstance(arr, list): sys.exit(f"forge: REFUSE — codex .hooks.{event} is not a list")
+    arr[:] = [e for e in arr if not is_cc(e)]       # drop stale CC (idempotent/upgrade)
+    arr.extend(entries)
+fd, tmp = tempfile.mkstemp(dir=cdir, suffix=".tmp")
+with os.fdopen(fd, "w") as f: json.dump(data, f, indent=2); f.write("\n")
+with open(tmp) as f: json.load(f)                   # re-parse validation
+os.replace(tmp, hpath)
+# marker for CODEX-EMISSION-OFF (no `event` field → skipped by the attention scan loop).
+h = hashlib.sha256(json.dumps(block, sort_keys=True).encode()).hexdigest()
+adir = os.path.join(root, ".dev", "attention"); os.makedirs(adir, exist_ok=True)
+mp = os.path.join(adir, "codex-register.json"); mt = mp + f".tmp.{os.getpid()}"
+with open(mt, "w") as f:
+    json.dump({"schema": "cc-codex-register/1", "hook_sha256": h, "hooks_path": hpath,
+               "registered_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}, f, indent=2)
+os.replace(mt, mp)
+print(f"registered codex CC hooks in {hpath} (trust: one-time /hooks review per root)")
+PY
+        echo "  codex: run /hooks in each codex pane at $root to trust the hook (one-time per hash)."
+    fi
+
     local wr="$HOME/.config/forge/watch-roots"
     mkdir -p "$(dirname "$wr")"; touch "$wr"
     if ! grep -qxF "$root" "$wr"; then echo "$root" >> "$wr"; echo "added $root to $wr"; fi

@@ -161,6 +161,17 @@ printf '{"prompt":"do X [dispatch_id:cc-fake] then subtask [dispatch_id:cc-relay
 python3 -c 'import json;assert json.load(open("'"$R"'/.dev/attention/wprompt.forge-x.p4.json"))["task_id"]=="cc-relay-1"' \
   && ok "backed relayed dispatch_id is the task_id (unbacked cc-fake filtered)" || bad "task_id not the relayed id"
 
+echo "── forge-cc-hook --codex: adapter maps codex payload → worker emission ──"
+new_root cx1
+printf '{"prompt":"codex task","turn_id":"turn-abc","session_id":"sid","cwd":"%s"}' "$R" \
+  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex userpromptsubmit
+python3 -c 'import json,os,sys;e=json.load(open(os.path.join(sys.argv[1],".dev","attention","wprompt.forge-x.p2.json")));assert e["agent"]=="codex" and e["role"]=="worker" and e["task_id"]=="turn-abc"' "$R" \
+  && ok "codex UserPromptSubmit → agent=codex, task_id=turn_id (native correlation)" || bad "codex prompt wrong"
+printf '{"last_assistant_message":"codex done, ok?","turn_id":"turn-abc","stop_hook_active":false}' \
+  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex stop
+python3 -c 'import json,os,sys;e=json.load(open(os.path.join(sys.argv[1],".dev","attention","wstop.forge-x.p2.turn-abc.json")));assert e["agent"]=="codex" and e["task_id"]=="turn-abc" and e["looks_like_question"] is True' "$R" \
+  && ok "codex Stop → wstop keyed on turn_id, agent=codex, question detected" || bad "codex stop wrong"
+
 echo "── forge-cc-hook: Step 6 worker trigger detaches AND fires (sentinel) ──"
 new_root tg1
 SENT="$WORK/fired.$$"; rm -f "$SENT"
