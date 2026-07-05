@@ -288,10 +288,12 @@ elif event == 'permissionrequest':
                     {'state': 'needs-input', 'tool_name': tn,
                      'command': snip(cmd, 300), 'command_hash': h,
                      'permission_suggestions': data.get('permission_suggestions') or []}))
+    fire_watch_check(event)
     done()  # explicit: no stdout, dialog left intact
 elif event == 'notification':
     atomic(os.path.join(adir, f'notify.{session}.json'),
            envelope('notification',
                     {'notification_type': data.get('notification_type', ''),
                      'message': snip(data.get('message', ''), 200)}))
+fire_watch_check(event)
 done()

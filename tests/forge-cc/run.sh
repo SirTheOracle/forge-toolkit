@@ -171,6 +171,16 @@ elapsed=$(( $(date +%s) - start ))
 for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$SENT" ] && break; sleep 0.3; done
 { [ "$elapsed" -lt 5 ] && [ -f "$SENT" ]; } && ok "worker Stop trigger detaches (<5s) AND fires (sentinel touched)" || bad "trigger blocked ${elapsed}s or never fired"
 
+echo "── forge-cc-hook: Step 6 orchestrator Stop trigger detaches AND fires (sentinel) ──"
+new_root tg2
+SENT="$WORK/fired-orch.$$"; rm -f "$SENT"
+STUBFW="$WORK/slowwatch2"; printf '#!/bin/bash\ntouch %q\nsleep 30\n' "$SENT" > "$STUBFW"; chmod +x "$STUBFW"
+start=$(date +%s)
+printf '{"last_assistant_message":"orchestrator done"}' | FORGE_WATCH_TRIGGER=1 FORGE_WATCH_BIN="$STUBFW" FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop
+elapsed=$(( $(date +%s) - start ))
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$SENT" ] && break; sleep 0.3; done
+{ [ "$elapsed" -lt 5 ] && [ -f "$SENT" ]; } && ok "orchestrator Stop trigger detaches AND fires (Diffs 6a/6b)" || bad "orchestrator trigger blocked ${elapsed}s or never fired"
+
 echo "── hook merge tool (on COPIES of live settings) ──"
 for pair in "headless_factory:PostToolUse" "feedforge:PreToolUse" "goparent-ai:__nohooks__"; do
   name="${pair%%:*}"; expect="${pair##*:}"

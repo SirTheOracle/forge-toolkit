@@ -326,6 +326,13 @@ _emit_event() {
     local log_file="$log_dir/orchestrator-events.log"
     mkdir -p "$log_dir" 2>/dev/null || return 0
     printf '%s: pipeline=%s %s\n' "$type" "$slug" "$*" >> "$log_file" 2>/dev/null || true
+    # Step 6: BLOCKED/COMPLETE/stage events land at ~1s instead of the 30s floor. Detached,
+    # fail-open, gated (FORGE_WATCH_TRIGGER=0 disables in tests). Never touches stdout/stderr or
+    # the return code.
+    if [ "${FORGE_WATCH_TRIGGER:-1}" = "1" ]; then
+        local _fw="${FORGE_WATCH_BIN:-$HOME/bin/forge-watch}"
+        [ -x "$_fw" ] && ( nohup "$_fw" check >/dev/null 2>&1 & ) 2>/dev/null || true
+    fi
 }
 
 # _observe_usage <worker_canonical> <slug> <stage> <worker_idx> <project_root>
