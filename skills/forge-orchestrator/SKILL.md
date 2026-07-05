@@ -1308,9 +1308,17 @@ Report to user: "N reviews complete (X PASS, Y CONCERNS, Z BLOCKING), M pending.
 If BLOCKING verdicts exist, list them and ask the user whether to proceed.
 Phase 1 is advisory — reviews don't hard-block pipeline advancement.
 
+## You are overseen (Command Center)
+
+Every task you receive — dispatched via `forge` or typed straight into a pane — is auto-registered
+by the command-center hook the moment your turn starts and ends; you need do nothing for the
+operator to see it start, finish, or get stuck. You MAY, at a natural boundary, emit a one-line
+milestone (a short assistant message) — best-effort only, never required, never a substitute for
+the structural signal.
+
 <!--
 Source: ~/.claude/skills/forge-orchestrator/SKILL.md
-Source sha256: 33c0f6b3ee0111a1c2f2b7f3e8dde795cd3529bf6e1710bb05b9193b44962557
+Source sha256: e1ed3d1178a1903e3f2508f4efa008691323f8ba18c247bece6419bc53a660a6
 Generated: 2026-06-29
 Hash tool: shasum -a 256 (macOS) or sha256sum (Linux).
 Hash input: the body ABOVE this comment block, i.e.

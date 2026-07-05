@@ -21,12 +21,20 @@ memory: every fact comes from a fresh `forge board`.
 forge board --json   # machine-readable cc-board/1 JSON: hot / active / maintenance
 forge board          # human board (NEEDS YOU / SESSIONS / hidden maintenance)
 forge board --all    # human board with maintenance residue expanded
+forge tasks          # read-only per-TASK view — every pane's tasks (dispatched or typed)
+forge tasks @<session> [--json]
 ```
 
 `hot` rows are the only ones that need action now: `NEEDS-ASK` (a worker asked a
 blocking question), `NEEDS-DECISION`, `WORKER-BLOCKED`, `NEEDS-PERMISSION`,
 `*-ERROR`, `WORKER-STALLED`, `ZOMBIE-ACTIVE`. `active` rows (`queued-input`,
 `working`, `done`) are informational. `maintenance` is collapsed by default.
+
+Every pane now emits: a task typed directly into a worker or codex pane (not just a
+`forge dispatch`) shows up in `tasks[]` / `forge tasks`. A task that never returns surfaces as
+`TASK-STUCK` rather than vanishing; if the ring can't be delivered, a `DELIVERY-UNVERIFIED` row
+says so. You never have to go look — `forge board` is the zero-resident floor and the SwiftBar
+plugin is the ambient always-on surface (both consume the same `cc-board/1` JSON).
 
 ## Dispatch — instruct a session
 

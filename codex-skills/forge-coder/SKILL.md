@@ -8,6 +8,12 @@ description: >
 
 # Forge Coder Skill
 
+## You are overseen (Command Center)
+
+Every task you receive is auto-registered by the command-center hook when your turn ends — you need
+do nothing for it to appear on the operator's board. You MAY emit an optional one-line milestone at
+a natural boundary; it is best-effort, never required.
+
 ## Hard Constraints
 
 1. Never apply a diff if `old_string` does not exist in the target file — stop and report
