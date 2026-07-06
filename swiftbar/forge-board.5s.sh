@@ -29,9 +29,16 @@ print(title)
 print("---")
 if stale:
     print(f"⚠ watcher stale ({b.get('heartbeat_age_s')}s) — run: forge-watch install | color=red")
+# Dropdown shows only UNSEEN hot rows — acked ("I've seen it, deferring") items collapse to a
+# dim count so acking visibly declutters. The full detail stays on `forge board`.
 for r in hot:
+    if r.get("acked"):
+        continue
     who = r.get("session") or r.get("label")
     print(f"! {r.get('condition')} · {who} | color=red")
+acked = len(hot) - unseen
+if acked:
+    print(f"{acked} seen item(s) hidden — details: forge board | color=gray")
 print(f"{len(tasks)} task(s) in window")
 print("Open board | bash=/bin/sh param1=-c param2='forge board' terminal=true")
 PY
