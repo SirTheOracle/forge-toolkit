@@ -257,10 +257,11 @@ The bridge writes `_emit_event` lines to
 `.dev/forge-tmp/orchestrator-events.log`:
 
 ```
-DISPATCH | WAIT | CALLBACK | DIGEST | STAGE | STALL | ERROR | COMPLETE | USAGE | LOCK: pipeline=<slug> <key=value …>
+DISPATCH | WAIT | CALLBACK | DIGEST | STAGE | STALL | ERROR | COMPLETE | USAGE: pipeline=<slug> <key=value …>
 ```
 
-Use it as a low-level audit stream when debugging. The current `/forge`
+Bridge internals also append `LOCK` events when infra-lock state changes.
+Use the log as a low-level audit stream when debugging. The current `/forge`
 path is in-pane and does not create the older hidden-agent monitor layer.
 
 <!-- TODO: `~/.claude/commands/forge-status.md` still says the status file
@@ -392,6 +393,14 @@ When `wait` returns `STATUS: BLOCKED`:
    ~/bin/forge-bridge callback-consume --slug {slug} --stage {stage} --status BLOCKED
    ```
 5. Wait again with the same args; the next callback resolves it
+
+Command Center ask exception: if the BLOCKED state came from a worker
+running `forge ask --slug {slug} --stage {stage} --worker {worker}
+"<question>"`, and the operator answers with `forge dispatch @<session>
+"<answer>" --answers <ask-id>`, that answer dispatch has already archived
+the BLOCKED callback before injecting the answer into pane 1. In that case,
+relay the answer to the worker with `send --force` and do **not** run a
+second `callback-consume`.
 
 If the continuation send fails or the orchestrator crashes before sending,
 leave the callback file in place. Resume will surface the same BLOCKED state

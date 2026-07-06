@@ -22,7 +22,7 @@ user talks directly to that orchestrator for the rest of the run.
 | 1 | `claude --model claude-opus-4-8` (no acceptEdits) | Orchestrator (Hard Rule 21) |
 | 2 | `codex -m gpt-5.5 -c model_reasoning_effort=xhigh -c service_tier=fast` | `codex-a` worker (HIGH tier) — review, implementation (default), verify (default) |
 | 3 | `codex -m gpt-5.5 -c model_reasoning_effort=medium -c service_tier=fast` | `codex-b` worker (THROUGHPUT tier) — qa, qa-retry |
-| 4 | `claude --model claude-sonnet-4-6 --permission-mode acceptEdits` | `claude-sonnet` worker (THROUGHPUT tier) — coding, qa-fix, qa (local fallback) |
+| 4 | `claude --model claude-sonnet-4-6 --permission-mode acceptEdits` | `claude-sonnet` worker (THROUGHPUT tier) — coding, qa-fix, qa dispatch fallback |
 
 **Control bus:** `~/bin/forge-bridge` — a single shell script that owns all
 inter-pane messaging, dispatch logging, callback collection, stall
@@ -37,7 +37,7 @@ everything goes through the bridge.
 | `.dev/.forge-session` | `forge-start` | tmux session name (e.g. `forge-2`) |
 | `.dev/forge-log.yml` | `forge-bridge log` / `log-response` | Project-wide dispatch summary |
 | `.dev/forge-context.<session>.yml` | `log-response` / `set-context` | Session-scoped active pipeline pointer, last stage, next stage, notes |
-| `.dev/forge-status.<session>.md` | bridge side-effect of dispatch/wait/callback/status | Session-scoped human-readable rolling state; includes infra-lock status when available |
+| `.dev/forge-status.<session-or-no-session>.md` | bridge side-effect of dispatch/wait/callback/status | Session-scoped human-readable rolling state; includes infra-lock status when available |
 | `.dev/forge-usage.<session>.yml` | `callback` usage observer | Per-worker usage snapshot. Claude parses footer `ctx`; Codex records honest `unknown` |
 | `.dev/proposals/{slug}/forge-log.yml` | bridge | Per-pipeline detail |
 | `.dev/proposals/{slug}/*.md` | workers | Stage artifacts (final-plan.md, review-feedback.md, etc.) |
@@ -45,7 +45,7 @@ everything goes through the bridge.
 | `.dev/forge-tmp/{worker}-{stage}-{slug}.txt` | `dispatch` | Rendered stage prompt sent to worker |
 | `.dev/forge-tmp/callbacks/{slug}-{stage}.callback` | `callback` | Canonical callback file consumed by `wait` |
 | `.dev/forge-tmp/callbacks/archive/` | `callback-consume` | Archived non-terminal BLOCKED callbacks after a continuation succeeds |
-| `.dev/forge-tmp/orchestrator-events.log` | `_emit_event` | Heartbeat event stream (`DISPATCH`, `WAIT`, `CALLBACK`, `DIGEST`, `STAGE`, `STALL`, `ERROR`, `COMPLETE`, `USAGE`, `LOCK`) |
+| `.dev/forge-tmp/orchestrator-events.log` | `emit` / `_emit_event` | Heartbeat event stream. Public `emit` accepts `DISPATCH`, `WAIT`, `CALLBACK`, `DIGEST`, `STAGE`, `STALL`, `ERROR`, `COMPLETE`, and `USAGE`; bridge internals also write `LOCK` |
 | `<git-common-dir>/forge-infra-lock/infra.{flock,holder}` | `infra-lock` | Cross-worktree mutex for shared infra stages |
 
 **Invocation modes:**
@@ -65,21 +65,27 @@ longer on the `/forge` path.
 <!-- TODO: Lower-tier command prose still names legacy `.dev/forge-status.md`
 and `.dev/forge-context.yml`; bridge code is authoritative and writes
 session-scoped `forge-status.<session>.md` and `forge-context.<session>.yml`. -->
+<!-- TODO: Earlier orchestrator role/worker-selection prose still calls
+claude-sonnet the qa "local fallback"; Hard Rule 22 is authoritative:
+claude-sonnet is a throughput dispatch fallback, and the true local fallback
+is gated pane-1 Agent Teams qa/qa-retry under infra-lock. -->
 <!-- docs-refresh:end section=architecture -->
 
 ## Bridge Commands
 
 <!-- docs-refresh:start section=bridge-commands -->
 The bridge splits into tmux-required commands (operate on panes; need an
-active forge session) and file-based commands that can run from a forge project
-directory with or without an attached tmux pane.
+active forge session) and file-based commands that do not require pane focus.
+File-based commands still resolve a forge project root from cwd when they
+need project state, and session-scoped filenames use the active session name
+or the `no-session` sentinel.
 
 ### Tmux-required commands
 
 | Command | Purpose |
 |---|---|
 | `send <pane> <message>` | Type into a pane; enforces per-target log-before-send hook |
-| `send --force <pane> <msg>` | Bypass the log check (non-pipeline messages, callbacks) |
+| `send --force <pane> <msg>` | Bypass the log check for non-pipeline follow-ups such as BLOCKED continuations |
 | `read <pane> [lines]` | Read last N lines from a pane |
 | `focus <pane>` | Switch tmux focus to a pane |
 | `back` | Return focus to the orchestrator pane |
@@ -88,7 +94,7 @@ directory with or without an attached tmux pane.
 | `stall-check [--project-root <p>] <pane>` | Classify pane state (IDLE / ACTIVE / STALLED / PROMPTING / COMPLETED-PENDING-LOG-RESPONSE / DEAD / UNKNOWN) |
 | `health` | Verify all 5 panes exist and run the expected worker process; exits 0 only if all OK |
 
-### No-tmux commands (work from any directory)
+### No-tmux commands (no pane focus required)
 
 | Command | Purpose |
 |---|---|
@@ -101,7 +107,7 @@ directory with or without an attached tmux pane.
 | `log-response --slug <s> --response <r> [--to <pane>] [--stage <s>] [--file <path:action>]...` | Update a pending entry; `--to` disambiguates when multiple pending |
 | `history [lines]` | Project-wide summary |
 | `pipeline-log <slug> [lines]` | Per-pipeline detail |
-| `status` | Render and print `.dev/forge-status.<session>.md` |
+| `status` | Render and print `.dev/forge-status.<session-or-no-session>.md` |
 | `context` | Show current pipeline state |
 | `set-context --slug <s>` | Manually set the active pipeline (auto-derives state) |
 | `add-note <text>` | Annotate context; persists in the session-scoped forge context file |
@@ -189,7 +195,7 @@ rationale.
 | 19 | Stall detection lives in `forge-bridge wait` | Don't call `stall-check` directly during a pipeline run |
 | 20 | `dispatch --clear` between same-pane Claude dispatches | Claude panes accumulate context; pass `--clear` when re-using one. Codex panes don't need it |
 | 21 | Worker permission-mode and ident contract | Pane-launch flags fixed; git idents are repo-local only (`git -C ... config` — never `--global`) |
-| 22 | Reasoning-tier routing (bridge-enforced) | HIGH stages (review, incorporate, implementation, impl-review, verify) → codex-a or claude-opus only; THROUGHPUT stages (coding, qa, qa-fix, qa-retry) → claude-sonnet or codex-b. `proposal` is the local pane-1 exception (not dispatchable). `dispatch` rejects illegal stage/worker pairs |
+| 22 | Reasoning-tier routing (bridge-enforced) | HIGH stages (review, incorporate, implementation, impl-review, verify) → codex-a or claude-opus only; THROUGHPUT stages (coding, qa, qa-fix, qa-retry) → claude-sonnet or codex-b. `proposal` is the local pane-1 exception (not dispatchable). A local pane-1 `qa` / `qa-retry` fallback is allowed only when throughput routing is unavailable and the infra lock is held. `dispatch` rejects illegal stage/worker pairs |
 | 23 | Cross-worktree infra lock | `coding`, `qa`, `qa-fix`, `qa-retry`, and `verify` acquire `infra-lock`; reasoning stages never lock. Release only on terminal DONE/ERROR, not while PROMPTING/STALLED/TIMEOUT/DEAD/BLOCKED |
 <!-- docs-refresh:end section=orchestrator-hard-rules -->
 
@@ -213,9 +219,9 @@ proposal → review → incorporate → implementation → impl-review → codin
 | implementation | codex-a (**claude-opus** fallback, `--clear`) | HIGH. Adversarial implementation doc. Fall back to the other HIGH pane only on explicit high-usage signal — never to a throughput pane |
 | impl-review | claude-opus (with `--clear`) | HIGH. Verify implementation against plan + scope diff check |
 | coding | claude-sonnet | THROUGHPUT. Execute the implementation via the `forge-coder` skill. No worktrees |
-| qa | codex-b (claude-sonnet local fallback) | THROUGHPUT (medium-reasoning, throughput-routed). Adversarial QA + regression sweep |
+| qa | codex-b; claude-sonnet dispatch fallback; pane-1 local fallback only when throughput routing is unavailable | THROUGHPUT (medium-reasoning, throughput-routed). Adversarial QA + regression sweep; all paths hold infra-lock |
 | qa-fix | claude-sonnet (with `--clear`) | THROUGHPUT. Resolve QA findings — only entered if qa digest has findings |
-| qa-retry | codex-b or claude-sonnet | THROUGHPUT. Re-run QA after qa-fix; one re-run only |
+| qa-retry | codex-b or claude-sonnet; pane-1 local fallback only when throughput routing is unavailable | THROUGHPUT. Re-run QA after qa-fix; one re-run only; all paths hold infra-lock |
 | verify | **codex-a (claude-opus fallback)** | HIGH. Final verification. Exclusion guard: MUST NOT be the same worker that ran the most recent qa stage (auto-satisfied under current QA routing) |
 
 ### Infra-lock coverage
@@ -236,14 +242,19 @@ Shape A wraps dispatched infra stages:
 The lock intentionally stays held while a stage is `PROMPTING`, `STALLED`,
 `TIMEOUT`, `DEAD`, or `BLOCKED`, because those states do not prove the
 worker has stopped touching shared ports or the shared database. For a
-BLOCKED continuation, the orchestrator sends `send --force`, then runs
-`callback-consume --slug <s> --stage <stage> --status BLOCKED` after the
-continuation succeeds.
+normal BLOCKED continuation, the orchestrator sends `send --force`, then
+runs `callback-consume --slug <s> --stage <stage> --status BLOCKED` after
+the continuation succeeds. If the BLOCKED state came from a worker
+`forge ask`, the Command Center answer path is different: `forge dispatch
+@<session> "<answer>" --answers <ask-id>` consumes the BLOCKED callback
+before injecting the answer into pane 1, so the orchestrator relays the
+answer to the worker with `send --force` and does **not** run its own
+`callback-consume`.
 
-Shape B is the local fallback for inline `qa` / `qa-retry` when Codex B is
-unavailable: acquire the lock, open a local `to: claude` log entry, run the
-Agent Teams QA inline under the held lock, close the entry on every exit,
-release, then render the digest.
+Shape B is the pane-1 local Agent Teams fallback for inline `qa` / `qa-retry`
+when throughput routing is unavailable: acquire the lock, open a local
+`to: claude` log entry, run the Agent Teams QA inline under the held lock,
+close the entry on every exit, release, then render the digest.
 
 ### Transition table
 
@@ -276,6 +287,20 @@ release, then render the digest.
 2. **Wait:** `forge-bridge wait --slug <s> --stage <s> --worker <w> [--timeout <s>] [--digest-template <name>]` — blocks until callback or stall classification. Returns one structured block on stdout.
 3. **Spawn digest agent:** when `--digest-template` was passed and STATUS=DONE, the bridge returns `DIGEST_PROMPT: <path>`. The orchestrator spawns a background agent with a one-line "follow this file" prompt.
 4. **Advance / change-of-course:** if digest is `CONFIDENCE: HIGH` and `BLOCKING_ITEMS: 0`, emit a one-line status and begin the next stage. Otherwise apply the Change-of-Course Heuristic.
+
+Stage templates should include the worker's forge identity and escalation
+command:
+
+```text
+forge ask --slug {slug} --stage {stage} --worker {worker} "<question>"
+```
+
+That command writes a `NEEDS-ASK` board row and a BLOCKED callback. When
+the operator answers with `forge dispatch @<session> "<answer>" --answers
+<ask-id>`, the answer path archives the BLOCKED callback before injecting
+the answer into the orchestrator pane. The orchestrator should relay the
+answer to the worker with `send --force`; treating `callback-consume` as a
+required second step creates a double-consume race.
 
 Codex panes don't need `--clear`. Claude panes accumulate in-conversation
 context, so `--clear` is mandatory when re-dispatching to a pane that
