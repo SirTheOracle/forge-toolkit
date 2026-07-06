@@ -795,7 +795,7 @@ def scan_attention(root, label):
                         and dstop is not None and dstop <= ZOMBIE_AGE_S):
                     qs = (s_stop.get('question_snippet') or snip or '').strip()
                     add_finding('NEEDS-REPLY', root, f"{sess}\t{aid}",
-                                f"{label} · {sess} — awaiting reply: {qs[:100]}" if qs
+                                f"{label} · {sess} — awaiting reply: {qs[:100]}{'…' if len(qs) > 100 else ''}" if qs
                                 else f"{label} · {sess} — awaiting reply (worker waiting; see tab)",
                                 policy=('standard' if NOTIFY_REPLY else 'never'),
                                 session=sess)

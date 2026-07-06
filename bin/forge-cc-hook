@@ -100,8 +100,39 @@ def redact(s):
     return KV.sub(r"\1\2«redacted»", s)
 def snip(s, n=280):
     return redact((s or "").strip().replace("\n", " "))[:n]
+Q_TAIL = re.compile(r"\?[\s*_\"'`)\]]*$")   # '?' + optional markdown closers
+def trailing_question(body, lookback=8):
+    # A worker that asks and then appends a short footer (status list, links)
+    # still needs a reply — endswith('?') alone hides it. Scan the last few
+    # non-empty lines for one ending in '?'; return the body truncated at that
+    # line (so snip_tail anchors the snippet on the question), else None.
+    lines = (body or '').splitlines()
+    for idx in range(len(lines) - 1, -1, -1):
+        s = lines[idx].strip()
+        if not s:
+            continue
+        if Q_TAIL.search(s):
+            return '\n'.join(lines[:idx + 1])
+        lookback -= 1
+        if lookback <= 0:
+            break
+    return None
+
 def snip_tail(s, n=200):
-    return redact((s or "").strip().replace("\n", " "))[-n:]   # redact BEFORE slicing; keeps the trailing '?'
+    # redact BEFORE slicing; keeps the trailing '?'. Align the window to the
+    # start of the last sentence (else a word boundary) so it never opens
+    # mid-word — the board renders this head-first as the pending question.
+    t = redact((s or "").strip().replace("\n", " "))
+    if len(t) <= n:
+        return t
+    tail = t[-n:]
+    starts = [m.end() for m in re.finditer(r'[.!?]["\')\]]*\s+', tail)]
+    if starts:
+        return tail[starts[-1]:]
+    sp = tail.find(' ')
+    if 0 <= sp < n // 4:
+        return tail[sp + 1:]
+    return tail
 
 def envelope(variant, extra):
     d = {'schema': 'cc-attention/1', 'event': event, 'variant': variant,
@@ -204,7 +235,8 @@ if role != 'orchestrator':
         else:
             msg, src = tail_transcript(data.get('transcript_path')), 'transcript_tail'
         body = (msg or '').strip()
-        is_q = body.endswith('?')
+        q_text = trailing_question(body)
+        is_q = q_text is not None
         # recover task_id + prompt snippet from the sibling wprompt (else a Stop-time ptask).
         task_id, prompt_snip = native_tid, ''
         try:
@@ -221,7 +253,7 @@ if role != 'orchestrator':
                         {'agent': agent, 'task_id': task_id, 'prompt_snippet': prompt_snip,
                          'snippet': snip(body, 400), 'snippet_source': src,
                          'looks_like_question': is_q,
-                         'question_snippet': (snip_tail(body, 200) if is_q else None)}))
+                         'question_snippet': (snip_tail(q_text, 200) if is_q else None)}))
     elif event == 'permissionrequest':
         tn = data.get('tool_name', '') or ''
         ti = data.get('tool_input') or {}
@@ -256,7 +288,8 @@ elif event == 'stop':
     else:
         msg, src = tail_transcript(data.get('transcript_path')), 'transcript_tail'
     body = (msg or '').strip()
-    is_q = body.endswith('?')
+    q_text = trailing_question(body)
+    is_q = q_text is not None
     # response payload(s), keyed by the dispatch_id(s) this turn answers. Fail-open:
     # a new cross-event read of prompt.<session>.json + payload writes, all wrapped;
     # any failure -> omit pointers, still write the lifecycle event, exit 0.
@@ -300,7 +333,7 @@ elif event == 'stop':
            envelope('snippet',
                     {'snippet': snip(body, 400), 'snippet_source': src,
                      'looks_like_question': is_q,
-                     'question_snippet': (snip_tail(body, 200) if is_q else None),
+                     'question_snippet': (snip_tail(q_text, 200) if is_q else None),
                      **resp}))
 elif event == 'permissionrequest':
     tn = data.get('tool_name', '') or ''
