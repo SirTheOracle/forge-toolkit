@@ -1169,6 +1169,62 @@ def _cls(c):
 def _task_ts(t):
     return t.get('answered_at') or t.get('dispatched_at') or t.get('started_at') or ''
 
+# ── human rendering helpers (shared by the --tasks view and the pretty board) ──
+import shutil
+R_WIDTH = max(60, min(shutil.get_terminal_size((100, 24)).columns, 120))
+R_COLOR = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+def paint(code, s):
+    return f"\033[{code}m{s}\033[0m" if R_COLOR else s
+def flat(s):
+    return ' '.join((s or '').split())
+def clip(s, w):
+    # word-boundary clip: never end a row mid-word
+    s = flat(s)
+    if len(s) <= w:
+        return s
+    cut = s[:max(1, w - 1)]
+    sp = cut.rfind(' ')
+    if sp >= int(w * 0.6):
+        cut = cut[:sp]
+    return cut.rstrip(' ,;:-') + '…'
+def sect(title, extra='', color='1'):
+    # section band: bold title + dim rule to the terminal edge
+    pad = R_WIDTH - len(title) - (len(extra) + 1 if extra else 0) - 1
+    return (paint(color, title) + (' ' + paint('2', extra) if extra else '')
+            + ' ' + paint('2', '─' * max(0, pad)))
+def natkey(s):
+    return [int(x) if x.isdigit() else x for x in re.split(r'(\d+)', s or '')]
+STAGE_DISPATCH = re.compile(r'\.dev/forge-tmp/([^\s`"\']+?)(?:\.(?:md|txt))?(?=[\s`"\']|$)')
+def task_desc(t):
+    # Pipeline stage dispatches all read "Read and follow instructions in
+    # .dev/forge-tmp/<worker-stage-slug>.md" — the basename IS the identity;
+    # surface it instead of the boilerplate.
+    d = flat(t.get('prompt_snippet') or t.get('snippet') or '')
+    m = STAGE_DISPATCH.search(d)
+    if m and re.match(r'(?i)(override|read and follow)', d):
+        return 'stage · ' + m.group(1)
+    return d
+TASK_COL = {'answered': '32', 'done': '32', 'working': '33', 'accepted': '33',
+            'queued': '2'}
+def task_rows(t, indent, show_sess=False):
+    # one task = one line (state · age · pane/agent · what) + a paste-ready
+    # retrieval hint under answered tasks
+    st = t['state']
+    ts = _task_ts(t)
+    a = age_s(ts) if ts else None
+    age = human_age(a) if a is not None else ''
+    pane = f"p{t['pane']}" if t.get('pane') is not None else 'p1'
+    who = (f"{t.get('session') or t.get('label') or ''}  " if show_sess else '')
+    meta = f"{pane} {t.get('agent') or ''}".strip()
+    used = len(indent) + 9 + 6 + len(who) + max(11, len(meta)) + 2
+    lines = [indent + paint(TASK_COL.get(st, '2'), f"{st:<9}")
+             + paint('2', f"{age:>4}  ") + paint('2', f"{who}{meta:<11}") + '  '
+             + clip(task_desc(t), max(20, R_WIDTH - used))]
+    if st == 'answered' and t.get('session'):
+        lines.append(indent + '  ' + paint('36',
+                     f"↳ forge reply @{t['session']} {t['task_id']}"))
+    return lines
+
 if os.environ.get('FORGE_WATCH_TASKS') == '1':
     # `forge tasks [@<session>] [--json]` — the operator projection. Optional @session filter
     # and a --json machine path (both threaded from cmd_status; see Diff 3f). Reconcile B-C1.
@@ -1177,25 +1233,12 @@ if os.environ.get('FORGE_WATCH_TASKS') == '1':
                      key=_task_ts, reverse=True)
     if os.environ.get('FORGE_WATCH_TASKS_JSON') == '1':
         print(json.dumps(tsorted, indent=2)); sys.exit(0)
-    import shutil
-    width = max(60, min(shutil.get_terminal_size((100, 24)).columns, 120))
-    use_color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
-    def paint(code, s): return f"\033[{code}m{s}\033[0m" if use_color else s
-    def clip(s, w):
-        s = ' '.join((s or '').split())
-        return s if len(s) <= w else s[:max(1, w - 1)].rstrip() + '…'
-    print(paint('1', 'FORGE TASKS') + paint('2', f"  ·  {len(tsorted)} task(s)"))
+    print(sect('FORGE TASKS', f'· {len(tsorted)} task(s)'))
     if not tsorted:
         print(paint('2', '  no tasks in the current window'))
-    COL = {'answered': '32', 'done': '32', 'working': '33', 'accepted': '33', 'queued': '2'}
     for t in tsorted[:40]:
-        st = t['state']; who = t.get('session') or t['label']
-        pane = f"p{t['pane']}" if t.get('pane') is not None else ''
-        desc = t.get('prompt_snippet') or t.get('snippet') or ''
-        print('  ' + paint(COL.get(st, '2'), f"{st:<9}")
-              + f" {who} {pane} [{t.get('agent')}]  " + clip(desc, width - 40))
-        if st == 'answered' and t.get('session'):
-            print('    ' + paint('36', f"-> forge reply @{t['session']} {t['task_id']}"))
+        for ln in task_rows(t, '  ', show_sess=True):
+            print(ln)
     sys.exit(0)
 
 if BOARD:
@@ -1226,16 +1269,6 @@ if BOARD:
 if PRETTY:
     # Human board: NEEDS YOU first, one line per live session, residue hidden.
     # Pure rendering over the same findings — no new detection, no writes.
-    import shutil
-    width = max(60, min(shutil.get_terminal_size((100, 24)).columns, 120))
-    use_color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
-    def paint(code, s):
-        return f"\033[{code}m{s}\033[0m" if use_color else s
-    def flat(s):
-        return ' '.join((s or '').split())
-    def clip(s, w):
-        s = flat(s)
-        return s if len(s) <= w else s[:max(1, w - 1)].rstrip() + '…'
     def detail_of(f):
         m = flat(f['msg'])                    # msg is "label · who — <detail>"
         return m.split(' — ', 1)[1] if ' — ' in m else m
@@ -1248,10 +1281,12 @@ if PRETTY:
     sess_map = {s: p for s, p in SESSIONS.items()
                 if os.path.isdir(os.path.join(p, '.dev'))}
     stamp = datetime.datetime.now().strftime('%a %H:%M')
-    print(paint('1', 'FORGE BOARD')
-          + paint('2', f"  ·  {stamp}  ·  {len(sess_map)} session(s) live"))
     _tick = state.get('last_tick'); _tage = age_s(_tick) if _tick else None
-    if _tage is None or _tage > STALE_TICK_S:
+    _fresh = _tage is not None and _tage <= STALE_TICK_S
+    print(sect('FORGE BOARD',
+               f'· {stamp} · {len(sess_map)} session(s) live'
+               + (f' · watch {human_age(_tage)}' if _fresh else '')))
+    if not _fresh:
         print(paint('33', "! forge-watch last ran "
                     + ((human_age(_tage) + ' ago') if _tage is not None else 'never')
                     + " — reload with `forge-watch install`"))
@@ -1261,14 +1296,14 @@ if PRETTY:
         print(paint('1;32', 'NEEDS YOU — nothing.')
               + paint('2', '  All sessions are self-sufficient.'))
     else:
-        print(paint('1;31', f'NEEDS YOU ({len(hot)})'))
+        print(sect(f'NEEDS YOU ({len(hot)})', color='1;31'))
         for f in hot:
             who = f.get('session') or root_label(f['root'])
             tag = f" ({f['slug']}/{f['stage']})" if f.get('slug') and f.get('stage') else ''
             ack = paint('2', '  [acked]') if conds.get(f['key'], {}).get('acked') else ''
             print('  ' + paint('1;31', '! ')
                   + paint('1', f"{who} · {root_label(f['root'])} — {f['condition']}{tag}") + ack)
-            print('    ' + clip(detail_of(f), width - 4))
+            print('    ' + clip(detail_of(f), R_WIDTH - 4))
             if f['condition'] == 'NEEDS-ASK':
                 aid = f['key'].split('\t')[2]
                 at = f"@{f['session']}" if f.get('session') \
@@ -1283,7 +1318,7 @@ if PRETTY:
 
     if sess_map:
         print()
-        print(paint('1', 'SESSIONS'))
+        print(sect('SESSIONS'))
         by_sess = {}
         for f in findings:
             if f.get('session'):
@@ -1293,8 +1328,7 @@ if PRETTY:
                  'idle': ('- idle', '2')}
         wname = max(len(s) for s in sess_map)
         wlab = min(max(len(root_label(p)) for p in sess_map.values()), 24)
-        nat = lambda s: [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', s)]
-        for s in sorted(sess_map, key=nat):
+        for s in sorted(sess_map, key=natkey):
             fs = by_sess.get(s, [])
             state, det = 'idle', ''
             hf = [f for f in fs if _cls(f['condition']) == 'hot']
@@ -1312,7 +1346,7 @@ if PRETTY:
             g, col = GLYPH[state]
             line = (f"  {s:<{wname}}  {clip(root_label(sess_map[s]), wlab):<{wlab}}  "
                     + paint(col, f'{g:<12}'))
-            room = width - (wname + wlab + 20)
+            room = R_WIDTH - (wname + wlab + 20)
             if det and room > 10:
                 line += '  ' + paint('2', clip(det, room))
             print(line)
@@ -1327,16 +1361,28 @@ if PRETTY:
     trecent = [t for t in tsorted if _trecent(t)]
     if trecent:
         print()
-        print(paint('1', 'TASKS') + paint('2', f'  ({len(trecent)})'))
-        TCOL = {'answered': '32', 'done': '32', 'working': '33', 'accepted': '33', 'queued': '2'}
-        for t in trecent[:20]:
-            st = t['state']; who = t.get('session') or root_label(t['root'])
-            pane = f"p{t['pane']}" if t.get('pane') is not None else ''
-            desc = flat(t.get('prompt_snippet') or t.get('snippet') or '')
-            print('  ' + paint(TCOL.get(st, '2'), f"{st:<9}")
-                  + f" {who} {pane} [{t.get('agent')}]  " + clip(desc, width - 40))
-            if st == 'answered' and t.get('session'):
-                print('    ' + paint('36', f"-> forge reply @{t['session']} {t['task_id']}"))
+        print(sect('TASKS', f'({len(trecent)})'))
+        # grouped by session, most recent activity first; per-group cap keeps
+        # one busy pane from drowning the rest
+        groups = {}
+        for t in trecent:
+            groups.setdefault(t.get('session') or t.get('label') or '?', []).append(t)
+        PER_GROUP = 5
+        shown = 0
+        for s in sorted(groups, key=lambda k: _task_ts(groups[k][0]), reverse=True):
+            if shown >= 24:
+                break
+            ts_ = groups[s]
+            lbl = root_label(ts_[0].get('root') or '')
+            print('  ' + paint('1', s)
+                  + (paint('2', f' · {lbl}') if lbl and lbl != s else ''))
+            for t in ts_[:PER_GROUP]:
+                for ln in task_rows(t, '    '):
+                    print(ln)
+                shown += 1
+            if len(ts_) > PER_GROUP:
+                print('    ' + paint('2',
+                      f'… {len(ts_) - PER_GROUP} more · forge tasks @{s}'))
         older = len(tsorted) - len(trecent)
         if older > 0:
             print(paint('2', f"  … {older} older task(s) in maintenance"))
@@ -1344,9 +1390,9 @@ if PRETTY:
     pipes = [f for f in active if f['condition'] == 'PIPELINE-COMPLETE']
     if pipes:
         print()
-        print(paint('1', 'PIPELINES'))
+        print(sect('PIPELINES'))
         for f in pipes:
-            print('  ' + paint('32', '+ ') + clip(flat(f['msg']), width - 4))
+            print('  ' + paint('32', '+ ') + clip(flat(f['msg']), R_WIDTH - 4))
 
     if maint:
         print()
@@ -1355,9 +1401,9 @@ if PRETTY:
             counts[f['condition']] = counts.get(f['condition'], 0) + 1
         summary = ', '.join(f"{n} {c}" for c, n in sorted(counts.items()))
         if SHOWALL:
-            print(paint('1', f'MAINTENANCE ({len(maint)})') + paint('2', f'  {summary}'))
+            print(sect(f'MAINTENANCE ({len(maint)})', summary))
             for f in maint:
-                print(paint('2', f"  [{f['condition']}] {clip(flat(f['msg']), width - 4)}"))
+                print(paint('2', f"  [{f['condition']}] {clip(flat(f['msg']), R_WIDTH - 4)}"))
         else:
             print(paint('2', f"MAINTENANCE — {len(maint)} old item(s) hidden ({summary})"
                              " · `forge board --all` to list"))
