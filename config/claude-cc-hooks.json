@@ -1,14 +1,58 @@
 {
   "UserPromptSubmit": [
-    { "hooks": [ { "type": "command", "command": "$HOME/bin/forge-cc-hook userpromptsubmit", "timeout": 10 } ] }
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "$HOME/bin/forge-cc-hook userpromptsubmit",
+          "timeout": 10
+        }
+      ]
+    }
   ],
   "Stop": [
-    { "hooks": [ { "type": "command", "command": "$HOME/bin/forge-cc-hook stop", "timeout": 10 } ] }
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "$HOME/bin/forge-cc-hook stop",
+          "timeout": 10
+        }
+      ]
+    }
   ],
   "PermissionRequest": [
-    { "hooks": [ { "type": "command", "command": "$HOME/bin/forge-cc-hook permissionrequest", "timeout": 10 } ] }
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "$HOME/bin/forge-cc-hook permissionrequest",
+          "timeout": 10
+        }
+      ]
+    }
   ],
   "Notification": [
-    { "hooks": [ { "type": "command", "command": "$HOME/bin/forge-cc-hook notification", "timeout": 10 } ] }
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "$HOME/bin/forge-cc-hook notification",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "AskUserQuestion",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "$HOME/bin/forge-cc-hook posttooluse",
+          "timeout": 10
+        }
+      ]
+    }
   ]
 }

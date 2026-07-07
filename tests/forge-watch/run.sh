@@ -41,6 +41,10 @@ new_env() {
     export FORGE_WATCH_SINK_CAPTURE="$CAP"
     # Deterministic thresholds: stall 600 (stale=1200s=20m), dwell 300, zombie 7d.
     unset FORGE_STALL_THRESHOLD_S FORGE_WATCH_DWELL_S FORGE_WATCH_RENOTIFY_S FORGE_WATCH_ZOMBIE_AGE_D 2>/dev/null || true
+    # Hardening knobs: existing tests re-run `check` and grep stdout, so pin
+    # quiet-unchanged OFF here; the dedicated hardening tests opt in inline.
+    export FORGE_WATCH_QUIET_UNCHANGED=0
+    unset FORGE_WATCH_CHECK_TIMEOUT_S FORGE_WATCH_NOTIFY_TIMEOUT_S 2>/dev/null || true
 }
 
 mk_root() {  # mk_root <name>  -> echoes path; registers in watch-roots
@@ -234,6 +238,21 @@ pending_log "$R" p-old coding codex-a "$(iso_ago 6000000)"   # ~69d
 run_check >/dev/null
 assert_not_notified "p-old" "months-old open pending is residue (status-only), not a stall notification"
 assert_status_has "STALE-PENDING.*p-old" "residue pending visible in status"
+
+new_env ws4
+R=$(mk_root proj); live_session forge-1 "$R"
+pending_log "$R" p-act coding codex-a "$(iso_ago 1800)"
+echo work > "$R/.dev/proposals/p-act/diagnosis.md"                      # fresh artifact = alive
+run_check >/dev/null
+assert_not_notified "p-act.*stalled" "stale pending with FRESH slug artifacts is working, not stalled"
+
+new_env ws5
+R=$(mk_root proj); live_session forge-1 "$R"
+pending_log "$R" p-idle coding codex-a "$(iso_ago 1800)"
+echo work > "$R/.dev/proposals/p-idle/diagnosis.md"
+touch -t "$(python3 -c "import datetime;print((datetime.datetime.now()-datetime.timedelta(seconds=1800)).strftime('%Y%m%d%H%M'))")" "$R/.dev/proposals/p-idle/diagnosis.md"
+run_check >/dev/null
+assert_notified "p-idle.*stalled" "stale pending with only OLD artifacts still fires WORKER-STALLED"
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo "── event: PIPELINE-ERROR / STALL / COMPLETE ──"
@@ -1121,6 +1140,54 @@ printf '{"schema":"cc-codex-register/1","hook_sha256":"abc","hooks_path":"x"}' >
 assert_status_has "CODEX-EMISSION-OFF" "installed codex hooks + no codex emission → CODEX-EMISSION-OFF"
 wstopf "$R" forge-1 2 30 turn-1 codex "codex answered"
 assert_status_missing "CODEX-EMISSION-OFF" "a codex-tagged wstop suppresses the row (trust proven observationally)"
+
+
+echo "── hardening: quiet ticks — unchanged check prints nothing (non-tty) ──"           # +3
+new_env tquiet
+R=$(mk_root proj); live_session forge-1 "$R"
+out1=$(FORGE_WATCH_QUIET_UNCHANGED=1 "$WATCH" check)
+out2=$(FORGE_WATCH_QUIET_UNCHANGED=1 "$WATCH" check)
+[ -n "$out1" ] && ok "first check prints (signature transition)" || bad "first check silent"
+[ -z "$out2" ] && ok "unchanged second check prints nothing" || bad "unchanged check still printed: $out2"
+askf "$R" forge-1 ask-q "" "" 30 "quiet?"
+out3=$(FORGE_WATCH_QUIET_UNCHANGED=1 "$WATCH" check)
+echo "$out3" | grep -q "NEEDS-ASK" && ok "changed findings print again" || bad "changed findings suppressed: $out3"
+
+echo "── hardening: lock contention leaves a stderr trace, exit 0 ──"                    # +3
+new_env tlock
+R=$(mk_root proj); live_session forge-1 "$R"
+python3 - "$FORGE_WATCH_CACHE_DIR/state.lock" <<'LKPY' &
+import sys, fcntl, time, datetime
+fh = open(sys.argv[1], 'a')
+fcntl.flock(fh, fcntl.LOCK_EX)
+fh.seek(0); fh.truncate()
+fh.write(datetime.datetime.now(datetime.timezone.utc).isoformat()); fh.flush()
+time.sleep(4)
+LKPY
+HOLDER=$!
+sleep 1
+err=$("$WATCH" check 2>&1 >/dev/null); rc=$?
+[ "$rc" -eq 0 ] && ok "skipped tick still exits 0" || bad "skip exit rc=$rc"
+echo "$err" | grep -q "state.lock held" && ok "skip leaves a stderr trace" || bad "no skip trace: $err"
+echo "$err" | grep -Eq "for ~[0-9]+s" && ok "trace includes held-duration" || bad "no held-duration: $err"
+wait "$HOLDER" 2>/dev/null
+
+echo "── hardening: wedged notifier is killed by fw_timed → rc!=0 audit ──"              # +2
+new_env tnto
+SLOWN="$WORK/slownotify"; printf '#!/bin/bash\nsleep 20\n' > "$SLOWN"; chmod +x "$SLOWN"
+start=$SECONDS
+FORGE_WATCH_NOTIFIER_BIN="$SLOWN" FORGE_WATCH_NOTIFY_TIMEOUT_S=1 "$WATCH" selftest >/dev/null 2>&1
+dur=$((SECONDS - start))
+[ "$dur" -lt 10 ] && ok "notifier bounded (${dur}s < 10s)" || bad "notifier not bounded (${dur}s)"
+python3 -c 'import json,sys;rec=json.loads(open(sys.argv[1]).read().splitlines()[-1]);assert rec["rc"]!=0 and rec["channel"]=="stub", rec' "$FORGE_WATCH_CACHE_DIR/delivered.log" && ok "timeout logged rc!=0 (DELIVERY-UNVERIFIED path)" || bad "timeout rc not logged"
+
+echo "── hardening: check-mode watchdog kills a hung engine ──"                          # +2
+new_env twdog
+mkfifo "$WORK/twdog-fifo"
+err=$(FORGE_WATCH_TMUX_LIST="$WORK/twdog-fifo" FORGE_WATCH_CHECK_TIMEOUT_S=1 \
+      perl -e 'alarm 15; exec @ARGV' "$WATCH" check 2>&1 >/dev/null); rc=$?
+[ "$rc" -eq 70 ] && ok "hung check dies with watchdog exit 70" || bad "watchdog rc=$rc"
+echo "$err" | grep -q "watchdog" && ok "watchdog leaves a stderr trace" || bad "no watchdog trace: $err"
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""

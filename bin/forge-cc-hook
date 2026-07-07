@@ -2,7 +2,7 @@
 # forge-cc-hook — command-center status hook (Phase A).
 #
 # Invoked as: forge-cc-hook <event>  where <event> ∈
-#   userpromptsubmit | stop | permissionrequest | notification
+#   userpromptsubmit | stop | permissionrequest | notification | posttooluse
 # Resolves pane/session/root STRUCTURALLY from $TMUX_PANE (the one attribution
 # key present on the live, unstamped forge-1..4 sessions) via a single
 # `tmux display-message` call, so it fires with NO FORGE_ROLE/TMUX_SESSION launch
@@ -27,7 +27,7 @@ codex = bool(argv) and argv[0] == '--codex'
 if codex:
     argv = argv[1:]
 event = (argv[0] if argv else '').lower()
-if event not in ('userpromptsubmit', 'stop', 'permissionrequest', 'notification'):
+if event not in ('userpromptsubmit', 'stop', 'permissionrequest', 'notification', 'posttooluse'):
     done()
 
 # --- structural resolution (pane_index / session / root) -----------------
@@ -190,7 +190,7 @@ def fire_watch_check(ev):
     # (hooks have a ~10s timeout) — fully detached, never waited on. The watcher's non-blocking
     # flock coalesces concurrent triggers. FORGE_WATCH_TRIGGER=0 disables it (tests); FORGE_WATCH_BIN
     # overrides the target (tests point it at a sleeping stub to prove fast return).
-    if ev not in ('stop', 'permissionrequest'):
+    if ev not in ('stop', 'permissionrequest', 'posttooluse'):
         return
     if os.environ.get('FORGE_WATCH_TRIGGER', '1') != '1':
         return
@@ -264,6 +264,27 @@ if role != 'orchestrator':
                         {'agent': agent, 'state': 'needs-input', 'tool_name': tn,
                          'command': snip(cmd, 300), 'command_hash': h,
                          'permission_suggestions': data.get('permission_suggestions') or []}))
+    elif event == 'posttooluse':
+        # A completed tool RESOLVES its pending permission request: archive the
+        # matching perm event so NEEDS-PERMISSION clears within a tick of the
+        # answer (stale rows previously lived until the next Stop; 2026-07-06).
+        tn = data.get('tool_name', '') or ''
+        ti = data.get('tool_input') or {}
+        cmd = (ti.get('command') if isinstance(ti, dict) else '') or ''
+        h = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()[:8]
+        pf = os.path.join(adir, f'wperm.{session}.p{pane_index}.{h}.json')
+        try:
+            with open(pf) as f:
+                rec = json.load(f)
+            # empty-command hashes collide across tools (AskUserQuestion vs
+            # Read): only the tool that actually requested may resolve.
+            if (rec.get('tool_name') or '') == tn:
+                arch = os.path.join(adir, 'archive')
+                os.makedirs(arch, exist_ok=True)
+                ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+                os.replace(pf, os.path.join(arch, os.path.basename(pf) + '.resolved.' + ts))
+        except (OSError, ValueError):
+            pass
     # notification: intentionally NO-OP for workers (would collide on notify.<session>.json).
     fire_watch_check(event)
     done()
@@ -347,6 +368,27 @@ elif event == 'permissionrequest':
                      'permission_suggestions': data.get('permission_suggestions') or []}))
     fire_watch_check(event)
     done()  # explicit: no stdout, dialog left intact
+elif event == 'posttooluse':
+    # A completed tool RESOLVES its pending permission request: archive the
+    # matching perm event so NEEDS-PERMISSION clears within a tick of the
+    # answer (stale rows previously lived until the next Stop; 2026-07-06).
+    tn = data.get('tool_name', '') or ''
+    ti = data.get('tool_input') or {}
+    cmd = (ti.get('command') if isinstance(ti, dict) else '') or ''
+    h = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()[:8]
+    pf = os.path.join(adir, f'perm.{session}.{h}.json')
+    try:
+        with open(pf) as f:
+            rec = json.load(f)
+        # empty-command hashes collide across tools (AskUserQuestion vs
+        # Read): only the tool that actually requested may resolve.
+        if (rec.get('tool_name') or '') == tn:
+            arch = os.path.join(adir, 'archive')
+            os.makedirs(arch, exist_ok=True)
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            os.replace(pf, os.path.join(arch, os.path.basename(pf) + '.resolved.' + ts))
+    except (OSError, ValueError):
+        pass
 elif event == 'notification':
     atomic(os.path.join(adir, f'notify.{session}.json'),
            envelope('notification',

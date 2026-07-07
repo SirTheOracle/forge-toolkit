@@ -997,6 +997,26 @@ cmd_gc() {
     } | sed '/^[[:space:]]*$/d' | sort -u | while read -r r; do
         { [ -d "$r/.dev" ] && gc_root "$r"; } || true
     done
+    gc_watch_logs
+    return 0
+}
+
+# forge-watch's launchd.out grows without bound (every-30s findings dumps;
+# 37MB by 2026-07-06). delivered.log + state.json carry the durable signal,
+# so past the cap the log is truncated in place (launchd writes O_APPEND —
+# an open writer just continues at the new end). forge-watch itself is
+# read-only by invariant and must never delete; the sweep lives here.
+gc_watch_logs() {
+    local wcache="${FORGE_WATCH_CACHE_DIR:-$HOME/.cache/forge-watch}"
+    local cap=$((10 * 1024 * 1024)) f sz
+    for f in "$wcache/launchd.out" "$wcache/launchd.err"; do
+        [ -f "$f" ] || continue
+        sz=$(stat -f%z "$f" 2>/dev/null || echo 0)
+        if [ "$sz" -gt "$cap" ]; then
+            : > "$f"
+            echo "gc: truncated ${f##*/} ($((sz / 1048576))MB > 10MB cap)"
+        fi
+    done
     return 0
 }
 

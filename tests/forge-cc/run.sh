@@ -73,6 +73,30 @@ pfout=$(env -u ANTHROPIC_API_KEY "$FORGE" preflight --root "$R" 2>&1) || true
 echo "$pfout" | grep -q FAIL && ok "apiKeyHelper in settings.local.json caught" || bad "apiKeyHelper missed"
 rm -f "$R/.claude/settings.local.json"
 
+echo "── forge-cc-hook: posttooluse resolves pending permission events ──"
+new_root pt1
+printf '{"tool_name":"Bash","tool_input":{"command":"npm test"}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null
+PH=$(python3 -c "import hashlib;print(hashlib.sha256(b'npm test').hexdigest()[:8])")
+test -f "$R/.dev/attention/perm.forge-x.$PH.json" && ok "permissionrequest wrote perm event" || bad "no perm event"
+printf '{"tool_name":"Bash","tool_input":{"command":"npm test"}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" posttooluse >/dev/null
+test ! -f "$R/.dev/attention/perm.forge-x.$PH.json" && ok "posttooluse archives the matching perm event" || bad "perm event survived posttooluse"
+ls "$R/.dev/attention/archive/perm.forge-x.$PH.json.resolved."* >/dev/null 2>&1 && ok "resolved perm preserved in archive/" || bad "no archived copy"
+
+new_root pt2
+printf '{"tool_name":"AskUserQuestion","tool_input":{}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null
+EH=$(python3 -c "import hashlib;print(hashlib.sha256(b'').hexdigest()[:8])")
+printf '{"tool_name":"Read","tool_input":{}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" posttooluse >/dev/null
+test -f "$R/.dev/attention/perm.forge-x.$EH.json" && ok "empty-hash collision guarded: Read cannot resolve AskUserQuestion perm" || bad "wrong tool resolved the perm"
+printf '{"tool_name":"AskUserQuestion","tool_input":{}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" posttooluse >/dev/null
+test ! -f "$R/.dev/attention/perm.forge-x.$EH.json" && ok "matching tool resolves the AskUserQuestion perm" || bad "AskUserQuestion perm not resolved"
+
+new_root pt3
+printf '{"tool_name":"Bash","tool_input":{"command":"pytest"}}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" permissionrequest >/dev/null
+WH=$(python3 -c "import hashlib;print(hashlib.sha256(b'pytest').hexdigest()[:8])")
+test -f "$R/.dev/attention/wperm.forge-x.p0.$WH.json" && ok "worker permissionrequest wrote wperm event" || bad "no wperm event"
+printf '{"tool_name":"Bash","tool_input":{"command":"pytest"}}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" posttooluse >/dev/null
+test ! -f "$R/.dev/attention/wperm.forge-x.p0.$WH.json" && ok "worker posttooluse archives the wperm event" || bad "wperm survived posttooluse"
+
 echo "── forge-cc-hook: hermetic branches (FORGE_CC_PANE_META) ──"
 new_root h1
 out=$(printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"permission_suggestions":["allow-once"]}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest)
@@ -200,10 +224,10 @@ for pair in "headless_factory:PostToolUse" "feedforge:PreToolUse" "goparent-ai:_
   C="$WORK/reg-$name"; mkdir -p "$C/.claude" "$C/.dev"; git -C "$C" init -q; echo '.dev/' > "$C/.gitignore"
   cp "$src" "$C/.claude/settings.json"
   reg "$C" >/dev/null 2>&1
-  python3 - "$C/.claude/settings.json" "$expect" <<'PY' && ok "$name: preserved + 4 CC hooks added" || bad "$name merge broke data"
+  python3 - "$C/.claude/settings.json" "$expect" <<'PY' && ok "$name: preserved + 5 CC hooks added" || bad "$name merge broke data"
 import json,sys
 d=json.load(open(sys.argv[1])); expect=sys.argv[2]; h=d["hooks"]
-for ev in ("UserPromptSubmit","Stop","PermissionRequest","Notification"):
+for ev in ("UserPromptSubmit","Stop","PermissionRequest","Notification","PostToolUse"):
     assert isinstance(h.get(ev),list) and any("forge-cc-hook" in x["hooks"][0]["command"] for x in h[ev]), ev
 if expect!="__nohooks__": assert expect in h, f"lost {expect}"
 if "permissions" in d: assert d["permissions"]
@@ -249,7 +273,8 @@ printf '{"task_id":"ptask-open"}' > "$G/.dev/attention/wprompt.forge-x.p2.json";
 echo '{}' > "$G2/.dev/attention/stop-old.json";     touch -t $OLD "$G2/.dev/attention/stop-old.json"
 GRF="$WORK/gc-roots"; printf '# comment header\n%s\n\n' "$G" > "$GRF"
 GTSV="$WORK/gc.tsv"; printf 'gc-sess\t%s\n' "$G2" > "$GTSV"
-FORGE_WATCH_ROOTS_FILE="$GRF" FORGE_TMUX_LIST="$GTSV" "$FORGE" gc; grc=$?
+GFWC="$WORK/gc-fwcache"; mkdir -p "$GFWC"
+FORGE_WATCH_ROOTS_FILE="$GRF" FORGE_TMUX_LIST="$GTSV" FORGE_WATCH_CACHE_DIR="$GFWC" "$FORGE" gc; grc=$?
 [ "$grc" -eq 0 ] && ok "gc sweep exits 0" || bad "gc exited $grc"
 test -f "$G/.dev/attention/dispatch-old.json" && ok "UNTERMINATED aged dispatch RETAINED (stuck task never vanishes)" || bad "unterminated dispatch deleted"
 test ! -f "$G/.dev/attention/dispatch-term.json" && ok "terminated aged dispatch GC'd" || bad "terminated dispatch survived"
@@ -264,9 +289,15 @@ test ! -f "$G2/.dev/attention/stop-old.json" && ok "tmux-only root also swept (u
 echo '{}' > "$G/.dev/attention/dispatch-mid.json";  touch -t "$D3" "$G/.dev/attention/dispatch-mid.json"
 echo 'r' > "$G/.dev/attention/payloads/response.mid.txt"; touch -t "$D3" "$G/.dev/attention/payloads/response.mid.txt"
 echo '{}' > "$G/.dev/attention/dispatch-stuck.json"; touch -t "$D3" "$G/.dev/attention/dispatch-stuck.json"
-FORGE_WATCH_ROOTS_FILE="$GRF" FORGE_TMUX_LIST="$GTSV" "$FORGE" gc --days 1
+FORGE_WATCH_ROOTS_FILE="$GRF" FORGE_TMUX_LIST="$GTSV" FORGE_WATCH_CACHE_DIR="$GFWC" "$FORGE" gc --days 1
 test ! -f "$G/.dev/attention/dispatch-mid.json" && ok "--days overrides TTL for a TERMINATED dispatch" || bad "--days ignored"
 test -f "$G/.dev/attention/dispatch-stuck.json" && ok "--days still EXEMPTS an unterminated dispatch" || bad "--days deleted a stuck task"
+mkfile_sz() { dd if=/dev/zero of="$1" bs=1024 count="$2" 2>/dev/null; }
+mkfile_sz "$GFWC/launchd.out" $((11 * 1024))   # 11MB > 10MB cap
+printf 'small\n' > "$GFWC/launchd.err"          # under cap
+FORGE_WATCH_ROOTS_FILE="$GRF" FORGE_TMUX_LIST="$GTSV" FORGE_WATCH_CACHE_DIR="$GFWC" "$FORGE" gc >/dev/null
+[ "$(stat -f%z "$GFWC/launchd.out")" -eq 0 ] && ok "gc truncates launchd.out past 10MB cap" || bad "launchd.out not truncated"
+[ -s "$GFWC/launchd.err" ] && ok "gc leaves under-cap launchd.err alone" || bad "launchd.err wrongly truncated"
 
 echo "── forge ask: session-scope event + secret redaction ──"
 new_root a1

@@ -31,6 +31,11 @@
 #   FORGE_WATCH_NOTIFY_COMPLETE       default 1  (notify on pipeline completion)
 #   FORGE_WATCH_NOTIFY_STALE_ZOMBIE   default 0  (notify on old zombie contexts)
 #   FORGE_WATCH_ROOTS_FILE            path to a roots list (default ~/.config/forge/watch-roots)
+#   FORGE_WATCH_CHECK_TIMEOUT_S       default 90 (check-mode engine watchdog, seconds; 0 disables)
+#   FORGE_WATCH_QUIET_UNCHANGED       default 1  (check prints nothing when findings are
+#                                                 unchanged and stdout is not a tty)
+#   FORGE_WATCH_NOTIFY_TIMEOUT_S      default 15 (bound on a single notifier call; env-only —
+#                                                 read by bash, not a watch.env key)
 
 set -euo pipefail
 
@@ -67,6 +72,18 @@ with open(os.environ["FW_LOG"], "a") as f:
 PY
 }
 
+# Bounded exec for notifier calls. macOS ships no coreutils `timeout`; alarm(2)
+# survives execve, so the exec'd notifier inherits the pending SIGALRM and is
+# killed (rc 142) if it wedges. FORGE_WATCH_NOTIFY_TIMEOUT_S=0 disables.
+fw_timed() {
+    if command -v perl >/dev/null 2>&1; then
+        perl -e 'alarm(shift @ARGV); exec @ARGV; exit 127;' \
+            "${FORGE_WATCH_NOTIFY_TIMEOUT_S:-15}" "$@"
+    else
+        "$@"
+    fi
+}
+
 fw_notify() {
     local title="$1" body="$2" channel rc=0 nb="${FORGE_WATCH_NOTIFIER_BIN:-}"
     # SINK_CAPTURE short-circuits UNLESS a stub notifier is wired (FORGE_WATCH_NOTIFIER_BIN) to
@@ -80,14 +97,16 @@ fw_notify() {
     fi
     # `|| rc=$?` (not `; rc=$?`): this script runs under set -e — a bare failing notifier
     # would abort the whole scan before the audit line is written (the failure tdel proves).
+    # Every branch runs under fw_timed: a wedged notifier once stalled a check ~110s
+    # (2026-07-06); a timeout kill reads as rc!=0 → the existing DELIVERY-UNVERIFIED path.
     if [ -n "$nb" ]; then
-        channel=stub; "$nb" "$title" "$body" >/dev/null 2>&1 || rc=$?
+        channel=stub; fw_timed "$nb" "$title" "$body" >/dev/null 2>&1 || rc=$?
     elif command -v terminal-notifier >/dev/null 2>&1; then
         channel=terminal-notifier
-        terminal-notifier -title "$title" -message "$body" >/dev/null 2>&1 || rc=$?
+        fw_timed terminal-notifier -title "$title" -message "$body" >/dev/null 2>&1 || rc=$?
     else
         channel=osascript
-        osascript -e "display notification \"$(fw_escape "$body")\" with title \"$(fw_escape "$title")\"" >/dev/null 2>&1 || rc=$?
+        fw_timed osascript -e "display notification \"$(fw_escape "$body")\" with title \"$(fw_escape "$title")\"" >/dev/null 2>&1 || rc=$?
     fi
     _fw_log_delivery "$title" "$body" "$channel" "$rc"
     return 0
@@ -133,7 +152,8 @@ ALLOWED_KEYS = {
     'FORGE_WATCH_NOTIFY_STALE_ZOMBIE', 'FORGE_WATCH_ROOTS_FILE',
     'FORGE_WATCH_NOTIFY_REPLY', 'FORGE_WATCH_NOTIFY_DONE',
     'FORGE_WATCH_NOTIFY_PANE_DONE', 'FORGE_WATCH_TASK_WINDOW_S',
-    'FORGE_WATCH_TASK_STUCK_S',
+    'FORGE_WATCH_TASK_STUCK_S', 'FORGE_WATCH_CHECK_TIMEOUT_S',
+    'FORGE_WATCH_QUIET_UNCHANGED',
 }
 # Conservative value grammar: allow path-ish chars (incl. space and ~ for real
 # paths) but no shell metacharacters, substitutions, or quotes. Values are only
@@ -206,6 +226,19 @@ TASK_WINDOW_S    = cfg_int('FORGE_WATCH_TASK_WINDOW_S', 86400)   # 24h live-task
 TASK_STUCK_S     = cfg_int('FORGE_WATCH_TASK_STUCK_S', 21600)    # 6h → TASK-STUCK
 STALE_TICK_S     = 3 * 30    # board/ambient freshness: ~3x the 30s launchd interval
 
+# ── check-mode watchdog ──────────────────────────────────────────────────
+# A hung check holds state.lock while every 30s tick skips silently; one ~110s
+# run read as "watcher stale (115s)" on the menubar (2026-07-06). Bound the
+# whole engine: die loudly on stderr, drop the lock, let the next tick recover.
+CHECK_TIMEOUT_S = cfg_int('FORGE_WATCH_CHECK_TIMEOUT_S', 90)
+if MODE == 'check' and CHECK_TIMEOUT_S > 0:
+    import signal
+    def _watchdog(signum, frame):
+        sys.stderr.write(f"forge-watch: check aborted — exceeded {CHECK_TIMEOUT_S}s watchdog\n")
+        os._exit(70)
+    signal.signal(signal.SIGALRM, _watchdog)
+    signal.alarm(CHECK_TIMEOUT_S)
+
 # ── time helpers ─────────────────────────────────────────────────────────
 def parse_iso(ts):
     # PyYAML auto-types an unquoted `updated_at: 2026-...Z` into a datetime/date;
@@ -246,12 +279,29 @@ def human_age(sec):
     return f"{sec // 86400}d"
 
 # ── state (lock-guarded, atomic write, corrupt-recovery) ─────────────────
-_lock_fh = open(LOCK_FILE, 'w')
+# 'a' (not 'w'): opening must not truncate the holder's start-time stamp below.
+_lock_fh = open(LOCK_FILE, 'a')
 try:
     fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except OSError:
-    # Another instance holds the lock (manual run vs launchd tick). Exit quietly.
+    # Another instance holds the lock (manual run vs launchd tick). Exit 0 so
+    # launchd stays green, but leave a stderr trace — silent skips hid a
+    # 2-minute stall from launchd.err entirely (2026-07-06).
+    held = ''
+    try:
+        with open(LOCK_FILE) as _lf:
+            _t = parse_iso(_lf.read().strip())
+        if _t is not None:
+            held = f" for ~{int((NOW - _t).total_seconds())}s"
+    except OSError:
+        pass
+    sys.stderr.write(f"forge-watch: {MODE} skipped — state.lock held by another run{held}\n")
     sys.exit(0)
+# We hold the lock: stamp our start time so a skipped run can report how long.
+_lock_fh.seek(0)
+_lock_fh.truncate()
+_lock_fh.write(NOW.isoformat())
+_lock_fh.flush()
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -501,6 +551,29 @@ def scan_root(root):
     for slug, p in stale_pendings:
         stage = p.get('stage')
         if (slug, stage) in live_blocked:
+            continue
+        # Activity gate: a stage actively writing artifacts under its proposals
+        # dir is WORKING, not stalled — a multi-round plan stage legitimately
+        # outlives the pending-age window (live false alarm 2026-07-06).
+        # forge-log.yml is excluded: the dispatch append itself is not liveness.
+        sdir = os.path.join(dev, 'proposals', slug)
+        fresh = False
+        try:
+            for dp, _, fns in os.walk(sdir):
+                for fn in fns:
+                    if fn == 'forge-log.yml':
+                        continue
+                    try:
+                        if NOW.timestamp() - os.path.getmtime(os.path.join(dp, fn)) < STALL_THRESHOLD:
+                            fresh = True
+                            break
+                    except OSError:
+                        continue
+                if fresh:
+                    break
+        except OSError:
+            pass
+        if fresh:
             continue
         sec = age_s(p.get('timestamp'))
         a = human_age(sec)
@@ -1100,6 +1173,7 @@ def interval_for(policy, count):
 
 # Only `check` mutates debounce state and persists. `status` is a pure read
 # (below, the output section reads `conds` without touching it).
+FINDINGS_CHANGED = True   # status/ack always print; check compares signatures below
 if MODE == 'check':
     for f in findings:
         key = f['key']
@@ -1136,7 +1210,16 @@ if MODE == 'check':
         if key not in current_keys:
             del conds[key]
 
-    state['last_tick'] = NOW.isoformat()   # heartbeat for the board/ambient freshness line
+    # Findings signature: lets the next tick print nothing when nothing changed
+    # (launchd.out hit 37MB from identical 30s dumps; delivered.log + state.json
+    # carry the durable signal).
+    _sig = json.dumps(sorted([f['condition'], f['msg']] for f in findings))
+    FINDINGS_CHANGED = state.get('findings_sig') != _sig
+    state['findings_sig'] = _sig
+    # Heartbeat for the board/ambient freshness line. Completion time, NOT the
+    # module-level NOW: a slow run must not stamp a heartbeat that is already
+    # stale at birth (the 115s-stale incident double-counted its own hang).
+    state['last_tick'] = datetime.datetime.now(UTC).isoformat()
     save_state(state)
 
 # ── output ───────────────────────────────────────────────────────────────
@@ -1413,16 +1496,22 @@ if PRETTY:
                          + ('' if SESSIONS else ' (no tmux server)')))
     sys.exit(0)
 
-for w in config_warnings:
-    print(f"! {w}")
-
-if not findings:
-    print("forge-watch: all clear" + ("" if SESSIONS else " (no tmux server)"))
-else:
-    for f in findings:
-        acked = conds.get(f['key'], {}).get('acked')
-        tag = ' [acked]' if acked else ''
-        print(f"[{f['condition']}]{tag} {f['msg']}")
+# Quiet ticks: under launchd (stdout not a tty) an unchanged check prints
+# nothing, so the 30s dump only lands in launchd.out when something changed.
+# A tty (manual run) always prints; FORGE_WATCH_QUIET_UNCHANGED=0 disables.
+QUIET = (MODE == 'check' and not FINDINGS_CHANGED and not config_warnings
+         and not sys.stdout.isatty()
+         and cfg_bool('FORGE_WATCH_QUIET_UNCHANGED', True))
+if not QUIET:
+    for w in config_warnings:
+        print(f"! {w}")
+    if not findings:
+        print("forge-watch: all clear" + ("" if SESSIONS else " (no tmux server)"))
+    else:
+        for f in findings:
+            acked = conds.get(f['key'], {}).get('acked')
+            tag = ' [acked]' if acked else ''
+            print(f"[{f['condition']}]{tag} {f['msg']}")
 
 # Emit deliveries for the bash sink.
 if MODE == 'check' and NOTIFY_OUT and NOTIFY_OUT != '-' and deliveries:
@@ -1434,14 +1523,18 @@ PYEOF
 
 # ── verbs ────────────────────────────────────────────────────────────────
 cmd_check() {
-    local nout; nout="$(mktemp "$CACHE_DIR/notify.XXXXXX")"
-    run_engine check "$nout" ""
+    # `|| rc=$?`: a watchdog-killed engine (exit 70) must still clean up the
+    # temp file, and its exit status must reach launchd instead of being
+    # swallowed by set -e mid-function.
+    local nout rc=0; nout="$(mktemp "$CACHE_DIR/notify.XXXXXX")"
+    run_engine check "$nout" "" || rc=$?
     if [ -s "$nout" ]; then
         while IFS=$'\t' read -r title body; do
             [ -n "$title" ] && fw_notify "$title" "$body"
         done < "$nout"
     fi
     rm -f "$nout"
+    return "$rc"
 }
 
 cmd_status() {
