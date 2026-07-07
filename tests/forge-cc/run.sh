@@ -97,6 +97,48 @@ test -f "$R/.dev/attention/wperm.forge-x.p0.$WH.json" && ok "worker permissionre
 printf '{"tool_name":"Bash","tool_input":{"command":"pytest"}}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" posttooluse >/dev/null
 test ! -f "$R/.dev/attention/wperm.forge-x.p0.$WH.json" && ok "worker posttooluse archives the wperm event" || bad "wperm survived posttooluse"
 
+echo "── forge-cc-hook: AskUserQuestion content capture (Q1-Q5) ──"
+AQ='{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Deploy to prod?","header":"Deploy","multiSelect":false,"options":[{"label":"yes"},{"label":"no"},{"label":"dry-run"}]}]}}'
+EH=$(python3 -c "import hashlib;print(hashlib.sha256(b'').hexdigest()[:8])")
+new_root aq1
+printf '%s' "$AQ" | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null
+test -f "$R/.dev/attention/perm.forge-x.$EH.json" && ok "Q1 keying unchanged (empty-command hash)" || bad "Q1 perm file missing or re-keyed"
+python3 - "$R/.dev/attention/perm.forge-x.$EH.json" <<'PY' && ok "Q1 question fields captured" || bad "Q1 question fields wrong"
+import json,sys
+e=json.load(open(sys.argv[1]))
+assert e["question_snippet"]=="Deploy to prod?"
+assert e["question_options"]==["yes","no","dry-run"]
+assert e["question_count"]==1 and e["multi_select"] is False
+assert e["tool_name"]=="AskUserQuestion" and e["command"]==""
+PY
+new_root aq2
+printf '%s' "$AQ" | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" permissionrequest >/dev/null
+python3 - "$R/.dev/attention/wperm.forge-x.p0.$EH.json" <<'PY' && ok "Q2 worker wperm carries question fields" || bad "Q2 wperm question fields wrong"
+import json,sys
+e=json.load(open(sys.argv[1]))
+assert e["question_snippet"]=="Deploy to prod?" and e["question_options"][0]=="yes"
+PY
+new_root aq3
+printf '{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"use api_key: sk-abcdef1234567890 ?","options":[{"label":"token=ghp_ABCDEFGHIJKLMNOPQRSTUVWX"}]}]}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null
+{ ! grep -q 'sk-abcdef' "$R/.dev/attention/perm.forge-x.$EH.json" && ! grep -q 'ghp_ABCDEF' "$R/.dev/attention/perm.forge-x.$EH.json"; } \
+  && ok "Q3 question text + option labels redacted" || bad "Q3 secret leaked into perm record"
+new_root aq4
+q4ok=1
+for payload in '{"tool_name":"AskUserQuestion","tool_input":{}}' \
+               '{"tool_name":"AskUserQuestion","tool_input":{"questions":"what"}}' \
+               '{"tool_name":"AskUserQuestion","tool_input":{"questions":[{}]}}' \
+               '{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"","options":["notadict"]}]}}'; do
+  rm -f "$R/.dev/attention/perm.forge-x.$EH.json"
+  printf '%s' "$payload" | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null || q4ok=0
+  python3 -c 'import json,sys;e=json.load(open(sys.argv[1]));assert "question_snippet" not in e and "question_options" not in e' \
+    "$R/.dev/attention/perm.forge-x.$EH.json" 2>/dev/null || q4ok=0
+done
+[ "$q4ok" -eq 1 ] && ok "Q4 malformed questions shapes fail-open (record legacy-shaped, exit 0)" || bad "Q4 fail-open violated"
+new_root aq5
+printf '%s' "$AQ" | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null
+printf '%s' "$AQ" | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" posttooluse >/dev/null
+test ! -f "$R/.dev/attention/perm.forge-x.$EH.json" && ok "Q5 posttooluse resolves the enriched AskUserQuestion perm" || bad "Q5 enriched perm not resolved"
+
 echo "── forge-cc-hook: hermetic branches (FORGE_CC_PANE_META) ──"
 new_root h1
 out=$(printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"permission_suggestions":["allow-once"]}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest)

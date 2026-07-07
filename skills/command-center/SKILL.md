@@ -101,5 +101,7 @@ it to the worker, which resumes.
 
 - Never edits files under any `.dev/` — `forge` and `forge-watch` own those.
 - Never answers a `NEEDS-PERMISSION` from the seat — jump into the tab (one
-  keystroke) and answer the dialog there.
+  keystroke) and answer the dialog there. The row tells you what you're walking
+  into: AskUserQuestion rows carry the question text + option labels, and the
+  board prints the go-to-pane hint under every hot permission row.
 - Never dispatches to a session it has not seen on the board.

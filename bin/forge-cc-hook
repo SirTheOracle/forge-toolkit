@@ -134,6 +134,29 @@ def snip_tail(s, n=200):
         return tail[sp + 1:]
     return tail
 
+def question_fields(tn, ti):
+    # AskUserQuestion carries its content in tool_input.questions, not .command —
+    # without this the perm row reads "permission needed: AskUserQuestion" and the
+    # operator must switch tabs just to learn WHAT is being asked (2026-07-07).
+    # Fail-open: any shape surprise returns {} and the record stays byte-compatible
+    # with today's. Additive to cc-attention/1; keying/hash untouched.
+    if tn != 'AskUserQuestion' or not isinstance(ti, dict):
+        return {}
+    qs = ti.get('questions')
+    if not isinstance(qs, list) or not qs or not isinstance(qs[0], dict):
+        return {}
+    q0 = qs[0]
+    qtext = str(q0.get('question') or '')
+    labels = [snip(str(o.get('label')), 60)
+              for o in (q0.get('options') or [])
+              if isinstance(o, dict) and o.get('label')][:8]
+    if not qtext and not labels:
+        return {}
+    return {'question_snippet': snip(qtext, 200),
+            'question_options': labels,
+            'question_count': len(qs),
+            'multi_select': bool(q0.get('multiSelect'))}
+
 def envelope(variant, extra):
     d = {'schema': 'cc-attention/1', 'event': event, 'variant': variant,
          'session': session, 'root': root, 'pane_index': pane_index,
@@ -263,7 +286,8 @@ if role != 'orchestrator':
                envelope('worker-permission',
                         {'agent': agent, 'state': 'needs-input', 'tool_name': tn,
                          'command': snip(cmd, 300), 'command_hash': h,
-                         'permission_suggestions': data.get('permission_suggestions') or []}))
+                         'permission_suggestions': data.get('permission_suggestions') or [],
+                         **question_fields(tn, ti)}))
     elif event == 'posttooluse':
         # A completed tool RESOLVES its pending permission request: archive the
         # matching perm event so NEEDS-PERMISSION clears within a tick of the
@@ -365,7 +389,8 @@ elif event == 'permissionrequest':
            envelope('permission',
                     {'state': 'needs-input', 'tool_name': tn,
                      'command': snip(cmd, 300), 'command_hash': h,
-                     'permission_suggestions': data.get('permission_suggestions') or []}))
+                     'permission_suggestions': data.get('permission_suggestions') or [],
+                     **question_fields(tn, ti)}))
     fire_watch_check(event)
     done()  # explicit: no stdout, dialog left intact
 elif event == 'posttooluse':

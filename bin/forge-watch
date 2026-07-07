@@ -751,6 +751,25 @@ def _load_att(path):
     except (ValueError, OSError):
         return None
 
+def perm_detail(pr):
+    # Detail slot of a NEEDS-PERMISSION row. An AskUserQuestion perm record
+    # carries question_snippet/question_options (forge-cc-hook, 2026-07-07) —
+    # show WHAT is being asked so the operator's tab-switch is informed, not
+    # blind. Records without the fields render exactly as before.
+    tool = pr.get('tool_name') or 'tool'
+    q = (pr.get('question_snippet') or '').strip()
+    if q:
+        msg = f"question ({tool}): {q[:100]}"
+        opts = [o for o in (pr.get('question_options') or []) if o][:4]
+        if opts:
+            msg += " · options: " + " / ".join(o[:30] for o in opts)
+        more = (pr.get('question_count') or 1) - 1
+        if more > 0:
+            msg += f" (+{more} more)"
+        return msg
+    cmd = (pr.get('command') or '').strip()
+    return f"permission needed: {tool}" + (f" ({cmd[:60]})" if cmd else "")
+
 def scan_attention(root, label):
     """Read <root>/.dev/attention/*.json (written by bin/forge + forge-cc-hook)
     and add findings. READ-ONLY — never writes or deletes. The live queued/
@@ -824,13 +843,8 @@ def scan_attention(root, label):
             a = age_s(pr.get('emitted_at'))
             if a is not None and a > ZOMBIE_AGE_S:
                 continue
-            tool = pr.get('tool_name') or 'tool'
-            cmd = (pr.get('command') or '').strip()
-            msg = f"{label} · {sess} — permission needed: {tool}"
-            if cmd:
-                msg += f" ({cmd[:60]})"
             add_finding('NEEDS-PERMISSION', root, f"{sess}\t{pr.get('command_hash','')}",
-                        msg, session=sess)
+                        f"{label} · {sess} — {perm_detail(pr)}", session=sess)
         # lifecycle: EXACTLY ONE of queued-input / working / done per session.
         d = latest_disp.get(sess)
         accepted = False
@@ -960,12 +974,8 @@ def scan_attention(root, label):
         wat = parse_iso(ws.get('emitted_at')) if ws else None
         if wat is not None and pat is not None and wat > pat:
             continue
-        tool = pr.get('tool_name') or 'tool'; cmd = (pr.get('command') or '').strip()
-        msg = f"{label} · {sess} p{pane} — permission needed: {tool}"
-        if cmd:
-            msg += f" ({cmd[:60]})"
         add_finding('NEEDS-PERMISSION', root, f"{sess}\tp{pane}\t{pr.get('command_hash','')}",
-                    msg, session=sess)
+                    f"{label} · {sess} p{pane} — {perm_detail(pr)}", session=sess)
     # PANE-DONE (active): latest done turn per pane, within the window, not working again.
     # policy 'never' by default (board row, no ring); FORGE_WATCH_NOTIFY_PANE_DONE arms it.
     for (sess, pane), ws in latest_wstop.items():
@@ -1398,6 +1408,14 @@ if PRETTY:
                     else f"@<session at {root_label(f['root'])}>"
                 print('    ' + paint('36',
                       f'-> reply with: forge dispatch {at} "<your reply>"'))
+            elif f['condition'] == 'NEEDS-PERMISSION':
+                # Honest for ALL permission dialogs (incl. AskUserQuestion):
+                # the pane is modally waiting on a selector — dispatched
+                # text+Enter cannot answer it (the cmd_send failure class).
+                where = f": tmux attach -t {f['session']}" if f.get('session') else ''
+                print('    ' + paint('36',
+                      '-> interactive prompt — answer in the pane '
+                      f'(cannot be dispatched){where}'))
 
     if sess_map:
         print()

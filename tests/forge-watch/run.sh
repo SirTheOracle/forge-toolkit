@@ -723,6 +723,29 @@ assert_status_missing "permission needed" "a later Stop supersedes the answered 
 printf 'not json{' > "$R/.dev/attention/perm.forge-1.bad.json"
 assert_status_has "unparseable" "malformed attention json fires STATE-UNPARSEABLE"
 
+echo "── attention: AskUserQuestion perm rows carry the question (QW1-QW4) ──"
+new_env attq1
+R=$(mk_root proj); live_session forge-1 "$R"
+a="$(attn "$R")"; cat > "$a/perm.forge-1.e3b0c442.json" <<JSON
+{"schema":"cc-attention/1","event":"permissionrequest","variant":"permission","session":"forge-1","root":"$R","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago 30)","state":"needs-input","tool_name":"AskUserQuestion","command":"","command_hash":"e3b0c442","permission_suggestions":[],"question_snippet":"Deploy to prod?","question_options":["yes","no","dry-run"],"question_count":2,"multi_select":false}
+JSON
+assert_status_has "question (AskUserQuestion): Deploy to prod?" "QW1 enriched perm row shows the question"
+assert_status_has "options: yes / no / dry-run" "QW1 option labels rendered"
+assert_status_has "(+1 more)" "QW1 additional-question count surfaces"
+assert_status_missing "permission needed: AskUserQuestion" "QW1 contentless fallback not used"
+cat > "$a/wperm.forge-1.p0.e3b0c442.json" <<JSON
+{"schema":"cc-attention/1","event":"permissionrequest","variant":"worker-permission","session":"forge-1","root":"$R","pane_index":"0","role":"worker","agent":"claude","tmux_pane":"%0","emitted_at":"$(iso_ago 30)","state":"needs-input","tool_name":"AskUserQuestion","command":"","command_hash":"e3b0c442","permission_suggestions":[],"question_snippet":"Which table?","question_options":["users","orders"],"question_count":1,"multi_select":false}
+JSON
+assert_status_has "forge-1 p0 — question (AskUserQuestion): Which table?" "QW1 worker wperm renders via the same path"
+run_status --pretty | grep -q "answer in the pane" && ok "QW3 pretty hot row carries the go-to-pane hint" || bad "QW3 go-to-pane hint missing"
+rm -f "$a/wperm.forge-1.p0.e3b0c442.json"
+stopf "$R" forge-1 5 "answered"
+assert_status_missing "Deploy to prod" "QW4 later Stop supersedes the enriched perm row"
+new_env attq2
+R=$(mk_root proj); live_session forge-1 "$R"
+permf "$R" forge-1 e3b0c442 AskUserQuestion 30
+assert_status_has "permission needed: AskUserQuestion" "QW2 legacy record (no question fields) renders as before"
+
 echo "── board: classes + maintenance collapse (2 actionable surface) ──"
 new_env bd
 R=$(mk_root proj); live_session forge-1 "$R"
