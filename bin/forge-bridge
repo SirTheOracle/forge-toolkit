@@ -1448,6 +1448,27 @@ import sys, os, yaml, datetime
 context_file, dev_dir, out_file = sys.argv[1:4]
 infra_lock_line = sys.argv[4] if len(sys.argv) > 4 else ''
 
+# Worker callback responses (and notes) arrive as raw markdown source; the
+# status file is a plain-text surface, so `**bold**`/backticks/[x](url) would
+# render verbatim. Same conservative ruleset as forge-watch strip_md (kept in
+# lockstep): double-asterisk emphasis only (`2 * 3`, `*.json` survive), heading
+# hashes need a following space (`#192` survives), underscore emphasis never
+# touched (`__init__`), truncated link tails degrade to their link text.
+import re as _re
+_MD_SUBS = [
+    (_re.compile(r'`{3,}[A-Za-z0-9_-]*'), ' '),                  # code fences
+    (_re.compile(r'!?\[([^\]]*)\]\([^)]*\)'), r'\1'),            # links/images → text
+    (_re.compile(r'!?\[([^\]]*)\]\([^)]*$'), r'\1'),             # link truncated mid-target
+    (_re.compile(r'\*{2,3}(\S(?:[^*]*?\S)?)\*{2,3}'), r'\1'),    # **bold** / ***both***
+    (_re.compile(r'~~(\S(?:[^~]*?\S)?)~~'), r'\1'),              # ~~strike~~
+    (_re.compile(r'`([^`]+)`'), r'\1'),                          # `inline code`
+    (_re.compile(r'(?:(?<=\s)|^)#{1,6}(?=\s)'), ''),             # heading hashes
+]
+def strip_md(s):
+    for rx, rep in _MD_SUBS:
+        s = rx.sub(rep, s)
+    return ' '.join(s.split())
+
 ctx = {}
 try:
     with open(context_file) as f:
@@ -1555,7 +1576,7 @@ for e in entries[-15:]:
             icon, tag = '⚠', 'ERROR'
         else:
             icon, tag = '·', 'updated'
-        tail = rs.split('—', 1)[1].strip() if '—' in rs else ''
+        tail = strip_md(rs.split('—', 1)[1].strip()) if '—' in rs else ''
         tail = (tail[:60] + '…') if len(tail) > 60 else tail
         line = f"  {ts}  {icon} {stage:<14} {tag}"
         if tail:
@@ -1612,7 +1633,7 @@ L.append("## Notes")
 L.append("")
 if notes:
     for n in notes:
-        L.append(f"  - {n}")
+        L.append(f"  - {strip_md(str(n))}")
 else:
     L.append("  (none)")
 L.append("")
