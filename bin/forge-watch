@@ -30,6 +30,8 @@
 #                                           and the WORKER-STALLED/residue split)
 #   FORGE_WATCH_NOTIFY_COMPLETE       default 1  (notify on pipeline completion)
 #   FORGE_WATCH_NOTIFY_STALE_ZOMBIE   default 0  (notify on old zombie contexts)
+#   FORGE_WATCH_EPISODE_SETTLE_S      default 600 (pane quiet this long → episode settles)
+#   FORGE_WATCH_NOTIFY_EPISODE_DONE   default 0  (ring once per episode, at settle)
 #   FORGE_WATCH_ROOTS_FILE            path to a roots list (default ~/.config/forge/watch-roots)
 #   FORGE_WATCH_CHECK_TIMEOUT_S       default 90 (check-mode engine watchdog, seconds; 0 disables)
 #   FORGE_WATCH_QUIET_UNCHANGED       default 1  (check prints nothing when findings are
@@ -151,7 +153,8 @@ ALLOWED_KEYS = {
     'FORGE_WATCH_ZOMBIE_AGE_D', 'FORGE_WATCH_NOTIFY_COMPLETE',
     'FORGE_WATCH_NOTIFY_STALE_ZOMBIE', 'FORGE_WATCH_ROOTS_FILE',
     'FORGE_WATCH_NOTIFY_REPLY', 'FORGE_WATCH_NOTIFY_DONE',
-    'FORGE_WATCH_NOTIFY_PANE_DONE', 'FORGE_WATCH_TASK_WINDOW_S',
+    'FORGE_WATCH_EPISODE_SETTLE_S', 'FORGE_WATCH_NOTIFY_EPISODE_DONE',
+    'FORGE_WATCH_TASK_WINDOW_S',
     'FORGE_WATCH_TASK_STUCK_S', 'FORGE_WATCH_CHECK_TIMEOUT_S',
     'FORGE_WATCH_QUIET_UNCHANGED',
 }
@@ -218,13 +221,20 @@ NOTIFY_STALE_ZOMBIE = cfg_bool('FORGE_WATCH_NOTIFY_STALE_ZOMBIE', False)
 # Return-path knobs (default OFF; the board row is unconditional — only the bell is opt-in).
 NOTIFY_REPLY    = cfg_bool('FORGE_WATCH_NOTIFY_REPLY', False)
 NOTIFY_DONE     = cfg_bool('FORGE_WATCH_NOTIFY_DONE', False)
-# Task-visibility knobs. PANE-DONE ring default OFF (code default stays 0 — the rollout flip to
-# 1 is watch.env config, per operator decision). TASK_WINDOW bounds the live tasks[]/PANE-DONE
-# view; TASK_STUCK is when an unanswered dispatched task becomes a loud, hot TASK-STUCK.
-NOTIFY_PANE_DONE = cfg_bool('FORGE_WATCH_NOTIFY_PANE_DONE', False)
+# Task/episode-visibility knobs. TASK_WINDOW bounds the live tasks[] view and settled-episode
+# conditions; TASK_STUCK is when an unanswered dispatched task becomes a loud, hot TASK-STUCK
+# (EPISODE-STUCK reuses the same horizon for a mid-turn pane hang). SETTLE is the quiet horizon
+# that flips an episode from in-progress to settled; the once-per-episode settle ring is
+# default OFF (dark-first — the operator flip lives in watch.env).
+EPISODE_SETTLE_S    = cfg_int('FORGE_WATCH_EPISODE_SETTLE_S', 600)   # 10m quiet → settle
+NOTIFY_EPISODE_DONE = cfg_bool('FORGE_WATCH_NOTIFY_EPISODE_DONE', False)
 TASK_WINDOW_S    = cfg_int('FORGE_WATCH_TASK_WINDOW_S', 86400)   # 24h live-task window
 TASK_STUCK_S     = cfg_int('FORGE_WATCH_TASK_STUCK_S', 21600)    # 6h → TASK-STUCK
 STALE_TICK_S     = 3 * 30    # board/ambient freshness: ~3x the 30s launchd interval
+# Cold-restart ring bound (D4): a settled episode may carry the 'once' ring only while its
+# quiet time is inside this band; longer-settled history renders rows but never rings. Do not
+# over-widen — the band IS the cold-start blast-radius bound.
+EPISODE_RING_FRESH_S = EPISODE_SETTLE_S + max(270, 3 * STALE_TICK_S)
 
 # ── check-mode watchdog ──────────────────────────────────────────────────
 # A hung check holds state.lock while every 30s tick skips silently; one ~110s
@@ -487,6 +497,9 @@ def parse_callback(path):
 # policy: 'standard' (backoff), 'daily' (>=24h), 'never' (status-only)
 findings = []  # dict: condition, root, key, policy, session, slug, stage, msg
 TASKS = []     # cc-board/1 tasks[] projection (Step 3): read-time fold, no ledger
+EPISODES = []  # episode records, ALL roots (R3a) — board assembles/sorts/caps once at render
+task_stuck_ids = set()  # (root, session, dispatch_id) collected at the TASK-STUCK emission
+                        # site (R1b) — never parsed back out of composite finding keys
 
 def add_finding(condition, root, key, msg, policy='standard',
                 session=None, slug=None, stage=None):
@@ -495,6 +508,7 @@ def add_finding(condition, root, key, msg, policy='standard',
         'key': f"{root}\t{condition}\t{key}", 'policy': policy,
         'session': session, 'slug': slug, 'stage': stage, 'msg': msg,
     })
+    return findings[-1]
 
 def root_label(root):
     return os.path.basename(root.rstrip('/')) or root
@@ -963,6 +977,72 @@ def scan_attention(root, label):
         ws_at = parse_iso(ws.get('emitted_at')) if ws else None
         if ws is None or (wp_at is not None and ws_at is not None and wp_at > ws_at):
             now_working.add((sess, pane))
+    # ── episode derivation (Step 2): stateless, read-only, per (session, pane) ──
+    # Partition ALL loaded stops into contiguous runs (a gap >= SETTLE splits); the newest
+    # run is the pane's CURRENT episode — the only one that sees the wprompt and the only
+    # one that emits board conditions (Step 3). Older runs are settled history for the
+    # episodes[] drill-in and per-task episode_id tags. Derived over stops ∪ prompts so a
+    # pane that prompted but never stopped (brand-new turn, first-turn hang) still counts.
+    by_pane = {}
+    for ws in worker_stops:
+        a = parse_iso(ws.get('emitted_at'))
+        if a is not None:
+            by_pane.setdefault((ws.get('session'), ws.get('pane_index')), []).append((a, ws))
+    episodes = []
+    ws_ep = {}    # id(wstop record) -> episode_id; the UNCAPPED per-root run partition is
+    cur_ep = {}   # the task-row tag lookup (R2c/R3b) — (sess, pane) -> current episode_id
+    for (sess, pane) in set(by_pane) | set(worker_prompts):   # UNION — catches no-wstop panes
+        rows = sorted(by_pane.get((sess, pane), []), key=lambda r: r[0], reverse=True)
+        wp = worker_prompts.get((sess, pane))
+        wp_at = parse_iso(wp.get('emitted_at')) if wp else None
+        runs = []                                 # newest first; a gap >= SETTLE splits runs
+        for r in rows:
+            if runs and (runs[-1][-1][0] - r[0]).total_seconds() < EPISODE_SETTLE_S:
+                runs[-1].append(r)
+            else:
+                runs.append([r])
+        # R2a — wprompt attachment: the live wprompt belongs to the newest stop run ONLY
+        # when its gap to that run is < SETTLE. A fresh prompt after a settled gap — or on
+        # a pane with no stops at all — OPENS a new prompt-only current run; the old run is
+        # never resurrected with its old id/turn_count.
+        if wp_at is not None and (not runs
+                or (wp_at - runs[0][0][0]).total_seconds() >= EPISODE_SETTLE_S):
+            runs.insert(0, [])                    # synthetic prompt-only current run
+        if not runs:
+            continue                              # no stops, no prompt — nothing to derive
+        for i, run in enumerate(runs):
+            cur = (i == 0)                        # only the newest run sees the wprompt
+            if run:
+                t0, ws0 = run[0]; ep_start = run[-1][0]
+                mid = cur and wp_at is not None and wp_at > t0
+                last = max(t0, wp_at) if (cur and wp_at) else t0
+                turn_count = len(run); snip = (ws0.get('snippet') or '')[:200]
+                agent = ws0.get('agent', 'claude')
+            else:                                 # synthesized wprompt-only run (no Stop yet)
+                ep_start = last = wp_at; mid = True
+                turn_count = 0; snip = ''; agent = wp.get('agent', 'claude')
+            # Identity-transient note: a prompt-only current run's episode_id anchors on the
+            # wprompt timestamp and CHANGES when its first wstop lands. Harmless — EPISODE-
+            # ACTIVE is policy='never' (row update only, no ring), and by the only ringing
+            # transition (settle) there is always >=1 wstop, so the id is stable through
+            # settle. Do NOT "fix" this by adding persistence.
+            quiet = (NOW - last).total_seconds()
+            ep_state = 'in_progress' if (cur and (mid or quiet < EPISODE_SETTLE_S)) else 'settled'
+            ep_id = f"{sess}|p{pane}|{ep_start.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+            episodes.append({'episode_id': ep_id,
+                'session': sess, 'pane': pane, 'root': root, 'label': label, 'agent': agent,
+                'state': ep_state, 'mid_turn': mid, 'turn_count': turn_count, 'current': cur,
+                'dispatch_id': (wp.get('dispatch_id') if (cur and wp) else None),  # for Step 4
+                'first_at': ep_start.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'last_at': last.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'quiet_s': int(quiet), 'earlier': cur and len(runs) > 1,  # stateless reopen hint
+                'last_snippet': snip})
+            for _, w in run:
+                ws_ep[id(w)] = ep_id
+            if cur:
+                cur_ep[(sess, pane)] = ep_id
+    EPISODES.extend(episodes)     # R3a — module-level accumulator, mirrors TASKS; the board
+                                  # sorts + caps ONCE at assembly, never scan-locally
     # worker NEEDS-PERMISSION (reuses the hot condition); a later worker Stop supersedes it.
     for pr in worker_perms:
         sess = pr.get('session'); pane = pr.get('pane_index')
@@ -976,19 +1056,36 @@ def scan_attention(root, label):
             continue
         add_finding('NEEDS-PERMISSION', root, f"{sess}\tp{pane}\t{pr.get('command_hash','')}",
                     f"{label} · {sess} p{pane} — {perm_detail(pr)}", session=sess)
-    # PANE-DONE (active): latest done turn per pane, within the window, not working again.
-    # policy 'never' by default (board row, no ring); FORGE_WATCH_NOTIFY_PANE_DONE arms it.
-    for (sess, pane), ws in latest_wstop.items():
-        if (sess, pane) in now_working:
-            continue
-        a = age_s(ws.get('emitted_at'))
-        if a is None or a > TASK_WINDOW_S:
-            continue
-        sn = (ws.get('snippet') or '')
-        add_finding('PANE-DONE', root, f"{sess}\tp{pane}\t{ws.get('task_id')}",
-                    f"{label} · {sess} p{pane} — pane done ({ws.get('agent','?')})"
-                    + (f": {sn[:80]}" if sn else ""),
-                    policy=('standard' if NOTIFY_PANE_DONE else 'never'), session=sess)
+    # ── episode conditions (Step 3): CURRENT run per pane only. Settled history lives in
+    # episodes[] and task tags, never as board conditions (emitting it would recreate the
+    # per-turn row pile). msgs carry ONLY episode-stable fields (turn_count + snippet) — NO
+    # live ages/spans, or the QUIET signature would churn every tick (the 37MB-launchd.out
+    # failure class); spans/ages render live from first_at/last_at at render time.
+    for ep in (e for e in episodes if e['current']):
+        k = f"{ep['session']}\tp{ep['pane']}\t{ep['episode_id']}"
+        if ep['mid_turn'] and ep['quiet_s'] > TASK_STUCK_S:                 # mid-turn hang
+            f = add_finding('EPISODE-STUCK', root, f"{ep['session']}\tp{ep['pane']}",
+                f"{label} · {ep['session']} p{ep['pane']} — mid-turn, no Stop "
+                f"(agent {ep['agent']})", session=ep['session'])            # no live age in msg
+        elif ep['state'] == 'in_progress':
+            f = add_finding('EPISODE-ACTIVE', root, k,
+                f"{label} · {ep['session']} p{ep['pane']} — in progress · {ep['turn_count']} turn(s)"
+                + (f" · last: {ep['last_snippet'][:60]}" if ep['last_snippet'] else ""),
+                policy='never', session=ep['session'])                      # stable msg only
+        else:                                                               # settled
+            if ep['quiet_s'] > TASK_WINDOW_S:      # R2b: stale settled → residue, not live
+                continue                           # (mirrors the old PANE-DONE window guard)
+            fresh = ep['quiet_s'] < EPISODE_RING_FRESH_S
+            pol = ('once' if (NOTIFY_EPISODE_DONE and fresh) else 'never')
+            f = add_finding('EPISODE-SETTLED', root, k,
+                f"{label} · {ep['session']} p{ep['pane']} — done · {ep['turn_count']} turn(s)"
+                + (f" · final: {ep['last_snippet'][:60]}" if ep['last_snippet'] else ""),
+                policy=pol, session=ep['session'])
+        if f is not None:
+            f.update({'pane': ep['pane'], 'episode_id': ep['episode_id'],
+                      'first_at': ep['first_at'], 'last_at': ep['last_at'],
+                      'turn_count': ep['turn_count'], 'mid_turn': ep['mid_turn'],
+                      'earlier': ep['earlier'], 'dispatch_id': ep['dispatch_id']})
     # older worker-done turns (beyond the window) collapse into ONE maintenance count.
     old_done = sum(1 for ws in worker_stops if (age_s(ws.get('emitted_at')) or 0) > TASK_WINDOW_S)
     if old_done:
@@ -1015,7 +1112,8 @@ def scan_attention(root, label):
                       'dispatched_at': disp_at, 'started_at': None,
                       'answered_at': (_mtime_iso(resp) if answered else None),
                       'response_path': (os.path.join('.dev', 'attention', 'payloads', f'response.{did}.txt') if answered else None),
-                      'prompt_snippet': d.get('instruction_snippet'), 'snippet': None})
+                      'prompt_snippet': d.get('instruction_snippet'), 'snippet': None,
+                      'episode_id': None})
     for (sess, pane) in now_working:
         wp = worker_prompts[(sess, pane)]
         if (age_s(wp.get('emitted_at')) or 0) > TASK_WINDOW_S:
@@ -1023,7 +1121,8 @@ def scan_attention(root, label):
         TASKS.append({'task_id': wp.get('task_id'), 'session': sess, 'root': root, 'label': label,
                       'agent': wp.get('agent', 'claude'), 'pane': pane, 'state': 'working',
                       'dispatched_at': None, 'started_at': wp.get('emitted_at'), 'answered_at': None,
-                      'response_path': None, 'prompt_snippet': wp.get('prompt_snippet'), 'snippet': None})
+                      'response_path': None, 'prompt_snippet': wp.get('prompt_snippet'), 'snippet': None,
+                      'episode_id': cur_ep.get((sess, pane))})
     for ws in worker_stops:
         if (age_s(ws.get('emitted_at')) or 1e18) > TASK_WINDOW_S:
             continue
@@ -1031,13 +1130,15 @@ def scan_attention(root, label):
                       'label': label, 'agent': ws.get('agent', 'claude'), 'pane': ws.get('pane_index'),
                       'state': 'done', 'dispatched_at': None, 'started_at': None,
                       'answered_at': ws.get('emitted_at'), 'response_path': None,
-                      'prompt_snippet': ws.get('prompt_snippet'), 'snippet': ws.get('snippet')})
+                      'prompt_snippet': ws.get('prompt_snippet'), 'snippet': ws.get('snippet'),
+                      'episode_id': ws_ep.get(id(ws))})   # run containing its timestamp (R3b)
     # ── TASK-STUCK (Step 4 partner): a dispatched task unterminated past the stall window ──
     for did, d in dispatch_by_id.items():
         if os.path.exists(os.path.join(adir_p, f'response.{did}.txt')):
             continue
         a = age_s(d.get('dispatched_at'))
         if a is not None and a > TASK_STUCK_S:
+            task_stuck_ids.add((root, d.get('session'), did))   # Step 4 suppression set (R1b)
             add_finding('TASK-STUCK', root, f"{d.get('session')}\t{did}",
                         f"{label} · {d.get('session')} — task {did} unanswered for {human_age(a)} "
                         f"(dispatched, never returned)", session=d.get('session'))
@@ -1142,6 +1243,18 @@ if ask_sessions:
                 if not (f['condition'] == 'NEEDS-REPLY'
                         and (f['root'], f['session']) in ask_sessions)]
 
+# Precedence TASK-STUCK > EPISODE-STUCK: a dispatched worker that accepted its dispatch
+# (its wprompt carries the dispatch_id) and then hangs mid-turn satisfies both conditions;
+# they key differently, so by_key dedup would keep two hot rows / two rings for one hang.
+# Keep only TASK-STUCK — it names the dispatch, which is more actionable. The id set is
+# built at the TASK-STUCK emission site, never parsed out of composite finding keys (R1b).
+# An undispatched hang (no dispatch_id) correctly fires EPISODE-STUCK alone.
+if task_stuck_ids:
+    findings = [f for f in findings
+                if not (f['condition'] == 'EPISODE-STUCK'
+                        and f.get('dispatch_id')
+                        and (f['root'], f.get('session'), f['dispatch_id']) in task_stuck_ids)]
+
 # ── dedup findings by key (context+event may agree) ──────────────────────
 by_key = {}
 for f in findings:
@@ -1235,22 +1348,26 @@ if MODE == 'check':
 # ── output ───────────────────────────────────────────────────────────────
 NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
           'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
-          'TASK-STUCK', 'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
+          'TASK-STUCK', 'EPISODE-STUCK',
+          'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'STATE-UNPARSEABLE']
 order = {c: i for i, c in enumerate(
-    NOTIFY + ['SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PANE-DONE',
+    NOTIFY + ['SESSION-QUEUED', 'SESSION-WORKING', 'EPISODE-ACTIVE', 'SESSION-DONE',
+              'EPISODE-SETTLED',
               'ZOMBIE-STALE-CONTEXT', 'STALE-PENDING', 'PANE-DONE-RESIDUE',
               'CODEX-EMISSION-OFF', 'LEGACY-CONTEXT'])}
 findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
 
 HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
        'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
-       'TASK-STUCK', 'DELIVERY-UNVERIFIED',
+       'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
        'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE'}
-ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE', 'PANE-DONE'}
+ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE',
+          'EPISODE-ACTIVE', 'EPISODE-SETTLED'}
 STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
-            'SESSION-DONE': 'done', 'PANE-DONE': 'done', 'NEEDS-PERMISSION': 'needs-input',
+            'SESSION-DONE': 'done', 'EPISODE-ACTIVE': 'working', 'EPISODE-SETTLED': 'done',
+            'EPISODE-STUCK': 'needs-input', 'NEEDS-PERMISSION': 'needs-input',
             'NEEDS-DECISION': 'needs-input', 'NEEDS-ASK': 'needs-input',
             'NEEDS-REPLY': 'needs-input', 'TASK-STUCK': 'needs-input',
             'DELIVERY-UNVERIFIED': 'needs-input',
@@ -1318,6 +1435,34 @@ def task_rows(t, indent, show_sess=False):
                      f"↳ forge reply @{t['session']} {t['task_id']}"))
     return lines
 
+def current_episodes():
+    # (root, session, str(pane)) -> the pane's CURRENT episode record. str() normalizes the
+    # worker pane_index string vs the dispatched-row int so the two key spaces agree.
+    return {(e['root'], e['session'], str(e['pane'])): e
+            for e in EPISODES if e.get('current')}
+
+def episode_header(ep, indent='  '):
+    # Per-pane episode header: span/age computed HERE from first_at/last_at — the finding
+    # msg stays age-free so the QUIET launchd signature never churns (Risk R2).
+    span = human_age(max(0, int((age_s(ep['first_at']) or 0) - (age_s(ep['last_at']) or 0))))
+    snip = flat(ep.get('last_snippet') or '')
+    if ep['state'] == 'in_progress':
+        head = (f"~ {ep['session']} p{ep['pane']}  in progress"
+                f" · {ep['turn_count']} turn(s) · {span}")
+        if snip:
+            head += f' · last "{clip(snip, 30)}" {human_age(age_s(ep["last_at"]))} ago'
+        col = '33'
+    else:
+        head = (f"+ {ep['session']} p{ep['pane']}  done"
+                f" · {ep['turn_count']} turn(s) · {span}")
+        if snip:
+            head += f' · final "{clip(snip, 30)}"'
+        col = '32'
+    line = indent + paint(col, head)
+    if ep.get('earlier'):
+        line += ' ' + paint('2', '(pane active earlier)')
+    return line
+
 if os.environ.get('FORGE_WATCH_TASKS') == '1':
     # `forge tasks [@<session>] [--json]` — the operator projection. Optional @session filter
     # and a --json machine path (both threaded from cmd_status; see Diff 3f). Reconcile B-C1.
@@ -1325,29 +1470,63 @@ if os.environ.get('FORGE_WATCH_TASKS') == '1':
     tsorted = sorted((t for t in TASKS if not want or t.get('session') == want),
                      key=_task_ts, reverse=True)
     if os.environ.get('FORGE_WATCH_TASKS_JSON') == '1':
+        # Contract: a BARE task array (R1d) — episodes[] lives only in status --board;
+        # worker rows carry the additive episode_id field.
         print(json.dumps(tsorted, indent=2)); sys.exit(0)
     print(sect('FORGE TASKS', f'· {len(tsorted)} task(s)'))
     if not tsorted:
         print(paint('2', '  no tasks in the current window'))
-    for t in tsorted[:40]:
-        for ln in task_rows(t, '  ', show_sess=True):
-            print(ln)
+    # Grouped per (root, session, pane), recency order preserved; a worker pane's current
+    # episode renders as the group header. Dispatched (pane-1) groups have no episode and
+    # render as before.
+    cur_eps = current_episodes()
+    groups, gorder = {}, []
+    for t in tsorted:
+        gk = (t.get('root'), t.get('session') or t.get('label') or '?',
+              str(t.get('pane')) if t.get('pane') is not None else '1')
+        if gk not in groups:
+            groups[gk] = []
+            gorder.append(gk)
+        groups[gk].append(t)
+    shown = 0
+    for gk in gorder:
+        if shown >= 40:
+            break
+        ep = cur_eps.get(gk)
+        if ep is not None:
+            print(episode_header(ep))
+        for t in groups[gk]:
+            if shown >= 40:
+                break
+            for ln in task_rows(t, '  ', show_sess=True):
+                print(ln)
+            shown += 1
     sys.exit(0)
 
 if BOARD:
     def _row(f):
         c = f['condition']
-        return {'condition': c, 'class': _cls(c), 'session': f.get('session'),
-                'root': f['root'], 'label': root_label(f['root']),
-                'slug': f.get('slug'), 'stage': f.get('stage'),
-                'state': STATE_OF.get(c), 'msg': f['msg'],
-                'acked': bool(conds.get(f['key'], {}).get('acked'))}
+        r = {'condition': c, 'class': _cls(c), 'session': f.get('session'),
+             'root': f['root'], 'label': root_label(f['root']),
+             'slug': f.get('slug'), 'stage': f.get('stage'),
+             'state': STATE_OF.get(c), 'msg': f['msg'],
+             'acked': bool(conds.get(f['key'], {}).get('acked'))}
+        # Episode metadata must be copied EXPLICITLY (R1c) — _row emits a fixed field set
+        # and would otherwise silently drop it from board rows.
+        for kx in ('pane', 'episode_id', 'first_at', 'last_at', 'turn_count',
+                   'mid_turn', 'earlier'):
+            if kx in f:
+                r[kx] = f[kx]
+        return r
     hot, active, maint = [], [], []
     for f in findings:
         r = _row(f)
         (hot if r['class'] == 'hot' else active if r['class'] == 'active' else maint).append(r)
     tick = state.get('last_tick'); tick_age = age_s(tick) if tick else None
     task_rows = sorted(TASKS, key=_task_ts, reverse=True)[:200]
+    # episodes[]: assembled at BOARD time from the all-roots accumulator (R3a); sort + cap
+    # happen only here. episode_id is unique within a root — correlate via (root, episode_id).
+    episode_rows = sorted(EPISODES, key=lambda e: e.get('last_at', ''), reverse=True)[:200]
     board = {'schema': 'cc-board/1',
              'generated_at': NOW.strftime('%Y-%m-%dT%H:%M:%SZ'),
              'heartbeat': tick,
@@ -1355,7 +1534,8 @@ if BOARD:
              'stale': (tick_age is None or tick_age > STALE_TICK_S),
              'hot': hot, 'active': active,
              'maintenance': {'collapsed': True, 'count': len(maint), 'rows': maint},
-             'tasks': task_rows}
+             'tasks': task_rows,
+             'episodes': episode_rows}
     print(json.dumps(board, indent=2))
     sys.exit(0)
 
@@ -1450,6 +1630,12 @@ if PRETTY:
             room = R_WIDTH - (wname + wlab + 20)
             if det and room > 10:
                 line += '  ' + paint('2', clip(det, room))
+            # Separate ADDITIVE annotation (§5): worker-pane activity never feeds the glyph
+            # (that stays pure pane-1 lifecycle); a busy worker behind an idle pane-1 row
+            # surfaces as a dim pane count instead. Settled episodes contribute nothing.
+            n_act = sum(1 for f in fs if f['condition'] == 'EPISODE-ACTIVE')
+            if n_act:
+                line += '  ' + paint('2', f'· {n_act} pane(s) active')
             print(line)
 
     # TASKS — the operator's unit of thought; N turns in one pane are N rows. Recency-bounded
@@ -1463,20 +1649,31 @@ if PRETTY:
     if trecent:
         print()
         print(sect('TASKS', f'({len(trecent)})'))
-        # grouped by session, most recent activity first; per-group cap keeps
-        # one busy pane from drowning the rest
+        # grouped by (session, pane), most recent activity first; a worker pane's current
+        # EPISODE is the group header (turn rows beneath are drill-in); dispatched-only
+        # (pane-1) groups render as before. per-group cap keeps one busy pane from
+        # drowning the rest
+        cur_eps = current_episodes()
         groups = {}
         for t in trecent:
-            groups.setdefault(t.get('session') or t.get('label') or '?', []).append(t)
+            groups.setdefault((t.get('root'), t.get('session') or t.get('label') or '?',
+                               str(t.get('pane')) if t.get('pane') is not None else '1'),
+                              []).append(t)
         PER_GROUP = 5
         shown = 0
-        for s in sorted(groups, key=lambda k: _task_ts(groups[k][0]), reverse=True):
+        for gk in sorted(groups, key=lambda k: _task_ts(groups[k][0]), reverse=True):
             if shown >= 24:
                 break
-            ts_ = groups[s]
+            ts_ = groups[gk]
+            s = gk[1]
             lbl = root_label(ts_[0].get('root') or '')
-            print('  ' + paint('1', s)
-                  + (paint('2', f' · {lbl}') if lbl and lbl != s else ''))
+            ep = cur_eps.get(gk)
+            if ep is not None:
+                print(episode_header(ep)
+                      + (paint('2', f' · {lbl}') if lbl and lbl != s else ''))
+            else:
+                print('  ' + paint('1', s)
+                      + (paint('2', f' · {lbl}') if lbl and lbl != s else ''))
             for t in ts_[:PER_GROUP]:
                 for ln in task_rows(t, '    '):
                     print(ln)
