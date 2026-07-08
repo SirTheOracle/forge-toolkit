@@ -61,6 +61,24 @@ FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 "$FORGE" dispatch @forge-x "depl
 ev=$(ls "$R"/.dev/attention/dispatch-*.json | head -1)
 grep -q 'sk-abcdef' "$ev" && bad "secret leaked into snippet" || ok "secret redacted in snippet"
 
+echo "── dispatch: redaction boundary — English words with key-shaped substrings survive ──"
+new_root d3b
+FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 "$FORGE" dispatch @forge-x "check the task-notification path and risk-assessment doc" --allow-api-billing >/dev/null 2>&1
+ev=$(ls "$R"/.dev/attention/dispatch-*.json | head -1)
+python3 - "$ev" <<'PY' && ok "task-notification / risk-assessment survive redaction" || bad "boundary fix regressed: words mangled"
+import json,sys
+s=json.load(open(sys.argv[1]))["instruction_snippet"]
+assert "task-notification" in s and "risk-assessment" in s and "«redacted»" not in s, s
+PY
+new_root d3c
+FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 "$FORGE" dispatch @forge-x "set token=abc123 but keep atoken=xyz789" --allow-api-billing >/dev/null 2>&1
+ev=$(ls "$R"/.dev/attention/dispatch-*.json | head -1)
+python3 - "$ev" <<'PY' && ok "KV boundary: token= redacts, atoken= untouched" || bad "KV boundary wrong"
+import json,sys
+s=json.load(open(sys.argv[1]))["instruction_snippet"]
+assert "token=«redacted»" in s and "atoken=xyz789" in s, s
+PY
+
 echo "── billing preflight ──"
 new_root d4
 ANTHROPIC_API_KEY=sk-x FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 "$FORGE" dispatch @forge-x "x" >/dev/null 2>&1 \
@@ -195,6 +213,19 @@ assert e["role"]=="worker" and e["agent"]=="claude" and e["variant"]=="worker-sn
 assert e["prompt_snippet"]=="do the thing"                  # copied from the sibling wprompt
 assert "worker finished" in e["snippet"]
 assert not os.path.exists(os.path.join(adir,"stop.forge-x.json"))   # HARD CONSTRAINT
+PY
+new_root w1b
+printf '{"prompt":"<task-notification> <task-id>abc123def456</task-id> done"}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" userpromptsubmit
+python3 - "$R" <<'PY' && ok "hook snip: <task-notification> survives redaction unmangled (sk- boundary)" || bad "sk- boundary regressed: tag mangled to ta«redacted»"
+import json,os,sys
+e=json.load(open(os.path.join(sys.argv[1],".dev","attention","wprompt.forge-x.p0.json")))
+assert e["prompt_snippet"].startswith("<task-notification>") and "«redacted»" not in e["prompt_snippet"], e["prompt_snippet"]
+PY
+printf '{"prompt":"real key sk-abcdef1234567890 here"}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" userpromptsubmit
+python3 - "$R" <<'PY' && ok "hook snip: a real sk- key still redacts" || bad "real key leaked through hook snip"
+import json,os,sys
+e=json.load(open(os.path.join(sys.argv[1],".dev","attention","wprompt.forge-x.p0.json")))
+assert "sk-abcdef" not in e["prompt_snippet"] and "«redacted»" in e["prompt_snippet"], e["prompt_snippet"]
 PY
 new_root w2
 for m in one two; do

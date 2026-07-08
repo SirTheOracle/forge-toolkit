@@ -783,6 +783,20 @@ def strip_md(s):
         s = rx.sub(rep, s)
     return ' '.join(s.split())
 
+# Harness-injected turns (subagent task-notifications, Agent-Teams messages,
+# slash-command wrappers) fire UserPromptSubmit exactly like typed prompts, so
+# forge-cc-hook records them as worker turns — but they are harness-internal
+# traffic, not tasks. Drop their rows from the tasks[] projection at fold time;
+# one filter covers every surface (board pretty, --json/SwiftBar, forge tasks,
+# "… N more" counts). Records stay raw on disk, same philosophy as strip_md.
+# 'ta«redacted»' matches legacy records written before the forge-cc-hook sk-
+# redaction boundary fix, which mangled '<task-notification>'.
+_HARNESS_TAG = re.compile(
+    r'^<(ta«redacted»|task-notification|agent-message|system-reminder'
+    r'|command-name|local-command)')
+def _harness_injected(rec):
+    return bool(_HARNESS_TAG.match((rec.get('prompt_snippet') or '').lstrip()))
+
 def _load_att(path):
     try:
         with open(path) as f:
@@ -1152,6 +1166,8 @@ def scan_attention(root, label):
         wp = worker_prompts[(sess, pane)]
         if (age_s(wp.get('emitted_at')) or 0) > TASK_WINDOW_S:
             continue
+        if _harness_injected(wp):
+            continue
         TASKS.append({'task_id': wp.get('task_id'), 'session': sess, 'root': root, 'label': label,
                       'agent': wp.get('agent', 'claude'), 'pane': pane, 'state': 'working',
                       'dispatched_at': None, 'started_at': wp.get('emitted_at'), 'answered_at': None,
@@ -1159,6 +1175,8 @@ def scan_attention(root, label):
                       'episode_id': cur_ep.get((sess, pane))})
     for ws in worker_stops:
         if (age_s(ws.get('emitted_at')) or 1e18) > TASK_WINDOW_S:
+            continue
+        if _harness_injected(ws):
             continue
         TASKS.append({'task_id': ws.get('task_id'), 'session': ws.get('session'), 'root': root,
                       'label': label, 'agent': ws.get('agent', 'claude'), 'pane': ws.get('pane_index'),

@@ -435,9 +435,12 @@ ts  = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 did = "cc-" + now.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
 sha = hashlib.sha256(instr.encode("utf-8", "replace")).hexdigest()
 SECRETS = re.compile(
+    # (?<!…) left boundary (lockstep with forge-cc-hook): English words containing
+    # key-shaped substrings survive ("task-notification", "risk-assessment").
+    r"(?<![A-Za-z0-9_-])"
     r"(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
     r"|AKIA[0-9A-Z]{12,}|xox[baprs]-[A-Za-z0-9-]{8,}|AIza[0-9A-Za-z_\-]{20,})")
-KV = re.compile(r"(?i)(api[_-]?key|token|secret|password)(\s*[=:]\s*)\S+")
+KV = re.compile(r"(?i)\b(api[_-]?key|token|secret|password)(\s*[=:]\s*)\S+")
 def redact(s):
     s = SECRETS.sub("«redacted»", s or ""); return KV.sub(r"\1\2«redacted»", s)
 adir = os.path.join(root, ".dev", "attention"); os.makedirs(adir, exist_ok=True)
@@ -577,9 +580,12 @@ if not session:
                      "from inside the initiative's tmux session (or pass --root with TMUX_SESSION).\n")
 
 SECRETS = re.compile(
+    # (?<!…) left boundary (lockstep with forge-cc-hook): English words containing
+    # key-shaped substrings survive ("task-notification", "risk-assessment").
+    r"(?<![A-Za-z0-9_-])"
     r"(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
     r"|AKIA[0-9A-Z]{12,}|xox[baprs]-[A-Za-z0-9-]{8,}|AIza[0-9A-Za-z_\-]{20,})")
-KV = re.compile(r"(?i)(api[_-]?key|token|secret|password)(\s*[=:]\s*)\S+")
+KV = re.compile(r"(?i)\b(api[_-]?key|token|secret|password)(\s*[=:]\s*)\S+")
 def redact(s):
     s = SECRETS.sub("«redacted»", s or ""); return KV.sub(r"\1\2«redacted»", s)
 snippet = redact(q.strip().replace("\n", " "))[:280]   # redact BEFORE truncating

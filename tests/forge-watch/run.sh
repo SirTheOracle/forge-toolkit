@@ -1620,6 +1620,49 @@ JSON
 assert_status_has "question (AskUserQuestion): Deploy now to prod?" "MD6 perm question stripped"
 assert_status_has "options: yes / no" "MD6 option labels stripped"
 
+echo "── harness-injected turns: dropped from tasks[] on every surface (HT1-HT6) ──"   # +7
+new_env htfilter
+R=$(mk_root proj); live_session forge-1 "$R"
+a="$(attn "$R")"
+# HT1: done turn whose prompt was an injected <task-notification> → no task row
+cat > "$a/wstop.forge-1.p0.ptask-ht1.json" <<JSON
+{"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"0","role":"worker","agent":"claude","tmux_pane":"%0","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht1","prompt_snippet":"<task-notification> <task-id>abc123</task-id> <tool-use-id>toolu_x</tool-use-id>","snippet":"noted, moving on","snippet_source":"last_assistant_message","looks_like_question":false}
+JSON
+# HT2: legacy mangled form (record written before the sk- boundary fix) → no task row
+cat > "$a/wstop.forge-1.p2.ptask-ht2.json" <<JSON
+{"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"2","role":"worker","agent":"claude","tmux_pane":"%2","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht2","prompt_snippet":"<ta«redacted»> <task-id>def456</task-id> <tool-use-id>toolu_y</tool-use-id>","snippet":"ack","snippet_source":"last_assistant_message","looks_like_question":false}
+JSON
+# HT3: Agent-Teams <agent-message> turn → no task row
+cat > "$a/wstop.forge-1.p4.ptask-ht3.json" <<JSON
+{"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"4","role":"worker","agent":"claude","tmux_pane":"%4","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht3","prompt_snippet":"<agent-message from=\"regression-hunter-b\"> No corrections","snippet":"ok","snippet_source":"last_assistant_message","looks_like_question":false}
+JSON
+# HT4: live injected wprompt (would render state=working) → no task row
+wpromptf "$R" forge-1 6 30 ptask-ht4 claude "<task-notification> <task-id>xyz</task-id> background agent done"
+# HT5: a normal typed task in the same root still renders (no over-filtering)
+wstopf "$R" forge-1 3 30 ptask-ht5 claude "real work done"
+run_status --board > "$TDIR/ht.json"
+python3 - "$TDIR/ht.json" <<'PY' && ok "HT1-HT4 injected rows absent from tasks[]; HT5 real task present" || bad "harness-injected filter wrong in tasks[]"
+import json, sys
+b = json.load(open(sys.argv[1]))
+ids = {t.get('task_id') for t in b.get('tasks', [])}
+assert 'ptask-ht5' in ids, ids
+assert not ({'ptask-ht1','ptask-ht2','ptask-ht3','ptask-ht4'} & ids), ids
+PY
+python3 - "$TDIR/ht.json" <<'PY' && ok "HT6 board JSON tasks[] carries no harness tags (SwiftBar surface)" || bad "HT6 harness tag leaked into board JSON"
+import json, sys
+b = json.load(open(sys.argv[1]))
+texts = [(t.get('prompt_snippet') or '') for t in b.get('tasks', [])]
+assert not any(x.lstrip().startswith('<ta') or 'agent-message' in x for x in texts), texts
+PY
+run_status --pretty | grep -q "task-notification\|ta«redacted»\|agent-message" && bad "injected tag visible on pretty board" || ok "pretty board free of injected-tag rows"
+run_status --tasks | grep -q "task-notification\|ta«redacted»\|agent-message" && bad "--tasks still lists injected turns" || ok "--tasks view filtered too"
+python3 - "$TDIR/ht.json" <<'PY' && ok "episodes still count injected turns (only the task projection hides them)" || bad "episode derivation over-filtered"
+import json, sys
+b = json.load(open(sys.argv[1]))
+panes = {e.get('pane') for e in b.get('episodes', [])}
+assert '0' in panes and '2' in panes and '4' in panes, panes
+PY
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "═══════════════════════════════════════"

@@ -92,9 +92,12 @@ except OSError:
 
 NOW = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 SECRETS = re.compile(
+    # (?<!…) left boundary: key-shaped tokens only match at a non-word start, so
+    # English words containing them survive ("task-notification", "risk-assessment").
+    r"(?<![A-Za-z0-9_-])"
     r"(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
     r"|AKIA[0-9A-Z]{12,}|xox[baprs]-[A-Za-z0-9-]{8,}|AIza[0-9A-Za-z_\-]{20,})")
-KV = re.compile(r"(?i)(api[_-]?key|token|secret|password)(\s*[=:]\s*)\S+")
+KV = re.compile(r"(?i)\b(api[_-]?key|token|secret|password)(\s*[=:]\s*)\S+")
 def redact(s):
     s = SECRETS.sub("«redacted»", s or "")
     return KV.sub(r"\1\2«redacted»", s)
