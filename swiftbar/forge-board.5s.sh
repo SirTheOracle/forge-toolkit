@@ -9,18 +9,24 @@
 # Install (operator-gated, DoD): symlink into the SwiftBar plugins folder, chmod +x.
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/bin:$PATH"
 FORGE_BIN="${FORGE_BIN:-forge}"
+# Menubar icon: anvil template image (alpha-only; macOS recolors per theme).
+# Source: swiftbar/forge-icon.svg — regenerate with swiftbar/render-icon.swift
+# (see the SVG header comment). Replaces the word "forge" in the title; the
+# status text (N!, ⚙N, ✓, ⚠) stays beside it.
+ICON="iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAYAAADhAJiYAAAAAXNSR0IArs4c6QAAAGxlWElmTU0AKgAAAAgABAEaAAUAAAABAAAAPgEbAAUAAAABAAAARgEoAAMAAAABAAIAAIdpAAQAAAABAAAATgAAAAAAAACQAAAAAQAAAJAAAAABAAKgAgAEAAAAAQAAACSgAwAEAAAAAQAAACQAAAAAQCQK+gAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAAaxJREFUWAntV7tKBEEQPEVN1MzYw8gPUExUMPBXBCMjYwNjA0ND8RsMTU38AxMFY8MDwXcVO3s0vbc9zzsX2YJmHl1d09PXO3CDQQ+7AnO2O8i7BNaOYz5gfA+KmhJpC7ovsB9nnHPvT8DKyGRkUvTNHPs4sU5Cj3up2cynBrpkMsLLh3buJ+MVt2Gyj7KbunOfvZXQKW6/wjJMASNoXsTqXiNAfz2l1tSOxgEiSiWgdagdDf6cTzAtlrumZmurWO8QD76BlQY1qZ2EDUR9w3KrUsdTi5qtWGj1VI5nDCewNcc7xLjr5hzuYXdizanFeYWfmsVwCaX6thy51gjh6Jjx2uqhMWmWkz4hX7V9Ta3jdUVXQVhXJO5JtL45khQ7HyLgFvYFk00dMmcMY6lRBMtQ4esacrjFoQa1snEEBeugGB+1TOiemETenLSZuOfVCmlqzblCMuewRU9SH/CfwY4FT2sJVzX1EhoR1cYbBlpxhCT0qU7ljeWtldtcaq0GOaSHHhtR6RtFtDr32bMeQxgfN5Y85jMnlzHBD2Pss86ei/0nMnJJYejxDyvwC5DK7O/F7D/AAAAAAElFTkSuQmCC"
 json="$("$FORGE_BIN" board --json 2>/dev/null)"
 if [ -z "$json" ]; then
-    echo "forge ⚠"; echo "---"; echo "board unavailable — is forge-watch installed? | color=red"; exit 0
+    echo "⚠ | templateImage=$ICON"; echo "---"; echo "board unavailable — is forge-watch installed? | color=red"; exit 0
 fi
 # JSON rides in an env var: `python3 - <<PY` takes its PROGRAM from stdin, so a pipe into the
 # heredoc would be unreadable (stdin cannot carry both the script and the data).
-FW_JSON="$json" python3 - <<'PY'
+FW_JSON="$json" FW_ICON="$ICON" python3 - <<'PY'
 import os, json
+ICON = os.environ.get("FW_ICON", "")
 try:
     b = json.loads(os.environ.get("FW_JSON", ""))
 except Exception:
-    print("forge ⚠"); print("---"); print("board parse error | color=red"); raise SystemExit(0)
+    print(f"⚠ | templateImage={ICON}"); print("---"); print("board parse error | color=red"); raise SystemExit(0)
 
 def esc(s):
     # SwiftBar uses '|' to separate text from line metadata — a content pipe corrupts the
@@ -45,14 +51,14 @@ inprog = sorted((e for e in eps if e.get("current") and e.get("state") == "in_pr
                 key=lambda e: e.get("last_at", ""), reverse=True)
 unseen = sum(1 for r in hot if not r.get("acked"))
 stale = b.get("stale")
-parts = ["forge"]
+parts = []                                 # icon replaces the word "forge"
 if unseen:
     parts.append(f"{unseen}!")
 if inprog:
     parts.append(f"⚙{len(inprog)}")
 if not unseen and not inprog:
     parts.append("✓")
-print(" ".join(parts) + (" ⚠" if stale else ""))
+print(" ".join(parts) + (" ⚠" if stale else "") + f" | templateImage={ICON}")
 print("---")
 if stale:
     print(f"⚠ watcher stale ({b.get('heartbeat_age_s')}s) — run: forge-watch install | color=red")

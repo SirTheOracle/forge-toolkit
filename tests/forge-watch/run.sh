@@ -1417,20 +1417,26 @@ run_status | grep -q "DELIVERY-UNVERIFIED" && ok "unconfirmed selftest → DELIV
 "$WATCH" selftest --confirm "$id" >/dev/null 2>&1
 run_status | grep -q "$id" && bad "banner persists after confirm" || ok "confirmed selftest clears the banner"
 
-echo "── SwiftBar plugin: renders counts + staleness from cc-board/1 JSON (hermetic) ──"   # +3
+echo "── SwiftBar plugin: renders counts + staleness from cc-board/1 JSON (hermetic) ──"   # +5
 new_env tsb
 PLUGIN="$(cd "$(dirname "$WATCH")/.." && pwd)/swiftbar/forge-board.5s.sh"
 if [ -f "$PLUGIN" ]; then
   STUBF="$WORK/fakeforge"
   printf '#!/bin/bash\ncat <<JSON\n{"schema":"cc-board/1","hot":[{"condition":"NEEDS-ASK","session":"forge-1","acked":false}],"active":[],"tasks":[{"task_id":"cc-a"}],"maintenance":{"collapsed":true,"count":0,"rows":[]},"stale":false}\nJSON\n' > "$STUBF"; chmod +x "$STUBF"
   out=$(FORGE_BIN="$STUBF" bash "$PLUGIN")
-  echo "$out" | head -1 | grep -q "forge 1!" && ok "SwiftBar menubar shows unseen hot count" || bad "swiftbar title wrong: $(echo "$out" | head -1)"
+  echo "$out" | head -1 | grep -q "^1! | templateImage=iVBOR" && ok "SwiftBar menubar shows unseen hot count + icon" || bad "swiftbar title wrong: $(echo "$out" | head -1)"
   echo "$out" | grep -q "1 task(s)" && ok "SwiftBar dropdown shows task count" || bad "swiftbar task count missing"
   STUBF2="$WORK/fakeforge2"
   printf '#!/bin/bash\ncat <<JSON\n{"schema":"cc-board/1","hot":[],"active":[],"tasks":[],"maintenance":{"collapsed":true,"count":0,"rows":[]},"stale":true,"heartbeat_age_s":300}\nJSON\n' > "$STUBF2"; chmod +x "$STUBF2"
   FORGE_BIN="$STUBF2" bash "$PLUGIN" | grep -q "watcher stale" && ok "SwiftBar self-reports watcher staleness" || bad "swiftbar staleness missing"
+  # icon integrity: the embedded base64 must decode to a real PNG (a single
+  # flipped char in the 850-char blob corrupts an IDAT CRC and kills the icon)
+  [ "$(sed -n 's/^ICON="\(.*\)"$/\1/p' "$PLUGIN" | base64 -d 2>/dev/null | head -c 8 | xxd -p)" = "89504e470d0a1a0a" ] \
+    && ok "embedded icon decodes to a PNG" || bad "embedded icon base64 invalid"
+  out=$(FORGE_BIN=/usr/bin/false bash "$PLUGIN")
+  echo "$out" | head -1 | grep -q "^⚠ | templateImage=iVBOR" && ok "no-board fallback title carries icon" || bad "fallback title: $(echo "$out" | head -1)"
 else
-  echo "  (skip: plugin not found)"; ok "swiftbar plugin present"; ok "swiftbar task count (skipped)"; ok "swiftbar staleness (skipped)"
+  echo "  (skip: plugin not found)"; ok "swiftbar plugin present"; ok "swiftbar task count (skipped)"; ok "swiftbar staleness (skipped)"; ok "swiftbar icon decode (skipped)"; ok "swiftbar fallback icon (skipped)"
 fi
 
 echo "── SwiftBar plugin: in-progress episodes SB1-SB12 (hermetic) ──"                     # +16
@@ -1446,19 +1452,22 @@ if [ -f "$PLUGIN" ]; then
   EP1='{"episode_id":"e1","session":"forge-3","pane":"0","root":"/r","label":"goparent-ai","agent":"claude","state":"in_progress","mid_turn":false,"turn_count":3,"current":true,"quiet_s":120,"first_at":"2026-01-01T00:00:00Z","last_at":"2026-01-01T00:02:00Z","last_snippet":"building the parser"}'
   BASE='"schema":"cc-board/1","active":[],"maintenance":{"collapsed":true,"count":0,"rows":[]}'
 
-  # SB1 — in-progress title + row
+  # SB1 — in-progress title + row (titles carry the icon param; compare the text
+  # part via ${title%% |*} — the icon replaces the word "forge", counts stay)
   out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EP1]}")
   t1=$(echo "$out" | head -1)
-  { echo "$t1" | grep -q "⚙1" && ! echo "$t1" | grep -q "✓"; } && ok "SB1: title shows ⚙1, no ✓" || bad "SB1 title: $t1"
+  { [ "${t1%% |*}" = "⚙1" ] && echo "$t1" | grep -q "templateImage=iVBOR"; } && ok "SB1: title shows ⚙1 + icon, no ✓" || bad "SB1 title: $t1"
   { echo "$out" | grep -q "forge-3 p0" && echo "$out" | grep -q "quiet 2m"; } && ok "SB1: episode row has session/pane + quiet age" || bad "SB1 row missing"
 
   # SB2 — hot leads, order pinned
   out=$(sbrun "{$BASE,\"hot\":[{\"condition\":\"NEEDS-ASK\",\"session\":\"forge-1\",\"acked\":false}],\"tasks\":[],\"stale\":false,\"episodes\":[$EP1]}")
-  [ "$(echo "$out" | head -1)" = "forge 1! ⚙1" ] && ok "SB2: hot leads gear in title" || bad "SB2 title: $(echo "$out" | head -1)"
+  t2=$(echo "$out" | head -1)
+  [ "${t2%% |*}" = "1! ⚙1" ] && ok "SB2: hot leads gear in title" || bad "SB2 title: $t2"
 
   # SB3 — degrade: no episodes key → exact legacy render, no traceback
   out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[{\"task_id\":\"cc-a\"}],\"stale\":false}" 2>"$WORK/sb3.err")
-  [ "$(echo "$out" | head -1)" = "forge ✓" ] && ok "SB3: legacy board → exact 'forge ✓'" || bad "SB3 title: $(echo "$out" | head -1)"
+  t3=$(echo "$out" | head -1)
+  [ "${t3%% |*}" = "✓" ] && ok "SB3: legacy board → exact '✓' text" || bad "SB3 title: $t3"
   { echo "$out" | grep -q "1 task(s) in window" && ! grep -q Traceback "$WORK/sb3.err"; } && ok "SB3: legacy task line, no traceback" || bad "SB3 task line/stderr"
 
   # SB4 — snippet pipe sanitized; exactly one | (the SwiftBar separator) on the row
@@ -1482,9 +1491,11 @@ if [ -f "$PLUGIN" ]; then
 
   # SB7 — stale suffix stays last with gear present
   out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":true,\"heartbeat_age_s\":300,\"episodes\":[$EP1]}")
-  [ "$(echo "$out" | head -1)" = "forge ⚙1 ⚠" ] && ok "SB7: 'forge ⚙1 ⚠' (⚠ last)" || bad "SB7 title: $(echo "$out" | head -1)"
+  t7=$(echo "$out" | head -1)
+  [ "${t7%% |*}" = "⚙1 ⚠" ] && ok "SB7: '⚙1 ⚠' (⚠ last)" || bad "SB7 title: $t7"
   out=$(sbrun "{$BASE,\"hot\":[{\"condition\":\"NEEDS-ASK\",\"session\":\"forge-1\",\"acked\":false}],\"tasks\":[],\"stale\":true,\"heartbeat_age_s\":300,\"episodes\":[$EP1]}")
-  [ "$(echo "$out" | head -1)" = "forge 1! ⚙1 ⚠" ] && ok "SB7: 'forge 1! ⚙1 ⚠'" || bad "SB7 hot title: $(echo "$out" | head -1)"
+  t7=$(echo "$out" | head -1)
+  [ "${t7%% |*}" = "1! ⚙1 ⚠" ] && ok "SB7: '1! ⚙1 ⚠'" || bad "SB7 hot title: $t7"
 
   # SB8 — mid_turn renders streaming, not quiet
   EPS=$(printf '%s' "$EP1" | sed 's/"mid_turn":false/"mid_turn":true/')
@@ -1514,7 +1525,8 @@ print(json.dumps(eps))')
 
   # SB12 — SESSION-WORKING alone does NOT light the gear (final-plan D5, deliberate)
   out=$(sbrun "{\"schema\":\"cc-board/1\",\"hot\":[],\"active\":[{\"condition\":\"SESSION-WORKING\",\"state\":\"working\",\"session\":\"forge-1\"}],\"maintenance\":{\"collapsed\":true,\"count\":0,\"rows\":[]},\"tasks\":[],\"stale\":false,\"episodes\":[]}")
-  { [ "$(echo "$out" | head -1)" = "forge ✓" ] && ! echo "$out" | grep -q "⚙"; } && ok "SB12: SESSION-WORKING-only → no gear (pinned exclusion)" || bad "SB12 title: $(echo "$out" | head -1)"
+  t12=$(echo "$out" | head -1)
+  { [ "${t12%% |*}" = "✓" ] && ! echo "$out" | grep -q "⚙"; } && ok "SB12: SESSION-WORKING-only → no gear (pinned exclusion)" || bad "SB12 title: $t12"
 else
   echo "  (skip: plugin not found)"
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do ok "swiftbar in-progress (skipped)"; done

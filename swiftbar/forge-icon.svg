@@ -1,0 +1,14 @@
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg">
+  <!-- Minimalist Tech Anvil — menubar template icon source.
+       Tweaked from .tmpFiles/forge-gemini-svg.svg for 16-18pt legibility:
+       stroke-width 2 → 2.75, spark r 1.5 → 2.2 (a 1.5r spark rasterizes to
+       ~1px at menubar size and reads as dust). currentColor renders black →
+       alpha-only template image; macOS recolors it per menubar theme.
+       Regenerate the PNG embedded in forge-board.5s.sh with:
+         swift swiftbar/render-icon.swift swiftbar/forge-icon.svg /tmp/forge-icon.png
+         base64 < /tmp/forge-icon.png | tr -d '\n'  -->
+  <path d="M4 7H20L18.5 11H5.5L4 7Z" fill="currentColor" stroke="none" />
+  <path d="M9 11V16H15V11" />
+  <rect x="7" y="16" width="10" height="4" rx="1" />
+  <circle cx="12" cy="4" r="2.2" fill="currentColor" stroke="none" />
+</svg>
