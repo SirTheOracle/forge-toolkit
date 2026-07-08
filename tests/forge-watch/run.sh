@@ -1433,6 +1433,93 @@ else
   echo "  (skip: plugin not found)"; ok "swiftbar plugin present"; ok "swiftbar task count (skipped)"; ok "swiftbar staleness (skipped)"
 fi
 
+echo "── SwiftBar plugin: in-progress episodes SB1-SB12 (hermetic) ──"                     # +16
+new_env tsb2
+PLUGIN="$(cd "$(dirname "$WATCH")/.." && pwd)/swiftbar/forge-board.5s.sh"
+if [ -f "$PLUGIN" ]; then
+  sbrun() {  # sbrun <json> — run the plugin against a stub forge emitting <json>
+    local f="$WORK/sbstub"
+    printf '#!/bin/bash\ncat "$0.json"\n' > "$f"; chmod +x "$f"
+    printf '%s' "$1" > "$f.json"
+    FORGE_BIN="$f" bash "$PLUGIN"
+  }
+  EP1='{"episode_id":"e1","session":"forge-3","pane":"0","root":"/r","label":"goparent-ai","agent":"claude","state":"in_progress","mid_turn":false,"turn_count":3,"current":true,"quiet_s":120,"first_at":"2026-01-01T00:00:00Z","last_at":"2026-01-01T00:02:00Z","last_snippet":"building the parser"}'
+  BASE='"schema":"cc-board/1","active":[],"maintenance":{"collapsed":true,"count":0,"rows":[]}'
+
+  # SB1 — in-progress title + row
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EP1]}")
+  t1=$(echo "$out" | head -1)
+  { echo "$t1" | grep -q "⚙1" && ! echo "$t1" | grep -q "✓"; } && ok "SB1: title shows ⚙1, no ✓" || bad "SB1 title: $t1"
+  { echo "$out" | grep -q "forge-3 p0" && echo "$out" | grep -q "quiet 2m"; } && ok "SB1: episode row has session/pane + quiet age" || bad "SB1 row missing"
+
+  # SB2 — hot leads, order pinned
+  out=$(sbrun "{$BASE,\"hot\":[{\"condition\":\"NEEDS-ASK\",\"session\":\"forge-1\",\"acked\":false}],\"tasks\":[],\"stale\":false,\"episodes\":[$EP1]}")
+  [ "$(echo "$out" | head -1)" = "forge 1! ⚙1" ] && ok "SB2: hot leads gear in title" || bad "SB2 title: $(echo "$out" | head -1)"
+
+  # SB3 — degrade: no episodes key → exact legacy render, no traceback
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[{\"task_id\":\"cc-a\"}],\"stale\":false}" 2>"$WORK/sb3.err")
+  [ "$(echo "$out" | head -1)" = "forge ✓" ] && ok "SB3: legacy board → exact 'forge ✓'" || bad "SB3 title: $(echo "$out" | head -1)"
+  { echo "$out" | grep -q "1 task(s) in window" && ! grep -q Traceback "$WORK/sb3.err"; } && ok "SB3: legacy task line, no traceback" || bad "SB3 task line/stderr"
+
+  # SB4 — snippet pipe sanitized; exactly one | (the SwiftBar separator) on the row
+  EPP=$(printf '%s' "$EP1" | sed 's/building the parser/a | b/')
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EPP]}")
+  line=$(echo "$out" | grep "color=orange")
+  { echo "$line" | grep -q "a ¦ b" && [ "$(printf '%s' "$line" | tr -cd '|' | wc -c | tr -d ' ')" -eq 1 ]; } && ok "SB4: snippet pipe → ¦, one separator" || bad "SB4 row: $line"
+
+  # SB5 — non-current / settled excluded; codex empty pane omits pN token
+  EPA='{"episode_id":"a","session":"s-old","pane":"0","root":"/r","label":"L","agent":"claude","state":"in_progress","mid_turn":false,"turn_count":1,"current":false,"quiet_s":5,"last_at":"2026-01-01T00:00:01Z","first_at":"2026-01-01T00:00:00Z","last_snippet":""}'
+  EPB='{"episode_id":"b","session":"s-done","pane":"2","root":"/r","label":"L","agent":"claude","state":"settled","mid_turn":false,"turn_count":1,"current":true,"quiet_s":900,"last_at":"2026-01-01T00:00:02Z","first_at":"2026-01-01T00:00:00Z","last_snippet":""}'
+  EPC='{"episode_id":"c","session":"codex-x","pane":"","root":"/r","label":"proj","agent":"codex","state":"in_progress","mid_turn":false,"turn_count":1,"current":true,"quiet_s":5,"last_at":"2026-01-01T00:00:03Z","first_at":"2026-01-01T00:00:00Z","last_snippet":""}'
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EPA,$EPB,$EPC]}")
+  { echo "$out" | head -1 | grep -q "⚙1" && [ "$(echo "$out" | grep -c 'color=orange')" -eq 1 ]; } && ok "SB5: only current+in_progress rendered" || bad "SB5 count wrong"
+  line=$(echo "$out" | grep "color=orange")
+  { echo "$line" | grep -q "codex-x" && ! echo "$line" | grep -qE " p[0-9]"; } && ok "SB5: empty pane omits pN token" || bad "SB5 row: $line"
+
+  # SB6 — pending task line; legacy substring retained
+  out=$(sbrun "{$BASE,\"hot\":[],\"stale\":false,\"episodes\":[],\"tasks\":[{\"task_id\":\"t1\",\"state\":\"queued\"},{\"task_id\":\"t2\",\"state\":\"working\"},{\"task_id\":\"t3\",\"state\":\"done\"}]}")
+  { echo "$out" | grep -q "2 pending (1 working)" && echo "$out" | grep -q "task(s) in window"; } && ok "SB6: pending task summary" || bad "SB6 task line"
+
+  # SB7 — stale suffix stays last with gear present
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":true,\"heartbeat_age_s\":300,\"episodes\":[$EP1]}")
+  [ "$(echo "$out" | head -1)" = "forge ⚙1 ⚠" ] && ok "SB7: 'forge ⚙1 ⚠' (⚠ last)" || bad "SB7 title: $(echo "$out" | head -1)"
+  out=$(sbrun "{$BASE,\"hot\":[{\"condition\":\"NEEDS-ASK\",\"session\":\"forge-1\",\"acked\":false}],\"tasks\":[],\"stale\":true,\"heartbeat_age_s\":300,\"episodes\":[$EP1]}")
+  [ "$(echo "$out" | head -1)" = "forge 1! ⚙1 ⚠" ] && ok "SB7: 'forge 1! ⚙1 ⚠'" || bad "SB7 hot title: $(echo "$out" | head -1)"
+
+  # SB8 — mid_turn renders streaming, not quiet
+  EPS=$(printf '%s' "$EP1" | sed 's/"mid_turn":false/"mid_turn":true/')
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EPS]}")
+  { echo "$out" | grep -q "streaming" && ! echo "$out" | grep -q "quiet"; } && ok "SB8: mid_turn → streaming" || bad "SB8 row"
+
+  # SB9 — negative quiet_s clamped to 0s
+  EPN=$(printf '%s' "$EP1" | sed 's/"quiet_s":120/"quiet_s":-50/')
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EPN]}")
+  { echo "$out" | grep -q "quiet 0s" && ! echo "$out" | grep -q -- "-50"; } && ok "SB9: negative quiet clamps to 0s" || bad "SB9 row"
+
+  # SB10 — 8-row cap + overflow line
+  NINE=$(python3 -c '
+import json
+eps=[{"episode_id":f"e{i}","session":f"s{i}","pane":"0","root":"/r","label":"L","agent":"claude",
+      "state":"in_progress","mid_turn":False,"turn_count":1,"current":True,"quiet_s":5,
+      "first_at":"2026-01-01T00:00:00Z","last_at":f"2026-01-01T00:00:{i:02d}Z","last_snippet":""}
+     for i in range(9)]
+print(json.dumps(eps))')
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":$NINE}")
+  { [ "$(echo "$out" | grep -c 'color=orange')" -eq 8 ] && echo "$out" | grep -q "+1 more in progress"; } && ok "SB10: cap 8 + overflow line" || bad "SB10 cap/overflow"
+
+  # SB11 — hot-row sanitizer: pipe in session name
+  out=$(sbrun "{$BASE,\"hot\":[{\"condition\":\"NEEDS-ASK\",\"session\":\"forge|1\",\"acked\":false}],\"tasks\":[],\"stale\":false,\"episodes\":[]}")
+  line=$(echo "$out" | grep "color=red")
+  { echo "$line" | grep -q "forge¦1" && [ "$(printf '%s' "$line" | tr -cd '|' | wc -c | tr -d ' ')" -eq 1 ]; } && ok "SB11: hot row pipe → ¦, one separator" || bad "SB11 row: $line"
+
+  # SB12 — SESSION-WORKING alone does NOT light the gear (final-plan D5, deliberate)
+  out=$(sbrun "{\"schema\":\"cc-board/1\",\"hot\":[],\"active\":[{\"condition\":\"SESSION-WORKING\",\"state\":\"working\",\"session\":\"forge-1\"}],\"maintenance\":{\"collapsed\":true,\"count\":0,\"rows\":[]},\"tasks\":[],\"stale\":false,\"episodes\":[]}")
+  { [ "$(echo "$out" | head -1)" = "forge ✓" ] && ! echo "$out" | grep -q "⚙"; } && ok "SB12: SESSION-WORKING-only → no gear (pinned exclusion)" || bad "SB12 title: $(echo "$out" | head -1)"
+else
+  echo "  (skip: plugin not found)"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do ok "swiftbar in-progress (skipped)"; done
+fi
+
 echo "── CODEX-EMISSION-OFF: marker + no codex signal → maintenance; codex fire clears ──"  # +2
 new_env tcodex
 R=$(mk_root proj); live_session forge-1 "$R"
