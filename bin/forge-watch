@@ -757,13 +757,47 @@ def _eval_context(root, label, cp, embedded, is_live,
                     session=embedded, slug=slug, stage=last)
 
 # ── attention ingestion (command center; READ-ONLY) ─────────────────────
+# Snippets are captured as RAW markdown source (forge-cc-hook snip() redacts and
+# truncates but never renders), so `**bold**` / `## Heading` / [x](url) / backticks
+# leak verbatim into every plain-text surface (board, SwiftBar, notifications).
+# Strip at LOAD time: this one choke point covers claude + codex records AND
+# legacy records already in the window; the stored files stay raw.
+# Conservative by design: emphasis needs a DOUBLE marker with non-space inner
+# edges (`2 * 3` and `*.json` globs survive), heading hashes need a following
+# space (`#192` survives), underscore emphasis is never touched (`__init__`,
+# snake_case). The unterminated-link rule handles snip()-truncated tails like
+# "[diagnosis.md](/Users/sirdrafton/sirtheoracle/auto".
+_MD_SUBS = [
+    (re.compile(r'`{3,}[A-Za-z0-9_-]*'), ' '),                  # code fences
+    (re.compile(r'!?\[([^\]]*)\]\([^)]*\)'), r'\1'),            # links/images → text
+    (re.compile(r'!?\[([^\]]*)\]\([^)]*$'), r'\1'),             # link truncated mid-target
+    (re.compile(r'\*{2,3}(\S(?:[^*]*?\S)?)\*{2,3}'), r'\1'),    # **bold** / ***both***
+    (re.compile(r'~~(\S(?:[^~]*?\S)?)~~'), r'\1'),              # ~~strike~~
+    (re.compile(r'`([^`]+)`'), r'\1'),                          # `inline code`
+    (re.compile(r'(?:(?<=\s)|^)#{1,6}(?=\s)'), ''),             # heading hashes
+]
+_MD_FIELDS = ('snippet', 'prompt_snippet', 'question_snippet', 'instruction_snippet')
+
+def strip_md(s):
+    for rx, rep in _MD_SUBS:
+        s = rx.sub(rep, s)
+    return ' '.join(s.split())
+
 def _load_att(path):
     try:
         with open(path) as f:
             d = json.load(f)
-        return d if isinstance(d, dict) else None
     except (ValueError, OSError):
         return None
+    if not isinstance(d, dict):
+        return None
+    for k in _MD_FIELDS:
+        if isinstance(d.get(k), str):
+            d[k] = strip_md(d[k])
+    opts = d.get('question_options')
+    if isinstance(opts, list):
+        d['question_options'] = [strip_md(o) if isinstance(o, str) else o for o in opts]
+    return d
 
 def perm_detail(pr):
     # Detail slot of a NEEDS-PERMISSION row. An AskUserQuestion perm record

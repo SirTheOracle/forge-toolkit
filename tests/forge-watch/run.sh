@@ -1576,6 +1576,38 @@ err=$(FORGE_WATCH_TMUX_LIST="$WORK/twdog-fifo" FORGE_WATCH_CHECK_TIMEOUT_S=1 \
 [ "$rc" -eq 70 ] && ok "hung check dies with watchdog exit 70" || bad "watchdog rc=$rc"
 echo "$err" | grep -q "watchdog" && ok "watchdog leaves a stderr trace" || bad "no watchdog trace: $err"
 
+echo "── markdown stripping: snippets render plain on every surface (MD1-MD6) ──"   # +7
+new_env mdstrip
+R=$(mk_root proj); live_session forge-1 "$R"
+# MD1: worker episode snippet — heading/bold/backticks/link all stripped
+wstopf "$R" forge-1 0 30 ptask-md1 claude '## Done **bold** with `code` and [plan.md](/tmp/plan.md)'
+assert_status_has "last: Done bold with code and plan.md" "MD1 episode snippet stripped"
+# MD2: session-level done snippet — nested bold+inline-code stripped
+stopf "$R" forge-1 60 'committed **`fix.py`** as `abc123`'
+assert_status_has "done: committed fix.py as abc123" "MD2 session-done snippet stripped"
+# MD3: a snip()-truncated link tail degrades to its link text
+wstopf "$R" forge-1 2 30 ptask-md3 claude 'artifact: [diagnosis.md](/Users/x/sirtheoracle/au'
+assert_status_has "p2 — in progress · 1 turn(s) · last: artifact: diagnosis.md" "MD3 truncated link → text"
+# MD4: non-markdown lookalikes survive (globs, math, #refs, dunders)
+wstopf "$R" forge-1 4 30 ptask-md4 claude 'keep *.json globs, 2 * 3, #192 and __init__.py'
+assert_status_has 'keep \*\.json globs, 2 \* 3, #192 and __init__\.py' "MD4 lookalikes untouched"
+# MD5: the cc-board JSON itself carries stripped text (the SwiftBar surface)
+run_status --board > "$TDIR/md.json"
+python3 - "$TDIR/md.json" <<'PY' && ok "MD5 board JSON is markdown-free" || bad "MD5 markdown leaked into board JSON"
+import json, sys
+b = json.load(open(sys.argv[1]))
+texts  = [e.get('last_snippet') or '' for e in b.get('episodes', [])]
+texts += [r.get('msg') or '' for r in b.get('hot', []) + b.get('active', [])]
+texts += [(t.get('snippet') or '') + (t.get('prompt_snippet') or '') for t in b.get('tasks', [])]
+assert not any('**' in t or '](' in t or '`' in t for t in texts), texts
+PY
+# MD6: AskUserQuestion perm question + option labels stripped
+a="$(attn "$R")"; cat > "$a/perm.forge-1.mdq.json" <<JSON
+{"schema":"cc-attention/1","event":"permissionrequest","variant":"permission","session":"forge-1","root":"$R","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago 30)","state":"needs-input","tool_name":"AskUserQuestion","command":"","command_hash":"mdq","permission_suggestions":[],"question_snippet":"Deploy **now** to \`prod\`?","question_options":["**yes**","\`no\`"],"question_count":1,"multi_select":false}
+JSON
+assert_status_has "question (AskUserQuestion): Deploy now to prod?" "MD6 perm question stripped"
+assert_status_has "options: yes / no" "MD6 option labels stripped"
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "═══════════════════════════════════════"
