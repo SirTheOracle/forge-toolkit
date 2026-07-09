@@ -103,6 +103,20 @@ def redact(s):
     return KV.sub(r"\1\2«redacted»", s)
 def snip(s, n=280):
     return redact((s or "").strip().replace("\n", " "))[:n]
+def stringify_cmd(v):
+    # Codex sends tool_input.command as an argv LIST (["bash","-lc","…"],
+    # ["apply_patch","*** Begin Patch…"]); Claude sends a str. Normalize to a stable
+    # str used IDENTICALLY by the permissionrequest writer AND the posttooluse resolver,
+    # or the command_hash diverges and the NEEDS-PERMISSION row never clears (the wperm
+    # filename is keyed on that hash). Strings pass through unchanged (Claude byte-
+    # identical); None/absent → '' (the existing empty-hash path). Cannot raise.
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list):
+        return ' '.join(str(x) for x in v)
+    if v is None:
+        return ''
+    return str(v)
 Q_TAIL = re.compile(r"\?[\s*_\"'`)\]]*$")   # '?' + optional markdown closers
 def trailing_question(body, lookback=8):
     # A worker that asks and then appends a short footer (status list, links)
@@ -283,7 +297,7 @@ if role != 'orchestrator':
     elif event == 'permissionrequest':
         tn = data.get('tool_name', '') or ''
         ti = data.get('tool_input') or {}
-        cmd = (ti.get('command') if isinstance(ti, dict) else '') or ''
+        cmd = stringify_cmd(ti.get('command') if isinstance(ti, dict) else '')
         h = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()[:8]
         atomic(os.path.join(adir, f'wperm.{session}.p{pane_index}.{h}.json'),
                envelope('worker-permission',
@@ -297,7 +311,7 @@ if role != 'orchestrator':
         # answer (stale rows previously lived until the next Stop; 2026-07-06).
         tn = data.get('tool_name', '') or ''
         ti = data.get('tool_input') or {}
-        cmd = (ti.get('command') if isinstance(ti, dict) else '') or ''
+        cmd = stringify_cmd(ti.get('command') if isinstance(ti, dict) else '')
         h = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()[:8]
         pf = os.path.join(adir, f'wperm.{session}.p{pane_index}.{h}.json')
         try:
@@ -386,7 +400,7 @@ elif event == 'stop':
 elif event == 'permissionrequest':
     tn = data.get('tool_name', '') or ''
     ti = data.get('tool_input') or {}
-    cmd = (ti.get('command') if isinstance(ti, dict) else '') or ''
+    cmd = stringify_cmd(ti.get('command') if isinstance(ti, dict) else '')
     h = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()[:8]
     atomic(os.path.join(adir, f'perm.{session}.{h}.json'),
            envelope('permission',
@@ -402,7 +416,7 @@ elif event == 'posttooluse':
     # answer (stale rows previously lived until the next Stop; 2026-07-06).
     tn = data.get('tool_name', '') or ''
     ti = data.get('tool_input') or {}
-    cmd = (ti.get('command') if isinstance(ti, dict) else '') or ''
+    cmd = stringify_cmd(ti.get('command') if isinstance(ti, dict) else '')
     h = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()[:8]
     pf = os.path.join(adir, f'perm.{session}.{h}.json')
     try:

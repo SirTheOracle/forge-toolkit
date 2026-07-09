@@ -4,5 +4,11 @@
   ],
   "Stop": [
     { "matcher": "", "hooks": [ { "type": "command", "command": "$HOME/bin/forge-cc-hook --codex stop", "timeout": 10 } ] }
+  ],
+  "PermissionRequest": [
+    { "matcher": "", "hooks": [ { "type": "command", "command": "$HOME/bin/forge-cc-hook --codex permissionrequest", "timeout": 10 } ] }
+  ],
+  "PostToolUse": [
+    { "matcher": "", "hooks": [ { "type": "command", "command": "$HOME/bin/forge-cc-hook --codex posttooluse", "timeout": 10 } ] }
   ]
 }

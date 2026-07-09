@@ -269,6 +269,67 @@ printf '{"last_assistant_message":"codex done, ok?","turn_id":"turn-abc","stop_h
 python3 -c 'import json,os,sys;e=json.load(open(os.path.join(sys.argv[1],".dev","attention","wstop.forge-x.p2.turn-abc.json")));assert e["agent"]=="codex" and e["task_id"]=="turn-abc" and e["looks_like_question"] is True' "$R" \
   && ok "codex Stop → wstop keyed on turn_id, agent=codex, question detected" || bad "codex stop wrong"
 
+echo "── forge-cc-hook --codex: argv-list command permission (crash fix + writer↔resolver key identity) ──"
+# T1 — argv-list permissionrequest writes a stringified wperm (closes the AttributeError crash).
+new_root cxp1
+LH=$(python3 -c "import hashlib;print(hashlib.sha256(b'bash -lc pytest').hexdigest()[:8])")
+printf '{"tool_name":"shell","tool_input":{"command":["bash","-lc","pytest"]}}' \
+  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
+{ [ "$rc" -eq 0 ] && test -f "$R/.dev/attention/wperm.forge-x.p2.$LH.json"; } \
+  && ok "codex list-command perm → wperm, no crash, stringified hash" || bad "codex perm crash/miskey (rc=$rc)"
+python3 -c 'import json,sys;e=json.load(open(sys.argv[1]));assert e["agent"]=="codex" and e["tool_name"]=="shell" and e["command"]=="bash -lc pytest"' \
+  "$R/.dev/attention/wperm.forge-x.p2.$LH.json" && ok "wperm stringified command + agent=codex" || bad "wperm fields wrong"
+# T2 — same argv list at posttooluse resolves it (writer↔resolver hash identity).
+printf '{"tool_name":"shell","tool_input":{"command":["bash","-lc","pytest"]}}' \
+  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex posttooluse >/dev/null
+test ! -f "$R/.dev/attention/wperm.forge-x.p2.$LH.json" \
+  && ok "codex posttooluse archives the matching wperm (hashes match)" || bad "codex wperm survived"
+
+echo "── forge-cc-hook --codex: apply_patch argv list does not crash ──"
+# T3 — apply_patch argv list (patch text as element 1). Newline-free patch body: a raw '\n'
+# is INVALID JSON under Python's strict json.load and would be swallowed by except Exception
+# (no file written); this exercises the identical list.encode() crash path without that trap.
+new_root cxp2
+printf '{"tool_name":"apply_patch","tool_input":{"command":["apply_patch","*** Begin Patch pytest *** End Patch"]}}' \
+  | FORGE_CC_PANE_META="$(meta 3 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
+{ [ "$rc" -eq 0 ] && ls "$R"/.dev/attention/wperm.forge-x.p3.*.json >/dev/null 2>&1; } \
+  && ok "codex apply_patch list → wperm, no crash" || bad "apply_patch crashed (rc=$rc)"
+
+echo "── forge-cc-hook --codex: empty/missing command + tool_name resolve-guard on the list path ──"
+# T4 — empty/missing command → empty-hash, no crash; mismatched tool_name does NOT resolve.
+new_root cxp3
+EH=$(python3 -c "import hashlib;print(hashlib.sha256(b'').hexdigest()[:8])")
+printf '{"tool_name":"mcp__x__do","tool_input":{}}' \
+  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
+{ [ "$rc" -eq 0 ] && test -f "$R/.dev/attention/wperm.forge-x.p2.$EH.json"; } \
+  && ok "codex empty command → empty-hash wperm, no crash" || bad "empty command crashed/miskey"
+printf '{"tool_name":"other","tool_input":{}}' \
+  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex posttooluse >/dev/null
+test -f "$R/.dev/attention/wperm.forge-x.p2.$EH.json" \
+  && ok "mismatched tool_name does NOT resolve codex wperm (guard survives list path)" || bad "wrong tool resolved codex wperm"
+
+echo "── forge-cc-hook: string command (Claude) byte-identical + zero-stdout invariant ──"
+# T5 — string command through the orchestrator writer (site 3): identical hash + zero stdout.
+new_root cxp4
+PH=$(python3 -c "import hashlib;print(hashlib.sha256(b'npm test').hexdigest()[:8])")
+out=$(printf '{"tool_name":"Bash","tool_input":{"command":"npm test"}}' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest)
+{ test -f "$R/.dev/attention/perm.forge-x.$PH.json" && [ -z "$out" ]; } \
+  && ok "string command hashes identically + zero stdout (Claude byte-identical)" || bad "string re-keyed or emitted stdout"
+# T5b (guardian completeness add) — orchestrator writer+resolver (sites 3 & 4) on an argv LIST.
+# Claude never sends a list today, but the shared helper now makes these two sites list-tolerant;
+# this proves site-3↔site-4 key identity directly (the only otherwise-untested list path).
+new_root cxp5
+LH2=$(python3 -c "import hashlib;print(hashlib.sha256(b'bash -lc make').hexdigest()[:8])")
+printf '{"tool_name":"Bash","tool_input":{"command":["bash","-lc","make"]}}' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null; rc=$?
+{ [ "$rc" -eq 0 ] && test -f "$R/.dev/attention/perm.forge-x.$LH2.json"; } \
+  && ok "orchestrator list-command perm → stringified perm (site 3 helper)" || bad "orch list writer crash/miskey (rc=$rc)"
+printf '{"tool_name":"Bash","tool_input":{"command":["bash","-lc","make"]}}' \
+  | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" posttooluse >/dev/null
+test ! -f "$R/.dev/attention/perm.forge-x.$LH2.json" \
+  && ok "orchestrator posttooluse resolves the list-keyed perm (site 4 helper, key identity)" || bad "orch list resolver miskey"
+
 echo "── forge-cc-hook: Step 6 worker trigger detaches AND fires (sentinel) ──"
 new_root tg1
 SENT="$WORK/fired.$$"; rm -f "$SENT"
@@ -304,6 +365,12 @@ for ev in ("UserPromptSubmit","Stop","PermissionRequest","Notification","PostToo
     assert isinstance(h.get(ev),list) and any("forge-cc-hook" in x["hooks"][0]["command"] for x in h[ev]), ev
 if expect!="__nohooks__": assert expect in h, f"lost {expect}"
 if "permissions" in d: assert d["permissions"]
+PY
+  python3 - "$C/.codex/hooks.json" <<'PY' && ok "$name: .codex/hooks.json gains 4 CC events" || bad "$name codex merge incomplete"
+import json,sys
+h=json.load(open(sys.argv[1]))["hooks"]
+for ev in ("UserPromptSubmit","Stop","PermissionRequest","PostToolUse"):
+    assert isinstance(h.get(ev),list) and any("--codex "+ev.lower() in x["hooks"][0]["command"] for x in h[ev]), ev
 PY
   before=$(md5 -q "$C/.claude/settings.json" 2>/dev/null || md5sum "$C/.claude/settings.json")
   reg "$C" >/dev/null 2>&1
