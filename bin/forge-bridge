@@ -814,6 +814,20 @@ cmd_review_status() {
     return 0
 }
 
+# Copy-mode guard: a pane that wandered into tmux copy-mode (stray mouse
+# scroll — mouse mode is on) EATS literal sends as navigation commands; a
+# swallowed 'f' even parks tmux at a "(jump forward)" status-line prompt and
+# the next send-keys blocks indefinitely (live incident 2026-07-09: codex-b
+# dispatch swallowed, retry send blocked 4+ min). Cancel any pane mode before
+# typing so every dispatch is self-unsticking. `|| true` throughout — the
+# guard must never fail the send path it protects.
+_cancel_copy_mode() {
+    local target="$1"
+    if [ "$(tmux display-message -p -t "$target" '#{pane_in_mode}' 2>/dev/null)" = "1" ]; then
+        tmux send-keys -t "$target" -X cancel 2>/dev/null || true
+    fi
+}
+
 # ---- Commands ----
 
 cmd_send() {
@@ -850,6 +864,7 @@ cmd_send() {
 
     tmux select-pane -t "$SESSION:$WINDOW.$PANE"
     sleep 0.3
+    _cancel_copy_mode "$SESSION:$WINDOW.$PANE"
     # Split the send into two events: type the text literally first (-l), pause
     # so the worker TUI commits the line into its input buffer, THEN press Enter
     # as a standalone keystroke. Combining text+Enter into one send-keys call
@@ -1918,6 +1933,7 @@ PYEOF
     if [ "$do_clear" = true ]; then
         # Split text/Enter (same TUI-commit reason as cmd_send) so /clear
         # reliably submits instead of sitting unsubmitted in the worker input.
+        _cancel_copy_mode "$SESSION:$WINDOW.$worker_pane"
         tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" -l "/clear"
         sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
         tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" Enter
@@ -2122,6 +2138,7 @@ EOF
         local sess
         sess="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
         if [ -n "$sess" ]; then
+            _cancel_copy_mode "$sess:$WINDOW.1"
             tmux send-keys -t "$sess:$WINDOW.1" -l "$legacy" 2>/dev/null || true
             sleep 0.2
             tmux send-keys -t "$sess:$WINDOW.1" Enter 2>/dev/null || true
