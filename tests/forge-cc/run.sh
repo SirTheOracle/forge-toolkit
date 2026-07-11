@@ -754,4 +754,58 @@ FORGE_TMUX_LIST="$TSV" FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BL" TMUX_SESSION=fo
 [ "$rc" -eq 124 ] && ok "R15 --wait --answers → answer injects, then wait times out (124)" || bad "R15 compose exit=$rc"
 test -f "$R/.dev/attention/archive/$AID.json" && ok "R15 --answers consumed the ask (archived) despite --wait" || bad "R15 ask not archived under --wait"
 
+echo "── recover registry lockstep 1: writer schema literals ⊆ registry (R2) ──"
+# A new "schema": "cc-…" literal in either writer file MUST gain a registry
+# entry (the wperm.*-miss failure mode). Recovery's own output schemas are the
+# only exemptions. Event-level drift is caught by lockstep 2 below.
+"$FORGE" recover --print-registry > "$WORK/reg.json" 2>/dev/null
+python3 - "$WORK/reg.json" "$ROOT/bin/forge" "$ROOT/bin/forge-cc-hook" <<'PY' && ok "every writer schema literal is registered" || bad "registry drift (new schema literal?)"
+import json, re, sys
+reg = json.load(open(sys.argv[1]))
+registered = {e["schema"] for e in reg["records"]}
+SELF = {"cc-recover-manifest/1", "cc-recover-report/1", "cc-recover-registry/1"}
+lit = re.compile(r"""["']schema["']\s*:\s*["'](cc-[a-z-]+/\d+)["']""")
+found = set()
+for fp in sys.argv[2:]:
+    found |= set(lit.findall(open(fp).read()))
+missing = found - registered - SELF
+assert not missing, "unregistered writer schemas: %s" % missing
+PY
+
+echo "── recover registry lockstep 2: driven writers classify (event-level, R-5) ──"
+# Run the REAL writer entry points (forge dispatch/ask + every forge-cc-hook
+# branch) into a fresh root, then require recover to classify every produced
+# record — an unregistered *event* under a known schema fails here even though
+# the schema-literal grep above cannot see it. (spawn-state is not CLI-drivable
+# without tmux; its fixture lives in tests/forge-recover T2.)
+new_root lk
+FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 "$FORGE" dispatch @forge-x "lockstep probe" --allow-api-billing >/dev/null 2>&1
+BL="$WORK/bl-lk"; : > "$BL"
+FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BL" TMUX_SESSION=forge-x "$FORGE" ask --session-scope "lockstep?" --root "$R" >/dev/null 2>&1
+printf '{"prompt":"hi"}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" userpromptsubmit >/dev/null 2>&1
+printf '{}'              | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" stop >/dev/null 2>&1
+printf '{"message":"m"}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" notification >/dev/null 2>&1
+printf '{"tool_name":"Bash","tool_input":{"command":"x"}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null 2>&1
+printf '{"prompt":"hi"}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" userpromptsubmit >/dev/null 2>&1
+printf '{}'              | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" stop >/dev/null 2>&1
+printf '{"tool_name":"Bash","tool_input":{"command":"x"}}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" permissionrequest >/dev/null 2>&1
+nrec=$(ls "$R/.dev/attention/"*.json 2>/dev/null | wc -l | tr -d ' ')
+out=$(FORGE_RECOVER_TMUX_STATUS=no-server FORGE_WATCH_TRIGGER=0 "$FORGE" recover --root "$R" --dry-run --json 2>/dev/null)
+python3 - <<PY && ok "all $nrec driven-writer records classify (0 unknown)" || bad "driven-writer records unclassifiable"
+import json
+r = json.loads('''$out''')["roots"][0]
+assert r["unknown"] == [], r["unknown"]
+assert r["candidates"] >= 7, (r["candidates"], r["candidate_files"])
+PY
+
+echo "── gc depth pin (Risk R-2): recover archives outside gc reach ──"
+new_root gcpin
+mkdir -p "$R/.dev/attention/archive/recover-pin-01"
+printf '{}' > "$R/.dev/attention/archive/recover-pin-01/x.json"
+printf '{}' > "$R/.dev/attention/archive/flat.json"
+touch -t 202601010000 "$R/.dev/attention/archive/recover-pin-01/x.json" "$R/.dev/attention/archive/flat.json"
+"$FORGE" gc --root "$R" >/dev/null 2>&1
+[ -f "$R/.dev/attention/archive/recover-pin-01/x.json" ] && ok "gc never reaches archive/<id>/ (depth-2)" || bad "gc swept a recover archive — R6 broken"
+[ ! -f "$R/.dev/attention/archive/flat.json" ] && ok "gc depth-1 reach unchanged" || bad "gc depth-1 sweep regressed"
+
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]

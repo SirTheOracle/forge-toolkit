@@ -874,6 +874,18 @@ def scan_attention(root, label):
         if ev == 'spawn-state':
             spawn_states.append(rec)  # needs-repair / population-failure / first-launch
             continue
+        if ev == 'recover-candidates':
+            # cc-recover/1 boot finding (root-scoped, written by `forge recover
+            # --service`; cleared by --apply). Render-only — recovery is never
+            # driven from the watcher (read-only invariant).
+            n = rec.get('candidates') or 0
+            add_finding('RECOVER-PENDING', root, f"recover-{rec.get('boot_id')}",
+                        f"{label} — {n} dead-session record(s) detected after reboot "
+                        f"(boot {rec.get('boot_id')}, sessions: "
+                        f"{', '.join(rec.get('sessions') or []) or '?'})"
+                        f"\n    -> review: forge recover --dry-run · archive: forge recover --apply",
+                        policy='daily')
+            continue
         if not sess:
             continue
         if ev == 'dispatch':
@@ -1402,7 +1414,8 @@ NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
           'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
           'TASK-STUCK', 'EPISODE-STUCK',
           'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
-          'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'STATE-UNPARSEABLE']
+          'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'STATE-UNPARSEABLE',
+          'RECOVER-PENDING']
 order = {c: i for i, c in enumerate(
     NOTIFY + ['SESSION-QUEUED', 'SESSION-WORKING', 'EPISODE-ACTIVE', 'SESSION-DONE',
               'EPISODE-SETTLED',
@@ -1414,7 +1427,7 @@ HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
        'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
        'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
-       'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE'}
+       'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING'}
 ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE',
           'EPISODE-ACTIVE', 'EPISODE-SETTLED'}
 STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',

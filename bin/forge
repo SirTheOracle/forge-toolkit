@@ -19,6 +19,10 @@
 #   forge status [--board]          alias for board (--board = the JSON)
 #   forge gc [--root PATH] [--days N]
 #   forge gc --install | --uninstall    daily launchd backstop (com.forge.gc)
+#   forge recover [--root PATH] [--session S] [--dry-run|--apply] [--yes] [--json]
+#                  archive dead-session residue (crash recovery; never deletes)
+#   forge recover --service | --install | --uninstall | --print-registry
+#                  once-per-boot detection-only scan (com.forge.recover)
 #
 # Dispatch REUSES `forge-bridge send claude` (the proven 3-step cmd_send split);
 # it never reimplements tmux send-keys. Every write lands under the target root's
@@ -992,15 +996,8 @@ cmd_gc() {
     if [ -n "$root" ]; then gc_root "$(cd "$root" && pwd -P)"; return; fi
     # Backstop sweep (the com.forge.gc tick lands here): registered watch-roots
     # ∪ live tmux session paths, so roots whose session is gone still age out.
-    local wr="${FORGE_WATCH_ROOTS_FILE:-$HOME/.config/forge/watch-roots}"
-    {
-        { [ -f "$wr" ] && grep -v '^[[:space:]]*#' "$wr"; } || true
-        if [ -n "${FORGE_TMUX_LIST:-}" ]; then
-            cut -f2 "$FORGE_TMUX_LIST"
-        else
-            tmux list-sessions -F '#{session_path}' 2>/dev/null || true
-        fi
-    } | sed '/^[[:space:]]*$/d' | sort -u | while read -r r; do
+    # Union factored into recover_roots() — shared with `forge recover` (P1).
+    recover_roots | while read -r r; do
         { [ -d "$r/.dev" ] && gc_root "$r"; } || true
     done
     gc_watch_logs
@@ -1066,6 +1063,807 @@ gc_launchd_uninstall() {
     launchctl unload "$GC_PLIST" 2>/dev/null || true
     rm -f "$GC_PLIST"
     echo "Unloaded and removed launchd agent $GC_LABEL."
+}
+
+# ═══ recover — crash-recovery verb (final-plan.md P1–P11) ═════════════════
+# Archives (never deletes) attention/context records owned by dead tmux
+# session incarnations into <root>/.dev/attention/archive/<archive-id>/ —
+# depth-2, outside gc_root's depth-1 sweep and forge-watch's depth-1 glob.
+# Every ambiguity fails closed to "report, don't touch". Detection-only boot
+# service via com.forge.recover (RunAtLoad + StartInterval; boot-id dedup).
+
+# P1 — shared root discovery: watch-roots ∪ live tmux session paths. cmd_gc's
+# backstop sweep consumes the same union (factored from its former inline pipe).
+recover_roots() {
+    local wr="${FORGE_WATCH_ROOTS_FILE:-$HOME/.config/forge/watch-roots}"
+    {
+        { [ -f "$wr" ] && grep -v '^[[:space:]]*#' "$wr"; } || true
+        if [ -n "${FORGE_TMUX_LIST:-}" ]; then
+            cut -f2 "$FORGE_TMUX_LIST"
+        else
+            tmux list-sessions -F '#{session_path}' 2>/dev/null || true
+        fi
+    } | sed '/^[[:space:]]*$/d' | sort -u
+}
+
+RECOVER_LABEL="com.forge.recover"
+RECOVER_PLIST="$HOME/Library/LaunchAgents/$RECOVER_LABEL.plist"
+
+# RunAtLoad alone never re-fires, so a first-fire INSPECT_FAILED would never
+# retry — StartInterval gives the retry cadence; once a boot is handled every
+# fire is a boot-id no-op (final-plan Divergence 4 / Risk R-8).
+recover_launchd_install() {
+    local cache="$HOME/.cache/forge-recover"
+    mkdir -p "$cache" "$(dirname "$RECOVER_PLIST")"
+    cat > "$RECOVER_PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$RECOVER_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/bin/forge</string>
+    <string>recover</string>
+    <string>--service</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardErrorPath</key><string>$cache/launchd.err</string>
+  <key>StandardOutPath</key><string>$cache/launchd.out</string>
+</dict>
+</plist>
+PLISTEOF
+    launchctl unload "$RECOVER_PLIST" 2>/dev/null || true
+    launchctl load "$RECOVER_PLIST"
+    echo "Loaded launchd agent $RECOVER_LABEL (at load + every 300s; boot-id dedup)."
+}
+
+recover_launchd_uninstall() {
+    launchctl unload "$RECOVER_PLIST" 2>/dev/null || true
+    rm -f "$RECOVER_PLIST"
+    echo "Unloaded and removed launchd agent $RECOVER_LABEL."
+}
+
+# P2 — command contract. Exit codes: 0 clean/no-op/archived-ok · 2 candidates
+# found (dry-run) · 3 partial failure · 4 unsafe/ambiguous aborted · 64 usage.
+cmd_recover() {
+    # bash-3.2-safe: no arrays (empty-array expansion breaks under set -u).
+    local mode="scan" session="" yes=0 jsonout=0 force=0 explicit=0
+    local rootsf; rootsf="$(mktemp "${TMPDIR:-/tmp}/forge-recover-roots.XXXXXX")"
+    while [ $# -gt 0 ]; do case "$1" in
+        --root)     explicit=1; printf '%s\n' "$2" | tr ',' '\n' >> "$rootsf"; shift 2 ;;
+        --session)  session="$2"; shift 2 ;;
+        --dry-run)  mode="scan"; shift ;;
+        --apply)    mode="apply"; shift ;;
+        --yes)      yes=1; shift ;;
+        --json)     jsonout=1; shift ;;
+        --force)    force=1; shift ;;
+        --service)  mode="service"; shift ;;
+        --print-registry) mode="print-registry"; shift ;;
+        --install)   rm -f "$rootsf"; recover_launchd_install; return 0 ;;
+        --uninstall) rm -f "$rootsf"; recover_launchd_uninstall; return 0 ;;
+        *) rm -f "$rootsf"; printf 'forge: recover: unknown flag %s\n' "$1" >&2; exit 64 ;;
+    esac; done
+    # --force must not bypass ambiguous ownership without a targeted selection.
+    if [ "$force" = "1" ] && { [ "$explicit" = "0" ] || [ -z "$session" ]; }; then
+        rm -f "$rootsf"
+        printf 'forge: recover: --force requires an explicit --root AND --session\n' >&2; exit 64
+    fi
+    [ "$explicit" = "1" ] || recover_roots > "$rootsf"
+    local rc=0
+    FORGE_RECOVER_MODE="$mode" FORGE_RECOVER_ROOTS_FILE="$rootsf" \
+    FORGE_RECOVER_SESSION="$session" FORGE_RECOVER_YES="$yes" \
+    FORGE_RECOVER_JSON="$jsonout" FORGE_RECOVER_FORCE="$force" \
+    FORGE_BRIDGE_BIN="$FORGE_BRIDGE_BIN" python3 - <<'PY' || rc=$?
+import os, sys, json, re, glob, time, fcntl, hashlib, secrets, subprocess, datetime
+
+MODE   = os.environ.get("FORGE_RECOVER_MODE", "scan")
+JSONOUT= os.environ.get("FORGE_RECOVER_JSON") == "1"
+YES    = os.environ.get("FORGE_RECOVER_YES") == "1"
+FORCE  = os.environ.get("FORGE_RECOVER_FORCE") == "1"
+SFILT  = os.environ.get("FORGE_RECOVER_SESSION") or None
+BRIDGE = os.environ.get("FORGE_BRIDGE_BIN") or os.path.expanduser("~/bin/forge-bridge")
+
+# ── P3: canonical record registry (R2). scope: session|root|never. Worker
+# turn types route by filename FIRST (a wstop carries event="stop" and must
+# never be read as a session-lifecycle stop — forge-watch:856-868 precedent).
+# `forge recover --print-registry` dumps this as JSON; the lockstep tests in
+# tests/forge-recover + tests/forge-cc diff it against the real writers.
+REGISTRY = [
+  {"schema": "cc-dispatch/1", "event": "dispatch", "scope": "session",
+   "filename_re": r"^dispatch-(?P<id>[A-Za-z0-9._-]+)\.json$", "session_field": "session",
+   "timestamp_field": "dispatched_at", "payload_refs": ["payload_path"], "implicit_payloads": "dispatch"},
+  # Headless codex automation records carry an EMPTY pane index ("…​.p.…") and a
+  # pseudo-session name with no tmux incarnation ever — they terminate normally
+  # and age out via gc; NEVER crash residue (verified live 2026-07-11).
+  {"schema": "cc-attention/1", "event": "userpromptsubmit", "scope": "never",
+   "filename_re": r"^wprompt\.(?P<session>.+)\.p\.json$", "worker": True,
+   "session_field": "session", "timestamp_field": "emitted_at", "payload_refs": []},
+  {"schema": "cc-attention/1", "event": "stop", "scope": "never",
+   "filename_re": r"^wstop\.(?P<session>.+)\.p\.(?P<task>.+)\.json$", "worker": True,
+   "session_field": "session", "timestamp_field": "emitted_at", "payload_refs": ["response_paths"]},
+  {"schema": "cc-attention/1", "event": "permissionrequest", "scope": "never",
+   "filename_re": r"^wperm\.(?P<session>.+)\.p\.(?P<hash>[0-9a-f]+)\.json$", "worker": True,
+   "session_field": "session", "timestamp_field": "emitted_at", "payload_refs": []},
+  {"schema": "cc-attention/1", "event": "userpromptsubmit", "scope": "session",
+   "filename_re": r"^wprompt\.(?P<session>.+)\.p(?P<pane>\d+)\.json$", "worker": True,
+   "session_field": "session", "timestamp_field": "emitted_at", "payload_refs": []},
+  {"schema": "cc-attention/1", "event": "stop", "scope": "session",
+   "filename_re": r"^wstop\.(?P<session>.+)\.p(?P<pane>\d+)\.(?P<task>.+)\.json$", "worker": True,
+   "session_field": "session", "timestamp_field": "emitted_at", "payload_refs": ["response_paths"]},
+  {"schema": "cc-attention/1", "event": "permissionrequest", "scope": "session",
+   "filename_re": r"^wperm\.(?P<session>.+)\.p(?P<pane>\d+)\.(?P<hash>[0-9a-f]+)\.json$", "worker": True,
+   "session_field": "session", "timestamp_field": "emitted_at", "payload_refs": []},
+  {"schema": "cc-attention/1", "event": "userpromptsubmit", "scope": "session",
+   "filename_re": r"^prompt\.(?P<session>[^.].*)\.json$", "session_field": "session",
+   "timestamp_field": "emitted_at", "payload_refs": []},
+  {"schema": "cc-attention/1", "event": "stop", "scope": "session",
+   "filename_re": r"^stop\.(?P<session>[^.].*)\.json$", "session_field": "session",
+   "timestamp_field": "emitted_at", "payload_refs": ["response_paths"]},
+  {"schema": "cc-attention/1", "event": "permissionrequest", "scope": "session",
+   "filename_re": r"^perm\.(?P<session>.+)\.(?P<hash>[0-9a-f]+)\.json$", "session_field": "session",
+   "timestamp_field": "emitted_at", "payload_refs": []},
+  {"schema": "cc-attention/1", "event": "notification", "scope": "session",
+   "filename_re": r"^notify\.(?P<session>[^.].*)\.json$", "session_field": "session",
+   "timestamp_field": "emitted_at", "payload_refs": []},
+  {"schema": "cc-attention/1", "event": "ask", "scope": "session-optional",
+   "filename_re": r"^ask-[0-9TZ]+-[0-9a-f]+\.json$", "session_field": "session",
+   "timestamp_field": "emitted_at", "payload_refs": []},
+  {"schema": "cc-spawn/1", "event": "spawn-state", "scope": "session",
+   "filename_re": r"^spawn-(?P<session>.+)-(?P<state>[a-z-]+)\.json$", "session_field": "session",
+   "timestamp_field": "emitted_at", "payload_refs": []},
+  {"schema": "cc-codex-register/1", "event": None, "scope": "root",
+   "filename_re": r"^codex-register\.json$", "session_field": None,
+   "timestamp_field": None, "payload_refs": []},
+  {"schema": "cc-recover/1", "event": "recover-candidates", "scope": "root",
+   "filename_re": r"^recover-[A-Za-z0-9._-]+\.json$", "session_field": None,
+   "timestamp_field": "emitted_at", "payload_refs": []},
+  {"schema": "cc-registry/1", "event": None, "scope": "root", "filename_re": None,
+   "session_field": None, "timestamp_field": None, "payload_refs": []},
+]
+CONTEXT_RE = re.compile(r"^forge-context\.(.+)\.yml$")   # bare forge-context.yml never matches
+CANON_STAGES = {"proposal", "implementation", "impl-review", "coding", "review",
+                "incorporate", "qa", "qa-fix", "qa-retry", "verify",
+                "fix-scout", "fix-reproduce", "fix-investigate", "fix-plan",
+                "fix-plan-review", "fix-code", "fix-qa"}
+
+if MODE == "print-registry":
+    print(json.dumps({"schema": "cc-recover-registry/1", "records": REGISTRY,
+                      "contexts": {"session_glob": "forge-context.*.yml",
+                                   "never_swept": ["forge-context.yml"],
+                                   "timestamp_field": "updated_at"}}, indent=2))
+    sys.exit(0)
+
+def say(msg):
+    if not JSONOUT:
+        print(msg)
+
+def parse_iso(s):
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+# ── P4: incarnation-aware snapshot. Three-way: NO_SERVER | OK | INSPECT_FAILED.
+# INSPECT_FAILED must abort mutation — never reuse forge-watch's fail-open
+# tmux_sessions() or the bridge's except-Exception-return-"dead" (Risk R-1).
+def tmux_snapshot():
+    st = os.environ.get("FORGE_RECOVER_TMUX_STATUS")
+    if st == "no-server":
+        return "NO_SERVER", {}
+    if st == "fail":
+        return "INSPECT_FAILED", {}
+    inject = os.environ.get("FORGE_RECOVER_TMUX_LIST")
+    if inject is not None:
+        try:
+            m = {}
+            with open(inject) as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) >= 4:
+                        name, path, sid, created = parts[0], parts[1], parts[2], parts[3]
+                        m[(os.path.realpath(path), name)] = (sid, int(created))
+            return "OK", m
+        except (OSError, ValueError):
+            return "INSPECT_FAILED", {}
+    try:
+        out = subprocess.run(
+            ["tmux", "list-sessions", "-F",
+             "#{session_name}\t#{session_path}\t#{session_id}\t#{session_created}"],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return "INSPECT_FAILED", {}
+    if out.returncode != 0:
+        if "no server running" in (out.stderr or ""):
+            return "NO_SERVER", {}
+        return "INSPECT_FAILED", {}
+    m = {}
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 4:
+            try:
+                m[(os.path.realpath(parts[1]), parts[0])] = (parts[2], int(parts[3]))
+            except ValueError:
+                return "INSPECT_FAILED", {}
+    return "OK", m
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+def classify(path):
+    """→ dict(kind, session, ts, payload_refs, entry, rec, confidence) or kind in
+    {root-scoped, unknown, malformed}. Body schema/event is the primary signal;
+    filename is routing (worker types) + fallback. Fail closed on ambiguity."""
+    base = os.path.basename(path)
+    try:
+        with open(path) as f:
+            rec = json.load(f)
+        if not isinstance(rec, dict):
+            rec = None
+    except (OSError, ValueError):
+        rec = None
+    worker_pref = base.startswith(("wprompt.", "wstop.", "wperm."))
+    for e in REGISTRY:
+        if not e["filename_re"]:
+            continue
+        m = re.match(e["filename_re"], base)
+        if not m:
+            continue
+        if bool(e.get("worker")) != worker_pref:
+            continue
+        if e["scope"] in ("root", "never"):
+            return {"kind": "root-scoped", "entry": e}
+        if rec is None:
+            # filename matched but body unreadable → classified via fallback,
+            # session from filename group when present; confidence low.
+            sess = (m.groupdict() or {}).get("session")
+            return {"kind": "candidate" if sess else "malformed", "session": sess,
+                    "ts": None, "payload_refs": [], "entry": e, "rec": None,
+                    "confidence": "low-filename-fallback"}
+        if e["event"] is not None and rec.get("event") != e["event"]:
+            return {"kind": "unknown", "why": "event mismatch vs registry", "entry": e, "rec": rec}
+        if rec.get("schema") != e["schema"]:
+            return {"kind": "unknown", "why": "schema mismatch vs registry", "entry": e, "rec": rec}
+        sess = rec.get(e["session_field"]) if e["session_field"] else None
+        if not sess:
+            if e["scope"] == "session-optional":
+                return {"kind": "retained", "why": "no session (session-optional record)"}
+            return {"kind": "unknown", "why": "session field missing", "entry": e, "rec": rec}
+        ts = parse_iso(rec.get(e["timestamp_field"])) if e["timestamp_field"] else None
+        refs = []
+        for rf in e["payload_refs"]:
+            v = rec.get(rf)
+            if isinstance(v, str):
+                refs.append(v)
+            elif isinstance(v, list):
+                refs += [x for x in v if isinstance(x, str)]
+        if e.get("implicit_payloads") == "dispatch" and rec.get("dispatch_id"):
+            did = rec["dispatch_id"]
+            refs += [os.path.join(".dev", "attention", "payloads", did + ".txt"),
+                     os.path.join(".dev", "attention", "payloads", "response.%s.txt" % did)]
+        return {"kind": "candidate", "session": sess, "ts": ts, "payload_refs": refs,
+                "entry": e, "rec": rec, "confidence": "high"}
+    if rec is not None and rec.get("schema"):
+        return {"kind": "unknown", "rec": rec,
+                "why": "no registry entry matches filename %r (schema %r)" % (base, rec.get("schema"))}
+    return {"kind": "malformed" if rec is None else "unknown", "why": "unrecognized file"}
+
+CTX_FIELD = re.compile(r"^(active_pipeline|last_stage_completed|last_stage_status|next_stage|updated_at):\s*['\"]?([^'\"\n]*)['\"]?\s*$", re.M)
+
+def classify_context(path):
+    base = os.path.basename(path)
+    m = CONTEXT_RE.match(base)
+    if not m or base == "forge-context.yml":
+        return None
+    sess = m.group(1)
+    fields = {}
+    try:
+        with open(path) as f:
+            for fm in CTX_FIELD.finditer(f.read()):
+                fields[fm.group(1)] = fm.group(2).strip()
+    except OSError:
+        return {"kind": "needs-manual", "session": sess, "why": "context unreadable"}
+    ts = parse_iso(fields.get("updated_at"))
+    return {"kind": "candidate", "session": sess, "ts": ts, "payload_refs": [],
+            "rec": fields, "context": True,
+            "confidence": "high" if ts is not None else "low-no-timestamp"}
+
+def is_dead(root_real, sess, ts, snap_status, snap):
+    """R4/D1 recoverable predicate, per record. None → fail closed (not dead)."""
+    if snap_status == "NO_SERVER":
+        return True
+    live = snap.get((root_real, sess))
+    if live is None:
+        return True
+    if ts is None:
+        return None          # name live, record timestamp unknown → ambiguous
+    return ts < live[1]      # predates live incarnation's session_created
+
+def followups(dev):
+    """D3-narrowed residue: open forge-log pendings + callbacks. Report-only."""
+    out = []
+    for logp in glob.glob(os.path.join(dev, "proposals", "*", "forge-log.yml")):
+        try:
+            raw = open(logp).read()
+        except OSError:
+            continue
+        if re.search(r"^\s+response:\s*null\s*$", raw, re.M):
+            out.append("open pending in %s (no session identity in schema — manual disposition)" % logp)
+    for cbp in glob.glob(os.path.join(dev, "forge-tmp", "callbacks", "*.callback")):
+        out.append("callback residue %s (manual disposition)" % cbp)
+    return out
+
+def scan_one_root(display, snap_status, snap):
+    r = {"display": display, "root": None, "status": "clean", "candidates": [],
+         "needs_manual": [], "unknown": [], "retained": 0, "followups": [],
+         "moved": 0, "archive_id": None, "errors": []}
+    try:
+        real = os.path.realpath(display)
+    except OSError:
+        real = None
+    if not real or not os.path.isdir(real):
+        r["status"] = "skipped"; r["errors"].append("root unreachable"); return r
+    dev = os.path.join(real, ".dev")
+    if not os.path.isdir(dev):
+        r["status"] = "skipped"; r["errors"].append("no .dev dir"); return r
+    r["root"] = real
+    att = os.path.join(dev, "attention")
+    live_payload_owners = {}   # rel payload path -> retained-owner count
+    cand_payload_owners = {}   # rel payload path -> [candidate indexes]
+    if os.path.isdir(att):
+        for fp in sorted(glob.glob(os.path.join(att, "*.json"))):
+            c = classify(fp)
+            kind = c.get("kind")
+            if kind == "root-scoped":
+                r["retained"] += 1; continue
+            if kind == "retained":
+                r["retained"] += 1; continue
+            if kind in ("unknown", "malformed"):
+                r["unknown"].append({"path": fp, "why": c.get("why", kind)}); continue
+            sess = c["session"]
+            if SFILT and sess != SFILT:
+                r["retained"] += 1
+                for ref in c.get("payload_refs", []):
+                    live_payload_owners[ref] = live_payload_owners.get(ref, 0) + 1
+                continue
+            dead = is_dead(real, sess, c.get("ts"), snap_status, snap)
+            if dead is None and FORCE:
+                dead, c["confidence"] = True, "forced"
+            if dead is None:
+                r["needs_manual"].append({"path": fp, "session": sess,
+                                          "why": "live same-name session; record timestamp unparseable"})
+                continue
+            if not dead:
+                r["retained"] += 1
+                for ref in c.get("payload_refs", []):
+                    live_payload_owners[ref] = live_payload_owners.get(ref, 0) + 1
+                continue
+            idx = len(r["candidates"])
+            st = os.stat(fp)
+            r["candidates"].append({
+                "path": fp, "rel": os.path.relpath(fp, real), "session": sess,
+                "ts": c.get("ts"), "confidence": c.get("confidence", "high"),
+                "sha256": sha256_of(fp), "mtime_ns": st.st_mtime_ns, "size": st.st_size,
+                "context": False, "meta": {}})
+            for ref in c.get("payload_refs", []):
+                cand_payload_owners.setdefault(ref, []).append(idx)
+        # session-fallback payloads (forge-cc-hook:380): owned by their session
+        pdir = os.path.join(att, "payloads")
+        for fp in sorted(glob.glob(os.path.join(pdir, "response.*.txt"))):
+            name = os.path.basename(fp)[len("response."):-len(".txt")]
+            if name.startswith("cc-"):          # dispatch-id-keyed — graph handles it
+                continue
+            rel = os.path.relpath(fp, real)
+            if SFILT and name != SFILT:
+                live_payload_owners[rel] = live_payload_owners.get(rel, 0) + 1
+                continue
+            dead = is_dead(real, name, None, snap_status, snap)
+            if dead is True:
+                cand_payload_owners.setdefault(rel, []).append(-1)   # session-owned
+            else:
+                live_payload_owners[rel] = live_payload_owners.get(rel, 0) + 1
+    for cf in sorted(glob.glob(os.path.join(dev, "forge-context.*.yml"))):
+        c = classify_context(cf)
+        if c is None:
+            continue
+        sess = c["session"]
+        if SFILT and sess != SFILT:
+            continue
+        if c["kind"] == "needs-manual":
+            r["needs_manual"].append({"path": cf, "session": sess, "why": c["why"]}); continue
+        dead = is_dead(real, sess, c.get("ts"), snap_status, snap)
+        if dead is None and FORCE:
+            dead, c["confidence"] = True, "forced"
+        if dead is None:
+            r["needs_manual"].append({"path": cf, "session": sess,
+                                      "why": "live same-name session; updated_at unparseable"})
+            continue
+        if not dead:
+            continue
+        f = c["rec"]; slug = f.get("active_pipeline") or ""
+        nxt = f.get("next_stage") or ""
+        if nxt and nxt in CANON_STAGES:
+            resume = "re-run stage '%s' for slug '%s' via /forge (recovery never auto-resumes)" % (nxt, slug)
+        elif nxt in ("complete", "none", ""):
+            resume = None
+        else:
+            resume = "manual reconstruction required"
+        st = os.stat(cf)
+        r["candidates"].append({
+            "path": cf, "rel": os.path.relpath(cf, real), "session": sess,
+            "ts": c.get("ts"), "confidence": c.get("confidence", "high"),
+            "sha256": sha256_of(cf), "mtime_ns": st.st_mtime_ns, "size": st.st_size,
+            "context": True,
+            "meta": {"slug": slug, "last_stage": f.get("last_stage_completed"),
+                     "last_status": f.get("last_stage_status"),
+                     "next_stage": nxt or None, "resume": resume}})
+    # ── P6: payload relationship graph — a payload moves ONLY if it has ≥1
+    # moving owner and ZERO retained/live owners. Orphans are reported.
+    r["payload_moves"], r["payload_notes"] = [], []
+    seen = set()
+    for rel, idxs in cand_payload_owners.items():
+        if rel in seen:
+            continue
+        seen.add(rel)
+        p = os.path.join(real, rel)
+        if not os.path.isfile(p):
+            r["payload_notes"].append("missing companion payload: %s" % rel)
+            continue
+        if live_payload_owners.get(rel):
+            r["payload_notes"].append("payload retained (live owner): %s" % rel)
+            continue
+        r["payload_moves"].append(rel)
+    if os.path.isdir(os.path.join(att, "payloads")):
+        for fp in glob.glob(os.path.join(att, "payloads", "*.txt")):
+            rel = os.path.relpath(fp, real)
+            if rel not in cand_payload_owners and rel not in live_payload_owners:
+                base = os.path.basename(fp)
+                if base.startswith(("response.cc-", "cc-")):
+                    r["payload_notes"].append("orphan payload (no owning record): %s" % rel)
+    r["followups"] = followups(dev)
+    if r["candidates"] or r["needs_manual"] or r["unknown"]:
+        r["status"] = "candidates"
+    return r
+
+# ── P9: per-root lock — a plain flock the OS releases on process death.
+# (infra-lock needs steal-if-dead-session logic only because its holders
+# outlive the flock fd via a sidecar; recovery's holder IS the process.)
+def lock_path_for(root_real):
+    d = os.environ.get("FORGE_RECOVER_LOCK_DIR") or os.path.join(root_real, ".dev", "forge-tmp")
+    os.makedirs(d, exist_ok=True)
+    if os.environ.get("FORGE_RECOVER_LOCK_DIR"):
+        return os.path.join(d, "recover.%s.lock" % hashlib.sha256(root_real.encode()).hexdigest()[:8])
+    return os.path.join(d, "recover.lock")
+
+def infra_contradiction_sessions(root_real):
+    """Read-only corroboration (Divergence 3): a HELD_LIVE infra-lock holder
+    proves its session is alive even if the tmux snapshot raced. Parses the
+    CLI's human line ("INFRA_LOCK: HELD live by … session <s> (…)") — the raw
+    VERDICT= line is internal to the bridge. Additive and fail-closed toward
+    skip: any failure here means no corroboration, never an abort; a same-name
+    match without a provable root only ever prevents archiving."""
+    try:
+        out = subprocess.run([BRIDGE, "infra-lock", "status"], cwd=root_real,
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return set()
+    for line in (out.stdout or "").splitlines():
+        if line.startswith("INFRA_LOCK: HELD live by"):
+            m = re.search(r"\bsession (\S+) \(", line)
+            if m:
+                return {m.group(1)}
+    return set()
+
+def apply_one_root(r):
+    real = r["root"]
+    lp = lock_path_for(real)
+    lf = open(lp, "w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        r["status"] = "failed"; r["errors"].append("recovery already running for this root (lock held)")
+        return
+    try:
+        # second snapshot + per-record revalidation immediately before mutation (R8)
+        snap_status, snap = tmux_snapshot()
+        if snap_status == "INSPECT_FAILED":
+            r["status"] = "failed"; r["errors"].append("tmux inspection failed at apply time — aborted")
+            return
+        held = infra_contradiction_sessions(real)
+        att = os.path.join(real, ".dev", "attention")
+        aid = "recover-%s-%s" % (
+            datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+            secrets.token_hex(2))
+        adir = os.path.join(att, "archive", aid)
+        if os.path.exists(adir):
+            r["status"] = "failed"; r["errors"].append("archive id collision: %s" % aid)
+            return
+        os.makedirs(os.path.join(adir, "payloads"))
+        marker = os.path.join(adir, ".incomplete")
+        open(marker, "w").close()
+        manifest = {"schema": "cc-recover-manifest/1", "archive_id": aid, "root": real,
+                    "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "snapshot_status": snap_status, "records": [], "payloads": [],
+                    "needs_manual": r["needs_manual"], "unknown": r["unknown"],
+                    "payload_notes": r["payload_notes"], "followups": r["followups"],
+                    "skipped": []}
+        moved = 0
+        skipped_sessions = set()
+        for c in r["candidates"]:
+            p = c["path"]
+            if c["session"] in held:
+                manifest["skipped"].append({"path": c["rel"],
+                    "why": "infra-lock HELD_LIVE contradicts dead verdict — fail closed"})
+                skipped_sessions.add(c["session"])
+                continue
+            dead = is_dead(real, c["session"], c.get("ts"), snap_status, snap)
+            if dead is not True and c.get("confidence") != "forced":
+                manifest["skipped"].append({"path": c["rel"], "why": "no longer dead at apply time"})
+                skipped_sessions.add(c["session"])
+                continue
+            try:
+                st = os.stat(p)
+                if st.st_mtime_ns != c["mtime_ns"] or st.st_size != c["size"] \
+                   or sha256_of(p) != c["sha256"]:
+                    manifest["skipped"].append({"path": c["rel"], "why": "record changed since scan"})
+                    continue
+                dest = os.path.join(adir, os.path.basename(p))
+                if os.path.exists(dest):
+                    manifest["skipped"].append({"path": c["rel"], "why": "destination exists"})
+                    continue
+                os.replace(p, dest)
+                moved += 1
+                entry = {"original": c["rel"], "archived": os.path.relpath(dest, real),
+                         "sha256": c["sha256"], "session": c["session"],
+                         "timestamp": c.get("ts"), "confidence": c["confidence"]}
+                if c["context"]:
+                    entry.update(c["meta"])
+                    if c["meta"].get("resume") is None and c["meta"].get("next_stage") is None:
+                        entry["resume"] = "manual reconstruction required"
+                manifest["records"].append(entry)
+            except OSError as e:
+                manifest["skipped"].append({"path": c["rel"], "why": "move failed: %s" % e})
+                r["errors"].append("move failed: %s" % c["rel"])
+        for rel in r["payload_moves"]:
+            p = os.path.join(real, rel)
+            try:
+                dest = os.path.join(adir, "payloads", os.path.basename(p))
+                if os.path.isfile(p) and not os.path.exists(dest):
+                    os.replace(p, dest)
+                    manifest["payloads"].append({"original": rel,
+                                                 "archived": os.path.relpath(dest, real)})
+            except OSError as e:
+                r["errors"].append("payload move failed: %s (%s)" % (rel, e))
+        mtmp = os.path.join(adir, "MANIFEST.json.tmp")
+        with open(mtmp, "w") as f:
+            json.dump(manifest, f, indent=2)
+        os.chmod(mtmp, 0o600)
+        os.replace(mtmp, os.path.join(adir, "MANIFEST.json"))
+        os.remove(marker)
+        r["moved"] = moved
+        r["archive_id"] = aid
+        r["skipped_records"] = manifest["skipped"]
+        r["skipped_sessions"] = sorted(skipped_sessions)
+        # supersede this root's boot finding (P11)
+        for bf in glob.glob(os.path.join(att, "recover-*.json")):
+            try: os.remove(bf)
+            except OSError: pass
+        r["status"] = "recovered" if not r["errors"] else "failed"
+    finally:
+        lf.close()
+
+def verify_root(r):
+    """P10 — recovery's OWN classifier re-run until stable; never forge-watch
+    check (which mutates delivery state). Bounded retries; report late arrivals."""
+    # Sessions the apply pass deliberately skipped (contradiction / revalidation)
+    # are expected residue, not verification failures.
+    archived_sessions = ({c["session"] for c in r["candidates"]}
+                         - set(r.get("skipped_sessions") or []))
+    tries = max(1, int(os.environ.get("FORGE_RECOVER_VERIFY_RETRIES", "3")))
+    delay = float(os.environ.get("FORGE_RECOVER_VERIFY_SLEEP", "1"))
+    for i in range(tries):
+        snap_status, snap = tmux_snapshot()
+        if snap_status == "INSPECT_FAILED":
+            return "verify inconclusive (tmux inspection failed)"
+        chk = scan_one_root(r["root"], snap_status, snap)
+        residual = [c for c in chk["candidates"] if c["session"] in archived_sessions]
+        if not residual:
+            return None
+        if i + 1 < tries:
+            time.sleep(delay)
+    return "verify: %d late/residual candidate(s) for archived session(s): %s" % (
+        len(residual), ", ".join(sorted({c["rel"] for c in residual})[:5]))
+
+def load_roots():
+    seen, out = set(), []
+    with open(os.environ["FORGE_RECOVER_ROOTS_FILE"]) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            key = os.path.realpath(line)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(line)
+    return out
+
+def run_scan_apply():
+    snap_status, snap = tmux_snapshot()
+    if snap_status == "INSPECT_FAILED":
+        say("forge recover: tmux inspection FAILED (timeout/error) — aborted, nothing touched.")
+        if JSONOUT:
+            print(json.dumps({"schema": "cc-recover-report/1", "snapshot": snap_status,
+                              "roots": [], "exit": 4}))
+        sys.exit(4)
+    results = [scan_one_root(d, snap_status, snap) for d in load_roots()]
+    ncand = sum(len(r["candidates"]) for r in results)
+    if MODE == "apply" and ncand:
+        if not YES:
+            if sys.stdin.isatty() or os.path.exists("/dev/tty"):
+                try:
+                    with open("/dev/tty") as tty:
+                        say("archive %d candidate record(s) across %d root(s)? [y/N] "
+                            % (ncand, sum(1 for r in results if r["candidates"])))
+                        ans = tty.readline().strip().lower()
+                except OSError:
+                    ans = ""
+            else:
+                ans = ""
+            if ans not in ("y", "yes"):
+                say("aborted (no confirmation; use --yes for non-interactive).")
+                sys.exit(4)
+        for r in results:
+            if r["candidates"]:
+                apply_one_root(r)
+                if r["status"] == "recovered":
+                    late = verify_root(r)
+                    if late:
+                        r["errors"].append(late)
+                        r["status"] = "failed"
+    # ── report ──
+    exit_code = 0
+    statuses = [r["status"] for r in results]
+    if "failed" in statuses:
+        exit_code = 3
+    elif MODE == "scan" and ncand:
+        exit_code = 2
+    if JSONOUT:
+        rows = []
+        for r in results:
+            row = {k: v for k, v in r.items() if k not in ("candidates", "payload_moves")}
+            row["candidates"] = len(r["candidates"])
+            row["candidate_files"] = [c["rel"] for c in r["candidates"]]
+            rows.append(row)
+        print(json.dumps({"schema": "cc-recover-report/1", "mode": MODE,
+                          "snapshot": snap_status, "exit": exit_code,
+                          "roots": rows}, indent=2, default=str))
+    else:
+        for r in results:
+            label = r["display"]
+            if r["status"] == "skipped":
+                print("  ~ %s — skipped (%s)" % (label, "; ".join(r["errors"]))); continue
+            if r["status"] == "clean":
+                print("  ✓ %s — clean" % label); continue
+            print("  ! %s — %d candidate(s), %d needs-manual, %d unknown%s" % (
+                label, len(r["candidates"]), len(r["needs_manual"]), len(r["unknown"]),
+                (" → archived %d as %s" % (r["moved"], r["archive_id"]))
+                if r["archive_id"] else ""))
+            for c in r["candidates"][:20]:
+                print("      %s (%s)" % (c["rel"], c["session"]))
+            if len(r["candidates"]) > 20:
+                print("      … %d more" % (len(r["candidates"]) - 20))
+            for n in r["needs_manual"]:
+                print("      MANUAL: %s — %s" % (n["path"], n["why"]))
+            for u in r["unknown"]:
+                print("      UNKNOWN (untouched): %s — %s" % (u["path"], u["why"]))
+            for fu in r["followups"]:
+                print("      FOLLOW-UP (not archived): %s" % fu)
+            for e in r["errors"]:
+                print("      ERROR: %s" % e)
+        summary = {s: statuses.count(s) for s in sorted(set(statuses))}
+        print("recover: %s · %s" % (MODE, ", ".join("%s=%d" % kv for kv in summary.items())))
+    sys.exit(exit_code)
+
+# ── P11: once-per-boot detection-only service (D4). Never archives unless
+# FORGE_RECOVER_AUTO_ARCHIVE=1. INSPECT_FAILED never advances the boot id.
+def boot_id():
+    v = os.environ.get("FORGE_RECOVER_BOOT_ID")
+    if v:
+        return v
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"],
+                             capture_output=True, text=True, timeout=5)
+        m = re.search(r"sec\s*=\s*(\d+)", out.stdout or "")
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+def run_service():
+    sf = os.environ.get("FORGE_RECOVER_STATE_FILE") or \
+         os.path.expanduser("~/.cache/forge-recover/boot-state.json")
+    os.makedirs(os.path.dirname(sf), exist_ok=True)
+    try:
+        with open(sf) as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, ValueError):
+        state = {}
+    bid = boot_id()
+    if bid is None:
+        say("recover --service: cannot establish boot identity (kern.boottime) — no scan.")
+        sys.exit(0)
+    def save(st):
+        tmp = sf + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            json.dump(st, f, indent=2)
+        os.replace(tmp, sf)
+    if not state.get("boot_id"):
+        save({"boot_id": bid, "status": "baseline", "retry_count": 0})
+        say("recover --service: baseline written for boot %s (no scan on first install)." % bid)
+        sys.exit(0)
+    if state.get("boot_id") == bid and state.get("status") != "failed":
+        sys.exit(0)
+    snap_status, snap = tmux_snapshot()
+    if snap_status == "INSPECT_FAILED":
+        state["status"] = "failed"
+        state["retry_count"] = int(state.get("retry_count", 0)) + 1
+        save(state)   # boot_id NOT advanced on a fresh boot failure
+        say("recover --service: tmux inspection failed — will retry (attempt %d)."
+            % state["retry_count"])
+        sys.exit(0)
+    results = [scan_one_root(d, snap_status, snap) for d in load_roots()]
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    wrote = 0
+    for r in results:
+        if not r["candidates"] or not r["root"]:
+            continue
+        att = os.path.join(r["root"], ".dev", "attention")
+        os.makedirs(att, exist_ok=True)
+        rec = {"schema": "cc-recover/1", "event": "recover-candidates",
+               "root": r["root"], "boot_id": bid, "emitted_at": now,
+               "candidates": len(r["candidates"]),
+               "sessions": sorted({c["session"] for c in r["candidates"]}),
+               "needs_manual": len(r["needs_manual"]),
+               "hint": "forge recover --dry-run · then forge recover --apply"}
+        path = os.path.join(att, "recover-%s.json" % bid)
+        tmp = path + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            json.dump(rec, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        wrote += 1
+    state = {"boot_id": bid, "status": "prompted" if wrote else "scanned",
+             "scanned_at": now, "retry_count": 0}
+    save(state)
+    say("recover --service: boot %s scanned — %d root(s) with candidates." % (bid, wrote))
+    if wrote and os.environ.get("FORGE_RECOVER_AUTO_ARCHIVE") == "1":
+        for r in results:
+            if r["candidates"]:
+                apply_one_root(r)
+    sys.exit(0)
+
+if MODE == "service":
+    run_service()
+else:
+    run_scan_apply()
+PY
+    rm -f "$rootsf"
+    return $rc
 }
 
 # ── reply (return path) — print a worker's answer to a seat dispatch ──────
@@ -1162,6 +1960,7 @@ case "${1:-help}" in
     # Read-only per-TASK projection over cc-board/1 tasks[] (no task-creating verb).
     tasks)     shift; exec "$FORGE_WATCH_BIN" status --tasks "$@" ;;
     gc)        shift; cmd_gc "$@" ;;
-    -h|--help|help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register status board tasks gc)" ;;
+    recover)   shift; cmd_recover "$@" ;;
+    -h|--help|help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register status board tasks gc recover)" ;;
 esac

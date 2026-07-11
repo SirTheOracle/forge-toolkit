@@ -331,6 +331,52 @@ grep -qi 'Multi-Worktree Concurrency' "$ROOT/docs/forge-operator-guide.md" 2>/de
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
+echo "── recover ∘ infra-lock composition (final-plan Divergence 3 / R-6) ──"
+# A HELD_LIVE holder for a session recovery's tmux seam calls dead must fail
+# closed: the record is skipped/reported, never archived. Exercises the REAL
+# `forge-bridge infra-lock status` output against the REAL `forge recover`
+# parser in one process chain (no isolated stubs — the R-6 coupling test).
+FORGE_CLI="$ROOT/bin/forge"
+CR="$WORK/comp-root"; mkdir -p "$CR/.dev/attention"
+tmux has-session -t "$TSESS" 2>/dev/null || tmux new-session -d -s "$TSESS" -c "$WORK" 2>/dev/null
+CID=$(tmux list-sessions -F '#{session_name}|#{session_id}|#{session_created}' 2>/dev/null | awk -F'|' -v s="$TSESS" '$1==s{print $2"|"$3}')
+if [ -n "$CID" ]; then
+    CSID="${CID%%|*}"; CSCREATED="${CID##*|}"
+    CANCHOR="$WORK/comp-anchor"; mkdir -p "$CANCHOR"
+    FORGE_INFRA_LOCK_DIR="$CANCHOR" FORGE_LOCK_SELF_HOST="$(hostname)" \
+      FORGE_LOCK_SELF_SESSION="$TSESS" FORGE_LOCK_SELF_SESSION_ID="$CSID" \
+      FORGE_LOCK_SELF_SESSION_CREATED="$CSCREATED" \
+      "$BRIDGE" infra-lock acquire --slug comp-x --stage coding >/dev/null 2>&1
+    printf '{"schema":"cc-attention/1","event":"stop","session":"%s","emitted_at":"2026-07-10T10:00:00Z"}' "$TSESS" \
+      > "$CR/.dev/attention/stop.$TSESS.json"
+    printf '{"schema":"cc-attention/1","event":"stop","session":"trulydead","emitted_at":"2026-07-10T10:00:00Z"}' \
+      > "$CR/.dev/attention/stop.trulydead.json"
+    # recovery's tmux seam: EMPTY server view → both sessions look dead; only
+    # the infra-lock corroboration can save $TSESS.
+    FORGE_INFRA_LOCK_DIR="$CANCHOR" FORGE_LOCK_SELF_HOST="$(hostname)" \
+      FORGE_LOCK_SELF_SESSION="$TSESS" FORGE_LOCK_SELF_SESSION_ID="$CSID" \
+      FORGE_LOCK_SELF_SESSION_CREATED="$CSCREATED" \
+      FORGE_BRIDGE_BIN="$BRIDGE" FORGE_RECOVER_TMUX_STATUS=no-server \
+      FORGE_WATCH_TRIGGER=0 FORGE_RECOVER_VERIFY_RETRIES=1 FORGE_RECOVER_VERIFY_SLEEP=0 \
+      "$FORGE_CLI" recover --root "$CR" --apply --yes >/dev/null 2>&1
+    [ -f "$CR/.dev/attention/stop.$TSESS.json" ] \
+      && ok "HELD_LIVE contradiction skips the held session's record" \
+      || bad "record archived despite live infra-lock holder"
+    [ ! -f "$CR/.dev/attention/stop.trulydead.json" ] \
+      && ok "uncontradicted dead record still archived" \
+      || bad "dead record not archived"
+    grep -q "infra-lock HELD_LIVE contradicts" "$CR"/.dev/attention/archive/*/MANIFEST.json 2>/dev/null \
+      && ok "contradiction skip recorded in manifest" \
+      || bad "no contradiction entry in manifest"
+    FORGE_INFRA_LOCK_DIR="$CANCHOR" FORGE_LOCK_SELF_HOST="$(hostname)" \
+      FORGE_LOCK_SELF_SESSION="$TSESS" FORGE_LOCK_SELF_SESSION_ID="$CSID" \
+      FORGE_LOCK_SELF_SESSION_CREATED="$CSCREATED" \
+      "$BRIDGE" infra-lock release --slug comp-x >/dev/null 2>&1
+else
+    bad "could not create throwaway tmux session for composition test"
+fi
+
+echo ""
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"
 [ "$FAIL" -gt 0 ] && red "FAIL: $FAIL" || green "FAIL: 0"

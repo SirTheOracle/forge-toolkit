@@ -1665,6 +1665,30 @@ PY
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
+echo "── RECOVER-PENDING: cc-recover/1 boot finding renders (read-only) ──"
+new_env recover_pending
+R=$(mk_root recroot)
+mkdir -p "$R/.dev/attention"
+cat > "$R/.dev/attention/recover-777.json" <<'EOF'
+{"schema":"cc-recover/1","event":"recover-candidates","boot_id":"777",
+ "emitted_at":"2026-07-11T10:00:00Z","candidates":4,"sessions":["forge-9"],
+ "needs_manual":0,"hint":"forge recover --dry-run · then forge recover --apply"}
+EOF
+out=$("$WATCH" status 2>/dev/null)
+echo "$out" | grep -q 'RECOVER-PENDING' && ok "RECOVER-PENDING finding emitted" || bad "no RECOVER-PENDING"
+echo "$out" | grep -q 'boot 777' && ok "finding carries the boot id" || bad "no boot id in msg"
+echo "$out" | grep -q 'forge recover --dry-run' && ok "finding carries the operator hint" || bad "no hint"
+
+echo "── recover archives (attention/archive/<id>/) invisible to the watcher ──"
+new_env recover_blind
+R=$(mk_root blindroot)
+mkdir -p "$R/.dev/attention/archive/recover-20260711T000000Z-aa/payloads"
+cat > "$R/.dev/attention/archive/recover-20260711T000000Z-aa/stop.deadghost.json" <<'EOF'
+{"schema":"cc-attention/1","event":"stop","session":"deadghost","emitted_at":"2026-07-10T10:00:00Z"}
+EOF
+out=$("$WATCH" status 2>/dev/null)
+echo "$out" | grep -q 'deadghost' && bad "archived record leaked into findings" || ok "depth-2 archive content produces zero findings"
+
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"
 [ "$FAIL" -gt 0 ] && red "FAIL: $FAIL" || green "FAIL: 0"
