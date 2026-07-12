@@ -77,6 +77,8 @@ grep 'send-keys -t psess:.0' "$TMLOG" | grep -q 'FORGE_ROLE=worker claude' && ok
 grep 'send-keys -t psess:.4' "$TMLOG" | grep -q 'FORGE_ROLE=worker claude' && ok "pane 4 stamped worker" || bad "pane 4 stamp missing"
 grep 'send-keys -t psess:.2\|send-keys -t psess:.3' "$TMLOG" | grep -q 'FORGE_ROLE' && bad "codex panes stamped (should not be)" || ok "codex panes 2/3 unstamped"
 [ "$(grep -v '^#' "$POPROOT/.dev/.forge-session" | grep -m1 .)" = "psess" ] && ok "populate wrote .forge-session with the session name" || bad ".forge-session not written"
+grep -q '^# advisory only' "$POPROOT/.dev/.forge-session" && ok "T-LEGACY-HEADER: writer prepends the advisory header" || bad "writer missing advisory header"
+ls "$POPROOT/.dev/".forge-session.tmp.* >/dev/null 2>&1 && bad "atomic-write temp residue left behind" || ok "no .forge-session temp residue (atomic rename)"
 grep -q 'set-environment -t psess TMUX_SESSION psess' "$WORK/roles.log" && ok "T-START-POP-RELAUNCH(shim): unstamped populate sets the session env stamp" || bad "unstamped populate did not set-environment"
 grep -q 'respawn-pane -k -t psess:.0' "$WORK/roles.log" && ok "T-START-POP-RELAUNCH(shim): unstamped populate relaunches pane 0" || bad "unstamped populate did not respawn pane 0"
 

@@ -162,9 +162,11 @@ mkdir -p "$HOME/.cache/forge"
 rm -f "$HOME/.cache/forge/${SESSION}-pane"*.snapshot \
       "$HOME/.cache/forge/${SESSION}-pane"*.last-stall-check 2>/dev/null
 
-# Persist session name so forge-bridge works from any subprocess
+# Persist session name (advisory only — identity is the host pane; P3.18). Atomic
+# temp+rename so a concurrent reader never sees a half-written name.
 mkdir -p "$DIR/.dev"
-echo "$SESSION" > "$DIR/.dev/.forge-session"
+{ printf '# advisory only — identity is the host pane\n%s\n' "$SESSION"; } > "$DIR/.dev/.forge-session.tmp.$$"
+mv -f "$DIR/.dev/.forge-session.tmp.$$" "$DIR/.dev/.forge-session"
 
 # Defensive alias drift check; WARN-not-halt.
 "$BRIDGE_BIN" alias-self-test --strict || echo "WARN: forge-bridge alias maps drifted or parser skipped entries; investigate before running pipelines" >&2

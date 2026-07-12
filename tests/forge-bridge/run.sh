@@ -105,6 +105,24 @@ else
     bad "T-ID-NOTMUX-0 zero same-root live → UNAVAILABLE, exit 3 (rc=$hrc out=$hout)"
 fi
 
+# T-LEGACY-HEADER: headered advisory file → diagnostics read the first non-comment
+# line; bare legacy files keep working; the value never routes (diagnostics-only).
+mkdir -p "$rootD/.dev"
+printf '# advisory only — identity is the host pane\nheadered-name\n' > "$rootD/.dev/.forge-session"
+lh="$(cd "$rootD" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION "$BRIDGE" identity 2>&1)"
+if printf '%s' "$lh" | grep -q 'legacy_file_session=headered-name' \
+   && printf '%s' "$lh" | grep -q 'identity_state=UNAVAILABLE'; then
+    ok "T-LEGACY-HEADER headered file read as diagnostics, never routes"
+else
+    bad "T-LEGACY-HEADER headered file read as diagnostics (out=$lh)"
+fi
+printf 'bare-name\n' > "$rootD/.dev/.forge-session"
+lb="$(cd "$rootD" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION "$BRIDGE" identity 2>&1)"
+printf '%s' "$lb" | grep -q 'legacy_file_session=bare-name' \
+    && ok "T-LEGACY-HEADER bare legacy file still readable (migration no-op)" \
+    || bad "T-LEGACY-HEADER bare legacy file still readable (out=$lb)"
+rm -f "$rootD/.dev/.forge-session"
+
 # ---- Real-tmux section ----
 if ! command -v tmux >/dev/null 2>&1; then
     echo "SKIP: tmux unavailable — real-tmux identity tests skipped"
