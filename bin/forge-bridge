@@ -82,15 +82,58 @@ EOF
     return 0
 }
 
-# Count live forge-* sessions with the required pane count (reuses the exact
-# refuse-if-ambiguous criterion from require_tmux_session's auto-detect block).
-_count_live_forge_candidates() {
-    tmux list-sessions -F '#{session_name}' 2>/dev/null \
-        | grep '^forge' \
-        | while read -r s; do
-            local panes; panes=$(tmux list-panes -t "$s" 2>/dev/null | wc -l | tr -d ' ')
-            if [ "$panes" -ge "$FORGE_REQUIRED_PANES" ]; then echo "$s"; fi
-          done | grep -c '^forge' || true
+# ---- Canonical project-root ownership (session-pin hardening §3.0) ----
+# ownership_root <dir> — THE one root function, applied identically to every operand
+# of every root comparison (fixes the realpath-vs-logical asymmetry; tolerates
+# subdir-created sessions + symlinks). Walks up from realpath(dir) to the nearest
+# .claude/forge-project.yml; anchors on that dir's configured forge.expected_root if
+# non-empty, else the yml dir; else dir itself. Returns pwd -P so BOTH operands
+# canonicalize the same way. bash-3.2-safe. Never applies the name charset guard to a PATH.
+ownership_root() {
+    local dir="$1" real anchor y ydir expected
+    [ -n "$dir" ] || return 1
+    real="$(cd "$dir" 2>/dev/null && pwd -P)" || real="$dir"
+    ydir="$real"
+    while [ "$ydir" != "/" ] && [ -n "$ydir" ]; do
+        if [ -f "$ydir/.claude/forge-project.yml" ]; then y="$ydir/.claude/forge-project.yml"; break; fi
+        ydir="$(dirname "$ydir")"
+    done
+    if [ -n "${y:-}" ]; then
+        expected="$(python3 -c "
+import yaml
+try:
+    with open('$y') as f: d=yaml.safe_load(f) or {}
+    print((d.get('forge',{}) or {}).get('expected_root','') or '')
+except Exception: pass
+" 2>/dev/null)"
+        if [ -n "$expected" ]; then anchor="$expected"; else anchor="$(dirname "$(dirname "$y")")"; fi
+    else
+        anchor="$real"
+    fi
+    (cd "$anchor" 2>/dev/null && pwd -P) || printf '%s' "$anchor"
+}
+
+# _same_root_sessions <dir> — list every LIVE session whose ownership_root equals
+# ownership_root(dir), REGARDLESS of name prefix (fixes the goparentbugs miss). Test
+# seam FORGE_TMUX_LIST names a 'name<TAB>path' file (seat/forge-watch convention,
+# bin/forge:67-75). One name per line. bash-3.2-safe.
+_same_root_sessions() {
+    local dir="$1" want inject _sn _sp
+    want="$(ownership_root "$dir")"
+    [ -n "$want" ] || return 0
+    inject="${FORGE_TMUX_LIST:-}"
+    if [ -n "$inject" ]; then
+        while IFS=$'\t' read -r _sn _sp; do
+            [ -n "$_sn" ] || continue
+            [ "$(ownership_root "$_sp")" = "$want" ] && printf '%s\n' "$_sn"
+        done < "$inject"
+    else
+        tmux list-sessions -F '#{session_name}	#{session_path}' 2>/dev/null \
+        | while IFS=$'\t' read -r _sn _sp; do
+            [ -n "$_sn" ] || continue
+            [ "$(ownership_root "$_sp")" = "$want" ] && printf '%s\n' "$_sn"
+          done
+    fi
 }
 
 # Resolve the current forge session name for FILE-NAMING / FILTERING only.
@@ -3140,16 +3183,16 @@ _resolve_project_root() {
     local explicit="$1"
     if [ -n "$explicit" ]; then
         if [ -d "$explicit" ] && [ -f "$explicit/.claude/forge-project.yml" ]; then
-            (cd "$explicit" && pwd)
+            (cd "$explicit" && pwd -P)
             return 0
         fi
         return 1
     fi
     local _dir
-    _dir="$(pwd)"
+    _dir="$(pwd -P)"
     while [ "$_dir" != "/" ]; do
         if [ -f "$_dir/.claude/forge-project.yml" ]; then
-            echo "$_dir"
+            (cd "$_dir" && pwd -P)
             return 0
         fi
         _dir=$(dirname "$_dir")
