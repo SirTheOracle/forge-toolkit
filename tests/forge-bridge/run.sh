@@ -457,6 +457,108 @@ printf '%s' "$cp" | grep -q "directory_state:    OK" \
     && ok "T-CANON-PREFLIGHT symlinked checkout → directory_state OK" \
     || bad "T-CANON-PREFLIGHT symlinked checkout → directory_state OK ($(printf '%s' "$cp" | grep directory_state))"
 
+# ---- Name-reuse / incarnation (R10, CG-6) ----
+echo "== name-reuse / incarnation (R10) =="
+
+# Hermetic stage-prompt template (dispatch resolves FORGE_PROMPTS_DIR/<stage>.txt).
+PDIR="$WORK/prompts"; mkdir -p "$PDIR"
+printf 'adhoc test prompt for {{slug}}\n' > "$PDIR/adhoc.txt"
+
+# T-REUSE-BLOCK: a dead predecessor's orphan (same name, DIFFERENT incarnation) must
+# not block a reborn session's dispatch.
+drb="$rootA/.dev/proposals/rb1"; mkdir -p "$drb"
+cat > "$drb/forge-log.yml" <<EOF
+pipeline: rb1
+entries:
+  - timestamp: "2026-07-11T00:01:00Z"
+    stage: adhoc
+    to: codex-a
+    session: $S2
+    incarnation: 1111111
+    prompt: old
+    response: null
+    files: []
+EOF
+run_in_pane "$S2:0.0" reuseblock "FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR $BRIDGE dispatch --slug rb1 --stage adhoc --worker codex-a"
+if [ "$(rc_of reuseblock)" = "0" ] && ! out_of reuseblock | grep -q "HOOK BLOCKED"; then
+    ok "T-REUSE-BLOCK reborn session not blocked by dead incarnation's orphan"
+else
+    bad "T-REUSE-BLOCK reborn session not blocked (rc=$(rc_of reuseblock) out=$(out_of reuseblock | head -3 | tr '\n' ' '))"
+fi
+
+# T-REUSE-LEGACY: a legacy pending (no incarnation field) still blocks by name.
+drl="$rootA/.dev/proposals/rl1"; mkdir -p "$drl"
+cat > "$drl/forge-log.yml" <<EOF
+pipeline: rl1
+entries:
+  - timestamp: "2026-07-11T00:02:00Z"
+    stage: adhoc
+    to: codex-a
+    session: $S2
+    prompt: legacy
+    response: null
+    files: []
+EOF
+run_in_pane "$S2:0.0" reuselegacy "FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR $BRIDGE dispatch --slug rl1 --stage adhoc --worker codex-a"
+if [ "$(rc_of reuselegacy)" != "0" ] && out_of reuselegacy | grep -q "open pending"; then
+    ok "T-REUSE-LEGACY legacy no-incarnation pending still blocks by name"
+else
+    bad "T-REUSE-LEGACY legacy pending still blocks (rc=$(rc_of reuselegacy))"
+fi
+
+# T-REUSE-SUPERSEDE: --supersede closes the caller-session orphan regardless of
+# incarnation, but NEVER a different-named session's pending.
+drs="$rootA/.dev/proposals/rs1"; mkdir -p "$drs"
+cat > "$drs/forge-log.yml" <<EOF
+pipeline: rs1
+entries:
+  - timestamp: "2026-07-11T00:03:00Z"
+    stage: adhoc
+    to: codex-a
+    session: $S2
+    incarnation: 2222222
+    prompt: orphan
+    response: null
+    files: []
+  - timestamp: "2026-07-11T00:03:01Z"
+    stage: adhoc
+    to: codex-a
+    session: $S1
+    prompt: other-session
+    response: null
+    files: []
+EOF
+run_in_pane "$S2:0.0" reusesup "FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR $BRIDGE dispatch --slug rs1 --stage adhoc --worker codex-a --supersede"
+supok=$(python3 - "$drs/forge-log.yml" "$S1" "$S2" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+s1, s2 = sys.argv[2], sys.argv[3]
+orphan = [e for e in d['entries'] if e.get('session') == s2 and str(e.get('incarnation','')) == '2222222']
+other  = [e for e in d['entries'] if e.get('session') == s1]
+print('OK' if orphan and orphan[0]['response'] and 'FORGE_SUPERSEDED' in str(orphan[0]['response'])
+      and other and other[0]['response'] is None else 'NO')
+PY
+)
+if [ "$(rc_of reusesup)" = "0" ] && [ "$supok" = "OK" ]; then
+    ok "T-REUSE-SUPERSEDE closes own-name orphan cross-incarnation, other session untouched"
+else
+    bad "T-REUSE-SUPERSEDE (rc=$(rc_of reusesup) supok=$supok)"
+fi
+
+# T-REUSE-ROUNDTRIP: to:claude local entries carry incarnation; YAML + renderer tolerate it.
+run_in_pane "$S2:0.0" reusert "FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug rt1 --stage adhoc --from claude --to claude --prompt p"
+rtinc=$(grep -A2 "to: claude" "$rootA/.dev/proposals/rt1/forge-log.yml" 2>/dev/null | sed -n 's/^ *incarnation: //p' | head -1)
+if [ "$(rc_of reusert)" = "0" ] && [ -n "$rtinc" ] \
+   && python3 -c "import yaml,sys; yaml.safe_load(open('$rootA/.dev/proposals/rt1/forge-log.yml')); yaml.safe_load(open('$rootA/.dev/forge-log.yml'))" 2>/dev/null; then
+    ok "T-REUSE-ROUNDTRIP to:claude entry carries incarnation; logs round-trip as YAML"
+else
+    bad "T-REUSE-ROUNDTRIP (rc=$(rc_of reusert) inc='$rtinc')"
+fi
+run_in_pane "$S2:0.0" reusestatus "FORGE_WATCH_TRIGGER=0 $BRIDGE status"
+[ "$(rc_of reusestatus)" = "0" ] \
+    && ok "T-REUSE-ROUNDTRIP status renderer tolerates the incarnation field" \
+    || bad "T-REUSE-ROUNDTRIP status renderer (rc=$(rc_of reusestatus))"
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

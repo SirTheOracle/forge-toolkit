@@ -733,13 +733,14 @@ canonical_pane_name() {
 has_pending_log_for() {
     local target_canonical="$1"
     local current_session="${2:-$(_resolve_session)}"
+    local current_incarnation="${3:-${ID_host_incarnation:-}}"
     if [ ! -f "$SUMMARY_LOG" ]; then
         return 1
     fi
-    python3 - "$SUMMARY_LOG" "$target_canonical" "$current_session" << 'PYEOF'
+    python3 - "$SUMMARY_LOG" "$target_canonical" "$current_session" "$current_incarnation" << 'PYEOF'
 import sys, yaml
 
-log_file, target_canonical, current_session = sys.argv[1], sys.argv[2], sys.argv[3]
+log_file, target_canonical, current_session, current_incarnation = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 # Inline alias map mirroring shell pane_index/pane_name.
 # Keep this in lockstep with all other ALIAS_TO_CANONICAL maps.
@@ -766,10 +767,15 @@ for entry in data.get('entries', []):
         continue
     entry_session = entry.get('session', '') or ''
     # Never skip legacy (no/empty session) entries — keeps in-flight upgrades
-    # closeable; only skip a CONFIRMED different-session pending. Mirrors
-    # cmd_stall_check_status's filter verbatim.
+    # closeable; only skip a CONFIRMED different-session pending.
     if entry_session and current_session and entry_session != current_session:
         continue  # different session; skip silently
+    # Incarnation tiebreak BENEATH the session filter (R10): a reborn same-name session
+    # must not be blocked by a dead predecessor's orphan. Legacy no/empty incarnation
+    # still matches by name.
+    entry_incarnation = str(entry.get('incarnation', '') or '')
+    if entry_incarnation and current_incarnation and entry_incarnation != str(current_incarnation):
+        continue
     entry_target = canonical(entry.get('to', ''))
     if entry_target == target_canonical:
         sys.exit(0)
@@ -1019,7 +1025,7 @@ cmd_send() {
     if [ "$FORCE" = false ]; then
         case "$TARGET" in
             codex-a|codex-b|claude-opus|claude-sonnet)
-                if ! has_pending_log_for "$TARGET" "$SESSION"; then
+                if ! has_pending_log_for "$TARGET" "$SESSION" "$ID_host_incarnation"; then
                     echo "HOOK BLOCKED: No pending log entry targeting '$TARGET'." >&2
                     echo "Run 'forge-bridge log --to $TARGET ...' before sending." >&2
                     echo "Or use 'forge-bridge send --force' to bypass for non-pipeline messages." >&2
@@ -1106,6 +1112,7 @@ cmd_log() {
 
     local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
 
+    local incarnation="${ID_host_incarnation:-}"
     cat >> "$pipeline_log" << EOF
 
   - timestamp: "$ts"
@@ -1113,6 +1120,7 @@ cmd_log() {
     from: $from
     to: $to
     session: $session
+    incarnation: $incarnation
     prompt: $escaped_prompt
     response: null
     files: []
@@ -1126,6 +1134,7 @@ EOF
     from: $from
     to: $to
     session: $session
+    incarnation: $incarnation
     response: null
 EOF
 
@@ -1303,8 +1312,8 @@ def matches(e):
         return False
     # Incarnation is a finer tiebreak BENEATH the session filter (inert until CG-6
     # stamps the field; caller_incarnation from the host probe, entries empty pre-CG-6).
-    ei = e.get('incarnation', '') or ''
-    if ei and caller_incarnation and ei != caller_incarnation:
+    ei = str(e.get('incarnation', '') or '')
+    if ei and caller_incarnation and ei != str(caller_incarnation):
         return False
     return True
 
@@ -1999,6 +2008,14 @@ cmd_dispatch() {
         return 1
     fi
 
+    # Identity gate at the TOP of the body (session-pin invariant): the pending
+    # guard and --supersede below filter by ID_target_session/ID_host_incarnation,
+    # so the gate MUST populate them first — a late gate leaves the filters inert.
+    require_identity "dispatch" host-pane || {
+        _emit_event ERROR "$slug" "stage=$stage reason=tmux-session-missing"
+        return 1
+    }
+
     local worker_canonical worker_pane
     worker_canonical=$(canonical_pane_name "$worker")
     worker_pane=$(pane_index "$worker")
@@ -2079,9 +2096,11 @@ cmd_dispatch() {
     # just before cmd_log (after preflight) — see below.
     local guard_log="$DEV_DIR/proposals/$slug/forge-log.yml"
     local pending_ts
-    pending_ts=$(python3 - "$guard_log" <<'PYEOF'
+    pending_ts=$(python3 - "$guard_log" "$ID_target_session" "$ID_host_incarnation" <<'PYEOF'
 import sys, yaml
 guard_log = sys.argv[1]
+cur_session = sys.argv[2] if len(sys.argv) > 2 else ''
+cur_incarnation = sys.argv[3] if len(sys.argv) > 3 else ''
 try:
     with open(guard_log) as f:
         data = yaml.safe_load(f) or {}
@@ -2090,10 +2109,17 @@ except FileNotFoundError:
 except Exception as ex:
     print(f"ERR_PARSE:{ex}", file=sys.stderr); sys.exit(3)
 for e in (data.get('entries') or []):
-    if e.get('response') is None:
-        ts = e.get('timestamp', '')
-        if ts:
-            print(ts)
+    if e.get('response') is not None:
+        continue
+    es = e.get('session', '') or ''
+    if es and cur_session and es != cur_session:
+        continue
+    ei = str(e.get('incarnation', '') or '')
+    if ei and cur_incarnation and ei != str(cur_incarnation):
+        continue
+    ts = e.get('timestamp', '')
+    if ts:
+        print(ts)
 PYEOF
 )
     if [ $? -eq 3 ]; then
@@ -2117,11 +2143,6 @@ PYEOF
         return 1
     fi
 
-    require_identity "dispatch" host-pane || {
-        _emit_event ERROR "$slug" "stage=$stage reason=tmux-session-missing"
-        return 1
-    }
-
     local prompt_file="$project_root/.dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
     mkdir -p "$(dirname "$prompt_file")"
     printf '%s' "$rendered" > "$prompt_file"
@@ -2144,16 +2165,38 @@ PYEOF
     # slug with closed-old entries and no replacement. Loops over ALL pendings —
     # cmd_log_response closes only candidates[-1], so a single delegated call
     # would silently leave duplicates open on a multi-pending slug.
-    if [ "$supersede" = true ] && [ "$n_pending" -gt 0 ]; then
-        local _sup_ts _sup_now
+    if [ "$supersede" = true ]; then
+        # Session-scoped, incarnation-AGNOSTIC (R10): close same-slug pendings of the
+        # caller's OWN session name regardless of incarnation, so a reborn same-name
+        # session can clean its dead predecessor's orphan — but never reach a
+        # DIFFERENT-named same-root session's pending. Re-gather here (NOT the guard's
+        # incarnation-scoped list), else supersede would be incarnation-strict and
+        # strand the dead orphan.
+        local _sup_pendings
+        _sup_pendings=$(python3 - "$guard_log" "$ID_target_session" <<'PYEOF'
+import sys, yaml
+guard_log = sys.argv[1]; cur_session = sys.argv[2] if len(sys.argv) > 2 else ''
+try:
+    with open(guard_log) as f: data = yaml.safe_load(f) or {}
+except Exception: sys.exit(0)
+for e in (data.get('entries') or []):
+    if e.get('response') is not None: continue
+    es = e.get('session', '') or ''
+    if es and cur_session and es != cur_session: continue
+    ts = e.get('timestamp', '')
+    if ts: print(ts)
+PYEOF
+)
+        local _sup_ts _sup_now _sup_n
         _sup_now=$(timestamp)
-        printf '%s\n' "$pending_ts" | while IFS= read -r _sup_ts; do
+        printf '%s\n' "$_sup_pendings" | while IFS= read -r _sup_ts; do
             [ -z "$_sup_ts" ] && continue
             _patch_response_by_ts "$slug" "$_sup_ts" \
                 "FORGE_SUPERSEDED: re-dispatched $stage (orphan-log-entries guard); auto-closed $_sup_now" \
                 || echo "WARN: --supersede: failed to close pending ts=$_sup_ts for slug=$slug" >&2
         done
-        _emit_event SUPERSEDE "$slug" "stage=$stage closed_pending=$n_pending worker=$worker_canonical"
+        _sup_n="$(printf '%s\n' "$_sup_pendings" | grep -c . || true)"
+        [ "$_sup_n" -gt 0 ] && _emit_event SUPERSEDE "$slug" "stage=$stage closed_pending=$_sup_n worker=$worker_canonical"
     fi
 
     local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
