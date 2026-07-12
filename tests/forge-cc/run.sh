@@ -842,7 +842,7 @@ if command -v tmux >/dev/null 2>&1; then
   printf 'entries:\n  - timestamp: "2026-07-11T00:00:01Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$R/.dev/proposals/p-rr/forge-log.yml"
   tmux new-session -d -s "$RELSESS" -x 200 -y 50 -c "$R"
   _i=0; while [ "$_i" -lt 4 ]; do tmux split-window -d -t "$RELSESS:0" -c "$R"; tmux select-layout -t "$RELSESS:0" tiled >/dev/null 2>&1; _i=$((_i+1)); done
-  env -u TMUX -u TMUX_PANE FORGE_WATCH_TRIGGER=0 TMUX_SESSION="$RELSESS" \
+  env -u TMUX -u TMUX_PANE FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=0 TMUX_SESSION="$RELSESS" \
     "$FORGE" ask --slug p-rr --stage coding --worker codex-a "report-only relay?" --root "$R" >/dev/null 2>&1
   { [ -f "$R/.dev/forge-tmp/callbacks/p-rr-coding.callback" ] \
     && grep -q '^status: BLOCKED' "$R/.dev/forge-tmp/callbacks/p-rr-coding.callback" \

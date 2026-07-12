@@ -261,7 +261,7 @@ bgd="$(cd "$rootC" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_IDENTITY_EN
 echo "== mutator gating =="
 
 # T-ENFORCE-OFF: in-pane MISMATCH (wrong checkout) + report-only → records, proceeds
-run_in_pane "$S1:0.0" enfoff "( cd $rootB && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug mm --stage coding --from claude --to codex-a --prompt p )"
+run_in_pane "$S1:0.0" enfoff "( cd $rootB && FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=0 $BRIDGE log --slug mm --stage coding --from claude --to codex-a --prompt p )"
 if [ "$(rc_of enfoff)" = "0" ] && [ -f "$rootB/.dev/proposals/mm/forge-log.yml" ] \
    && grep -q "state=MISMATCH" "$rootB/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null; then
     ok "T-ENFORCE-OFF report-only MISMATCH mutator proceeds + IDENTITY event recorded"

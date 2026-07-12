@@ -285,7 +285,7 @@ _usage_file() { printf '%s/forge-usage.%s.yml' "$DEV_DIR" "$(_session_or_sentine
 
 # ---- Classified identity gate (session-pin hardening P1.7) ----
 # Report-only in Phases 1-3; the Phase-4 commit flips the default to 1.
-FORGE_IDENTITY_ENFORCE="${FORGE_IDENTITY_ENFORCE:-0}"
+FORGE_IDENTITY_ENFORCE="${FORGE_IDENTITY_ENFORCE:-1}"
 
 # session_path_of <name> — echo a live session's #{session_path}; empty if gone. Uses
 # the same FORGE_TMUX_LIST seam as _same_root_sessions so P4 root-validation tests can
