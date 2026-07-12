@@ -1689,6 +1689,112 @@ EOF
 out=$("$WATCH" status 2>/dev/null)
 echo "$out" | grep -q 'deadghost' && bad "archived record leaked into findings" || ok "depth-2 archive content produces zero findings"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Blocked-item lifecycle (C1): parser-unit tests. parse_callback / pending_entries
+# live inside forge-watch's PYEOF heredoc, so we slice the real def-region out of
+# bin/forge-watch and exec it (NOT a hand copy) — the assertions exercise the exact
+# shipped bodies. FW_DRIVER prints KEY=VALUE lines for grep.
+# ═══════════════════════════════════════════════════════════════════════════
+echo "── W1: parse_callback yaml.safe_load-first + _first_line (P4b) ──"
+new_env w1
+FW_DRIVER="$WORK/_fw_unit.py"
+cat > "$FW_DRIVER" <<'PYDRV'
+import sys, re, os, glob, json
+try:
+    import yaml; HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+src = open(os.environ['FW_BIN']).read().splitlines()
+start = next(i for i, l in enumerate(src) if l.startswith('def note_unparseable('))
+end   = next(i for i, l in enumerate(src) if l.startswith('# ── findings'))
+ns = {'re': re, 'os': os, 'glob': glob, 'HAVE_YAML': HAVE_YAML, 'unparseable': []}
+if HAVE_YAML: ns['yaml'] = yaml
+exec(compile("\n".join(src[start:end]), 'forge-watch-slice', 'exec'), ns)
+mode = sys.argv[1]
+if mode == 'parse_callback':
+    d = ns['parse_callback'](sys.argv[2])
+    if d is None:
+        print('parsed=0'); sys.exit(0)
+    print('parsed=1')
+    print('first_line=%s' % d.get('_first_line', ''))
+    print('status=%s' % d.get('status', ''))
+    print('session=%s' % d.get('session', ''))
+    print('origin=%s' % d.get('origin', ''))
+elif mode == 'pending_entries':
+    out = ns['pending_entries']('r', sys.argv[2])
+    print('count=%d' % len(out))
+    if out:
+        e = out[0]
+        print('to=%s' % e.get('to'))
+        print('session=%s' % e.get('session'))
+        print('parked_at=%s' % e.get('parked_at'))
+        print('parked_reason=%s' % e.get('parked_reason'))
+        print('uncommitted=%s' % e.get('uncommitted'))
+        print('response_none=%s' % (e.get('stage') is not None and 'response' not in e))
+PYDRV
+fw_unit() { FW_BIN="$WATCH" python3 "$FW_DRIVER" "$@"; }
+
+# block-scalar message → _first_line is the FIRST body line (not "message: |")
+CB_BLK="$ROOTS_DIR/cb_block.callback"
+cat > "$CB_BLK" <<'EOF'
+slug: w1
+stage: coding
+status: BLOCKED
+session: forge-1
+origin: ask
+callback_id: w1-coding-x
+timestamp: 2026-07-11T10:00:00Z
+message: |
+  needs a human here
+  second line ignored
+EOF
+o=$(fw_unit parse_callback "$CB_BLK")
+echo "$o" | grep -q '^parsed=1$'                 && ok "W1 block: parse_callback returns a dict" || bad "W1 block: parse_callback None"
+echo "$o" | grep -q '^first_line=needs a human here$' && ok "W1 block: _first_line == first body line" || bad "W1 block: _first_line wrong ($o)"
+echo "$o" | grep -q '^session=forge-1$'          && ok "W1 block: session header captured" || bad "W1 block: session missing ($o)"
+echo "$o" | grep -q '^origin=ask$'               && ok "W1 block: origin header captured" || bad "W1 block: origin missing ($o)"
+
+# inline scalar message → _first_line is the inline text verbatim
+CB_INL="$ROOTS_DIR/cb_inline.callback"
+cat > "$CB_INL" <<'EOF'
+slug: w1
+stage: coding
+status: BLOCKED
+message: hello inline world
+EOF
+o=$(fw_unit parse_callback "$CB_INL")
+echo "$o" | grep -q '^first_line=hello inline world$' && ok "W1 inline: _first_line == inline text" || bad "W1 inline: _first_line wrong ($o)"
+
+# malformed file (tab breaks yaml) → scalar fallback returns a dict, NO abort
+CB_BAD="$ROOTS_DIR/cb_bad.callback"
+printf 'status: BLOCKED\n\tbadtab: x\n' > "$CB_BAD"
+o=$(fw_unit parse_callback "$CB_BAD" 2>/dev/null)
+echo "$o" | grep -q '^parsed=1$'      && ok "W1 malformed: scalar fallback still returns a dict (no abort)" || bad "W1 malformed: aborted/None ($o)"
+echo "$o" | grep -q '^status=BLOCKED$' && ok "W1 malformed: fallback captured scalar header" || bad "W1 malformed: header lost ($o)"
+
+echo "── W15: regex-fallback pending_entries retains parked_*/session/to (P4a) ──"
+new_env w15
+BAD_LOG="$ROOTS_DIR/malformed-forge-log.yml"
+{
+  printf 'entries:\n'
+  printf '  - timestamp: "2026-07-11T10:00:00Z"\n'
+  printf '    stage: coding\n'
+  printf '    to: codex-a\n'
+  printf '    session: forge-1\n'
+  printf '    parked_at: "2026-07-11T10:05:00Z"\n'
+  printf '    parked_reason: "waiting on human"\n'
+  printf '    uncommitted: true\n'
+  printf '    response: null\n'
+  printf '\tfiles:- legacy malformed tab line\n'
+} > "$BAD_LOG"
+o=$(FW_BIN="$WATCH" python3 "$FW_DRIVER" pending_entries "$BAD_LOG" 2>/dev/null)
+echo "$o" | grep -q '^count=1$'                           && ok "W15: one open entry reconstructed via regex fallback" || bad "W15: count wrong ($o)"
+echo "$o" | grep -q '^to=codex-a$'                        && ok "W15: 'to' retained in fallback" || bad "W15: to lost ($o)"
+echo "$o" | grep -q '^session=forge-1$'                   && ok "W15: 'session' retained in fallback" || bad "W15: session lost ($o)"
+echo "$o" | grep -q '^parked_at=.*2026-07-11T10:05:00Z'   && ok "W15: 'parked_at' retained in fallback" || bad "W15: parked_at lost ($o)"
+echo "$o" | grep -q '^parked_reason=waiting on human$'    && ok "W15: 'parked_reason' retained + unquoted" || bad "W15: parked_reason lost ($o)"
+echo "$o" | grep -q '^uncommitted=True$'                  && ok "W15: 'uncommitted' normalized to bool True" || bad "W15: uncommitted wrong ($o)"
+
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"
 [ "$FAIL" -gt 0 ] && red "FAIL: $FAIL" || green "FAIL: 0"

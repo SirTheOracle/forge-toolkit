@@ -466,32 +466,73 @@ def pending_entries(root, path):
             if not rmatch:
                 continue
             resp = None if rmatch.group(1) == 'null' else rmatch.group(1)
+            # Blocked-item lifecycle: the regex fallback (legacy malformed logs) must
+            # NOT drop parked_*/session/to, or a parked row reconstructed from a
+            # malformed log silently loses its tag.
+            unc = grab('uncommitted')
             entries.append({'timestamp': ts, 'stage': grab('stage'),
-                            'to': grab('to'), 'response': resp})
+                            'to': grab('to'), 'response': resp,
+                            'session': grab('session'),
+                            'parked_at': grab('parked_at'),
+                            'parked_reason': grab('parked_reason'),
+                            'uncommitted': (str(unc).strip().lower() == 'true') if unc else False})
     out = []
     for e in entries:
         # A hand-edited/legacy log can yield non-dict list items; skip them
         # rather than letting e.get() abort the whole root's scan.
         if isinstance(e, dict) and e.get('response') is None:
+            pr = e.get('parked_reason')
+            if isinstance(pr, str):
+                pr = pr.strip().strip('"')
             out.append({'stage': e.get('stage'), 'to': e.get('to'),
-                        'timestamp': e.get('timestamp')})
+                        'timestamp': e.get('timestamp'),
+                        'session': e.get('session'),
+                        'parked_at': e.get('parked_at'),
+                        'parked_reason': pr,
+                        'uncommitted': bool(e.get('uncommitted'))})
     return out
 
 def parse_callback(path):
-    """Parse a .callback file's scalar header. Returns dict or None."""
+    """Parse a .callback file. Returns dict or None.
+    Blocked-item lifecycle: yaml.safe_load first (captures the message body so
+    `_first_line` — the first non-empty semantic line, block-scalar or inline —
+    carries real payload into the blocked/parked row). The hand-rolled scalar
+    parser is retained ONLY as the malformed-file fallback. Never abort the scan."""
     try:
         with open(path) as f:
             raw = f.read()
     except OSError:
         return None
-    d = {}
-    for line in raw.splitlines():
-        if line.startswith('message:'):
-            break
-        m = re.match(r'^([a-z_]+):\s*(.*)$', line)
-        if m:
-            d[m.group(1)] = m.group(2).strip()
-    return d or None
+    d = None
+    if HAVE_YAML:
+        try:
+            y = yaml.safe_load(raw)
+            if isinstance(y, dict):
+                d = {k: ('' if v is None else str(v).strip() if not isinstance(v, str) else v)
+                     for k, v in y.items()}
+        except Exception:
+            d = None
+    if d is None:
+        # Malformed-file fallback: scalar headers only (message body unreachable).
+        d = {}
+        for line in raw.splitlines():
+            if line.startswith('message:'):
+                break
+            m = re.match(r'^([a-z_]+):\s*(.*)$', line)
+            if m:
+                d[m.group(1)] = m.group(2).strip()
+    if not d:
+        return None
+    # First non-empty semantic line of message (defensive empty-string fallback).
+    fl = ''
+    msg = d.get('message')
+    if isinstance(msg, str):
+        for ln in msg.splitlines():
+            if ln.strip():
+                fl = ln.strip()
+                break
+    d['_first_line'] = fl
+    return d
 
 # ── findings ─────────────────────────────────────────────────────────────
 # policy: 'standard' (backoff), 'daily' (>=24h), 'never' (status-only)

@@ -663,10 +663,10 @@ PY
     # snippet (one redaction pass feeds both the event and the callback file). A
     # bridge failure NEVER fails the worker — the attention event already carries it.
     if [ "$a_mode" = "stage" ]; then
-        ( cd "$a_root" && "$FORGE_BRIDGE_BIN" callback \
+        ( cd "$a_root" && FORGE_INTERNAL_ASK_ORIGIN=1 "$FORGE_BRIDGE_BIN" callback \
             --target-session "$a_sess" --cross-session \
             --slug "$slug" --stage "$stage" --worker "$worker" \
-            --status BLOCKED --message "$a_snip" --quiet >/dev/null 2>&1 ) \
+            --status BLOCKED --origin ask --message "$a_snip" --quiet >/dev/null 2>&1 ) \
           || printf 'forge ask: bridge BLOCKED callback failed (ask %s still escalated via attention).\n' "$a_id" >&2
     fi
     fire_watch_check    # Step 6: surface the NEEDS-ASK escalation at ~1s

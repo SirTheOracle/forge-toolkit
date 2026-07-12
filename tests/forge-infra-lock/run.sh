@@ -376,6 +376,40 @@ else
     bad "could not create throwaway tmux session for composition test"
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════
+echo "══ SUITE 4: blocked-item lifecycle (C1 — identity/origin contract) ══"
+# NOTE (C1 scope): B1(filename)/B2(legacy-resolve+foreign-session) require the
+# FORGE_TMUX_LIST identity seam to make _resolve_session return a name; B4
+# (_callback_ask_origin) and B5 (_insert_parked_fields_by_ts) have no CLI driver
+# until the guard/park verbs land — they are authored in C5/C3 respectively. The
+# C1-feasible slice below covers P1a (origin contract) and P1b (session/origin
+# headers + yaml round-trip), the headline identity surface.
+
+# ── B3: --origin contract (defined value set + internal-only 'ask') ──
+P="$(mkproj bi-origin)"
+pending_entry "$P" bi-o coding codex-a "2026-06-29T00:00:00Z"
+out=$(cb "$P" --slug bi-o --stage coding --status BLOCKED --origin foo --worker codex-a --quiet 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "callback --origin foo rejected (defined value set)" || bad "--origin foo accepted (rc=$rc)"
+pending_entry "$P" bi-o2 coding codex-a "2026-06-29T00:00:00Z"
+out=$(cb "$P" --slug bi-o2 --stage coding --status BLOCKED --origin ask --worker codex-a --quiet 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "callback --origin ask without internal token rejected" || bad "--origin ask accepted without token"
+P3="$(mkproj bi-origin3)"
+pending_entry "$P3" bi-o3 coding codex-a "2026-06-29T00:00:00Z"
+out=$( cd "$P3" && env -u TMUX FORGE_INTERNAL_ASK_ORIGIN=1 "$BRIDGE" callback --slug bi-o3 --stage coding --status BLOCKED --origin ask --worker codex-a --message "q?" --quiet 2>&1 ); rc=$?
+OF="$P3/.dev/forge-tmp/callbacks/bi-o3-coding.callback"
+{ [ "$rc" -eq 0 ] && [ -f "$OF" ] && grep -q '^origin: ask' "$OF"; } && ok "internal ask origin stamps 'origin: ask'" || bad "internal ask origin not stamped (rc=$rc out=$out)"
+
+# ── B1(headers): P1b session:/origin: scalar headers present + yaml-parseable ──
+P="$(mkproj bi-hdr)"
+pending_entry "$P" bi-h coding codex-a "2026-06-29T00:00:00Z"
+cb "$P" --slug bi-h --stage coding --status BLOCKED --worker codex-a --message "needs a human" --quiet >/dev/null 2>&1
+HF="$P/.dev/forge-tmp/callbacks/bi-h-coding.callback"
+grep -q '^session:' "$HF" && ok "callback carries a session: header (P1b)" || bad "no session: header"
+grep -q '^origin:'  "$HF" && ok "callback carries an origin: header (P1b)"  || bad "no origin: header"
+grep -q '^callback_id:' "$HF" && ok "callback carries callback_id (identity)" || bad "no callback_id"
+python3 -c "import yaml,sys; d=yaml.safe_load(open('$HF')); sys.exit(0 if isinstance(d,dict) and 'session' in d and 'origin' in d else 1)" \
+    && ok "callback body round-trips yaml.safe_load with session/origin keys" || bad "callback not yaml-parseable with new headers"
+
 echo ""
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"

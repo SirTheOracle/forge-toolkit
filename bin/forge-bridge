@@ -1200,6 +1200,138 @@ PYEOF
     fi
 }
 
+# ---- Lifecycle lock: per-(slug,stage) mutex for park/resolve/supersede/publish/consume ----
+# §3.3. flock via an inherited fd (fd 9) so a bash critical section can hold the lock
+# across multiple statements (revalidate-under-lock). Short wait then loud failure —
+# never hang a pane. Callers MUST pair _lifecycle_lock with _lifecycle_unlock (or a
+# subshell exit closes fd 9 → auto-release). The infra lock is acquired/released
+# OUTSIDE this lock (park step 4) — no nested locks.
+_lifecycle_lock() {   # <slug> <stage> ; rc 0 = held on fd 9
+    local slug="$1" stage="$2"
+    local pr; pr="$(_resolve_project_root "" 2>/dev/null)"
+    [ -n "$pr" ] || { echo "ERROR: lifecycle-lock: no project root" >&2; return 1; }
+    local ld="$pr/.dev/forge-tmp/locks"; mkdir -p "$ld" 2>/dev/null
+    local lf="$ld/lifecycle-${slug}--${stage}.lock"
+    exec 9>"$lf" || { echo "ERROR: lifecycle-lock: cannot open $lf" >&2; return 1; }
+    FORGE_LC_WAIT_S="${FORGE_LIFECYCLE_LOCK_WAIT_S:-5}" python3 - <<'PY'
+import fcntl, os, time, sys
+deadline = time.time() + float(os.environ.get("FORGE_LC_WAIT_S", "5"))
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB); sys.exit(0)
+    except OSError:
+        if time.time() >= deadline:
+            sys.exit(75)
+        time.sleep(0.1)
+PY
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        exec 9>&-
+        echo "LIFECYCLE_LOCK: busy — could not acquire lifecycle-${slug}--${stage} within ${FORGE_LIFECYCLE_LOCK_WAIT_S:-5}s (another transition holds it)." >&2
+        return 1
+    fi
+    return 0
+}
+_lifecycle_unlock() { exec 9>&- 2>/dev/null || true; }
+
+# Insert parked_at/parked_reason/uncommitted as SIBLINGS of a specific open entry
+# (located by timestamp anchor), keeping response: null, in BOTH logs — mirroring
+# _patch_response_by_ts's dual-write (pipeline hard-fail, summary soft-fail). §3.1.
+# Reason is YAML-escaped (read back by yaml.safe_load). Never yaml.dump. Idempotent:
+# a pre-existing parked_* set on that entry is stripped first (re-park overwrites).
+_insert_parked_fields_by_ts() {   # <slug> <ts> <parked_at> <reason> <uncommitted-true|false>
+    local slug="$1" target_ts="$2" parked_at="$3" reason="$4" uncommitted="$5"
+    local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
+    if [ ! -f "$pipeline_log" ]; then
+        echo "ERROR: _insert_parked_fields_by_ts: no log for '$slug'" >&2; return 1
+    fi
+    FORGE_PK_AT="$parked_at" FORGE_PK_REASON="$reason" FORGE_PK_UNCO="$uncommitted" \
+    python3 - "$pipeline_log" "$SUMMARY_LOG" "$target_ts" <<'PYEOF'
+import os, re, sys
+pipeline_log, summary_log, target_ts = sys.argv[1:4]
+parked_at = os.environ.get("FORGE_PK_AT", "")
+uncommitted = "true" if os.environ.get("FORGE_PK_UNCO") == "true" else "false"
+reason = os.environ.get("FORGE_PK_REASON", "")
+reason = " ".join(reason.splitlines()[0].split())[:120] if reason else ""
+esc = reason.replace('\\', '\\\\').replace('"', '\\"')
+
+# Anchor the newest open (response: null) entry at this ts; insert siblings each on
+# their OWN line at the same indentation as `response:` (indent here is spaces-only —
+# the anchor's trailing newline is consumed by group(1)). Drop any prior parked_* on
+# that entry first (re-park overwrites, never duplicates). Reconstruct through
+# `response: null` (group 3) so the fields land immediately before it.
+pat = re.compile(
+    r'(timestamp:\s*"' + re.escape(target_ts) + r'"[^\n]*\n(?:\s+[^\n]*\n)*?)(\s+)(response:\s*null)',
+    re.MULTILINE)
+
+def patch(text):
+    matches = list(pat.finditer(text))
+    if not matches:
+        return text, 0, 0
+    m = matches[-1]                 # D2 newest
+    head, indent = m.group(1), m.group(2)
+    head = re.sub(r'[ \t]+(?:parked_at|parked_reason|uncommitted):[^\n]*\n', '', head)
+    ins = (f'{indent}parked_at: "{parked_at}"\n'
+           f'{indent}parked_reason: "{esc}"\n'
+           f'{indent}uncommitted: {uncommitted}\n'
+           f'{indent}response: null')
+    new = text[:m.start(1)] + head + ins + text[m.end(3):]
+    return new, 1, len(matches) - 1
+
+with open(pipeline_log) as f:
+    content = f.read()
+content, n, dups = patch(content)
+if n != 1:
+    print(f"ERR: _insert_parked_fields_by_ts: pipeline patch failed (n={n}, ts={target_ts})", file=sys.stderr)
+    sys.exit(2)
+with open(pipeline_log, "w") as f:
+    f.write(content)
+if dups:
+    print(f"WARN: parked fields inserted on the NEWEST of {dups+1} open entries at ts={target_ts}; {dups} older duplicate(s) left un-parked.", file=sys.stderr)
+
+try:
+    with open(summary_log) as f:
+        s = f.read()
+    s2, sn, _ = patch(s)
+    if sn == 1:
+        with open(summary_log, "w") as f:
+            f.write(s2)
+except FileNotFoundError:
+    pass
+PYEOF
+    local rc=$?
+    [ $rc -eq 0 ] || { echo "ERROR: _insert_parked_fields_by_ts failed slug=$slug ts=$target_ts" >&2; return 1; }
+}
+
+# Revalidate-under-lock: confirm the callback status+callback_id and the target
+# pending (open + timestamp) match what the operation validated before acquiring.
+# Echoes "OK" or "MISMATCH:<detail>"; caller refuses on mismatch.
+_lifecycle_revalidate() {   # <cb_file> <want_status> <want_cb_id> <pipeline_log> <want_ts>
+    local cbf="$1" want_status="$2" want_cbid="$3" plog="$4" want_ts="$5"
+    if [ ! -f "$cbf" ]; then echo "MISMATCH:callback-gone"; return 0; fi
+    local now_status now_cbid
+    now_status=$(grep '^status:' "$cbf" 2>/dev/null | awk '{print $2}')
+    now_cbid=$(grep '^callback_id:' "$cbf" 2>/dev/null | awk '{print $2}')
+    if [ -n "$want_status" ] && [ "$now_status" != "$want_status" ]; then
+        echo "MISMATCH:status-changed have=$now_status want=$want_status"; return 0
+    fi
+    if [ -n "$want_cbid" ] && [ "$now_cbid" != "$want_cbid" ]; then
+        echo "MISMATCH:callback_id-changed have=$now_cbid want=$want_cbid"; return 0
+    fi
+    if [ -n "$want_ts" ]; then
+        grep -q "timestamp: \"$want_ts\"" "$plog" 2>/dev/null || { echo "MISMATCH:pending-gone"; return 0; }
+        python3 - "$plog" "$want_ts" <<'PY' || { echo "MISMATCH:pending-closed"; return 0; }
+import re, sys
+plog, ts = sys.argv[1], sys.argv[2]
+raw = open(plog).read()
+pat = re.compile(r'timestamp:\s*"' + re.escape(ts) + r'"[^\n]*\n(?:\s+[^\n]*\n)*?\s+response:\s*(null|"[^"]*")', re.M)
+m = pat.search(raw)
+sys.exit(0 if (m and m.group(1) == 'null') else 1)
+PY
+    fi
+    echo "OK"
+}
+
 cmd_log_response() {
     require_identity "log-response" host-degrade || return 1
     # Phase 1b Step 4a: target-aware response update.
@@ -2222,7 +2354,7 @@ PYEOF
 # --worker auto-resolves from TMUX_PANE if omitted.
 cmd_callback() {
     require_identity "callback" host-degrade || return 1
-    local slug="" stage="" status="" message="" worker="" quiet=false
+    local slug="" stage="" status="" message="" worker="" quiet=false origin=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --slug)    slug="$2";    shift 2 ;;
@@ -2230,10 +2362,24 @@ cmd_callback() {
             --status)  status="$2";  shift 2 ;;
             --message) message="$2"; shift 2 ;;
             --worker)  worker="$2";  shift 2 ;;
+            --origin)  origin="$2";  shift 2 ;;
             --quiet)   quiet=true;   shift ;;
             *)         shift ;;
         esac
     done
+    # --origin: defined value set only ('ask'), and 'ask' is settable ONLY via the
+    # internal token the public CLI does not document (§3.5). An ordinary worker
+    # callback therefore cannot acquire the ask carve-out.
+    if [ -n "$origin" ]; then
+        case "$origin" in
+            ask)
+                if [ "${FORGE_INTERNAL_ASK_ORIGIN:-}" != "1" ]; then
+                    echo "ERROR: --origin ask is internal (set by 'forge ask' only); not a public flag" >&2
+                    return 1
+                fi ;;
+            *)  echo "ERROR: --origin must be one of: ask; got '$origin'" >&2; return 1 ;;
+        esac
+    fi
     if [ -z "$slug" ] || [ -z "$stage" ] || [ -z "$status" ]; then
         echo "Usage: forge-bridge callback --slug <s> --stage <s> --status <DONE|BLOCKED|ERROR> [--message <m>] [--worker <w>] [--quiet]" >&2
         return 1
@@ -2288,26 +2434,28 @@ cmd_callback() {
 
     local cb_dir="$project_root/.dev/forge-tmp/callbacks"
     mkdir -p "$cb_dir"
-    local cb_file="$cb_dir/${slug}-${stage}.callback"
+    # Session-qualified filename when the session resolves; legacy path otherwise
+    # (§3.2). Readers glob ${slug}-${stage}*.callback (_resolve_callback_file); a
+    # session-qualified file is OWNED by its session, a legacy file is unowned.
+    local cb_session; cb_session="$(_resolve_session)"
+    local cb_file
+    if [ -n "$cb_session" ]; then
+        cb_file="$cb_dir/${slug}-${stage}.${cb_session}.callback"
+    else
+        cb_file="$cb_dir/${slug}-${stage}.callback"
+    fi
     local ts cb_id
     ts=$(timestamp)
-    # Filename-safe unique id for this callback. timestamp() is ISO-8601 with
-    # colons (not filename-safe), so derive a separate id used to name the
-    # archive on `callback-consume`. epoch+pid+RANDOM is unique across a stage's
-    # lifetime even within the same wall-clock second.
     cb_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
 
-    # Render the callback body once; published atomically (temp → mv) below so a
-    # polling `wait` never observes a half-written file. yaml_escape may emit a
-    # multi-line block scalar for a newline-bearing message; command-substitution
-    # preserves the internal newlines and the printf re-adds the single trailing
-    # one — byte-equivalent to the prior heredoc.
     local cb_body
     cb_body=$(cat <<EOF
 slug: $slug
 stage: $stage
 status: $status
 worker: $worker_canonical
+session: ${cb_session:-}
+origin: ${origin:-}
 callback_id: $cb_id
 timestamp: $ts
 message: $(yaml_escape "$message")
@@ -2322,7 +2470,10 @@ EOF
     # --- Callback lifecycle: terminal vs non-terminal (R3-3 / R4-1 / R4-2) ---
     # Atomic publish writes to a temp file in the SAME dir (same filesystem) then
     # renames into place.
-    local cb_tmp="$cb_dir/.${slug}-${stage}.callback.tmp.$$"
+    local cb_tmp="$cb_dir/.$(basename "$cb_file").tmp.$$"
+    # §3.3: serialize publication against park/resolve/supersede/consume on the same
+    # (slug,stage). Acquire before close-then-publish; release after the mv.
+    _lifecycle_lock "$slug" "$stage" || return 1
     case "$status" in
         DONE|ERROR)
             # R4-2 (terminal path — used by EVERY stage, highest blast radius):
@@ -2336,11 +2487,13 @@ EOF
                 _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=terminal-close-failed status=$status"
                 echo "ERROR: callback $status: failed to close the pending log entry for slug=$slug stage=$stage; terminal callback NOT published (no matching open pending, or patch failed). Resolve the log state and retry." >&2
                 rm -f "$cb_tmp"
+                _lifecycle_unlock
                 return 1
             fi
             # Close succeeded → publish the terminal callback atomically.
             if ! { printf '%s\n' "$cb_body" > "$cb_tmp" && mv -f "$cb_tmp" "$cb_file"; }; then
                 rm -f "$cb_tmp"
+                _lifecycle_unlock
                 _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=callback-publish-failed status=$status"
                 echo "ERROR: callback $status: pending closed but callback publish failed for slug=$slug stage=$stage." >&2
                 return 1
@@ -2360,12 +2513,14 @@ EOF
             # the message.
             if ! { printf '%s\n' "$cb_body" > "$cb_tmp" && mv -f "$cb_tmp" "$cb_file"; }; then
                 rm -f "$cb_tmp"
+                _lifecycle_unlock
                 _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=callback-publish-failed status=$status"
                 echo "ERROR: callback BLOCKED: callback publish failed for slug=$slug stage=$stage." >&2
                 return 1
             fi
             ;;
     esac
+    _lifecycle_unlock
 
     # Back-compat: still notify the orchestrator pane so humans see the line.
     # Suppressed by --quiet. Only attempts when inside a tmux session.
@@ -2396,6 +2551,41 @@ EOF
 
     _render_status_file
     echo "CALLBACK $status stage=$stage slug=$slug worker=$worker_canonical → $cb_file"
+}
+
+# Resolve the callback file for (slug,stage) for the ACTING session. Prefers the
+# session-owned file, else an unowned legacy file, else empty (a different-session
+# owned file is NOT returned). §3.2 blast radius. NOTE: this is called on the wait
+# POLL path (every tick), so it stays SILENT — callers on the wait path suppress
+# stderr anyway. The "unowned legacy" WARN is emitted by the mutation callers
+# (consume/park) at their decision point (see P1e), not here, so it is not lost.
+_resolve_callback_file() {   # <cb_dir> <slug> <stage> <session>
+    local d="$1" slug="$2" stage="$3" sess="$4"
+    local owned="$d/${slug}-${stage}.${sess}.callback"
+    local legacy="$d/${slug}-${stage}.callback"
+    if [ -n "$sess" ] && [ -f "$owned" ]; then printf '%s' "$owned"; return 0; fi
+    if [ -f "$legacy" ]; then printf '%s' "$legacy"; return 0; fi
+    return 1
+}
+
+# Legacy ask carve-out: a pre-origin BLOCKED callback is ask-origin iff its explicit
+# header says so, OR a live ask-*.json record matches root+slug+stage+stage-mode.
+# NEVER "any ask-*.json for the pair" (§3.5). Echoes "ask" or "".
+_callback_ask_origin() {   # <project_root> <slug> <stage> <cb_origin_header>
+    local pr="$1" slug="$2" stage="$3" hdr="$4"
+    if [ "$hdr" = "ask" ]; then printf 'ask'; return 0; fi
+    FORGE_AO_ROOT="$pr" FORGE_AO_SLUG="$slug" FORGE_AO_STAGE="$stage" python3 - <<'PY'
+import os, glob, json
+root=os.environ["FORGE_AO_ROOT"]; slug=os.environ["FORGE_AO_SLUG"]; stage=os.environ["FORGE_AO_STAGE"]
+for fp in glob.glob(os.path.join(root, ".dev", "attention", "ask-*.json")):
+    try: r = json.load(open(fp))
+    except Exception: continue
+    if (r.get("event")=="ask" and r.get("slug")==slug and r.get("stage")==stage
+            and r.get("mode")=="stage"):
+        # An answered ask is archived by dispatch --answers, so a live ask-*.json is
+        # by construction unresolved.
+        print("ask"); break
+PY
 }
 
 # wait — block until a callback file appears for <slug>/<stage>, or until
@@ -2439,7 +2629,9 @@ cmd_wait() {
         return 1
     }
 
-    local cb_file="$project_root/.dev/forge-tmp/callbacks/${slug}-${stage}.callback"
+    local cb_dir="$project_root/.dev/forge-tmp/callbacks"
+    local wait_session; wait_session="$(_resolve_session)"
+    local cb_file=""
     local started
     started=$(date +%s)
 
@@ -2451,7 +2643,7 @@ cmd_wait() {
     _emit_event WAIT "$slug" "stage=$stage worker=$worker_canonical"
 
     while true; do
-        if [ -f "$cb_file" ]; then
+        if cb_file="$(_resolve_callback_file "$cb_dir" "$slug" "$stage" "$wait_session" 2>/dev/null)" && [ -n "$cb_file" ] && [ -f "$cb_file" ]; then
             _wait_emit_callback "$cb_file" "$slug" "$stage" "$worker_canonical" \
                 "$digest_template" "$project_root"
             _render_status_file
@@ -2538,13 +2730,14 @@ print(d.get('message', '') or '')
 #     non-terminal status) -> STRUCTURED NO-OP (exit 0) so the orchestrator does
 #     not re-wait blindly.
 cmd_callback_consume() {
-    local slug="" stage="" status="BLOCKED"
+    local slug="" stage="" status="BLOCKED" _no_lock=0
     while [ $# -gt 0 ]; do
         case "$1" in
-            --slug)   slug="$2";   shift 2 ;;
-            --stage)  stage="$2";  shift 2 ;;
-            --status) status="$2"; shift 2 ;;
-            *)        shift ;;
+            --slug)     slug="$2";   shift 2 ;;
+            --stage)    stage="$2";  shift 2 ;;
+            --status)   status="$2"; shift 2 ;;
+            --_no_lock) _no_lock=1;  shift ;;   # caller already holds the lifecycle lock
+            *)          shift ;;
         esac
     done
     if [ -z "$slug" ] || [ -z "$stage" ]; then
@@ -2570,7 +2763,16 @@ cmd_callback_consume() {
     fi
 
     local cb_dir="$project_root/.dev/forge-tmp/callbacks"
-    local cb_file="$cb_dir/${slug}-${stage}.callback"
+    local consume_session; consume_session="$(_resolve_session)"
+    local cb_file
+    cb_file="$(_resolve_callback_file "$cb_dir" "$slug" "$stage" "$consume_session" 2>/dev/null)" || cb_file=""
+    [ -z "$cb_file" ] && cb_file="$cb_dir/${slug}-${stage}.${consume_session}.callback"
+    # Un-suppressed decision-point WARN (the resolver is silent on the poll path):
+    # consuming a legacy unqualified file that no session owns.
+    case "$cb_file" in
+        "$cb_dir/${slug}-${stage}.callback")
+            [ -f "$cb_file" ] && echo "WARN: callback-consume: archiving unowned legacy callback $cb_file (no session identity)" >&2 ;;
+    esac
 
     # Structured no-op: nothing to consume.
     if [ ! -f "$cb_file" ]; then
@@ -2601,17 +2803,22 @@ cmd_callback_consume() {
     local archive_dir="$cb_dir/archive"
     mkdir -p "$archive_dir"
     local archive_file="$archive_dir/${slug}-${stage}.${file_cb_id}.callback"
-    # Atomic same-filesystem rename (archive/ is a subdir of callbacks/), preserves
-    # bytes. If the target name somehow already exists, the id was non-unique —
-    # fall back to an extra suffix rather than clobber.
     if [ -e "$archive_file" ]; then
         archive_file="$archive_dir/${slug}-${stage}.${file_cb_id}.$$-${RANDOM}.callback"
     fi
+    # §3.3: serialize the archive mv against a concurrent transition. Callers that
+    # ALREADY hold the lifecycle lock (park-resolve, supersede) pass --_no_lock so a
+    # fresh subshell OFD does not self-conflict. Never nest _lifecycle_lock in one
+    # process — hold at most one fd 9 at a time.
+    local _held=0
+    if [ "$_no_lock" != 1 ]; then _lifecycle_lock "$slug" "$stage" || return 1; _held=1; fi
     if ! mv -f "$cb_file" "$archive_file"; then
+        [ "$_held" = 1 ] && _lifecycle_unlock
         _emit_event ERROR "$slug" "stage=$stage reason=callback-archive-failed status=$status"
         echo "ERROR: callback-consume: failed to archive $cb_file → $archive_file" >&2
         return 1
     fi
+    [ "$_held" = 1 ] && _lifecycle_unlock
     _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=archived status=$status callback_id=$file_cb_id archive=$archive_file"
     echo "CALLBACK_CONSUME ARCHIVED stage=$stage slug=$slug status=$status → $archive_file"
 }
