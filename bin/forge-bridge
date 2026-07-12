@@ -55,7 +55,7 @@ WINDOW="0"
 DEV_DIR=".dev"
 SUMMARY_LOG="$DEV_DIR/forge-log.yml"
 CONTEXT_FILE="$DEV_DIR/forge-context.yml"
-SESSION=""   # populated by require_tmux_session() for tmux-required commands
+SESSION=""   # populated by require_identity() (=$ID_target_session) for session-scoped commands
 
 # Required pane count (Phase 2: 5 panes)
 FORGE_REQUIRED_PANES="${FORGE_REQUIRED_PANES:-5}"
@@ -136,42 +136,131 @@ _same_root_sessions() {
     fi
 }
 
-# Resolve the current forge session name for FILE-NAMING / FILTERING only.
-# Echoes the name, or "" if none can be safely resolved. Steps 1-3 of the
-# canonical idiom; NO auto-pick, NO pane gate, NO existence validation.
-#   1. TMUX_SESSION env            (trusted unconditionally — caller declared id)
-#   2. tmux display-message        (trusted; only if inside tmux: $TMUX set)
-#   3. .dev/.forge-session walk-up (trusted ONLY if <=1 live candidate; else "")
-_resolve_session() {
-    local s="${TMUX_SESSION:-}"
-    if [ -z "$s" ] && [ -n "${TMUX:-}" ]; then
-        s="$(tmux display-message -p '#{session_name}' 2>/dev/null)"
-    fi
-    if [ -z "$s" ]; then
-        local _dir; _dir="$(pwd)"
-        while [ "$_dir" != "/" ]; do
-            if [ -f "$_dir/.dev/.forge-session" ]; then
-                s="$(cat "$_dir/.dev/.forge-session")"
-                # B-lite ambiguity guard: the single file is last-write-wins, so
-                # it cannot be trusted when multiple sessions are live in this
-                # project. Refuse -> "" -> sentinel -> "no active pipeline".
-                if [ "$(_count_live_forge_candidates)" -gt 1 ]; then
-                    s=""
-                fi
-                break
+# ---- Structured identity descriptor (session-pin hardening P1.1-P1.3) ----
+# _forge_identity computes {host,target,source,root,incarnation,state} and assigns it
+# to caller-shell ID_* globals by DIRECT ASSIGNMENT — no eval, no serialization, no
+# exported var. Stale-globals invariant: each forge-bridge process runs exactly one
+# command, so ID_* cannot bleed between commands; require_identity calls this at the
+# TOP of the command body, before any $(...) filename resolution, so every downstream
+# read is consistent. The charset guard applies to session NAMES only, never to paths.
+_valid_session_name() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_.-]+$'; }
+
+_forge_identity() {
+    ID_host_session=""; ID_host_pane=""; ID_host_root=""; ID_host_incarnation=""
+    ID_target_session=""; ID_target_source="none"; ID_target_root=""
+    ID_legacy_file_session=""; ID_state=""; ID_ambiguous_list=""
+    local env_stamp="${TMUX_SESSION:-}"
+    [ -n "$env_stamp" ] && ! _valid_session_name "$env_stamp" && env_stamp=""
+
+    # --- Host probe: ONE TMUX_PANE-targeted display-message (untargeted resolves the
+    #     ACTIVE pane, not the caller — tests/forge-start/run.sh:98-100). ---
+    local host_state="" hp rc pid sn spath screated
+    if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+        hp="$(tmux display-message -p -t "$TMUX_PANE" \
+            '#{pane_id}	#{session_name}	#{session_path}	#{session_created}' 2>/dev/null)"; rc=$?
+        if [ "$rc" -ne 0 ] || [ -z "$hp" ]; then
+            host_state="tmux-unavailable"
+        else
+            IFS=$'\t' read -r pid sn spath screated <<< "$hp"
+            if [ "$pid" = "$TMUX_PANE" ]; then
+                host_state="in-pane"
+                ID_host_pane="$pid"
+                _valid_session_name "$sn" && ID_host_session="$sn"
+                ID_host_root="$(ownership_root "$spath")"; ID_host_incarnation="$screated"
+            else
+                host_state="tmux-unavailable"     # probe hit the wrong pane → do not trust
             fi
-            _dir="$(dirname "$_dir")"
-        done
+        fi
+    elif [ -n "${TMUX:-}" ]; then
+        host_state="tmux-unavailable"             # $TMUX set but no TMUX_PANE
+    else
+        host_state="no-tmux"
     fi
-    # Charset guard: session names are tmux-legal and used unquoted as targets;
-    # reject anything that could escape .dev/ as a filename segment.
-    if [ -n "$s" ] && ! printf '%s' "$s" | grep -Eq '^[A-Za-z0-9_.-]+$'; then
-        s=""
+
+    # --- Legacy file: DIAGNOSTICS ONLY, never a routing source (P3.18). New writers
+    #     prepend a "# advisory only" header; read the first non-comment, non-empty
+    #     line and charset-guard it. Routing uses only the LIVE same-root set below,
+    #     so a stale name is dropped by construction. ---
+    local _dir; _dir="$(pwd)"; local _lf
+    while [ "$_dir" != "/" ]; do
+        if [ -f "$_dir/.dev/.forge-session" ]; then
+            _lf="$(grep -v '^#' "$_dir/.dev/.forge-session" 2>/dev/null | grep -m1 . || true)"
+            _valid_session_name "$_lf" && ID_legacy_file_session="$_lf"
+            break
+        fi
+        _dir="$(dirname "$_dir")"
+    done
+
+    local cwd_root; cwd_root="$(ownership_root "$(pwd)")"
+
+    # --- Explicit cross-session declaration (validated later; P4.19). --target-root
+    #     (if given) is the intended-root operand, else the caller's cwd. ---
+    if [ "${_FORGE_CROSS:-0}" = "1" ] && [ -n "${_FORGE_TARGET:-}" ]; then
+        ID_target_session="$_FORGE_TARGET"; ID_target_source="explicit-arg"
+        ID_target_root="$(ownership_root "${_FORGE_TARGET_ROOT:-$(pwd)}")"
+        ID_state="CROSS_SESSION_DECLARED"
+    else
+        case "$host_state" in
+            in-pane)
+                ID_target_session="$ID_host_session"; ID_target_source="host"
+                ID_target_root="$ID_host_root"
+                if [ -n "$ID_host_root" ] && [ -n "$cwd_root" ] && [ "$ID_host_root" != "$cwd_root" ]; then
+                    ID_state="MISMATCH"          # wrong checkout / nested tmux / wandered cwd
+                elif [ -n "$env_stamp" ] && [ "$env_stamp" != "$ID_host_session" ]; then
+                    ID_state="MISMATCH"          # env stamp ≠ probed host (incident replay; MINOR-1)
+                else
+                    ID_state="MATCH"
+                fi
+                ;;
+            no-tmux)
+                local cands n
+                cands="$(_same_root_sessions "$(pwd)")"
+                n="$(printf '%s\n' "$cands" | grep -c . || true)"
+                if [ "$n" -eq 1 ]; then
+                    ID_target_session="$(printf '%s\n' "$cands" | grep . | head -1)"
+                    ID_target_source="unique-root-candidate"; ID_target_root="$cwd_root"; ID_state="MATCH"
+                elif [ "$n" -gt 1 ]; then
+                    ID_state="AMBIGUOUS"; ID_ambiguous_list="$cands"
+                else
+                    ID_state="UNAVAILABLE"
+                fi
+                ;;
+            *) ID_state="UNAVAILABLE" ;;          # tmux-unavailable
+        esac
     fi
-    # Collision guard: a real session must never masquerade as the sentinel.
-    if [ "$s" = "__nosession__" ]; then
-        s=""
+
+    if [ -n "$ID_target_session" ] && ! _valid_session_name "$ID_target_session"; then
+        ID_target_session=""
     fi
+    [ "$ID_target_session" = "__nosession__" ] && ID_target_session=""
+    return 0
+}
+
+# Shared descriptor printer (also prepended by preflight/health/identity, P1.10).
+_print_identity_block() {
+    printf 'host_session=%s   host_pane=%s   host_root=%s\n' \
+        "${ID_host_session:-none}" "${ID_host_pane:-none}" "${ID_host_root:-unknown}"
+    printf 'target_session=%s target_source=%s\n' \
+        "${ID_target_session:-none}" "${ID_target_source:-none}"
+    printf 'legacy_file_session=%s   identity_state=%s\n' \
+        "${ID_legacy_file_session:-none}" "${ID_state:-UNAVAILABLE}"
+}
+
+# Resolve the current forge session name for FILE-NAMING / FILTERING only. Fast path:
+# if the gate ran (ID_state set), echo its target; else compute inline. Empty on
+# MISMATCH-with-no-host / AMBIGUOUS / UNAVAILABLE so __nosession__ engages instead of a
+# wrong name (P1.4). On an in-pane MISMATCH the target is the correct host pane, so the
+# echoed name stays safe.
+_resolve_session() {
+    local s
+    if [ -n "${ID_state:-}" ]; then
+        s="$ID_target_session"
+    else
+        _forge_identity
+        s="$ID_target_session"
+    fi
+    if [ -n "$s" ] && ! _valid_session_name "$s"; then s=""; fi
+    [ "$s" = "__nosession__" ] && s=""
     printf '%s' "$s"
 }
 
@@ -191,78 +280,114 @@ _context_file() { printf '%s/forge-context.%s.yml' "$DEV_DIR" "$(_session_or_sen
 # $project_root. See .dev/proposals/per-task-usage-reporting/final-plan.md.
 _usage_file() { printf '%s/forge-usage.%s.yml' "$DEV_DIR" "$(_session_or_sentinel)"; }
 
-require_tmux_session() {
-    local cmd="${1:-(unknown)}"
+# require_tmux_session was superseded by require_identity (session-pin hardening).
+# Every former caller now calls `require_identity <cmd> <class-token>`.
 
-    # Resolution order:
-    #   1. TMUX_SESSION env (explicit override)
-    #   2. tmux display-message — ONLY if we're inside tmux ($TMUX set)
-    #   3. .dev/.forge-session walk-up from cwd
-    #   4. Auto-pick a forge-* session with the required pane count
-    # Outside tmux, `tmux display-message` returns the most-recently-attached
-    # session globally, which is unrelated to cwd. Skip step 2 in that case so
-    # cwd-rooted invocations (Claude Code agents, cron, headless scripts) route
-    # to the correct session via .dev/.forge-session.
-    # Steps 1-3 (env / tmux / guarded walk-up) via the unified resolver. Its
-    # B-lite ambiguity guard only makes the walk-up MORE conservative; the
-    # step-4 auto-detect and pane gate below are unchanged.
-    SESSION="$(_resolve_session)"
+# ---- Classified identity gate (session-pin hardening P1.7) ----
+# Report-only in Phases 1-3; the Phase-4 commit flips the default to 1.
+FORGE_IDENTITY_ENFORCE="${FORGE_IDENTITY_ENFORCE:-0}"
 
-    # Stale-session validation: if a name resolved (from TMUX_SESSION, $TMUX, or
-    # the .dev/.forge-session walk-up) but no such tmux session exists, refuse
-    # rather than fall through to auto-detect and silently misroute to a random
-    # forge-* session. Validating EVERY resolved name (not just the walk-up path)
-    # also covers the "$TMUX set but display-message empty, walk-up succeeded"
-    # case the prior inline gate skipped. Hard Rule 0 guarantees a legitimately-
-    # pinned name is always live, so no valid flow breaks.
-    if [ -n "$SESSION" ] && ! tmux has-session -t "$SESSION" 2>/dev/null; then
-        cat >&2 <<EOF
-ERROR: resolved tmux session '$SESSION' but no such session exists.
-       (resolved from TMUX_SESSION, \$TMUX, or .dev/.forge-session)
-       Clear the stale source (e.g. rm .dev/.forge-session / unset TMUX_SESSION)
-       or run forge-start to (re)create the session.
-EOF
-        return 1
+# session_path_of <name> — echo a live session's #{session_path}; empty if gone. Uses
+# the same FORGE_TMUX_LIST seam as _same_root_sessions so P4 root-validation tests can
+# inject topology hermetically.
+session_path_of() {
+    local inject="${FORGE_TMUX_LIST:-}"
+    if [ -n "$inject" ]; then
+        awk -F'\t' -v s="$1" '$1==s{print $2; exit}' "$inject"
+    else
+        tmux list-sessions -F '#{session_name}	#{session_path}' 2>/dev/null \
+            | awk -F'\t' -v s="$1" '$1==s{print $2; exit}'
+    fi
+}
+
+# Durable board attention event + operator block on a class-2/3 identity refuse (P4.20).
+_identity_refuse() {
+    local cmd="$1"
+    _emit_event identity-mismatch "-" \
+        "cmd=$cmd root=${ID_host_root:-unknown} host=${ID_host_session:-none} target=${ID_target_session:-none} source=${ID_target_source:-none} state=${ID_state:-UNAVAILABLE}" 2>/dev/null || true
+    {
+        echo "ERROR: identity ${ID_state} — command '$cmd' refused (host=${ID_host_session:-none} target=${ID_target_session:-none})."
+        _print_identity_block
+        echo "  Run 'forge-bridge identity' for the full descriptor."
+    } >&2
+}
+
+# require_identity <cmd> <class-token> — THE one fail-closed identity gate; supersedes
+# require_tmux_session. Runs _forge_identity, sets ID_*, records an IDENTITY event, sets
+# legacy SESSION="$ID_target_session" so every "$SESSION:$WINDOW.$PANE" call site is
+# byte-unchanged. Unknown class → fail closed. Tokens: root-scoped | host-pane |
+# host-session | host-degrade | target-scoped | diagnostic.
+require_identity() {
+    local cmd="${1:-(unknown)}" class="${2:-}"
+
+    # Dual-mode: send/callback upgrade to class-3 iff BOTH flags present.
+    if { [ "$cmd" = "send" ] || [ "$cmd" = "callback" ]; } \
+       && [ "${_FORGE_CROSS:-0}" = "1" ] && [ -n "${_FORGE_TARGET:-}" ]; then
+        class="target-scoped"
     fi
 
-    # Fallback 2: auto-detect a forge session with the required pane count.
-    # Refuse-if-ambiguous: only auto-pick when exactly one forge-* session has
-    # the required pane count. Picking arbitrarily when many candidates exist
-    # is what made the orchestrator wander into other users' sessions.
-    if [ -z "$SESSION" ]; then
-        local _candidates _ncand
-        _candidates=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-            | grep '^forge' \
-            | while read -r s; do
-                local panes
-                panes=$(tmux list-panes -t "$s" 2>/dev/null | wc -l | tr -d ' ')
-                if [ "$panes" -ge "$FORGE_REQUIRED_PANES" ]; then echo "$s"; fi
-              done)
-        _ncand=$(printf '%s\n' "$_candidates" | grep -c '^forge' || true)
-        if [ "$_ncand" -gt 1 ]; then
-            {
-                echo "ERROR: multiple forge sessions present — refuse to auto-pick for command '$cmd'."
-                echo "Candidates with >= $FORGE_REQUIRED_PANES panes:"
-                printf '%s\n' "$_candidates" | sed 's/^/  /'
-                echo "Resolve by either:"
-                echo "  - export TMUX_SESSION=<name>   (explicit override)"
-                echo "  - run from a project dir containing .dev/.forge-session"
-            } >&2
-            return 1
+    _forge_identity
+    _emit_event IDENTITY "-" \
+        "cmd=$cmd class=$class state=${ID_state} host=${ID_host_session:-none} target=${ID_target_session:-none} source=${ID_target_source}" 2>/dev/null || true
+    SESSION="$ID_target_session"
+
+    case "$class" in
+        root-scoped|diagnostic) return 0 ;;       # diagnostics: SESSION set, body prints/handles; never refuse (R7)
+        host-pane|host-session|host-degrade|target-scoped) : ;;
+        *) echo "ERROR: command '$cmd' has no identity class — refusing (fail-closed gate)." >&2; return 1 ;;
+    esac
+
+    # Identity-state refusal — dormant until FORGE_IDENTITY_ENFORCE=1 (P4).
+    if [ "$FORGE_IDENTITY_ENFORCE" = "1" ]; then
+        case "$class" in
+            host-degrade)                                   # callback/log-response/context/stall-check-status
+                [ "$ID_state" = "MISMATCH" ] && { _identity_refuse "$cmd"; return 1; } ;;
+            host-pane|host-session|target-scoped)
+                case "$ID_state" in
+                    MISMATCH|AMBIGUOUS|UNAVAILABLE) _identity_refuse "$cmd"; return 1 ;;
+                esac ;;
+        esac
+        # class-3 cross-session validation: target exists + rooted at the intended
+        # (caller-supplied, cd-bound or --target-root) root — NOT the bridge cwd (MAJOR-1 / P4.19).
+        if [ "$class" = "target-scoped" ]; then
+            if ! tmux has-session -t "$ID_target_session" 2>/dev/null; then
+                echo "ERROR: --cross-session target '$ID_target_session' does not exist — refusing." >&2
+                return 1
+            fi
+            local troot; troot="$(ownership_root "$(session_path_of "$ID_target_session")")"
+            if [ "$troot" != "$ID_target_root" ]; then
+                echo "ERROR: --cross-session target '$ID_target_session' is rooted at $troot, not the intended root $ID_target_root — refusing." >&2
+                return 1
+            fi
+            _emit_event CROSS "-" "cmd=$cmd host=${ID_host_session:-none} target=$ID_target_session target_root=$ID_target_root source=${ID_target_source} caller_mode=explicit-arg"
         fi
-        if [ "$_ncand" -eq 1 ]; then
-            SESSION="$_candidates"
-            _session_source="auto-detect-sole-candidate"
-        fi
     fi
 
-    if [ -z "$SESSION" ]; then
-        echo "ERROR: command '$cmd' requires a tmux forge session. Run forge-start first." >&2
-        return 1
-    fi
-
-    # Validate pane count at every entry point, not just the auto-scan fallback
-    require_pane_count "$SESSION" "$FORGE_REQUIRED_PANES" || return 1
+    # Pane precondition (BOTH phases) — pane ops need a live host session with the full
+    # pane count (= the old require_tmux_session contract); cross-session needs a live
+    # target. host-session / host-degrade / diagnostic have NO precondition (they were
+    # unguarded before and must tolerate headless invocation — this structurally
+    # resolves OQ-3: file mutators never newly require 5 panes).
+    case "$class" in
+        host-pane)
+            if [ -z "$SESSION" ]; then
+                echo "ERROR: command '$cmd' requires a live forge session. Run forge-start first." >&2
+                return 1
+            fi
+            if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+                echo "ERROR: resolved session '$SESSION' but no such tmux session exists (stale pin/arg)." >&2
+                return 1
+            fi
+            require_pane_count "$SESSION" "$FORGE_REQUIRED_PANES" || return 1
+            ;;
+        target-scoped)
+            if [ -z "$SESSION" ] || ! tmux has-session -t "$SESSION" 2>/dev/null; then
+                echo "ERROR: cross-session target '$SESSION' is not a live session." >&2
+                return 1
+            fi
+            require_pane_count "$SESSION" "$FORGE_REQUIRED_PANES" || return 1
+            ;;
+    esac
     return 0
 }
 
@@ -476,15 +601,14 @@ PYEOF
     if [ -n "${FORGE_USAGE_FIXTURE:-}" ] && [ -f "${FORGE_USAGE_FIXTURE}" ]; then
         raw_file="$FORGE_USAGE_FIXTURE"; fixture_mode=1
     else
-        # cmd_callback does NOT call require_tmux_session, so the global SESSION
-        # is empty here — resolve the pane the same way cmd_callback does.
+        # cmd_callback ran require_identity, so ID_target_session is authoritative
+        # (host for a worker self-callback; the declared target for a seat relay).
         case "$worker_idx" in
             ''|*[!0-9]*) fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=bad-pane"
                          _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
                          return 0 ;;
         esac
-        local sess
-        sess="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+        local sess="${ID_target_session:-}"
         if [ -z "$sess" ]; then
             fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=no-session"
             _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
@@ -874,7 +998,7 @@ _cancel_copy_mode() {
 # ---- Commands ----
 
 cmd_send() {
-    require_tmux_session "send" || return 1
+    require_identity "send" host-pane || return 1
 
     local FORCE=false
     if [ "$1" = "--force" ]; then
@@ -920,7 +1044,7 @@ cmd_send() {
 }
 
 cmd_read() {
-    require_tmux_session "read" || return 1
+    require_identity "read" host-pane || return 1
     local PANE
     PANE=$(pane_index "$1")
     local LINES="${2:-20}"
@@ -928,18 +1052,19 @@ cmd_read() {
 }
 
 cmd_focus() {
-    require_tmux_session "focus" || return 1
+    require_identity "focus" host-pane || return 1
     local PANE
     PANE=$(pane_index "$1")
     tmux select-pane -t "$SESSION:$WINDOW.$PANE"
 }
 
 cmd_back() {
-    require_tmux_session "back" || return 1
+    require_identity "back" host-pane || return 1
     tmux select-pane -t "$SESSION:$WINDOW.1"
 }
 
 cmd_log() {
+    require_identity "log" host-session || return 1
     local slug="" stage="" from="" to="" prompt=""
 
     while [ $# -gt 0 ]; do
@@ -1067,6 +1192,7 @@ PYEOF
 }
 
 cmd_log_response() {
+    require_identity "log-response" host-degrade || return 1
     # Phase 1b Step 4a: target-aware response update.
     # New flags: --to <pane> (alias-normalized), --stage <stage>
     # Without --to/--stage, ambiguity guard refuses if more than one
@@ -1132,12 +1258,14 @@ cmd_log_response() {
     # Filter pending entries by --to (canonical) and --stage. Apply ambiguity
     # guard if no filters provided and more than one pending entry exists.
     local matched
-    matched=$(python3 - "$pipeline_log" "$target_canonical" "$target_stage" << 'PYEOF'
+    matched=$(python3 - "$pipeline_log" "$target_canonical" "$target_stage" "$ID_target_session" "$ID_host_incarnation" << 'PYEOF'
 import sys, yaml
 
 pipeline_log = sys.argv[1]
 target_canonical = sys.argv[2] or None
 target_stage = sys.argv[3] or None
+caller_session = sys.argv[4] or None
+caller_incarnation = sys.argv[5] or None
 
 ALIAS_TO_CANONICAL = {
     'inline': 'claude-opus', 'general': 'claude-opus', 'claude-general': 'claude-opus',
@@ -1166,9 +1294,31 @@ def matches(e):
         return False
     if target_stage and e.get('stage', '') != target_stage:
         return False
+    # R10 (MAJOR-3): filter by the caller's session so a close from session X can never
+    # close session Y's coincident slug+stage+to pending. Never-skip-legacy: entries
+    # with empty session still match (mirrors :604). A headless caller (empty
+    # caller_session) also matches empty-session entries — the infra-lock lifecycle.
+    es = e.get('session', '') or ''
+    if es and caller_session and es != caller_session:
+        return False
+    # Incarnation is a finer tiebreak BENEATH the session filter (inert until CG-6
+    # stamps the field; caller_incarnation from the host probe, entries empty pre-CG-6).
+    ei = e.get('incarnation', '') or ''
+    if ei and caller_incarnation and ei != caller_incarnation:
+        return False
     return True
 
 candidates = [e for e in pending if matches(e)]
+# Headless cross-session close guard: when the caller has NO resolved session
+# (host-degrade headless), matches() cannot session-filter, so a close spanning >1
+# DISTINCT nonempty session is unsafe — refuse and demand an explicit target. A
+# single-session or empty-session (legacy / infra-lock) candidate set proceeds.
+if caller_session is None:
+    _distinct = set((e.get('session', '') or '') for e in candidates)
+    _distinct.discard('')
+    if len(_distinct) > 1:
+        print("ERR_XSESSION:%d distinct sessions in the pending set; pass --target-session <name> --cross-session to disambiguate the close." % len(_distinct), file=sys.stderr)
+        sys.exit(2)
 if not candidates:
     filt = []
     if target_canonical: filt.append(f"--to={target_canonical}")
@@ -1318,9 +1468,11 @@ cmd_pipeline_log() {
 # ---- Context (session start / recovery) ----
 
 cmd_context() {
-    # Per-call session-scoped pointer (shadows the static global). No
-    # require_tmux_session — this runs at session start with no $TMUX; the
-    # resolver degrades to the __nosession__ sentinel safely.
+    # host-degrade (MINOR-3): with a host present it is host-scoped (an in-pane
+    # MISMATCH halts under enforce); headless with >1 same-root it DEGRADES to
+    # "(no active pipeline)" via the __nosession__ sentinel rather than a hard refuse.
+    # The single-session early-return below is preserved.
+    require_identity "context" host-degrade || return 1
     local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
     # Phase 1b Step 3: prepend stall-check-status section if non-empty.
     # Inserted BEFORE the existing early-return so stale-pending warnings
@@ -1410,6 +1562,7 @@ cmd_context() {
 }
 
 cmd_set_context() {
+    require_identity "set-context" host-session || return 1
     local slug=""
 
     while [ $# -gt 0 ]; do
@@ -1702,6 +1855,7 @@ PYEOF
 }
 
 cmd_status() {
+    require_identity "status" host-session || return 1
     _render_status_file
     local project_root
     project_root=$(_resolve_project_root "" 2>/dev/null)
@@ -1963,7 +2117,7 @@ PYEOF
         return 1
     fi
 
-    require_tmux_session "dispatch" || {
+    require_identity "dispatch" host-pane || {
         _emit_event ERROR "$slug" "stage=$stage reason=tmux-session-missing"
         return 1
     }
@@ -2024,6 +2178,7 @@ PYEOF
 #      orchestrator pane for any human reading scrollback.
 # --worker auto-resolves from TMUX_PANE if omitted.
 cmd_callback() {
+    require_identity "callback" host-degrade || return 1
     local slug="" stage="" status="" message="" worker="" quiet=false
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -2053,8 +2208,7 @@ cmd_callback() {
     if [ -z "$worker" ]; then
         local pane_id="${TMUX_PANE:-}"
         if [ -n "$pane_id" ]; then
-            local sess
-            sess="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+            local sess="${ID_host_session:-}"
             if [ -n "$sess" ]; then
                 local idx
                 idx=$(tmux list-panes -t "$sess:$WINDOW" -F '#{pane_index} #{pane_id}' 2>/dev/null \
@@ -2178,8 +2332,7 @@ EOF
     # Enter into one send-keys call leaves the text sitting in the input
     # unsubmitted on current Claude TUI builds.
     if [ "$quiet" != true ] && [ -n "${TMUX:-}" ]; then
-        local sess
-        sess="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+        local sess="${ID_target_session:-$ID_host_session}"
         if [ -n "$sess" ]; then
             _cancel_copy_mode "$sess:$WINDOW.1"
             tmux send-keys -t "$sess:$WINDOW.1" -l "$legacy" 2>/dev/null || true
@@ -2238,7 +2391,7 @@ cmd_wait() {
         return 1
     fi
 
-    require_tmux_session "wait" || {
+    require_identity "wait" host-pane || {
         _emit_event ERROR "$slug" "stage=$stage reason=tmux-session-missing"
         return 1
     }
@@ -2895,6 +3048,7 @@ cmd_emit() {
 # Read-only FILE read (forge-usage.<session>.yml); never scrapes a pane — a
 # status query must not perturb workers. Recorded per task by _observe_usage.
 cmd_usage() {
+    require_identity "usage" host-session || return 1
     local filter="${1:-}"
     local project_root
     project_root=$(_resolve_project_root "")
@@ -2956,6 +3110,10 @@ cmd_preflight() {
     # Pre-flight discipline (Phase 1a). Prints a kickoff snapshot and a
     # final status_code line. Does NOT require a tmux session. Always
     # exits 0; orchestrator decides whether to halt based on status_code.
+    # Carries the identity descriptor even in a bad state (R7); the documented exit
+    # code lives ONLY on `identity`, never here.
+    require_identity "preflight" diagnostic
+    _print_identity_block
 
     local cur_pwd
     cur_pwd=$(pwd)
@@ -2987,9 +3145,12 @@ except Exception:
     fi
 
     local directory_state="OK"
+    local _pwd_real _exp_real
+    _pwd_real="$(cd "$cur_pwd" 2>/dev/null && pwd -P)"; [ -n "$_pwd_real" ] || _pwd_real="$cur_pwd"
+    _exp_real="$(cd "$expected_root" 2>/dev/null && pwd -P)"; [ -n "$_exp_real" ] || _exp_real="$expected_root"
     if [ -z "$expected_root" ]; then
         directory_state="UNKNOWN"
-    elif [ "$cur_pwd" != "$expected_root" ]; then
+    elif [ "$_pwd_real" != "$_exp_real" ]; then
         directory_state="WRONG_DIRECTORY"
     fi
 
@@ -3129,6 +3290,9 @@ base_ref:           $base_ref
 merge_state:        $merge_state
 merge_check_method: $merge_method
 merge_check_detail: $merge_detail
+host_session:       ${ID_host_session:-none}
+target_session:     ${ID_target_session:-none}
+identity_state:     ${ID_state:-UNAVAILABLE}
 status:             $status
 status_code:        $status_code
 EOF
@@ -3136,6 +3300,7 @@ EOF
 }
 
 cmd_add_note() {
+    require_identity "add-note" host-session || return 1
     local note="$*"
     # Per-call session-scoped pointer (shadows the static global).
     local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
@@ -3229,7 +3394,7 @@ cmd_stall_check() {
     fi
     cd "$project_root" || { echo "UNKNOWN cd_failed pane=$target"; return 0; }
 
-    require_tmux_session "stall-check" || return 1
+    require_identity "stall-check" host-pane || return 1
 
     local canonical idx
     canonical=$(canonical_pane_name "$target")
@@ -3727,7 +3892,8 @@ cmd_health() {
     #
     # Followed by a one-line summary: SUMMARY total=5 ok=N dead=N wrong=N unknown=N
 
-    require_tmux_session "health" || return 1
+    require_identity "health" diagnostic
+    _print_identity_block
 
     local tmpdir
     tmpdir=$(mktemp -d -t forge-health-XXXXXX)
@@ -3880,13 +4046,52 @@ PYEOF
         esac
     done
 
-    echo "SUMMARY total=5 ok=$ok dead=$dead wrong=$wrong unknown=$unknown session=$SESSION"
+    echo "SUMMARY total=5 ok=$ok dead=$dead wrong=$wrong unknown=$unknown session=$SESSION identity_state=${ID_state:-UNAVAILABLE}"
 
     if [ "$ok" -eq 5 ]; then
         return 0
     fi
     return 1
 }
+
+# identity — print ONLY the descriptor block; documented exit code. NO --export, NO
+# eval-able output. Exit 0 = MATCH / CROSS_SESSION_DECLARED; exit 3 = MISMATCH /
+# AMBIGUOUS / UNAVAILABLE.
+cmd_identity() {
+    require_identity "identity" diagnostic
+    _print_identity_block
+    case "${ID_state:-}" in
+        MATCH|CROSS_SESSION_DECLARED) return 0 ;;
+        *) return 3 ;;
+    esac
+}
+
+# ---- Global cross-session flags (session-pin hardening P1.6) ----
+# PROCESS-LOCAL, NEVER exported → authorization cannot be inherited by a nested bridge
+# call, and an in-pane orchestrator cannot acquire the bypass from its session env.
+# Stripped from ANYWHERE in argv before the subcommand. --target-session without
+# --cross-session is always a usage error.
+_FORGE_TARGET=""; _FORGE_CROSS=0; _FORGE_TARGET_ROOT=""
+_fb_argv=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --target-session) _FORGE_TARGET="$2"; shift 2 ;;
+        --cross-session)  _FORGE_CROSS=1; shift ;;
+        --target-root)    _FORGE_TARGET_ROOT="$2"; shift 2 ;;
+        *) _fb_argv+=("$1"); shift ;;
+    esac
+done
+set -- ${_fb_argv[@]+"${_fb_argv[@]}"}
+if [ -n "$_FORGE_TARGET" ] && [ "$_FORGE_CROSS" != "1" ]; then
+    echo "ERROR: --target-session requires --cross-session (cross-session routing must be explicitly declared)." >&2
+    exit 2
+fi
+if [ "$_FORGE_CROSS" = "1" ]; then
+    case "${1:-}" in
+        send|callback) ;;
+        *) echo "ERROR: --cross-session is only valid for 'send' and 'callback' (got '${1:-}')." >&2; exit 2 ;;
+    esac
+fi
 
 # ---- Main ----
 
@@ -3917,8 +4122,9 @@ case "${1:-help}" in
     digest)          shift; cmd_digest "$@" ;;
     emit)            shift; cmd_emit "$@" ;;
     stall-check)         shift; cmd_stall_check "$@" ;;
-    stall-check-status)  shift; cmd_stall_check_status "$@" ;;
+    stall-check-status)  shift; require_identity "stall-check-status" host-degrade || true; cmd_stall_check_status "$@" ;;
     alias-self-test)     shift; cmd_alias_self_test "$@" ;;
+    identity)            cmd_identity ;;
     health)              cmd_health ;;
     help|*)
         echo "forge-bridge — cross-pane messaging with hooks and audit log"
@@ -3952,6 +4158,7 @@ case "${1:-help}" in
         echo "  set-context --slug <s>        Set active pipeline (auto-derives state)"
         echo "  add-note <text>               Add a note to context (persists across sessions)"
         echo "  usage [<worker>]              Show per-worker usage snapshot (read-only; from forge-usage.<session>.yml)"
+        echo "  identity                      Print host/target identity descriptor; exit 0 (MATCH/CROSS) or 3 (MISMATCH/AMBIGUOUS/UNAVAILABLE)"
         echo "  stall-check-status [--project-root <p>]"
         echo "                                List panes with pending dispatch and stale stall-check coverage"
         echo "  alias-self-test [--strict]    Verify pane alias maps stay in lockstep"

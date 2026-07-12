@@ -1,8 +1,13 @@
 #!/bin/bash
 # tests/forge-bridge/run.sh — identity core for bin/forge-bridge (session-pin hardening).
 # Harness modeled on tests/forge-infra-lock/run.sh: hermetic mkR roots, real tmux for
-# liveness tests (skips cleanly when tmux is unavailable), PASS/FAIL counters,
-# EXIT-trap cleanup. bash-3.2-safe.
+# the identity-sensitive core (skips the tmux section cleanly when tmux is absent),
+# PASS/FAIL counters, EXIT-trap cleanup. bash-3.2-safe.
+#
+# HERMETIC GUARANTEES:
+#   * All project state lives under $WORK; sessions are uniquely-named fbid*-$$ and
+#     killed in the EXIT trap. Real forge sessions are never touched.
+#   * FORGE_WATCH_TRIGGER=0 everywhere so _emit_event never pokes the real board.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -11,21 +16,26 @@ PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); printf '  ok: %s\n' "$1"; }
 bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 
+export FORGE_WATCH_TRIGGER=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fbid.XXXXXX")"; WORK="$(cd "$WORK" && pwd -P)"
-trap 'rm -rf "$WORK"' EXIT
+S1="fbid1-$$"; S2="fbid2-$$"; S3="fbid3-$$"; S4="fbid4-$$"
+trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; rm -rf "$WORK"' EXIT
 
-# ---- Pure-helper extraction (no main dispatch): ownership_root + _same_root_sessions ----
+# ---- Pure-helper extraction (no main dispatch) ----
 FNS="$WORK/fns.sh"
-sed -n '/^ownership_root()/,/^}$/p; /^_same_root_sessions()/,/^}$/p' "$BRIDGE" > "$FNS"
+{
+  grep -m1 '^_valid_session_name()' "$BRIDGE"
+  sed -n '/^ownership_root()/,/^}$/p; /^_same_root_sessions()/,/^}$/p' "$BRIDGE"
+} > "$FNS"
 # shellcheck disable=SC1090
 . "$FNS"
 
 # mkR <name> — hermetic project root with forge-project.yml + expected_root pin.
-mkR(){ local d="$WORK/$1"; mkdir -p "$d/.claude" "$d/.dev/proposals"; printf 'name: %s\nforge:\n  expected_root: %s\n' "$1" "$d" > "$d/.claude/forge-project.yml"; printf '%s' "$d"; }
+mkR(){ local d="$WORK/$1"; mkdir -p "$d/.claude" "$d/.dev/proposals" "$d/.dev/forge-tmp/callbacks"; printf 'name: %s\nforge:\n  expected_root: %s\n' "$1" "$d" > "$d/.claude/forge-project.yml"; printf '%s' "$d"; }
 
 echo "== ownership_root / _same_root_sessions (pure helpers) =="
 
-rootA="$(mkR rootA)"; rootB="$(mkR rootB)"
+rootA="$(mkR rootA)"; rootB="$(mkR rootB)"; rootC="$(mkR rootC)"; rootD="$(mkR rootD)"
 mkdir -p "$rootA/sub/dir"
 
 # T-OWN-1: subdir-created path resolves to the same ownership root as the root itself.
@@ -44,9 +54,7 @@ else
     bad "T-OWN-2 symlink alias collapses (got: $(ownership_root "$WORK/aliasA"))"
 fi
 
-# T-SRS-1 / T-SRS-2 via the FORGE_TMUX_LIST seam (name<TAB>path, one per line):
-# sessA rooted at rootA, sessB rooted at a rootA SUBDIR (same ownership root, custom
-# non-forge names), other rooted at rootB (unrelated).
+# T-SRS-1 / T-SRS-2 via the FORGE_TMUX_LIST seam.
 LIST="$WORK/tmuxlist"
 printf 'sessA\t%s\nsessB\t%s/sub/dir\nother\t%s\n' "$rootA" "$rootA" "$rootB" > "$LIST"
 srs_out="$(FORGE_TMUX_LIST="$LIST" _same_root_sessions "$rootA")"
@@ -60,6 +68,376 @@ if printf '%s\n' "$srs_out" | grep -qx 'other'; then
 else
     ok "T-SRS-2 unrelated-root session excluded"
 fi
+
+# ---- Sourced-gate test (hermetic, no tmux needed): fail-closed class ----
+echo "== require_identity fail-closed (sourced) =="
+GFNS="$WORK/gatefns.sh"
+{
+  echo '_emit_event(){ :; }'
+  echo 'require_pane_count(){ return 0; }'
+  echo 'SESSION=""'
+  echo 'FORGE_REQUIRED_PANES=5'
+  grep -m1 '^_valid_session_name()' "$BRIDGE"
+  sed -n '/^ownership_root()/,/^}$/p; /^_same_root_sessions()/,/^}$/p; /^session_path_of()/,/^}$/p; /^_forge_identity()/,/^}$/p; /^_print_identity_block()/,/^}$/p; /^_identity_refuse()/,/^}$/p; /^require_identity()/,/^}$/p' "$BRIDGE"
+} > "$GFNS"
+gout="$(cd "$rootD" && bash -c ". '$GFNS'; require_identity bogus-cmd bogusclass" 2>&1)"; grc=$?
+if [ "$grc" -ne 0 ] && printf '%s' "$gout" | grep -q "no identity class"; then
+    ok "T-CLASS-FAILCLOSED unknown class refuses (fail-closed)"
+else
+    bad "T-CLASS-FAILCLOSED unknown class refuses (rc=$grc out=$gout)"
+fi
+
+# ---- Flag-parser usage errors (headless, real bridge) ----
+echo "== global flag parser =="
+"$BRIDGE" --target-session x read 0 >/dev/null 2>&1; [ $? -eq 2 ] \
+    && ok "T-CLASS-USAGE-1 --target-session without --cross-session → exit 2" \
+    || bad "T-CLASS-USAGE-1 --target-session without --cross-session → exit 2"
+"$BRIDGE" --cross-session read 0 >/dev/null 2>&1; [ $? -eq 2 ] \
+    && ok "T-CLASS-USAGE-2 --cross-session on non-send/callback → exit 2" \
+    || bad "T-CLASS-USAGE-2 --cross-session on non-send/callback → exit 2"
+
+# ---- Headless (no-tmux) resolution states ----
+echo "== headless resolution =="
+hout="$(cd "$rootD" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION "$BRIDGE" identity 2>&1)"; hrc=$?
+if [ "$hrc" -eq 3 ] && printf '%s' "$hout" | grep -q 'identity_state=UNAVAILABLE'; then
+    ok "T-ID-NOTMUX-0 zero same-root live → UNAVAILABLE, exit 3"
+else
+    bad "T-ID-NOTMUX-0 zero same-root live → UNAVAILABLE, exit 3 (rc=$hrc out=$hout)"
+fi
+
+# ---- Real-tmux section ----
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "SKIP: tmux unavailable — real-tmux identity tests skipped"
+    echo
+    printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
+    [ "$FAIL" -eq 0 ]; exit $?
+fi
+
+echo "== real-tmux identity core =="
+tmux new-session -d -s "$S1" -x 200 -y 50 -c "$rootA"
+tmux split-window -d -t "$S1:0" -c "$rootA"
+tmux new-session -d -s "$S2" -x 220 -y 50 -c "$rootA"
+i=0; while [ $i -lt 4 ]; do tmux split-window -d -t "$S2:0" -c "$rootA"; tmux select-layout -t "$S2:0" tiled >/dev/null 2>&1; i=$((i+1)); done
+S1P0="$(tmux display-message -p -t "$S1:0.0" '#{pane_id}')"
+S2P0="$(tmux display-message -p -t "$S2:0.0" '#{pane_id}')"
+sleep 1
+
+# run_in_pane <pane-target> <name> <command string>  (command may not contain unescaped ")
+run_in_pane(){
+    local pane="$1" name="$2"; shift 2
+    local o="$WORK/out.$name"
+    : > "$o"
+    tmux send-keys -t "$pane" "{ $* ; } > $o 2>&1; echo DONE_\$? >> $o" Enter
+    local i=0
+    while [ $i -lt 60 ]; do grep -q '^DONE_' "$o" 2>/dev/null && return 0; sleep 0.5; i=$((i+1)); done
+    echo "TIMEOUT" >> "$o"; return 1
+}
+rc_of(){ sed -n 's/^DONE_//p' "$WORK/out.$1" | tail -1; }
+out_of(){ cat "$WORK/out.$1"; }
+
+# T-ID-INPANE
+run_in_pane "$S1:0.0" inpane "FORGE_WATCH_TRIGGER=0 $BRIDGE identity"
+if [ "$(rc_of inpane)" = "0" ] && out_of inpane | grep -q "identity_state=MATCH" \
+   && out_of inpane | grep -q "host_session=$S1" && out_of inpane | grep -q "target_source=host"; then
+    ok "T-ID-INPANE in-pane MATCH via host probe"
+else
+    bad "T-ID-INPANE in-pane MATCH via host probe ($(out_of inpane | tr '\n' ' '))"
+fi
+
+# T-ID-CMD-NOEVAL (reuses inpane output)
+if out_of inpane | grep -q 'host_session=' && ! out_of inpane | grep -q 'export ' && ! out_of inpane | grep -q 'eval '; then
+    ok "T-ID-CMD-NOEVAL descriptor only — no export/eval in output"
+else
+    bad "T-ID-CMD-NOEVAL descriptor only — no export/eval in output"
+fi
+
+# T-ID-ENVMATCH
+run_in_pane "$S1:0.0" envmatch "TMUX_SESSION=$S1 FORGE_WATCH_TRIGGER=0 $BRIDGE identity"
+[ "$(rc_of envmatch)" = "0" ] && out_of envmatch | grep -q "identity_state=MATCH" \
+    && ok "T-ID-ENVMATCH stamp==host → MATCH" \
+    || bad "T-ID-ENVMATCH stamp==host → MATCH ($(out_of envmatch | tr '\n' ' '))"
+
+# T-ID-ENVMISMATCH (the incident replay: stale env stamp ≠ live host)
+run_in_pane "$S1:0.0" envmis "TMUX_SESSION=$S2 FORGE_WATCH_TRIGGER=0 $BRIDGE identity"
+if [ "$(rc_of envmis)" = "3" ] && out_of envmis | grep -q "identity_state=MISMATCH" \
+   && out_of envmis | grep -q "target_session=$S1"; then
+    ok "T-ID-ENVMISMATCH stale stamp → MISMATCH, target stays host"
+else
+    bad "T-ID-ENVMISMATCH stale stamp → MISMATCH, target stays host ($(out_of envmis | tr '\n' ' '))"
+fi
+
+# T-ID-LIVESTALE (MINOR-1: TMUX_PANE pointing at a live same-root OTHER session)
+run_in_pane "$S1:0.0" livestale "TMUX_SESSION=$S1 TMUX_PANE=$S2P0 FORGE_WATCH_TRIGGER=0 $BRIDGE identity"
+if [ "$(rc_of livestale)" = "3" ] && out_of livestale | grep -q "identity_state=MISMATCH" \
+   && out_of livestale | grep -q "host_session=$S2"; then
+    ok "T-ID-LIVESTALE live-stale TMUX_PANE + stamp → MISMATCH (env corroborator)"
+else
+    bad "T-ID-LIVESTALE live-stale TMUX_PANE + stamp → MISMATCH ($(out_of livestale | tr '\n' ' '))"
+fi
+
+# T-ID-WRONGCHECKOUT (host rooted rootA, cwd rootB)
+run_in_pane "$S1:0.0" wrongco "( cd $rootB && FORGE_WATCH_TRIGGER=0 $BRIDGE identity )"
+out_of wrongco | grep -q "identity_state=MISMATCH" \
+    && ok "T-ID-WRONGCHECKOUT host-root ≠ cwd-root → MISMATCH" \
+    || bad "T-ID-WRONGCHECKOUT host-root ≠ cwd-root → MISMATCH ($(out_of wrongco | tr '\n' ' '))"
+
+# T-ID-UNAVAIL (dead/invalid TMUX_PANE)
+run_in_pane "$S1:0.0" unavail "TMUX_PANE=%9999 FORGE_WATCH_TRIGGER=0 $BRIDGE identity"
+[ "$(rc_of unavail)" = "3" ] && out_of unavail | grep -q "identity_state=UNAVAILABLE" \
+    && ok "T-ID-UNAVAIL dead TMUX_PANE → UNAVAILABLE" \
+    || bad "T-ID-UNAVAIL dead TMUX_PANE → UNAVAILABLE ($(out_of unavail | tr '\n' ' '))"
+
+# T-ID-PROBE-TARGETED (active pane ≠ caller pane; probe must resolve the CALLER)
+tmux select-pane -t "$S1:0.1"
+run_in_pane "$S1:0.0" probetgt "FORGE_WATCH_TRIGGER=0 $BRIDGE identity"
+tmux select-pane -t "$S1:0.0"
+out_of probetgt | grep -q "host_pane=$S1P0" \
+    && ok "T-ID-PROBE-TARGETED resolves the CALLER's pane, not the active pane" \
+    || bad "T-ID-PROBE-TARGETED resolves the CALLER's pane ($(out_of probetgt | tr '\n' ' '))"
+
+# T-ID-NOTMUX-1 (exactly one same-root live session)
+tmux new-session -d -s "$S3" -x 120 -y 30 -c "$rootC"
+sleep 0.5
+n1out="$(cd "$rootC" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION "$BRIDGE" identity 2>&1)"; n1rc=$?
+if [ "$n1rc" -eq 0 ] && printf '%s' "$n1out" | grep -q "target_source=unique-root-candidate" \
+   && printf '%s' "$n1out" | grep -q "target_session=$S3"; then
+    ok "T-ID-NOTMUX-1 single same-root candidate → MATCH"
+else
+    bad "T-ID-NOTMUX-1 single same-root candidate → MATCH (rc=$n1rc out=$n1out)"
+fi
+
+# T-CTX-SINGLE (headless, 1 same-root, real context file → renders, not the degrade)
+printf 'pipeline: ctx-single-test\nnotes: []\n' > "$rootC/.dev/forge-context.$S3.yml"
+ctx1="$(cd "$rootC" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION "$BRIDGE" context 2>&1)"; ctx1rc=$?
+if [ "$ctx1rc" -eq 0 ] && ! printf '%s' "$ctx1" | grep -q "no active pipeline"; then
+    ok "T-CTX-SINGLE headless single-session context renders"
+else
+    bad "T-CTX-SINGLE headless single-session context renders (rc=$ctx1rc out=$ctx1)"
+fi
+
+# Second same-root session → ambiguity cases
+tmux new-session -d -s "$S4" -x 120 -y 30 -c "$rootC"
+sleep 0.5
+
+# T-ID-NOTMUX-2
+n2out="$(cd "$rootC" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION "$BRIDGE" identity 2>&1)"; n2rc=$?
+[ "$n2rc" -eq 3 ] && printf '%s' "$n2out" | grep -q "identity_state=AMBIGUOUS" \
+    && ok "T-ID-NOTMUX-2 two same-root candidates → AMBIGUOUS, exit 3" \
+    || bad "T-ID-NOTMUX-2 two same-root candidates → AMBIGUOUS (rc=$n2rc out=$n2out)"
+
+# T-CTX-DEGRADE (headless, >1 same-root → degrades, exit 0)
+ctx2="$(cd "$rootC" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_IDENTITY_ENFORCE=1 "$BRIDGE" context 2>&1)"; ctx2rc=$?
+if [ "$ctx2rc" -eq 0 ] && printf '%s' "$ctx2" | grep -q "no active pipeline"; then
+    ok "T-CTX-DEGRADE headless ambiguous context degrades (no refuse, enforce on)"
+else
+    bad "T-CTX-DEGRADE headless ambiguous context degrades (rc=$ctx2rc out=$ctx2)"
+fi
+
+# T-BG-DETACHED (no TMUX_PANE, 2 same-root, enforce → host-session refuses)
+bgd="$(cd "$rootC" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_IDENTITY_ENFORCE=1 "$BRIDGE" add-note detached-note 2>&1)"; bgdrc=$?
+[ "$bgdrc" -ne 0 ] && printf '%s' "$bgd" | grep -q "identity AMBIGUOUS" \
+    && ok "T-BG-DETACHED detached ambiguous mutator refused under enforce" \
+    || bad "T-BG-DETACHED detached ambiguous mutator refused under enforce (rc=$bgdrc out=$bgd)"
+
+# ---- Mutator gating (report-only vs enforce) ----
+echo "== mutator gating =="
+
+# T-ENFORCE-OFF: in-pane MISMATCH (wrong checkout) + report-only → records, proceeds
+run_in_pane "$S1:0.0" enfoff "( cd $rootB && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug mm --stage coding --from claude --to codex-a --prompt p )"
+if [ "$(rc_of enfoff)" = "0" ] && [ -f "$rootB/.dev/proposals/mm/forge-log.yml" ] \
+   && grep -q "state=MISMATCH" "$rootB/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null; then
+    ok "T-ENFORCE-OFF report-only MISMATCH mutator proceeds + IDENTITY event recorded"
+else
+    bad "T-ENFORCE-OFF report-only MISMATCH mutator proceeds (rc=$(rc_of enfoff))"
+fi
+
+# T-MUT-LOG / T-ENFORCE-ON: same but enforce=1 → refused + identity-mismatch event
+run_in_pane "$S1:0.0" enfon "( cd $rootB && FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 $BRIDGE log --slug mm2 --stage coding --from claude --to codex-a --prompt p )"
+if [ "$(rc_of enfon)" != "0" ] && [ ! -f "$rootB/.dev/proposals/mm2/forge-log.yml" ] \
+   && out_of enfon | grep -q "identity MISMATCH" \
+   && grep -q "identity-mismatch:" "$rootB/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null; then
+    ok "T-MUT-LOG/T-ENFORCE-ON enforce MISMATCH mutator refused + identity-mismatch event"
+else
+    bad "T-MUT-LOG/T-ENFORCE-ON enforce MISMATCH mutator refused (rc=$(rc_of enfon) out=$(out_of enfon | tr '\n' ' '))"
+fi
+
+# T-MUT-OK: in-pane MATCH log writes the pending with the host session stamped
+run_in_pane "$S1:0.0" mutok "FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug mutok --stage coding --from claude --to codex-a --prompt p"
+if [ "$(rc_of mutok)" = "0" ] && grep -q "session: $S1" "$rootA/.dev/proposals/mutok/forge-log.yml" 2>/dev/null; then
+    ok "T-MUT-OK in-pane MATCH log writes pending stamped with host session"
+else
+    bad "T-MUT-OK in-pane MATCH log writes pending (rc=$(rc_of mutok))"
+fi
+
+# T-BG-AGENT: a CHILD process of the pane (inherited TMUX_PANE) resolves the same host
+printf 'pipeline: bg-agent-test\nnotes: []\n' > "$rootA/.dev/forge-context.$S1.yml"
+run_in_pane "$S1:0.0" bgagent "bash -c 'FORGE_WATCH_TRIGGER=0 $BRIDGE add-note bg-agent-note-xyz'"
+if [ "$(rc_of bgagent)" = "0" ] && grep -q "bg-agent-note-xyz" "$rootA/.dev/forge-context.$S1.yml" 2>/dev/null; then
+    ok "T-BG-AGENT child process inherits TMUX_PANE → correct session context"
+else
+    bad "T-BG-AGENT child process inherits TMUX_PANE (rc=$(rc_of bgagent))"
+fi
+
+# ---- Dual-mode + cross-session validation ----
+echo "== dual-mode / cross-session =="
+
+# T-CLASS-DUAL-DEFAULT: no flags, headless, enforce → host-pane class refuses (UNAVAILABLE)
+dd="$(cd "$rootD" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_IDENTITY_ENFORCE=1 "$BRIDGE" send claude x 2>&1)"; ddrc=$?
+[ "$ddrc" -ne 0 ] && printf '%s' "$dd" | grep -q "identity UNAVAILABLE" \
+    && ok "T-CLASS-DUAL-DEFAULT flagless send stays host-pane (refused headless)" \
+    || bad "T-CLASS-DUAL-DEFAULT flagless send stays host-pane (rc=$ddrc out=$dd)"
+
+# T-CLASS-DUAL-SEND: flags upgrade to target-scoped — headless caller proceeds under enforce
+ds="$(cd "$rootA" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 "$BRIDGE" send --target-session "$S2" --cross-session claude dual-ok-marker 2>&1)"; dsrc=$?
+[ "$dsrc" -eq 0 ] \
+    && ok "T-CLASS-DUAL-SEND validated flags upgrade send to target-scoped (proceeds)" \
+    || bad "T-CLASS-DUAL-SEND validated flags upgrade send to target-scoped (rc=$dsrc out=$ds)"
+
+# T-ID-CROSS / T-CROSS-VALID: in-pane declared cross-session send to a correctly-rooted target
+run_in_pane "$S1:0.0" crossval "FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 $BRIDGE send --target-session $S2 --cross-session claude cross-ok-marker"
+sleep 1
+if [ "$(rc_of crossval)" = "0" ] && tmux capture-pane -p -t "$S2:0.1" | grep -q "cross-ok-marker"; then
+    ok "T-CROSS-VALID declared cross-session send lands in the target's pane 1"
+else
+    bad "T-CROSS-VALID declared cross-session send lands in target (rc=$(rc_of crossval))"
+fi
+
+# T-CROSS-WRONGROOT: FORGE_TMUX_LIST claims S2 is rooted elsewhere → root validation refuses
+LISTW="$WORK/tmuxlist-wrong"; printf '%s\t%s\n' "$S2" "$rootB" > "$LISTW"
+run_in_pane "$S1:0.0" crosswrong "FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 FORGE_TMUX_LIST=$LISTW $BRIDGE send --target-session $S2 --cross-session claude nope"
+if [ "$(rc_of crosswrong)" != "0" ] && out_of crosswrong | grep -q "rooted at"; then
+    ok "T-CROSS-WRONGROOT target rooted elsewhere → refused (class-3 root validation)"
+else
+    bad "T-CROSS-WRONGROOT target rooted elsewhere → refused (rc=$(rc_of crosswrong) out=$(out_of crosswrong | tr '\n' ' '))"
+fi
+
+# ---- Callback / terminal-close isolation ----
+echo "== callback / terminal-close =="
+
+# pending_entry <root> <slug> <stage> <to> <ts> [session]
+pending_entry(){
+    local d="$1/.dev/proposals/$2"; mkdir -p "$d"
+    if [ -n "${6:-}" ]; then
+        cat > "$d/forge-log.yml" <<EOF
+pipeline: $2
+entries:
+  - timestamp: "$5"
+    stage: $3
+    to: $4
+    session: $6
+    response: null
+EOF
+    else
+        cat > "$d/forge-log.yml" <<EOF
+pipeline: $2
+entries:
+  - timestamp: "$5"
+    stage: $3
+    to: $4
+    response: null
+EOF
+    fi
+}
+
+# T-CB-HEADLESS-DONE: headless caller, zero live same-root, empty-session pending, enforce=1
+pending_entry "$rootD" hdl coding codex-a "2026-07-11T00:00:00Z"
+cbh="$(cd "$rootD" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_IDENTITY_ENFORCE=1 "$BRIDGE" callback --slug hdl --stage coding --status DONE --worker codex-a --quiet 2>&1)"; cbhrc=$?
+if [ "$cbhrc" -eq 0 ] && [ -f "$rootD/.dev/forge-tmp/callbacks/hdl-coding.callback" ] \
+   && ! grep -q "response: null" "$rootD/.dev/proposals/hdl/forge-log.yml"; then
+    ok "T-CB-HEADLESS-DONE headless callback proceeds under enforce (host-degrade)"
+else
+    bad "T-CB-HEADLESS-DONE headless callback proceeds under enforce (rc=$cbhrc out=$cbh)"
+fi
+
+# T-CLOSE-ISOLATION: two same-slug/stage/to pendings for S1 and S2; close from S1 pane
+d="$rootA/.dev/proposals/xiso"; mkdir -p "$d"
+cat > "$d/forge-log.yml" <<EOF
+pipeline: xiso
+entries:
+  - timestamp: "2026-07-11T00:00:01Z"
+    stage: coding
+    to: codex-a
+    session: $S1
+    response: null
+  - timestamp: "2026-07-11T00:00:02Z"
+    stage: coding
+    to: codex-a
+    session: $S2
+    response: null
+EOF
+run_in_pane "$S1:0.0" closeiso "FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug xiso --stage coding --status DONE --worker codex-a --quiet"
+nulls=$(grep -c "response: null" "$d/forge-log.yml" 2>/dev/null)
+if [ "$(rc_of closeiso)" = "0" ] && [ "$nulls" = "1" ] \
+   && python3 -c "
+import yaml,sys
+d=yaml.safe_load(open('$d/forge-log.yml'))
+e=[x for x in d['entries'] if x.get('session')=='$S2']
+sys.exit(0 if e and e[0]['response'] is None else 1)
+"; then
+    ok "T-CLOSE-ISOLATION close from S1 leaves S2's coincident pending open"
+else
+    bad "T-CLOSE-ISOLATION close from S1 leaves S2's pending open (rc=$(rc_of closeiso) nulls=$nulls)"
+fi
+
+# T-CLOSE-HEADLESS-XSESSION-REFUSED: empty-caller close over pendings spanning 2 sessions
+d2="$rootA/.dev/proposals/xhdl"; mkdir -p "$d2"
+cat > "$d2/forge-log.yml" <<EOF
+pipeline: xhdl
+entries:
+  - timestamp: "2026-07-11T00:00:03Z"
+    stage: coding
+    to: codex-a
+    session: $S1
+    response: null
+  - timestamp: "2026-07-11T00:00:04Z"
+    stage: coding
+    to: codex-a
+    session: $S2
+    response: null
+EOF
+xh="$(cd "$rootA" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_IDENTITY_ENFORCE=1 "$BRIDGE" callback --slug xhdl --stage coding --status DONE --worker codex-a --quiet 2>&1)"; xhrc=$?
+xnulls=$(grep -c "response: null" "$d2/forge-log.yml" 2>/dev/null)
+if [ "$xhrc" -ne 0 ] && [ "$xnulls" = "2" ]; then
+    ok "T-CLOSE-HEADLESS-XSESSION-REFUSED multi-session close refused, nothing closed"
+else
+    bad "T-CLOSE-HEADLESS-XSESSION-REFUSED (rc=$xhrc nulls=$xnulls out=$xh)"
+fi
+
+# T-CB-NOTIFY-HOST: non-quiet self-callback notifies the HOST's pane 1 (target==host)
+pending_entry "$rootA" ntfy coding codex-a "2026-07-11T00:00:05Z" "$S1"
+run_in_pane "$S1:0.0" notify "FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug ntfy --stage coding --status DONE --worker codex-a --message notify-marker-xyz"
+sleep 1
+if [ "$(rc_of notify)" = "0" ] && tmux capture-pane -p -t "$S1:0.1" | grep -q "notify-marker-xyz"; then
+    ok "T-CB-NOTIFY-HOST non-quiet callback notify lands in the host's pane 1"
+else
+    bad "T-CB-NOTIFY-HOST non-quiet callback notify lands in host pane 1 (rc=$(rc_of notify))"
+fi
+
+# ---- Diagnostics under bad identity (R7) ----
+echo "== diagnostics (R7) =="
+
+# T-PREFLIGHT-ID: preflight under MISMATCH still runs, prints descriptor + yaml field, exit 0
+run_in_pane "$S1:0.0" pfid "TMUX_SESSION=$S2 FORGE_WATCH_TRIGGER=0 $BRIDGE preflight"
+if [ "$(rc_of pfid)" = "0" ] && out_of pfid | grep -q "identity_state=MISMATCH" \
+   && out_of pfid | grep -q "identity_state:     MISMATCH"; then
+    ok "T-PREFLIGHT-ID preflight runs + carries identity under MISMATCH (exit 0)"
+else
+    bad "T-PREFLIGHT-ID preflight carries identity under MISMATCH (rc=$(rc_of pfid))"
+fi
+
+# T-HEALTH-MISMATCH: health under MISMATCH + enforce STILL RUNS and prints SUMMARY
+run_in_pane "$S1:0.0" hlth "TMUX_SESSION=$S2 FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 $BRIDGE health"
+if out_of hlth | grep -q "^SUMMARY " && out_of hlth | grep -q "identity_state=MISMATCH"; then
+    ok "T-HEALTH-MISMATCH health runs-and-prints under enforce MISMATCH (R7)"
+else
+    bad "T-HEALTH-MISMATCH health runs-and-prints under enforce MISMATCH ($(out_of hlth | tail -2 | tr '\n' ' '))"
+fi
+
+# T-CANON-PREFLIGHT: symlinked cwd → directory_state OK (symmetric canonicalization)
+cp="$(cd "$WORK/aliasA" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION "$BRIDGE" preflight 2>&1)"
+printf '%s' "$cp" | grep -q "directory_state:    OK" \
+    && ok "T-CANON-PREFLIGHT symlinked checkout → directory_state OK" \
+    || bad "T-CANON-PREFLIGHT symlinked checkout → directory_state OK ($(printf '%s' "$cp" | grep directory_state))"
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
