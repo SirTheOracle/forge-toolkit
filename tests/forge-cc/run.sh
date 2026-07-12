@@ -18,6 +18,7 @@ reg(){ HOME="$FHOME" PYTHONPATH="$USERSITE" "$FORGE" register "$@"; }
 STUB="$WORK/fake-bridge"; cat > "$STUB" <<'SH'
 #!/bin/bash
 echo "$@" >> "${BRIDGE_LOG:?}"
+echo "PWD=$PWD" >> "${BRIDGE_LOG:?}"
 exit "${BRIDGE_RC:-0}"
 SH
 chmod +x "$STUB"
@@ -807,5 +808,60 @@ touch -t 202601010000 "$R/.dev/attention/archive/recover-pin-01/x.json" "$R/.dev
 "$FORGE" gc --root "$R" >/dev/null 2>&1
 [ -f "$R/.dev/attention/archive/recover-pin-01/x.json" ] && ok "gc never reaches archive/<id>/ (depth-2)" || bad "gc swept a recover archive — R6 broken"
 [ ! -f "$R/.dev/attention/archive/flat.json" ] && ok "gc depth-1 reach unchanged" || bad "gc depth-1 sweep regressed"
+
+echo "── T-SEAT-DISPATCH-ROOTBIND: seat send carries cross-session flags + root binding ──"
+new_root sb1
+BRIDGE_LOG="$WORK/blsb"; : > "$BRIDGE_LOG"
+FORGE_TMUX_LIST="$TSV" FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BRIDGE_LOG" \
+  "$FORGE" dispatch @forge-x "rootbind probe" --allow-api-billing >/dev/null 2>&1
+grep -q -- 'send --target-session forge-x --cross-session claude' "$BRIDGE_LOG" \
+  && ok "seat dispatch passes --target-session/--cross-session to send" \
+  || bad "seat dispatch argv wrong: $(cat "$BRIDGE_LOG")"
+grep -q 'TMUX_SESSION' "$BRIDGE_LOG" && bad "seat dispatch still leans on TMUX_SESSION" || ok "no TMUX_SESSION in the seat send path"
+grep -q "PWD=$(cd "$R" && pwd -P)" "$BRIDGE_LOG" && ok "seat send is cd-bound to the target root (MAJOR-1)" || bad "seat send not root-bound: $(grep PWD= "$BRIDGE_LOG")"
+
+echo "── T-SEAT-RELAY-FLAGS: ask relay callback carries the declared target ──"
+new_root rf1
+mkdir -p "$R/.dev/proposals/p-rf"
+printf 'entries:\n  - timestamp: "2026-07-11T00:00:00Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$R/.dev/proposals/p-rf/forge-log.yml"
+BRIDGE_LOG="$WORK/blrf"; : > "$BRIDGE_LOG"
+BRIDGE_LOG="$BRIDGE_LOG" FORGE_BRIDGE_BIN="$STUB" TMUX_SESSION=forge-x \
+  "$FORGE" ask --slug p-rf --stage coding --worker codex-a "flags?" --root "$R" >/dev/null 2>&1
+{ grep -q -- 'callback --target-session forge-x --cross-session' "$BRIDGE_LOG" \
+  && grep -q -- '--status BLOCKED' "$BRIDGE_LOG" && grep -q -- '--quiet' "$BRIDGE_LOG"; } \
+  && ok "relay callback declares --target-session/--cross-session (BLOCKED --quiet)" \
+  || bad "relay callback argv wrong: $(cat "$BRIDGE_LOG")"
+grep -v '^PWD=' "$BRIDGE_LOG" | grep -q 'TMUX_SESSION' && bad "relay still passes TMUX_SESSION" || ok "no TMUX_SESSION in the relay argv"
+
+if command -v tmux >/dev/null 2>&1; then
+  echo "── T-SEAT-RELAY-REPORTONLY: real-bridge out-of-tmux relay proceeds (report-only) ──"
+  new_root rr1
+  RELSESS="fccrel-$$"
+  mkdir -p "$R/.claude" "$R/.dev/proposals/p-rr" "$R/.dev/forge-tmp/callbacks"
+  printf 'name: rr1\n' > "$R/.claude/forge-project.yml"
+  printf 'entries:\n  - timestamp: "2026-07-11T00:00:01Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$R/.dev/proposals/p-rr/forge-log.yml"
+  tmux new-session -d -s "$RELSESS" -x 200 -y 50 -c "$R"
+  _i=0; while [ "$_i" -lt 4 ]; do tmux split-window -d -t "$RELSESS:0" -c "$R"; tmux select-layout -t "$RELSESS:0" tiled >/dev/null 2>&1; _i=$((_i+1)); done
+  env -u TMUX -u TMUX_PANE FORGE_WATCH_TRIGGER=0 TMUX_SESSION="$RELSESS" \
+    "$FORGE" ask --slug p-rr --stage coding --worker codex-a "report-only relay?" --root "$R" >/dev/null 2>&1
+  { [ -f "$R/.dev/forge-tmp/callbacks/p-rr-coding.callback" ] \
+    && grep -q '^status: BLOCKED' "$R/.dev/forge-tmp/callbacks/p-rr-coding.callback" \
+    && grep -q 'response: null' "$R/.dev/proposals/p-rr/forge-log.yml"; } \
+    && ok "out-of-tmux declared relay proceeds through the REAL bridge (BLOCKED keeps pending open)" \
+    || bad "real-bridge relay refused or callback not published"
+  tmux kill-session -t "$RELSESS" 2>/dev/null
+else
+  echo "  (skip T-SEAT-RELAY-REPORTONLY: no tmux)"
+fi
+
+echo "── T-LOCKSTEP: identity rule in lockstep across repo + installed prose copies ──"
+for f in "$HOME/.claude/skills/forge-orchestrator/SKILL.md" \
+         "$HOME/.claude/commands/forge.md" "$HOME/.claude/agents/forge-orchestrator.md" \
+         "$ROOT/skills/forge-orchestrator/SKILL.md" \
+         "$ROOT/commands/forge.md" "$ROOT/agents/forge-orchestrator.md"; do
+  [ -f "$f" ] || continue
+  grep -q 'export TMUX_SESSION' "$f" && bad "export TMUX_SESSION in $f" || ok "no export TMUX_SESSION: $(basename "$f")"
+  grep -q 'forge-bridge identity' "$f" && ok "references forge-bridge identity: $(basename "$f")" || bad "missing forge-bridge identity: $f"
+done
 
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]

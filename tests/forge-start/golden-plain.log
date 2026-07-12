@@ -1,5 +1,5 @@
 has-session -t forge-1
-new-session -d -s forge-1 -c __DIR__
+new-session -d -s forge-1 -c __DIR__ -e TMUX_SESSION=forge-1 -e FORGE_ROOT=__DIR__
 split-window -h -t forge-1:.0 -c __DIR__ -p 50
 split-window -v -t forge-1:.0 -c __DIR__ -p 50
 split-window -v -t forge-1:.2 -c __DIR__ -p 66

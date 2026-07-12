@@ -328,13 +328,13 @@ The bridge enforces two automatic hooks:
    `set-context --slug <slug>` once to adopt it (it never auto-adopts another
    session's pipeline).
 
-**Required (see Hard Rule 0):** the orchestrator MUST `export TMUX_SESSION=<name>`
-at session start. Background agents you spawn inherit env from your shell,
-so once you've pinned, they target the correct session automatically. The
-bridge's auto-detect fallback now refuses to pick when multiple `forge-*`
-sessions exist with the required pane count — if you forgot to pin and
-there are other forge sessions on the host, every bridge call will fail
-with a "multiple candidates" error rather than silently misrouting.
+**Required (see Hard Rule 0):** the orchestrator does NOT export `TMUX_SESSION` and
+does NOT `cat .dev/.forge-session`. Identity is the HOST PANE, resolved live by
+`forge-bridge` on every call via a `TMUX_PANE`-targeted probe. Background agents you
+spawn inherit `TMUX_PANE` and resolve your pane-1 host automatically; a detached
+agent under two same-root sessions is refused unless it passes `--target-session
+<name> --cross-session`. Run `~/bin/forge-bridge identity` to read the resolved
+`host_session=` / `identity_state=`; never `export` or `eval` a session variable.
 
 ---
 
@@ -871,32 +871,31 @@ Background agent failures follow this protocol:
 
 ## Hard Rules
 
-0. **Session pinning — step 0 on every invocation.** Before *any* other
-   action (including Rule 16's `context` load and Rule 18's `preflight`):
+0. **Identity — step 0 on every invocation.** Before *any* other action
+   (including Rule 16's `context` load and Rule 18's `preflight`), run
+   `~/bin/forge-bridge identity` and read its lines. Do NOT `export` and do NOT
+   `eval` anything — identity is the host pane, resolved live by the bridge.
 
-   1. Resolve the tmux session name:
-      - **Agent-spawned mode** — parse `Tmux session: <name>` from the spawn
-        prompt's preamble (written by `~/.claude/commands/forge.md`).
-      - **Escape-hatch mode** (`/forge-orchestrator` loaded directly into a
-        user session) — `cat .dev/.forge-session` from the project root.
-   2. If neither yields a name → halt with
-      `error: cannot resolve forge session — refusing to guess. Set TMUX_SESSION or run from a project containing .dev/.forge-session.`
-   3. Verify the session exists: `tmux has-session -t "$name"`. If not →
-      halt with `error: tmux session '<name>' does not exist. Run forge-start.`
-   4. `export TMUX_SESSION="$name"` in the orchestrator's shell environment
-      before any `forge-bridge` call. Every subsequent bridge invocation
-      inherits this and short-circuits the auto-detect fallback path that
-      was causing cross-session pane reads.
+   1. If the command exits non-zero, or `identity_state=` is not `MATCH` (nor
+      `CROSS_SESSION_DECLARED`), HALT and print the full block. Common states:
+      `MISMATCH` (contaminated env / wrong checkout — clean it up, do not proceed),
+      `AMBIGUOUS` (>1 same-root session and no host — be in a pane, or pass
+      `--target-session`), `UNAVAILABLE` (no resolvable session — run `forge-start`).
+   2. Read `host_session=` for display/logging. Every subsequent `forge-bridge`
+      call re-resolves the same host automatically; you never pin it.
+   3. **Agent-spawned mode** still parses the `Tmux session: <name>` preamble for
+      display, but validates it against `host_session=` and HALTS on a mismatch —
+      the preamble is advisory; the probe is authoritative.
 
-   **Why this rule exists:** without an explicit pin, `forge-bridge`
-   re-resolves the session on every call via `require_tmux_session`. With
-   multiple `forge-*` sessions on the host, the auto-detect fallback used
-   to silently pick the wrong one — manifesting as "the orchestrator
-   keeps reading panes from a different window." Pinning at step 0 makes
-   every bridge call deterministic.
+   **A user report of "nothing is happening in pane X" is a first-class misroute
+   signal (R9):** re-run `forge-bridge identity` and compare `host_session=` /
+   `target_session=` BEFORE any reassurance; never rebut with output from a session
+   the user is not watching.
 
-   This rule supersedes the §297-299 "Recommended" wording — passing the
-   session is now **required** for agent-spawned mode.
+   **Why this rule exists:** the 2026-07-10 incident exported a stale
+   `.dev/.forge-session` value as `TMUX_SESSION`; every bridge call trusted it and
+   dispatched a whole pipeline into the wrong session. Identity is now the live host
+   pane, and no env/file value can override it.
 
 1. **Always log before sending.** No unlogged dispatches. The bridge
    enforces this — `send` to worker panes will fail with `HOOK BLOCKED`

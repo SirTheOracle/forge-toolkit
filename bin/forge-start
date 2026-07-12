@@ -96,10 +96,30 @@ else
     _RP0=""; _RP1=""; _RP4=""
 fi
 
+# R8 populate: a spawn-created session carries -e TMUX_SESSION by construction; an
+# arbitrary pre-existing 1-pane session may not, and pane 0's already-running child
+# cannot be restamped in place. Set the session env and relaunch pane 0 so its child
+# inherits the stamp BEFORE we split. Idempotent (no-op when already stamped).
+if [ "$POPULATE" = 1 ]; then
+    _stamp="$(tmux show-environment -t "$SESSION" TMUX_SESSION 2>/dev/null | sed -n 's/^TMUX_SESSION=//p')"
+    if [ "$_stamp" != "$SESSION" ]; then
+        tmux set-environment -t "$SESSION" TMUX_SESSION "$SESSION"
+        tmux set-environment -t "$SESSION" FORGE_ROOT "$DIR"
+        tmux respawn-pane -k -t "$SESSION:.0" -c "$DIR" 2>/dev/null \
+            || { echo "ERROR: --populate-existing: could not relaunch pane 0 to apply the TMUX_SESSION stamp on '$SESSION'." >&2; exit 2; }
+    fi
+fi
+
 # 5-pane split sequence (verified by Phase 2 Step 0 V6). Populate mode inherits
 # the existing detached 1-pane session (spawn created it with -c <root>); plain
 # mode creates it. Everything from the first split on is identical.
-if [ "$POPULATE" = 0 ]; then tmux new-session -d -s "$SESSION" -c "$DIR"; fi
+if [ "$POPULATE" = 0 ]; then
+    # R8: stamp session env BEFORE any pane child launches so every pane inherits
+    # TMUX_SESSION by construction. Defensive under the new model (host detection is
+    # authoritative); a missing stamp degrades to host-derived identity, never a misroute.
+    tmux new-session -d -s "$SESSION" -c "$DIR" \
+        -e "TMUX_SESSION=$SESSION" -e "FORGE_ROOT=$DIR"
+fi
 tmux split-window -h -t "$SESSION:.0" -c "$DIR" -p 50; _maybe_fail 1
 tmux split-window -v -t "$SESSION:.0" -c "$DIR" -p 50; _maybe_fail 2
 tmux split-window -v -t "$SESSION:.2" -c "$DIR" -p 66; _maybe_fail 3

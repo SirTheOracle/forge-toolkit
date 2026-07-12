@@ -40,7 +40,7 @@ in this pane, in plain English.
    Canonical user intent: <canonical_user_intent>
    Original user request: <verbatim user slash-command line>
    Project root: <cwd at /forge invocation>
-   Tmux session: <value of $TMUX_SESSION or contents of .dev/.forge-session>
+   Host session: <the host_session= line from `~/bin/forge-bridge identity`>
    Operational event log: .dev/forge-tmp/orchestrator-events.log
    ```
 
@@ -54,7 +54,9 @@ in this pane, in plain English.
 
 4. **Resume** (`/forge resume <slug>`): load SKILL.md as in step 3, then:
    1. cd to <project_root>.
-   2. Run: ~/bin/forge-bridge preflight (validates session, panes, working tree).
+   2. Run: ~/bin/forge-bridge identity (confirm identity_state=MATCH; HALT and print
+      the block otherwise), then ~/bin/forge-bridge preflight (working-tree / branch /
+      merge-state snapshot — it does NOT validate panes).
    3. Run: ~/bin/forge-bridge context (renders current pipeline context).
    4. Inspect .dev/forge-context.yml for the active stage/worker/wait state.
    5. Only if the above is stale or ambiguous, inspect .dev/proposals/<slug>/forge-log.yml.
@@ -64,12 +66,15 @@ in this pane, in plain English.
       machine recovery source.
 
 5. **Local-handled cases** (no SKILL load needed):
-   - `/forge status` (no further args) → run `~/bin/forge-bridge status` and
-     print verbatim. Identical to `/forge-status`.
-   - `/forge pause` → you are the orchestrator in this pane. Stop dispatching,
-     leave any in-flight worker callbacks intact, run `~/bin/forge-bridge
-     status` so the user sees current state, and tell the user the pipeline is
-     paused and how to resume (`/forge resume <slug>`). Do not kill worker panes.
+   - `/forge status` (no further args) → run `~/bin/forge-bridge identity` first; if
+     `identity_state=` is not `MATCH`/`CROSS_SESSION_DECLARED` (or it exits non-zero),
+     print that block and stop. Otherwise run `~/bin/forge-bridge status` and print
+     verbatim. Identical to `/forge-status`.
+   - `/forge pause` → you are the orchestrator in this pane. Confirm identity with
+     `~/bin/forge-bridge identity` first. Stop dispatching, leave any in-flight worker
+     callbacks intact, run `~/bin/forge-bridge status` so the user sees current state,
+     and tell the user the pipeline is paused and how to resume (`/forge resume
+     <slug>`). Do not kill worker panes.
 
 ## During a run
 

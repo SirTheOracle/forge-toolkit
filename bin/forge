@@ -485,7 +485,7 @@ PY
     if [ "$dry" = true ]; then
         printf 'DRY-RUN inject → %s:0.1: %s\n' "$session" "$oneliner"
     else
-        if ! TMUX_SESSION="$session" "$FORGE_BRIDGE_BIN" send claude "$oneliner"; then
+        if ! ( cd "$root" && "$FORGE_BRIDGE_BIN" send --target-session "$session" --cross-session claude "$oneliner" ); then
             _dispatch_fail "injection failed (forge-bridge send)"
         fi
         printf 'DISPATCHED @%s pane=1 sender=%s%s\n' "$session" "$sender" \
@@ -663,7 +663,8 @@ PY
     # snippet (one redaction pass feeds both the event and the callback file). A
     # bridge failure NEVER fails the worker — the attention event already carries it.
     if [ "$a_mode" = "stage" ]; then
-        ( cd "$a_root" && TMUX_SESSION="$a_sess" "$FORGE_BRIDGE_BIN" callback \
+        ( cd "$a_root" && "$FORGE_BRIDGE_BIN" callback \
+            --target-session "$a_sess" --cross-session \
             --slug "$slug" --stage "$stage" --worker "$worker" \
             --status BLOCKED --message "$a_snip" --quiet >/dev/null 2>&1 ) \
           || printf 'forge ask: bridge BLOCKED callback failed (ask %s still escalated via attention).\n' "$a_id" >&2

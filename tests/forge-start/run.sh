@@ -6,8 +6,8 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 START="$ROOT/bin/forge-start"
 GOLD="$ROOT/tests/forge-start/golden-plain.log"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fst.XXXXXX")"
-RSESS="fstrap-$$"; ROLESESS="fsrole-$$"
-trap 'tmux kill-session -t "$RSESS" 2>/dev/null; tmux kill-session -t "$ROLESESS" 2>/dev/null; rm -rf "$WORK"' EXIT
+RSESS="fstrap-$$"; ROLESESS="fsrole-$$"; SSTAMP="fsstamp-$$"; PRELSESS="fsprel-$$"
+trap 'tmux kill-session -t "$RSESS" 2>/dev/null; tmux kill-session -t "$ROLESESS" 2>/dev/null; tmux kill-session -t "$SSTAMP" 2>/dev/null; tmux kill-session -t "$PRELSESS" 2>/dev/null; rm -rf "$WORK"' EXIT
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); printf '  ok: %s\n' "$1"; }
 bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
@@ -30,6 +30,7 @@ case "$1" in
       *) n="${FAKE_PANES:-5}"; i=0; while [ "$i" -lt "$n" ]; do echo "$i"; i=$((i+1)); done ;;
     esac ;;
   display-message) echo "${FAKE_DISP:-/tmp}" ;;
+  show-environment) [ -n "${FAKE_ENV_STAMP:-}" ] && echo "TMUX_SESSION=${FAKE_ENV_STAMP}"; exit 0 ;;
   *) exit 0 ;;
 esac
 SH
@@ -65,7 +66,7 @@ out=$( TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_LAYOUT=
 [ "$rc" -ne 0 ] && ok "layout failure exits nonzero" || bad "layout failure exited 0"
 echo "$out" | grep -q 'partial-split' && ok "trap reports partial-split state" || bad "no partial-split report: $out"
 grep -q 'kill-session' "$TMLOG" && bad "trap ran kill-session" || ok "trap never kills the session"
-[ "$(cat "$POPROOT/.dev/.forge-session")" = "prior-session" ] && ok "prior .forge-session preserved byte-identical" || bad ".forge-session clobbered"
+[ "$(grep -v '^#' "$POPROOT/.dev/.forge-session" | grep -m1 .)" = "prior-session" ] && ok "prior .forge-session preserved (first non-comment line)" || bad ".forge-session clobbered"
 
 echo "── T-START-POP-ROLES: per-pane FORGE_ROLE stamps in populate launch strings ──"
 TMLOG="$WORK/roles.log"; : > "$TMLOG"
@@ -75,7 +76,15 @@ grep 'send-keys -t psess:.1' "$TMLOG" | grep -q 'FORGE_ROLE=orchestrator claude'
 grep 'send-keys -t psess:.0' "$TMLOG" | grep -q 'FORGE_ROLE=worker claude' && ok "pane 0 stamped worker" || bad "pane 0 stamp missing"
 grep 'send-keys -t psess:.4' "$TMLOG" | grep -q 'FORGE_ROLE=worker claude' && ok "pane 4 stamped worker" || bad "pane 4 stamp missing"
 grep 'send-keys -t psess:.2\|send-keys -t psess:.3' "$TMLOG" | grep -q 'FORGE_ROLE' && bad "codex panes stamped (should not be)" || ok "codex panes 2/3 unstamped"
-[ "$(cat "$POPROOT/.dev/.forge-session")" = "psess" ] && ok "populate wrote .forge-session with the session name" || bad ".forge-session not written"
+[ "$(grep -v '^#' "$POPROOT/.dev/.forge-session" | grep -m1 .)" = "psess" ] && ok "populate wrote .forge-session with the session name" || bad ".forge-session not written"
+grep -q 'set-environment -t psess TMUX_SESSION psess' "$WORK/roles.log" && ok "T-START-POP-RELAUNCH(shim): unstamped populate sets the session env stamp" || bad "unstamped populate did not set-environment"
+grep -q 'respawn-pane -k -t psess:.0' "$WORK/roles.log" && ok "T-START-POP-RELAUNCH(shim): unstamped populate relaunches pane 0" || bad "unstamped populate did not respawn pane 0"
+
+echo "── T-START-POP-RELAUNCH(shim, stamped): already-stamped populate is a no-op ──"
+TMLOG="$WORK/roles2.log"; : > "$TMLOG"
+out=$( TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_ENV_STAMP=psess2 FAKE_DISP="$POPROOT" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --populate-existing psess2 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "stamped populate exits 0" || bad "stamped populate (rc=$rc): $out"
+grep -q 'respawn-pane' "$TMLOG" && bad "stamped populate respawned pane 0 (should be no-op)" || ok "stamped populate never respawns pane 0 (idempotent)"
 
 if command -v tmux >/dev/null 2>&1; then
   echo "── T-START-POP-TRAP-LIVE: real tmux, injected failure, session survives ──"
@@ -87,7 +96,7 @@ if command -v tmux >/dev/null 2>&1; then
   tmux has-session -t "$RSESS" 2>/dev/null && ok "session still ALIVE after failure" || bad "session was killed"
   lp=$(tmux list-panes -t "$RSESS" -F '#{pane_index}' 2>/dev/null | grep -c .)
   [ "$lp" = 1 ] && ok "panes torn back down to 1 (only this run's panes removed)" || bad "pane count after trap: $lp"
-  [ "$(cat "$DL/.dev/.forge-session")" = "prior-session" ] && ok "live: prior .forge-session intact" || bad "live: .forge-session touched"
+  [ "$(grep -v '^#' "$DL/.dev/.forge-session" | grep -m1 .)" = "prior-session" ] && ok "live: prior .forge-session intact" || bad "live: .forge-session touched"
   tmux kill-session -t "$RSESS" 2>/dev/null
 
   echo "── T-START-POP-ROLES-LIVE: FORGE_ROLE reaches the launched child process ──"
@@ -110,7 +119,7 @@ SH
   FH2="$WORK/panehome"; mkdir -p "$FH2"
   printf 'export PATH="%s:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"\n' "$WORK/rolebin" > "$FH2/.zprofile"
   cp "$FH2/.zprofile" "$FH2/.zshrc"
-  ( cd "$DR" && tmux new-session -d -s "$ROLESESS" -c "$DR" -e "HOME=$FH2" -e "PATH=$WORK/rolebin:$PATH" )
+  ( cd "$DR" && tmux new-session -d -s "$ROLESESS" -c "$DR" -e "HOME=$FH2" -e "PATH=$WORK/rolebin:$PATH" -e "TMUX_SESSION=$ROLESESS" )
   ( cd "$DR" && FORGE_BRIDGE_BIN="$FB" bash "$START" --populate-existing "$ROLESESS" >/dev/null 2>&1 ) || true
   for _i in $(seq 1 15); do
     [ -f "$WORK/roles/0" ] && [ -f "$WORK/roles/1" ] && [ -f "$WORK/roles/4" ] && break
@@ -120,6 +129,31 @@ SH
   { [ "$(cat "$WORK/roles/0" 2>/dev/null)" = "worker" ] && [ "$(cat "$WORK/roles/4" 2>/dev/null)" = "worker" ]; } \
     && ok "panes 0/4 children saw FORGE_ROLE=worker" || bad "worker roles: 0='$(cat "$WORK/roles/0" 2>/dev/null)' 4='$(cat "$WORK/roles/4" 2>/dev/null)'"
   tmux kill-session -t "$ROLESESS" 2>/dev/null
+
+  echo "── T-START-STAMP-LIVE: -e birth stamp reaches a real pane child (R8) ──"
+  # A real plain-mode run would type live claude/codex launch strings into panes,
+  # so this mirrors the production new-session line the HC4 golden now pins
+  # (new-session … -e TMUX_SESSION=<name> -e FORGE_ROOT=<dir>) and proves a real
+  # child shell inherits the stamp — tmux show-environment alone is insufficient.
+  DS="$WORK/livestamp"; mkdir -p "$DS"
+  tmux new-session -d -s "$SSTAMP" -c "$DS" -e "TMUX_SESSION=$SSTAMP" -e "FORGE_ROOT=$DS"
+  tmux send-keys -t "$SSTAMP:0.0" "printf '%s' \"\$TMUX_SESSION\" > $WORK/stamp-probe" Enter
+  for _i in $(seq 1 10); do [ -s "$WORK/stamp-probe" ] && break; sleep 1; done
+  [ "$(cat "$WORK/stamp-probe" 2>/dev/null)" = "$SSTAMP" ] \
+    && ok "real pane child inherited TMUX_SESSION from the -e birth stamp" \
+    || bad "pane child TMUX_SESSION='$(cat "$WORK/stamp-probe" 2>/dev/null)' (want $SSTAMP)"
+  tmux kill-session -t "$SSTAMP" 2>/dev/null
+
+  echo "── T-START-POP-RELAUNCH-LIVE: unstamped populate stamps + relaunches pane 0 ──"
+  DP="$WORK/liverelaunch"; mkdir -p "$DP/.dev"
+  ( cd "$DP" && tmux new-session -d -s "$PRELSESS" -c "$DP" -e "HOME=$FH2" -e "PATH=$WORK/rolebin:$PATH" )
+  ( cd "$DP" && FORGE_BRIDGE_BIN="$FB" bash "$START" --populate-existing "$PRELSESS" >/dev/null 2>&1 ) || true
+  _stamp_live="$(tmux show-environment -t "$PRELSESS" TMUX_SESSION 2>/dev/null | sed -n 's/^TMUX_SESSION=//p')"
+  [ "$_stamp_live" = "$PRELSESS" ] && ok "unstamped populate installed the session env stamp" || bad "populate stamp missing: '$_stamp_live'"
+  tmux has-session -t "$PRELSESS" 2>/dev/null && ok "session survived the pane-0 relaunch" || bad "session died during relaunch"
+  _plp=$(tmux list-panes -t "$PRELSESS" -F '#{pane_index}' 2>/dev/null | grep -c .)
+  [ "$_plp" = 5 ] && ok "populate completed the 5-pane split after relaunch" || bad "pane count after relaunch populate: $_plp"
+  tmux kill-session -t "$PRELSESS" 2>/dev/null
 else
   echo "  (skip live blocks: no tmux)"
 fi
