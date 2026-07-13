@@ -842,12 +842,16 @@ if command -v tmux >/dev/null 2>&1; then
   printf 'entries:\n  - timestamp: "2026-07-11T00:00:01Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$R/.dev/proposals/p-rr/forge-log.yml"
   tmux new-session -d -s "$RELSESS" -x 200 -y 50 -c "$R"
   _i=0; while [ "$_i" -lt 4 ]; do tmux split-window -d -t "$RELSESS:0" -c "$R"; tmux select-layout -t "$RELSESS:0" tiled >/dev/null 2>&1; _i=$((_i+1)); done
-  env -u TMUX -u TMUX_PANE FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=0 TMUX_SESSION="$RELSESS" \
+  env -u TMUX -u TMUX_PANE FORGE_WATCH_TRIGGER=0 TMUX_SESSION="$RELSESS" \
     "$FORGE" ask --slug p-rr --stage coding --worker codex-a "report-only relay?" --root "$R" >/dev/null 2>&1
-  { [ -f "$R/.dev/forge-tmp/callbacks/p-rr-coding.callback" ] \
-    && grep -q '^status: BLOCKED' "$R/.dev/forge-tmp/callbacks/p-rr-coding.callback" \
+  RR_CB="$R/.dev/forge-tmp/callbacks/p-rr-coding.${RELSESS}.callback"
+  { [ -f "$RR_CB" ] \
+    && grep -q '^status: BLOCKED' "$RR_CB" \
+    && grep -q "^session: ${RELSESS}$" "$RR_CB" \
+    && grep -q '^origin: ask$' "$RR_CB" \
+    && grep -Eq '^callback_id: .+' "$RR_CB" \
     && grep -q 'response: null' "$R/.dev/proposals/p-rr/forge-log.yml"; } \
-    && ok "out-of-tmux declared relay proceeds through the REAL bridge (BLOCKED keeps pending open)" \
+    && ok "out-of-tmux declared relay publishes qualified ask callback (BLOCKED keeps pending open)" \
     || bad "real-bridge relay refused or callback not published"
   tmux kill-session -t "$RELSESS" 2>/dev/null
 else
@@ -863,5 +867,46 @@ for f in "$HOME/.claude/skills/forge-orchestrator/SKILL.md" \
   grep -q 'export TMUX_SESSION' "$f" && bad "export TMUX_SESSION in $f" || ok "no export TMUX_SESSION: $(basename "$f")"
   grep -q 'forge-bridge identity' "$f" && ok "references forge-bridge identity: $(basename "$f")" || bad "missing forge-bridge identity: $f"
 done
+
+echo "── SwiftBar render: parked title/dropdown + enriched blocked (S1–S6) ──"
+sb_render() {  # sb_render <board-json>  -> plugin stdout
+    local d; d="$(mktemp -d)"; printf '#!/bin/sh\ncat <<'\''JSON'\''\n%s\nJSON\n' "$1" > "$d/forge"
+    chmod +x "$d/forge"
+    FORGE_BIN="$d/forge" bash "$ROOT/swiftbar/forge-board.5s.sh"
+    rm -rf "$d"
+}
+# S1: parked-only board → title ⏸1, no ✓, no red !
+J='{"schema":"cc-board/1","hot":[],"active":[],"parked":[{"slug":"p","stage":"coding","reason":"r","parked_at":"2026-07-01T00:00:00Z","uncommitted":false,"root":"/x","session":"forge-1"}],"episodes":[],"tasks":[]}'
+T=$(sb_render "$J" | head -1)
+echo "$T" | grep -q '⏸1' && ! echo "$T" | grep -q '✓' && ! echo "$T" | grep -q '!' \
+  && ok "S1 parked-only title ⏸1, no ✓/!" || bad "S1 title wrong: $T"
+# S2/S3: h_iso_age via a fixture with known parked_at ages (seconds/min/hour/day; malformed; future)
+#   → assert the dropdown line's age token (Ns/Nm/Nh/Nd/?/0s)
+# S4: parked dropdown line color=gray with slug/stage/reason
+sb_render "$J" | grep -q '⏸ p/coding · parked .* · "r" | color=gray' && ok "S4 parked dropdown gray" || bad "S4 dropdown wrong"
+# S5: enriched blocked hot row carries slug/stage/age/reason
+JB='{"schema":"cc-board/1","hot":[{"condition":"ITEM-BLOCKED","slug":"p","stage":"coding","blocked_at":"2026-07-01T00:00:00Z","reason":"boom","acked":false,"session":"forge-1"}],"active":[],"parked":[],"episodes":[],"tasks":[]}'
+sb_render "$JB" | grep -q '! ITEM-BLOCKED · p/coding .* · "boom" | color=red' && ok "S5 enriched blocked row" || bad "S5 blocked row wrong"
+# S6: unseen>0 AND parked>0 → title has both 1! and ⏸1, no ✓
+J6='{"schema":"cc-board/1","hot":[{"condition":"ITEM-BLOCKED","slug":"p","stage":"coding","acked":false}],"active":[],"parked":[{"slug":"q","stage":"qa","reason":"r","parked_at":"2026-07-01T00:00:00Z","root":"/x","session":"forge-1"}],"episodes":[],"tasks":[]}'
+T6=$(sb_render "$J6" | head -1)
+echo "$T6" | grep -q '1!' && echo "$T6" | grep -q '⏸1' && ! echo "$T6" | grep -q '✓' \
+  && ok "S6 both 1! and ⏸1, no ✓" || bad "S6 title wrong: $T6"
+
+echo "── forge parked: exit codes + filters + --resolve proxy (P-1) ──"
+watch_stub() { local d; d="$(mktemp -d)"; printf '#!/bin/sh\n[ "$1" = status ] && cat <<'\''JSON'\''\n%s\nJSON\n' "$2" > "$d/forge-watch"; chmod +x "$d/forge-watch"; echo "$d"; }
+J='{"parked":[{"slug":"p","stage":"coding","worker":"codex-a","session":"forge-1","uncommitted":true,"reason":"r","root":"'"$PWD"'"}]}'
+D=$(watch_stub _ "$J")
+out=$( FORGE_WATCH_BIN="$D/forge-watch" TMUX_SESSION=forge-1 "$ROOT/bin/forge" parked --root "$PWD" --session forge-1 2>&1 ); rc=$?
+[ "$rc" -eq 10 ] && echo "$out" | grep -q 'worker=codex-a' && echo "$out" | grep -q 'session=forge-1' \
+  && ok "P-1 exit 10 + worker/session fields" || bad "P-1 wrong: rc=$rc $out"
+out=$( FORGE_WATCH_BIN="$D/forge-watch" "$ROOT/bin/forge" parked --root "$PWD" --session other 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "P-1 session filter → exit 0 (empty)" || bad "P-1 filter wrong: rc=$rc"
+rm -rf "$D"
+# P-1 resolve proxy: stub FORGE_BRIDGE_BIN, assert it is called with the note as one argv
+D=$(mktemp -d); printf '#!/bin/sh\necho "$@" > "%s/called"\n' "$D" > "$D/forge-bridge"; chmod +x "$D/forge-bridge"
+FORGE_BRIDGE_BIN="$D/forge-bridge" "$ROOT/bin/forge" parked --resolve p coding --note "a b c" >/dev/null 2>&1
+grep -q 'park --resolve --slug p --stage coding --note a b c' "$D/called" && ok "P-1 --resolve proxies bridge (note one argv)" || bad "P-1 resolve proxy wrong: $(cat "$D/called")"
+rm -rf "$D"
 
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]

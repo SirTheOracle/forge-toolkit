@@ -23,6 +23,8 @@
 #                  archive dead-session residue (crash recovery; never deletes)
 #   forge recover --service | --install | --uninstall | --print-registry
 #                  once-per-boot detection-only scan (com.forge.recover)
+#   forge parked [--root PATH] [--session S] [--json]   list parked items (exit 10 if any)
+#   forge parked --resolve <slug> <stage> [--note "…"]  clear a parked item (proxies bridge)
 #
 # Dispatch REUSES `forge-bridge send claude` (the proven 3-step cmd_send split);
 # it never reimplements tmux send-keys. Every write lands under the target root's
@@ -1947,6 +1949,71 @@ sys.exit(0)
 PY
 }
 
+cmd_parked() {
+    local root_filter="" session_filter="" jsonout=0 resolve=0 rslug="" rstage="" note=""
+    while [ $# -gt 0 ]; do case "$1" in
+        --root)     root_filter="$2"; shift 2 ;;
+        --session)  session_filter="$2"; shift 2 ;;
+        --json)     jsonout=1; shift ;;
+        --resolve)  resolve=1; rslug="$2"; rstage="$3"; shift 3 ;;
+        --note)     note="$2"; shift 2 ;;
+        *)          die "parked: unknown flag $1" ;;
+    esac; done
+
+    # Resolve facade — one spelling: proxies forge-bridge park --resolve. Quote the note
+    # as a single argv (no word-split on a multi-word reason).
+    if [ "$resolve" = 1 ]; then
+        [ -n "$rslug" ] && [ -n "$rstage" ] || die "parked --resolve requires <slug> <stage>"
+        if [ -n "$note" ]; then
+            exec "$FORGE_BRIDGE_BIN" park --resolve --slug "$rslug" --stage "$rstage" --note "$note"
+        else
+            exec "$FORGE_BRIDGE_BIN" park --resolve --slug "$rslug" --stage "$rstage"
+        fi
+    fi
+
+    # Defaults: current project root + current session. No _current_root helper exists —
+    # walk up to .claude/forge-project.yml like cmd_ask.
+    if [ -z "$root_filter" ]; then
+        local d; d="$(pwd)"
+        while [ "$d" != "/" ] && [ ! -f "$d/.claude/forge-project.yml" ]; do d="$(dirname "$d")"; done
+        root_filter="$(cd "$d" 2>/dev/null && pwd || true)"
+    fi
+    [ -z "$session_filter" ] && session_filter="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null || true)}"
+
+    # Board JSON rides in an env var — a heredoc owns python's stdin (see
+    # swiftbar/forge-board.5s.sh:21), so a `… | python3 - <<PY` pipe is discarded.
+    local _board; _board="$("$FORGE_WATCH_BIN" status --board 2>/dev/null)"
+    FORGE_PK_ROOT="$root_filter" FORGE_PK_SESSION="$session_filter" FORGE_PK_JSON="$jsonout" \
+    FORGE_PK_BOARD="$_board" python3 - <<'PY'
+import os, json, sys
+try:
+    b = json.loads(os.environ.get("FORGE_PK_BOARD") or "")
+except Exception:
+    print("forge parked: board unavailable", file=sys.stderr); sys.exit(1)
+root = os.environ.get("FORGE_PK_ROOT") or ""
+sess = os.environ.get("FORGE_PK_SESSION") or ""
+jsonout = os.environ.get("FORGE_PK_JSON") == "1"
+rows = b.get("parked") or []
+def keep(r):
+    if root and os.path.realpath(r.get("root") or "") != os.path.realpath(root):
+        return False
+    if sess and (r.get("session") or "") != sess:
+        return False
+    return True
+rows = [r for r in rows if keep(r)]
+if jsonout:
+    print(json.dumps(rows, indent=2))
+else:
+    if not rows:
+        print("no parked items in scope")
+    for r in rows:
+        unco = " UNCOMMITTED" if r.get("uncommitted") else ""
+        print(f"⏸ {r.get('slug')}/{r.get('stage')} · worker={r.get('worker')} "
+              f"session={r.get('session')}{unco} : {r.get('reason') or ''}")
+sys.exit(10 if rows else 0)
+PY
+}
+
 case "${1:-help}" in
     dispatch)  shift; cmd_dispatch "$@" ;;
     reply)     shift; cmd_reply "$@" ;;
@@ -1962,6 +2029,7 @@ case "${1:-help}" in
     tasks)     shift; exec "$FORGE_WATCH_BIN" status --tasks "$@" ;;
     gc)        shift; cmd_gc "$@" ;;
     recover)   shift; cmd_recover "$@" ;;
-    -h|--help|help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register status board tasks gc recover)" ;;
+    parked)    shift; cmd_parked "$@" ;;
+    -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register status board tasks gc recover parked)" ;;
 esac

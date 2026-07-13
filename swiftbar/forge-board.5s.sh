@@ -42,8 +42,27 @@ def h_age(s):
         s = 0
     return f"{s//3600}h" if s >= 3600 else (f"{s//60}m" if s >= 60 else f"{s}s")
 
+def h_iso_age(ts):
+    # Parse %Y-%m-%dT%H:%M:%SZ against current UTC. malformed → '?'; future/negative
+    # → '0s' (clock-skew fail-safe). Seconds/minutes/hours/days.
+    import datetime
+    if not ts or not isinstance(ts, str):
+        return '?'
+    try:
+        dt = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(
+            tzinfo=datetime.timezone.utc)
+    except (ValueError, TypeError):
+        return '?'
+    s = int((datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds())
+    if s < 0:
+        s = 0
+    if s >= 86400:
+        return f"{s//86400}d"
+    return f"{s//3600}h" if s >= 3600 else (f"{s//60}m" if s >= 60 else f"{s}s")
+
 hot   = b.get("hot") or []
 tasks = b.get("tasks") or []
+parked = b.get("parked") or []             # additive cc-board/1 key (.get or [])
 eps   = b.get("episodes") or []            # absent on an older forge-watch → today's render
 # In-progress = worker-pane episodes only, by decision (final-plan D5): SESSION-WORKING
 # (pane-1/operator seat) is deliberately NOT counted — the gear means worker progress.
@@ -56,7 +75,11 @@ if unseen:
     parts.append(f"{unseen}!")
 if inprog:
     parts.append(f"⚙{len(inprog)}")
-if not unseen and not inprog:
+if parked:
+    parts.append(f"⏸{len(parked)}")        # between ⚙N and ✓; never part of `unseen`
+# ✓ only when unseen, in-progress, AND parked are all empty — a parked-only board must
+# never render "⏸1 ✓".
+if not unseen and not inprog and not parked:
     parts.append("✓")
 print(" ".join(parts) + (" ⚠" if stale else "") + f" | templateImage={ICON}")
 print("---")
@@ -68,10 +91,27 @@ for r in hot:
     if r.get("acked"):
         continue
     who = esc(r.get("session") or r.get("label") or "")
-    print(f"! {esc(r.get('condition'))} · {who} | color=red")
+    slug = r.get("slug"); stage = r.get("stage")
+    if slug and stage:
+        age = h_iso_age(r.get("blocked_at")) if r.get("blocked_at") else ""
+        tail = f" · {age}" if age else ""
+        reason = esc(r.get("reason") or "")[:40]
+        rtail = f' · "{reason}"' if reason else ""
+        print(f"! {esc(r.get('condition'))} · {esc(slug)}/{esc(stage)}{tail}{rtail} | color=red")
+    else:
+        print(f"! {esc(r.get('condition'))} · {who} | color=red")
 acked = len(hot) - unseen
 if acked:
     print(f"{acked} seen item(s) hidden — details: forge board | color=gray")
+for r in parked[:3]:
+    slug = esc(r.get("slug") or "")
+    stage = esc(r.get("stage") or "")
+    age = h_iso_age(r.get("parked_at"))
+    unco = " · UNCOMMITTED" if r.get("uncommitted") else ""
+    reason = esc(r.get("reason") or "")[:40]
+    print(f'⏸ {slug}/{stage} · parked {age}{unco} · "{reason}" | color=gray')
+if len(parked) > 3:
+    print(f"+{len(parked) - 3} more parked · forge board | color=gray")
 for e in inprog[:8]:
     who = esc(e.get("session") or e.get("label") or "?")
     pane = f" p{e['pane']}" if e.get("pane") not in (None, "") else ""

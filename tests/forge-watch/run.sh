@@ -95,6 +95,42 @@ message: |
 EOF
 }
 
+parked_entry() {  # <root> <slug> <stage> <to> <ts> <reason> [uncommitted] [session]
+    local d="$1/.dev/proposals/$2"; mkdir -p "$d"
+    { echo "entries:"; echo "  - timestamp: \"$5\""; echo "    stage: $3"; echo "    to: $4";
+      [ -n "${8:-}" ] && echo "    session: $8";
+      echo "    parked_at: $5"; echo "    parked_reason: \"$6\""; echo "    uncommitted: ${7:-false}";
+      echo "    response: null"; } > "$d/forge-log.yml"
+}
+parked_entry_append() {  # <root> <slug> <stage> <to> <ts> <reason> [session]
+    { echo "  - timestamp: \"$5\""; echo "    stage: $3"; echo "    to: $4";
+      [ -n "${7:-}" ] && echo "    session: $7";
+      echo "    parked_at: $5"; echo "    parked_reason: \"$6\""; echo "    uncommitted: false";
+      echo "    response: null"; } >> "$1/.dev/proposals/$2/forge-log.yml"
+}
+parked_callback() {  # <root> <slug> <stage> <worker> [session]
+    local f; if [ -n "${5:-}" ]; then f="$1/.dev/forge-tmp/callbacks/$2-$3.$5.callback";
+    else f="$1/.dev/forge-tmp/callbacks/$2-$3.callback"; fi
+    { echo "slug: $2"; echo "stage: $3"; echo "status: PARKED"; echo "worker: $4";
+      [ -n "${5:-}" ] && echo "session: $5"; echo "callback_id: ${2}-${3}-x";
+      echo "parked_at: $(iso_ago 120)"; echo "parked_reason: \"held\""; echo "uncommitted: false";
+      echo "timestamp: $(iso_ago 120)"; echo "message: |"; echo "  parked"; } > "$f"
+}
+ask_callback() {  # <root> <slug> <stage> <worker>
+    cat > "$1/.dev/forge-tmp/callbacks/$2-$3.callback" <<EOF
+slug: $2
+stage: $3
+status: BLOCKED
+origin: ask
+worker: $4
+callback_id: ${2}-${3}-x
+timestamp: $(iso_ago 60)
+message: |
+  operator ask
+EOF
+}
+board_parked() { run_status --board | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin).get("parked") or []))'; }
+
 evlog() { echo "$1/.dev/forge-tmp/orchestrator-events.log"; }
 evlog_touch() { : > "$(evlog "$1")"; }        # empty file to baseline against
 evlog_append() { echo "$2" >> "$(evlog "$1")"; }
@@ -187,10 +223,12 @@ assert_notified "p-ev.*ERRORED" "STAGE status=error event fires STAGE-ERROR"
 echo "── WORKER-BLOCKED ──"
 new_env wb
 R=$(mk_root proj); live_session forge-1 "$R"
+# W7 event-path BLOCKED negative regression (C2.5: event k=v line cannot carry payload
+# and is ungated; emission removed — the gated live scan is the sole source)
 evlog_touch "$R"; run_check >/dev/null
-evlog_append "$R" "CALLBACK: pipeline=p-blk stage=qa worker=codex-a status=BLOCKED message_len=10 callback_file=x"
+evlog_append "$R" "CALLBACK: pipeline=p-ev2 stage=qa worker=codex-a status=BLOCKED message_len=10 callback_file=x"
 run_check >/dev/null
-assert_notified "p-blk.*BLOCKED" "CALLBACK status=BLOCKED event fires"
+assert_not_notified "p-ev2" "W7 event-path BLOCKED no longer fires"
 
 new_env wb2
 R=$(mk_root proj); live_session forge-1 "$R"
@@ -253,6 +291,92 @@ echo work > "$R/.dev/proposals/p-idle/diagnosis.md"
 touch -t "$(python3 -c "import datetime;print((datetime.datetime.now()-datetime.timedelta(seconds=1800)).strftime('%Y%m%d%H%M'))")" "$R/.dev/proposals/p-idle/diagnosis.md"
 run_check >/dev/null
 assert_notified "p-idle.*stalled" "stale pending with only OLD artifacts still fires WORKER-STALLED"
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo "── ITEM-PARKED (log-authoritative) + PARK-INCONSISTENT ──"
+# W2 log-only reconstruction
+new_env w2
+R=$(mk_root proj); live_session forge-1 "$R"
+parked_entry "$R" p-park coding codex-a "$(iso_ago 300)" "out of scope now" false forge-1
+run_check >/dev/null
+assert_status_has "p-park.*parked at coding" "W2 ITEM-PARKED row from log alone"
+assert_notified "p-park.*incomplete park" "W2 hot PARK-INCONSISTENT"
+
+# W3 entry + BLOCKED callback → parked row + repair
+new_env w3
+R=$(mk_root proj); live_session forge-1 "$R"
+parked_entry "$R" p-pk3 coding codex-a "$(iso_ago 300)" "reason3" false forge-1
+callback "$R" p-pk3 coding BLOCKED codex-a
+run_check >/dev/null
+assert_status_has "p-pk3.*parked at coding" "W3 parked row present"
+assert_notified "p-pk3.*incomplete park" "W3 repair finding"
+
+# W4 orphan PARKED callback
+new_env w4
+R=$(mk_root proj); live_session forge-1 "$R"
+parked_callback "$R" p-orph coding codex-a forge-1
+run_check >/dev/null
+assert_notified "p-orph.*orphan PARKED callback" "W4 orphan repair finding"
+
+# W5 agreement → clean ITEM-PARKED + board payload
+new_env w5
+R=$(mk_root proj); live_session forge-1 "$R"
+parked_entry "$R" p-ok coding codex-a "$(iso_ago 300)" "held reason" true forge-1
+parked_callback "$R" p-ok coding codex-a forge-1
+run_check >/dev/null
+assert_not_notified "p-ok.*incomplete park" "W5 no repair on agreement"
+board_parked | python3 -c 'import json,sys
+r=json.load(sys.stdin); assert r and r[0]["slug"]=="p-ok" and r[0]["stage"]=="coding" \
+  and r[0]["reason"]=="held reason" and r[0]["uncommitted"] is True \
+  and r[0]["worker"]=="codex-a" and r[0]["session"]=="forge-1", r' \
+  && ok "W5 board[parked][0] payload" || bad "W5 board parked payload wrong"
+
+# W6 duplicates
+new_env w6
+R=$(mk_root proj); live_session forge-1 "$R"
+parked_entry "$R" p-dup coding codex-a "$(iso_ago 500)" "older" false forge-1
+parked_entry_append "$R" p-dup coding codex-a "$(iso_ago 100)" "newer" forge-1
+run_check >/dev/null
+assert_status_has "p-dup.*×2 entries" "W6 duplicate ×2 flag"
+
+# W11 parked excluded from stall
+new_env w11
+R=$(mk_root proj); live_session forge-1 "$R"
+parked_entry "$R" p-ps coding codex-a "$(iso_ago 6000000)" "old parked" false forge-1
+run_check >/dev/null
+assert_not_notified "p-ps.*stalled" "W11 parked excluded from stall"
+
+# W12 ack leaves parked[] + PRETTY intact
+new_env w12
+R=$(mk_root proj); live_session forge-1 "$R"
+parked_entry "$R" p-ack coding codex-a "$(iso_ago 300)" "keep" false forge-1
+parked_callback "$R" p-ack coding codex-a forge-1
+run_check >/dev/null
+"$WATCH" ack p-ack >/dev/null 2>&1 || true
+run_check >/dev/null
+run_status --pretty | grep -q "p-ack/coding" && ok "W12 PRETTY parked survives ack" || bad "W12 PRETTY parked lost"
+board_parked | grep -q '"p-ack"' && ok "W12 board parked survives ack" || bad "W12 board parked lost"
+
+# W13 7-day survival
+new_env w13
+R=$(mk_root proj); live_session forge-1 "$R"
+parked_entry "$R" p-7d coding codex-a "$(iso_ago 604800)" "week old" false forge-1
+parked_callback "$R" p-7d coding codex-a forge-1
+run_check >/dev/null
+assert_status_has "p-7d.*parked at coding" "W13 parked survives 7 days"
+
+# W16 ITEM-PARKED not suppressed by an ask on a different stage
+new_env w16
+R=$(mk_root proj); live_session forge-1 "$R"
+parked_entry "$R" p-mix coding codex-a "$(iso_ago 300)" "parked" false forge-1
+parked_callback "$R" p-mix coding codex-a forge-1
+# APPEND a second open pending (qa/ask) to the SAME log — production accumulates all
+# stage entries in one forge-log.yml; a plain pending_log would clobber the parked entry.
+{ echo "  - timestamp: \"$(iso_ago 30)\""; echo "    stage: qa"; echo "    to: codex-b";
+  echo "    session: forge-1"; echo "    response: null"; } >> "$R/.dev/proposals/p-mix/forge-log.yml"
+ask_callback "$R" p-mix qa codex-b
+run_check >/dev/null
+assert_status_has "p-mix.*parked at coding" "W16 parked coexists with an ask"
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo "── event: PIPELINE-ERROR / STALL / COMPLETE ──"

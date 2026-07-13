@@ -593,9 +593,73 @@ def scan_root(root):
             live_blocked[(slug, stage)] = cb
 
     for (slug, stage), cb in live_blocked.items():
+        first = cb.get('_first_line') or 'needs a human'
         msg = f"{label} · {slug} — worker BLOCKED at {stage} (needs a human)"
-        add_finding('WORKER-BLOCKED', root, f"{slug}\t{stage}", msg,
-                    slug=slug, stage=stage)
+        f = add_finding('WORKER-BLOCKED', root, f"{slug}\t{stage}", msg,
+                        slug=slug, stage=stage, session=cb.get('session'))
+        f['reason'] = first
+        f['blocked_at'] = cb.get('timestamp')
+        f['worker'] = cb.get('worker')
+
+    # --- PARKED (log-authoritative, §3.1): open pendings carrying parked_at ---
+    # Keyed by (slug, stage, session) — two sessions sharing one root with the SAME
+    # slug/stage are DISTINCT parked items, never each other's duplicate (§3.2).
+    parked = {}            # (slug,stage,session) -> newest parked pending dict
+    parked_dups = {}       # (slug,stage,session) -> count of older duplicates
+    parked_stages = set()  # (slug,stage) for stale-exclusion across all sessions
+    for slug, plist in open_by_slug.items():
+        by_key = {}
+        for p in plist:
+            if p.get('parked_at'):
+                by_key.setdefault((p.get('stage'), p.get('session')), []).append(p)
+        for (stage, sess), lst in by_key.items():
+            lst.sort(key=lambda p: p.get('timestamp') or '')
+            parked[(slug, stage, sess)] = lst[-1]          # D2 newest
+            parked_stages.add((slug, stage))
+            if len(lst) > 1:
+                parked_dups[(slug, stage, sess)] = len(lst) - 1
+
+    parked_cbs = {}        # (slug,stage,session|None) -> cb
+    for cbp in glob.glob(os.path.join(tmp, 'callbacks', '*.callback')):
+        cb = parse_callback(cbp)
+        if not cb:
+            continue
+        if (cb.get('status') or '').upper() == 'PARKED':
+            s, st = cb.get('slug'), cb.get('stage')
+            if s and st:
+                parked_cbs[(s, st, cb.get('session'))] = cb
+
+    def _cb_for(slug, stage, sess):
+        if (slug, stage, sess) in parked_cbs:
+            return parked_cbs[(slug, stage, sess)]
+        return parked_cbs.get((slug, stage, None))   # legacy unowned fallback
+
+    for (slug, stage, sess), p in parked.items():
+        reason = p.get('parked_reason') or '(no reason recorded)'
+        unco = bool(p.get('uncommitted'))
+        worker = p.get('to')
+        entry_ts = p.get('timestamp')
+        dups = parked_dups.get((slug, stage, sess), 0)
+        cb = _cb_for(slug, stage, sess)
+        if cb is None or (cb.get('status') or '').upper() != 'PARKED':
+            add_finding('PARK-INCONSISTENT', root, f"{slug}\t{stage}\t{sess}\tentry",
+                        f"{label} · {slug} — incomplete park at {stage} — re-run park",
+                        slug=slug, stage=stage, session=sess)
+        umark = ' · UNCOMMITTED WORK' if unco else ''
+        dmark = f" · ×{dups+1} entries" if dups else ''
+        msg = f"{label} · {slug} — parked at {stage}{umark}{dmark}: {reason}"
+        f = add_finding('ITEM-PARKED', root, f"{slug}\t{stage}\t{sess}", msg,
+                        policy='daily', slug=slug, stage=stage, session=sess)
+        f['reason'] = reason; f['parked_at'] = p.get('parked_at')
+        f['uncommitted'] = unco; f['worker'] = worker
+        f['entry_ts'] = entry_ts; f['duplicates'] = dups
+
+    for (slug, stage, sess), cb in parked_cbs.items():
+        if (slug, stage, sess) not in parked and (slug, stage, None) not in parked \
+           and (slug, stage) not in parked_stages:
+            add_finding('PARK-INCONSISTENT', root, f"{slug}\t{stage}\t{sess}\torphan",
+                        f"{label} · {slug} — orphan PARKED callback at {stage} — consume or re-park",
+                        slug=slug, stage=stage, session=sess)
 
     # --- WORKER-STALLED (suppressed when a live BLOCKED callback covers it) ---
     # A pending crossing the STALE threshold (2x FORGE_STALL_THRESHOLD_S) is an
@@ -605,7 +669,7 @@ def scan_root(root):
     # Same active-vs-residue split the zombie triggers use, same knob.
     for slug, p in stale_pendings:
         stage = p.get('stage')
-        if (slug, stage) in live_blocked:
+        if (slug, stage) in live_blocked or (slug, stage) in parked_stages:
             continue
         # Activity gate: a stage actively writing artifacts under its proposals
         # dir is WORKING, not stalled — a multi-round plan stage legitimately
@@ -716,11 +780,11 @@ def _handle_event_line(root, label, line):
             if k == 'pipeline':
                 slug = v
     stage = fields.get('result_stage') or fields.get('stage')
-    if typ == 'CALLBACK' and fields.get('status', '').upper() == 'BLOCKED':
-        msg = f"{label} · {slug} — worker BLOCKED at {stage} (needs a human)"
-        add_finding('WORKER-BLOCKED', root, f"{slug}\t{stage}", msg,
-                    slug=slug, stage=stage)
-    elif typ == 'STAGE' and fields.get('status') == 'error':
+    # Event-path BLOCKED emission REMOVED (R2 §2.2): the k=v event line cannot carry
+    # payload and is ungated (re-raises already-resolved blocks). The gated live scan
+    # (scan_root live_blocked) is the sole source and carries reason + blocked_at;
+    # every cmd_callback already fires an immediate detached `forge-watch check`.
+    if typ == 'STAGE' and fields.get('status') == 'error':
         msg = f"{label} · {slug} — stage {stage} ERRORED"
         add_finding('STAGE-ERROR', root, f"{slug}\t{stage}", msg,
                     slug=slug, stage=stage)
@@ -1453,12 +1517,13 @@ if MODE == 'check':
 # ── output ───────────────────────────────────────────────────────────────
 NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
           'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
-          'TASK-STUCK', 'EPISODE-STUCK',
+          'PARK-INCONSISTENT', 'TASK-STUCK', 'EPISODE-STUCK',
           'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'STATE-UNPARSEABLE',
           'RECOVER-PENDING']
 order = {c: i for i, c in enumerate(
-    NOTIFY + ['SESSION-QUEUED', 'SESSION-WORKING', 'EPISODE-ACTIVE', 'SESSION-DONE',
+    NOTIFY + ['ITEM-PARKED',
+              'SESSION-QUEUED', 'SESSION-WORKING', 'EPISODE-ACTIVE', 'SESSION-DONE',
               'EPISODE-SETTLED',
               'ZOMBIE-STALE-CONTEXT', 'STALE-PENDING', 'PANE-DONE-RESIDUE',
               'CODEX-EMISSION-OFF', 'LEGACY-CONTEXT'])}
@@ -1466,7 +1531,7 @@ findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
 
 HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
        'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
-       'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
+       'PARK-INCONSISTENT', 'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
        'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING'}
 ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE',
@@ -1480,6 +1545,8 @@ STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
             'SPAWN-NEEDS-REPAIR': 'needs-input', 'SPAWN-POPULATE-FAILED': 'needs-input',
             'SPAWN-FIRST-LAUNCH': 'needs-input'}
 def _cls(c):
+    if c == 'ITEM-PARKED':
+        return 'parked'
     return 'hot' if c in HOT else 'active' if c in ACTIVE else 'maintenance'
 
 def _task_ts(t):
@@ -1620,14 +1687,28 @@ if BOARD:
         # Episode metadata must be copied EXPLICITLY (R1c) — _row emits a fixed field set
         # and would otherwise silently drop it from board rows.
         for kx in ('pane', 'episode_id', 'first_at', 'last_at', 'turn_count',
-                   'mid_turn', 'earlier'):
+                   'mid_turn', 'earlier',
+                   'reason', 'parked_at', 'uncommitted', 'worker', 'entry_ts',
+                   'duplicates', 'blocked_at'):
             if kx in f:
-                r[kx] = f[kx]
+                v = f[kx]
+                # Board rows are JSON — coerce any datetime (unquoted YAML timestamps,
+                # e.g. the callback `timestamp:` and log `parked_at:`) to the canonical
+                # ...Z string consumers (h_iso_age) expect; strings/bools pass through.
+                r[kx] = v.strftime('%Y-%m-%dT%H:%M:%SZ') if hasattr(v, 'strftime') else v
         return r
-    hot, active, maint = [], [], []
+    hot, active, maint, parked_rows = [], [], [], []
     for f in findings:
         r = _row(f)
-        (hot if r['class'] == 'hot' else active if r['class'] == 'active' else maint).append(r)
+        cl = r['class']
+        if cl == 'parked':
+            parked_rows.append(r)
+        elif cl == 'hot':
+            hot.append(r)
+        elif cl == 'active':
+            active.append(r)
+        else:
+            maint.append(r)
     tick = state.get('last_tick'); tick_age = age_s(tick) if tick else None
     task_rows = sorted(TASKS, key=_task_ts, reverse=True)[:200]
     # episodes[]: assembled at BOARD time from the all-roots accumulator (R3a); sort + cap
@@ -1638,7 +1719,7 @@ if BOARD:
              'heartbeat': tick,
              'heartbeat_age_s': (int(tick_age) if tick_age is not None else None),
              'stale': (tick_age is None or tick_age > STALE_TICK_S),
-             'hot': hot, 'active': active,
+             'hot': hot, 'active': active, 'parked': parked_rows,
              'maintenance': {'collapsed': True, 'count': len(maint), 'rows': maint},
              'tasks': task_rows,
              'episodes': episode_rows}
@@ -1702,6 +1783,20 @@ if PRETTY:
                 print('    ' + paint('36',
                       '-> interactive prompt — answer in the pane '
                       f'(cannot be dispatched){where}'))
+
+    parked_fs = [f for f in findings if f['condition'] == 'ITEM-PARKED']
+    if parked_fs:
+        print()
+        print(sect(f'PARKED ({len(parked_fs)})', color='33'))
+        for f in parked_fs:
+            age = human_age(age_s(f.get('parked_at'))) if f.get('parked_at') else '?'
+            unc = ' · UNCOMMITTED' if f.get('uncommitted') else ''
+            dups = f.get('duplicates') or 0
+            dmark = f' · ×{dups+1} entries' if dups else ''
+            reason = clip(f.get('reason') or '', R_WIDTH - 40)
+            print('  ' + paint('33', '⏸ ')
+                  + paint('1', f"{f.get('slug')}/{f.get('stage')}")
+                  + paint('2', f" · parked {age}{unc}{dmark}") + f" : {reason}")
 
     if sess_map:
         print()
