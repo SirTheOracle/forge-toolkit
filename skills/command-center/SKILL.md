@@ -26,7 +26,7 @@ forge tasks @<session> [--json]
 ```
 
 `hot` rows are the only ones that need action now: `NEEDS-ASK` (a worker asked a
-blocking question), `NEEDS-DECISION`, `WORKER-BLOCKED`, `NEEDS-PERMISSION`,
+blocking question), `NEEDS-DECISION`, `ITEM-BLOCKED`, `PARK-INCONSISTENT`, `NEEDS-PERMISSION`,
 `*-ERROR`, `WORKER-STALLED`, `ZOMBIE-ACTIVE`. `active` rows (`queued-input`,
 `working`, `done`) are informational. `maintenance` is collapsed by default.
 

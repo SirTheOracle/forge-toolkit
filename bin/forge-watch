@@ -594,8 +594,8 @@ def scan_root(root):
 
     for (slug, stage), cb in live_blocked.items():
         first = cb.get('_first_line') or 'needs a human'
-        msg = f"{label} · {slug} — worker BLOCKED at {stage} (needs a human)"
-        f = add_finding('WORKER-BLOCKED', root, f"{slug}\t{stage}", msg,
+        msg = f"{label} · {slug} — blocked at {stage}: {first}"
+        f = add_finding('ITEM-BLOCKED', root, f"{slug}\t{stage}", msg,
                         slug=slug, stage=stage, session=cb.get('session'))
         f['reason'] = first
         f['blocked_at'] = cb.get('timestamp')
@@ -1164,7 +1164,7 @@ def scan_attention(root, label):
     # superseded by a later Stop — it stays hot until answered (dispatch --answers
     # archives it out of this depth-1 glob). A very old ask is abandoned residue
     # (same ZOMBIE_AGE_S cutoff the permission feed uses). Precedence ask > BLOCKED
-    # is enforced by the WORKER-BLOCKED suppression at the run-scan level below.
+    # is enforced by the ITEM-BLOCKED suppression at the run-scan level below.
     for rec in asks:
         aid = rec.get('ask_id')
         if not aid:
@@ -1478,23 +1478,23 @@ if zombie_slugs:
                         and (f['root'], f['slug']) in zombie_slugs)]
 
 # Precedence ask > open BLOCKED callback: a stage-mode `forge ask` writes BOTH an
-# ask event (NEEDS-ASK) AND a BLOCKED callback (WORKER-BLOCKED via scan_root) for
+# ask event (NEEDS-ASK) AND a BLOCKED callback (ITEM-BLOCKED via scan_root) for
 # the same (root,slug,stage). Keep only the richer NEEDS-ASK (it carries the
 # question) so one escalation is not notified twice.
 ask_stage_keys = {(f['root'], f['slug'], f['stage']) for f in findings
                   if f['condition'] == 'NEEDS-ASK' and f['slug'] and f['stage']}
 if ask_stage_keys:
     findings = [f for f in findings
-                if not (f['condition'] == 'WORKER-BLOCKED'
+                if not (f['condition'] == 'ITEM-BLOCKED'
                         and (f['root'], f['slug'], f['stage']) in ask_stage_keys)]
 
-# ABANDONED supersedes its plain WORKER-BLOCKED twin (same (root,slug,stage)) — one
+# ABANDONED supersedes its plain ITEM-BLOCKED twin (same (root,slug,stage)) — one
 # escalation, not two. (Condition string renamed to ITEM-BLOCKED with the emission in P19.)
 aband_keys = {(f['root'], f['slug'], f['stage']) for f in findings
               if f['condition'] == 'ITEM-BLOCKED-ABANDONED' and f['slug'] and f['stage']}
 if aband_keys:
     findings = [f for f in findings
-                if not (f['condition'] == 'WORKER-BLOCKED'
+                if not (f['condition'] == 'ITEM-BLOCKED'
                         and (f['root'], f['slug'], f['stage']) in aband_keys)]
 
 # Precedence NEEDS-ASK > NEEDS-REPLY: a stage-mode `forge ask` ends its turn on a
@@ -1611,7 +1611,7 @@ if MODE == 'check':
 
 # ── output ───────────────────────────────────────────────────────────────
 NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
-          'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
+          'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'ITEM-BLOCKED', 'NEEDS-PERMISSION',
           'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK',
           'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'STATE-UNPARSEABLE',
@@ -1625,7 +1625,7 @@ order = {c: i for i, c in enumerate(
 findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
 
 HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
-       'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
+       'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'ITEM-BLOCKED', 'NEEDS-PERMISSION',
        'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
        'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING'}

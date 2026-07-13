@@ -237,7 +237,7 @@ evlog_touch "$R"
 pending_log "$R" p-pre coding codex-a "$(iso_ago 120)"
 callback "$R" p-pre coding BLOCKED codex-a
 run_check >/dev/null
-assert_notified "p-pre.*BLOCKED" "pre-existing BLOCKED callback + open pending fires on first scan (EOF offset)"
+assert_notified "p-pre.*blocked at" "pre-existing BLOCKED callback + open pending fires on first scan (EOF offset)"
 
 new_env wb3
 R=$(mk_root proj); live_session forge-1 "$R"
@@ -251,7 +251,27 @@ R=$(mk_root proj); live_session forge-1 "$R"
 pending_log "$R" p-done coding codex-a "$(iso_ago 120)"
 callback "$R" p-done coding DONE codex-a               # lingering DONE
 run_check >/dev/null
-assert_not_notified "p-done.*BLOCKED" "lingering DONE callback never fires WORKER-BLOCKED"
+assert_not_notified "p-done.*BLOCKED" "lingering DONE callback never fires ITEM-BLOCKED"
+
+# W8 live-scan blocked → ITEM-BLOCKED + reason
+new_env w8
+R=$(mk_root proj); live_session forge-1 "$R"
+pending_log "$R" p-lb coding codex-a "$(iso_ago 120)"
+callback "$R" p-lb coding BLOCKED codex-a
+run_check >/dev/null
+assert_notified "p-lb.*blocked at coding" "W8 ITEM-BLOCKED item-first wording + reason"
+
+# W9 rapid blocked→resolved
+new_env w9
+R=$(mk_root proj); live_session forge-1 "$R"
+closed_log "$R" p-rap coding codex-a "$(iso_ago 120)"
+callback "$R" p-rap coding BLOCKED codex-a
+run_check >/dev/null
+assert_not_notified "p-rap" "W9 closed pending → no blocked finding"
+
+# W17 registries contain ITEM-BLOCKED (literal probe)
+grep -q "'ITEM-BLOCKED'" "$WATCH" && ok "W17 ITEM-BLOCKED literal present" || bad "W17 ITEM-BLOCKED missing"
+! grep -q "'WORKER-BLOCKED'" "$WATCH" && ok "W17 no WORKER-BLOCKED literal remains" || bad "W17 WORKER-BLOCKED remains"
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo "── WORKER-STALLED + residue ──"
@@ -267,7 +287,7 @@ R=$(mk_root proj); live_session forge-1 "$R"
 pending_log "$R" p-both coding codex-a "$(iso_ago 1800)"
 callback "$R" p-both coding BLOCKED codex-a
 run_check >/dev/null
-assert_notified   "p-both.*BLOCKED" "blocked callback fires"
+assert_notified   "p-both.*blocked at" "blocked callback fires"
 assert_not_notified "p-both.*stalled" "WORKER-STALLED suppressed when a live BLOCKED callback covers the pending"
 
 new_env ws3
@@ -754,7 +774,7 @@ printf 'entries:\n  - "oops not a dict"\n' > "$R/.dev/proposals/p-bad/forge-log.
 pending_log "$R" p-healthy coding codex-a "$(iso_ago 120)"
 callback "$R" p-healthy coding BLOCKED codex-a
 run_check >/dev/null
-assert_notified "p-healthy.*BLOCKED" "a non-dict log entry does not suppress unrelated findings in the same root"
+assert_notified "p-healthy.*blocked at" "a non-dict log entry does not suppress unrelated findings in the same root"
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo "── concurrency lock ──"
@@ -1008,7 +1028,7 @@ askf "$R" forge-1 ask-2 p-mig coding 60
 n=$(run_status | grep -c "p-mig")
 [ "$n" -eq 1 ] && ok "exactly one row for the asked slug/stage (no ask+blocked double)" || bad "got $n rows for p-mig"
 assert_status_has "NEEDS-ASK" "the surviving row is the richer NEEDS-ASK"
-assert_status_missing "worker BLOCKED at coding" "WORKER-BLOCKED twin suppressed by the ask"
+assert_status_missing "blocked at coding" "ITEM-BLOCKED twin suppressed by the ask"
 
 echo "── ask is NOT superseded by a later Stop (unlike NEEDS-PERMISSION) ──"
 new_env cask3
