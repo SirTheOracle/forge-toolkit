@@ -661,6 +661,56 @@ def scan_root(root):
                         f"{label} · {slug} — orphan PARKED callback at {stage} — consume or re-park",
                         slug=slug, stage=stage, session=sess)
 
+    # Ask set for ABANDONED exclusion — SAME predicate as the guard/audit (§3.5).
+    _ask_keys = set()
+    for _ap in glob.glob(os.path.join(dev, 'attention', 'ask-*.json')):
+        try:
+            _a = json.load(open(_ap))
+        except Exception:
+            continue
+        if _a.get('event') == 'ask' and _a.get('slug') and _a.get('mode') == 'stage':
+            _ask_keys.add((_a.get('slug'), _a.get('stage')))
+    def _is_ask(slug, stage, cb):
+        o = cb.get('origin') or ''
+        return o == 'ask' or (not o and (slug, stage) in _ask_keys)
+
+    # ITEM-BLOCKED-ABANDONED evidence (PERSIST-only): "{root}\t{slug}\t{stage}" ->
+    # {callback_id, blocked_at, later_other_dispatch}. Reset the WHOLE record on a new
+    # BLOCKED incarnation (new callback_id). §5.3.
+    ev_map = state.setdefault('blocked_evidence', {}) if PERSIST else state.get('blocked_evidence', {})
+    live_keys = set()
+    for (slug, stage), cb in live_blocked.items():
+        if _is_ask(slug, stage, cb):
+            continue
+        k = f"{root}\t{slug}\t{stage}"
+        live_keys.add(k)
+        cbid = cb.get('callback_id') or ''
+        rec = ev_map.get(k)
+        if rec is None or rec.get('callback_id') != cbid:
+            rec = {'callback_id': cbid, 'blocked_at': cb.get('timestamp') or '',
+                   'later_other_dispatch': False}
+        ev_map[k] = rec
+    if PERSIST:
+        for k in list(ev_map.keys()):
+            if k.startswith(root + '\t') and k not in live_keys:
+                del ev_map[k]
+
+    ABANDON_S = cfg_int('FORGE_BLOCKED_ABANDON_S', 600)
+    for (slug, stage), cb in live_blocked.items():
+        if _is_ask(slug, stage, cb):
+            continue
+        rec = ev_map.get(f"{root}\t{slug}\t{stage}") or {}
+        age = age_s(cb.get('timestamp'))
+        if (rec.get('callback_id') == (cb.get('callback_id') or '')
+                and rec.get('later_other_dispatch')
+                and age is not None and age >= ABANDON_S):
+            f = add_finding('ITEM-BLOCKED-ABANDONED', root, f"{slug}\t{stage}",
+                            f"{label} · {slug} — blocked at {stage} and SKIPPED "
+                            f"(guard bypassed, orchestrator moved on): {cb.get('_first_line') or ''}",
+                            slug=slug, stage=stage, session=cb.get('session'))
+            f['reason'] = cb.get('_first_line') or ''
+            f['blocked_at'] = cb.get('timestamp')
+
     # --- WORKER-STALLED (suppressed when a live BLOCKED callback covers it) ---
     # A pending crossing the STALE threshold (2x FORGE_STALL_THRESHOLD_S) is an
     # actionable stall ONLY within the zombie age window; beyond that it is an
@@ -793,13 +843,23 @@ def _handle_event_line(root, label, line):
         msg = f"{label} · {slug} — pipeline {typ.lower()} at {stage} ({reason})"
         add_finding('PIPELINE-ERROR', root, f"{slug}\t{stage}\t{reason}", msg,
                     slug=slug, stage=stage)
+    elif typ == 'DISPATCH':
+        ev_map = state.get('blocked_evidence', {})
+        for k, rec in ev_map.items():
+            kroot, kslug, kstage = k.split('\t', 2)
+            if kroot == root and kslug != slug:
+                rec['later_other_dispatch'] = True
     elif typ == 'STALL':
         st = fields.get('state', '')
         msg = f"{label} · {slug} — worker stall reported at {stage} ({st})"
         add_finding('WORKER-STALL-EVENT', root, f"{slug}\t{stage}\t{st}", msg,
                     slug=slug, stage=stage)
     elif typ == 'COMPLETE' and NOTIFY_COMPLETE:
-        msg = f"{label} · {slug} — pipeline COMPLETE"
+        if fields.get('qualifier') == 'incomplete':
+            pk = fields.get('parked', '0'); bl = fields.get('blocked', '0')
+            msg = f"{label} · {slug} — complete — {pk} parked, {bl} blocked (incomplete)"
+        else:
+            msg = f"{label} · {slug} — pipeline COMPLETE"
         add_finding('PIPELINE-COMPLETE', root, slug, msg, policy='once', slug=slug)
 
 def _eval_context(root, label, cp, embedded, is_live,
@@ -821,8 +881,34 @@ def _eval_context(root, label, cp, embedded, is_live,
         # dedup; the context source persists the condition so the event-consumed
         # finding does not re-fire on the next scan.
         if nxt == 'complete' and NOTIFY_COMPLETE:
-            add_finding('PIPELINE-COMPLETE', root, slug,
-                        f"{label} · {slug} — pipeline COMPLETE",
+            # Qualify (non-green) when parked/blocked work is still open for THIS session
+            # at this root — mirror the event-path qualifier (P16d) so a later tick (event
+            # already consumed) does not revert to plain green. Session-scoped (§3.4) and
+            # ask-EXCLUDED (§3.5) — same predicate as the guard/ABANDONED.
+            _dev = os.path.join(root, '.dev')
+            _ask_keys = set()
+            for _ap in glob.glob(os.path.join(_dev, 'attention', 'ask-*.json')):
+                try:
+                    _a = json.load(open(_ap))
+                except Exception:
+                    continue
+                if _a.get('event') == 'ask' and _a.get('slug') and _a.get('mode') == 'stage':
+                    _ask_keys.add((_a.get('slug'), _a.get('stage')))
+            def _mine(x):
+                xs = x.get('session') or ''
+                return (not embedded) or (not xs) or xs == embedded
+            def _is_ask(s, st, cb):
+                o = cb.get('origin') or ''
+                return o == 'ask' or (not o and (s, st) in _ask_keys)
+            _pk = sum(1 for pl in open_by_slug.values() for p in pl
+                      if p.get('parked_at') and _mine(p))
+            _bl = sum(1 for (s, st), cb in live_blocked.items()
+                      if _mine(cb) and not _is_ask(s, st, cb))
+            if _pk or _bl:
+                _cmsg = f"{label} · {slug} — complete — {_pk} parked, {_bl} blocked (incomplete)"
+            else:
+                _cmsg = f"{label} · {slug} — pipeline COMPLETE"
+            add_finding('PIPELINE-COMPLETE', root, slug, _cmsg,
                         policy='once', session=embedded, slug=slug)
         # STAGE-ERROR from context.
         if status == 'error':
@@ -1402,6 +1488,15 @@ if ask_stage_keys:
                 if not (f['condition'] == 'WORKER-BLOCKED'
                         and (f['root'], f['slug'], f['stage']) in ask_stage_keys)]
 
+# ABANDONED supersedes its plain WORKER-BLOCKED twin (same (root,slug,stage)) — one
+# escalation, not two. (Condition string renamed to ITEM-BLOCKED with the emission in P19.)
+aband_keys = {(f['root'], f['slug'], f['stage']) for f in findings
+              if f['condition'] == 'ITEM-BLOCKED-ABANDONED' and f['slug'] and f['stage']}
+if aband_keys:
+    findings = [f for f in findings
+                if not (f['condition'] == 'WORKER-BLOCKED'
+                        and (f['root'], f['slug'], f['stage']) in aband_keys)]
+
 # Precedence NEEDS-ASK > NEEDS-REPLY: a stage-mode `forge ask` ends its turn on a
 # '?' too, so the same session can raise both. Keep only the richer NEEDS-ASK.
 # Keyed (root, session) so same-named sessions in different roots never cross-suppress.
@@ -1517,7 +1612,7 @@ if MODE == 'check':
 # ── output ───────────────────────────────────────────────────────────────
 NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
           'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
-          'PARK-INCONSISTENT', 'TASK-STUCK', 'EPISODE-STUCK',
+          'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK',
           'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'STATE-UNPARSEABLE',
           'RECOVER-PENDING']
@@ -1531,7 +1626,7 @@ findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
 
 HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
        'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'WORKER-BLOCKED', 'NEEDS-PERMISSION',
-       'PARK-INCONSISTENT', 'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
+       'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
        'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING'}
 ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE',

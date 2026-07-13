@@ -541,21 +541,51 @@ For one-off ad-hoc work (not a pipeline stage), use the low-level `send` +
 
 ## Handling FORGE_BLOCKED
 
-When `wait` returns `STATUS: BLOCKED`:
+Every worker `STATUS: BLOCKED` (operator asks excepted — see below) MUST end in
+exactly ONE terminal action. The bridge ENFORCES this: it refuses new dispatches
+AND worker sends while an unresolved BLOCKED item exists for this session.
 
-1. Read the CALLBACK message; if more context is needed, read the full
-   artifact at `.dev/proposals/{slug}/` or `.dev/qa/{slug}/`.
-2. Resolve the issue (edit files, run commands, etc.).
-3. Send a continuation message to the worker (use `--force` because the
-   worker still holds the original task — do NOT `dispatch` again, that
-   would `/clear` and lose context):
+1. **Fix + continue (same item).** Resolve, then continue the SAME task:
    ```bash
    ~/bin/forge-bridge send --force {worker} "Fixed X. Continue."
+   ~/bin/forge-bridge callback-consume --slug {slug} --stage {stage} --status BLOCKED
    ```
-4. Wait again with the same args; the next callback will resolve it.
+2. **Supersede + re-dispatch.** Abandon this attempt, start the stage over:
+   ```bash
+   ~/bin/forge-bridge dispatch --slug {slug} --stage {stage} --worker {W} --supersede
+   ```
+3. **Park (terminal, recorded).** Out-of-scope-for-now — a durable "needs a human
+   decision" (add `--uncommitted` when the fix-coder report shows applied-but-
+   uncommitted work):
+   ```bash
+   ~/bin/forge-bridge park --slug {slug} --stage {stage} --reason "<why>" [--uncommitted]
+   ```
+   Park RELEASES the infra lock; a fix-and-continue HOLDS it. A parked slug cannot
+   advance without `--supersede`. Re-running `park` on an already-parked item is a
+   safe no-op.
 
-If you can't fix it yourself, escalate: send the problem to the other
-worker, or surface to the user.
+A resumed orchestrator that sees `STATUS: PARKED` treats it as already-parked — skip
+it, do NOT re-park, do NOT release again.
+
+**Operator asks are exempt**: an `origin=ask` BLOCKED is answered via
+`forge dispatch @<session> "<answer>" --answers <ask-id>`, never parked or superseded.
+The guard ignores ask-origin blocks and raises no ABANDONED for them.
+
+For a deliberate one-off exception, `--allow-blocked "<reason>"` bypasses the guard for
+a single command (reason mandatory, logged with the bypassed item keys).
+
+**Hard Rule (ask-carved).** Every worker BLOCKED ends in fix-and-continue / supersede /
+park; the bridge refuses new dispatches AND worker sends while an unresolved block
+exists; a parked slug cannot advance without `--supersede`; `--allow-blocked "<reason>"`
+is a one-shot audited bypass; operator asks are answered via `dispatch --answers`, never
+parked or superseded.
+
+**Batch end.** The completion summary MUST run
+`forge parked --root <root> --session <session>`; exit 10 → report the run INCOMPLETE
+and enumerate the items. The bridge Step 5.2 qualifier
+(`COMPLETE qualifier=incomplete parked=<n> blocked=<m>`) backstops this prose. Deeper
+per-pane block-time visibility remains `orchestrator-work-visibility`'s scope (an
+explicit dependency, not a handoff).
 
 ---
 
@@ -1194,12 +1224,13 @@ Background agent failures follow this protocol:
     #   PROMPTING     -> surface to user; on approval re-enter the wait loop                                (HOLD)
     #   STALLED|TIMEOUT -> Agent-Failure-Recovery; re-enter loop or abort                                   (HOLD; abort path force-releases AFTER confirming the stage is stopped)
     #   DEAD          -> DEAD sub-policy below                                                              (HOLD by default)
-    #   BLOCKED       -> the bridge LEFT the BLOCKED callback in place and kept the pending OPEN; do NOT release.
-    #                    Read the blocked message (the canonical callback file is the source of truth),
-    #                    run repair (may itself touch infra — fine, the lock is HELD),
-    #                    ~/bin/forge-bridge send --force {W} "<continuation>"
-    #                      on send SUCCESS: ~/bin/forge-bridge callback-consume --slug {slug} --stage {stage} --status BLOCKED ; re-enter the wait loop
-    #                      on send FAIL / crash before send: leave it — the canonical BLOCKED stays visible and resume re-surfaces it
+    #   BLOCKED       -> the bridge LEFT the BLOCKED callback in place and kept the pending OPEN. Choose ONE terminal action:
+    #                    (a) fix + ~/bin/forge-bridge send --force {W} "<continuation>"
+    #                        on send SUCCESS: ~/bin/forge-bridge callback-consume --slug {slug} --stage {stage} --status BLOCKED ; re-enter the wait loop (lock stays HELD)
+    #                    (b) ~/bin/forge-bridge dispatch --slug {slug} --stage {stage} --worker {W} --supersede   (lock stays HELD)
+    #                    (c) ~/bin/forge-bridge park --slug {slug} --stage {stage} --reason "<why>" [--uncommitted]  → park RELEASES the infra lock; do NOT release again
+    #                    on crash before any action: the canonical BLOCKED + open pending persist and resume re-surfaces it
+    #   PARKED        -> a resumed wait sees an already-parked item: skip it, no re-park, no release
     ```
 
     Release the lock the moment `wait` returns `DONE`/`ERROR`, **then** spawn the

@@ -378,6 +378,83 @@ ask_callback "$R" p-mix qa codex-b
 run_check >/dev/null
 assert_status_has "p-mix.*parked at coding" "W16 parked coexists with an ask"
 
+# W10 ABANDONED + incarnation reset + ask control  (impl-C-r3 §6.1, verbatim body)
+new_env w10
+R=$(mk_root proj); live_session forge-1 "$R"
+export FORGE_BLOCKED_ABANDON_S=1
+pending_log "$R" p-ab coding codex-a "$(iso_ago 5)"
+callback "$R" p-ab coding BLOCKED codex-a
+evlog_touch "$R"; run_check >/dev/null          # tick 1: evidence recorded
+evlog_append "$R" "DISPATCH: pipeline=p-other stage=coding worker=codex-b"
+run_check >/dev/null                            # tick 2: later_other_dispatch=True
+sleep 2; run_check >/dev/null                   # tick 3: aged past window
+assert_notified "p-ab.*SKIPPED" "W10 ABANDONED after guard-bypass evidence + age"
+# incarnation reset: consume + re-block → new callback_id, no inherited later_other_dispatch
+rm -f "$R"/.dev/forge-tmp/callbacks/p-ab-coding*.callback
+cat > "$R/.dev/forge-tmp/callbacks/p-ab-coding.callback" <<EOF
+slug: p-ab
+stage: coding
+status: BLOCKED
+worker: codex-a
+callback_id: p-ab-coding-REBORN
+timestamp: $(iso_ago 5)
+message: |
+  needs a human
+EOF
+: > "$CAP"                                       # fresh-tick assertion: only THIS tick counts
+run_check >/dev/null
+assert_not_notified "p-ab.*SKIPPED" "W10 incarnation reset: reborn block not ABANDONED"
+unset FORGE_BLOCKED_ABANDON_S
+# ask-origin control: raises nothing
+R=$(mk_root proj); live_session forge-1 "$R"
+pending_log "$R" p-ask coding codex-a "$(iso_ago 5)"
+ask_callback "$R" p-ask coding codex-a
+export FORGE_BLOCKED_ABANDON_S=1
+evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "DISPATCH: pipeline=p-o2 stage=coding worker=codex-b"
+run_check >/dev/null; sleep 2; run_check >/dev/null
+assert_not_notified "p-ask.*SKIPPED" "W10 ask-origin never ABANDONED"
+unset FORGE_BLOCKED_ABANDON_S
+
+# W14 qualified COMPLETE non-green on event tick AND later tick
+new_env w14
+R=$(mk_root proj); live_session forge-1 "$R"
+parked_entry "$R" p-cq verify codex-a "$(iso_ago 60)" "still parked" false forge-1
+parked_callback "$R" p-cq verify codex-a forge-1
+# context reached terminal next_stage so the context-fallback qualifier (P16e) re-derives
+# the non-green COMPLETE on every tick (the event finding notifies once but is consumed).
+ctx "$R" forge-1 <<EOF
+schema: forge-context/1
+active_pipeline: p-cq
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete
+updated_at: "$(iso_ago 60)"
+EOF
+evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "COMPLETE: pipeline=p-cq last_stage=verify worker=codex-a qualifier=incomplete parked=1 blocked=0"
+run_check >/dev/null
+assert_notified "p-cq.*1 parked" "W14 qualified COMPLETE non-green (event tick)"
+run_check >/dev/null
+assert_status_has "p-cq.*1 parked" "W14 still non-green on a later tick (context fallback)"
+
+# W15 ask-origin block → context-fallback COMPLETE stays GREEN
+new_env w15
+R=$(mk_root proj); live_session forge-1 "$R"
+pending_log "$R" p-aq qa codex-a "$(iso_ago 30)"
+ask_callback "$R" p-aq qa codex-a
+ctx "$R" forge-1 <<EOF
+schema: forge-context/1
+active_pipeline: p-aq
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete
+updated_at: "$(iso_ago 30)"
+EOF
+run_check >/dev/null
+assert_status_has "p-aq.*pipeline COMPLETE" "W15 ask-only → fallback COMPLETE stays green"
+assert_status_missing "p-aq.*blocked (incomplete)" "W15 ask not counted as blocked"
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo "── event: PIPELINE-ERROR / STALL / COMPLETE ──"
 new_env ev

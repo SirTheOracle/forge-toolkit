@@ -459,6 +459,20 @@ cbS "$P" forge-1 --slug p2 --stage coding --status BLOCKED --worker codex-a --me
 out=$(briS "$P" forge-2 callback-consume --slug p2 --stage coding --status BLOCKED 2>&1); rc=$?
 [ -f "$P/.dev/forge-tmp/callbacks/p2-coding.forge-1.callback" ] && ok "B2 foreign-session consume NOOP (owner file intact)" || bad "B2 foreign consume mutated owner file"
 
+# B4 [D3/P14] precise ask matcher via blocked-audit
+P="$(mkproj b4)"; mkdir -p "$P/.dev/attention"
+pending_entry "$P" p4 coding codex-a "2026-06-29T00:00:00Z"
+cb "$P" --slug p4 --stage coding --status BLOCKED --worker codex-a --message x >/dev/null 2>&1  # worker, no ask
+out=$( cd "$P" && "$BRIDGE" blocked-audit --json 2>&1 )
+echo "$out" | grep -q '"origin": "worker"' && ok "B4 worker cb → origin worker (no ask record)" || bad "B4 misclassified worker"
+printf '{"event":"ask","slug":"p4","stage":"coding","mode":"stage"}' > "$P/.dev/attention/ask-1.json"
+out=$( cd "$P" && "$BRIDGE" blocked-audit --json 2>&1 )
+echo "$out" | grep -q '"origin": "ask"' && ok "B4 matching live ask → origin ask" || bad "B4 ask not inferred"
+# stale/different-stage ask must NOT match
+rm -f "$P/.dev/attention/ask-1.json"; printf '{"event":"ask","slug":"p4","stage":"qa","mode":"stage"}' > "$P/.dev/attention/ask-2.json"
+out=$( cd "$P" && "$BRIDGE" blocked-audit --json 2>&1 )
+echo "$out" | grep -q '"origin": "worker"' && ok "B4 different-stage ask does not match" || bad "B4 stale ask matched"
+
 # B5 [D4] insert-parked-fields via park: newest of 2 open entries + WARN + round-trip
 P="$(mkproj b5)"
 { echo "pipeline: p5"; echo "entries:";
@@ -546,14 +560,37 @@ out=$( cd "$P" && "$BRIDGE" park --resolve --slug p11 --stage coding --note "don
 grep -q 'FORGE_PARK_RESOLVED' "$P/.dev/proposals/p11/forge-log.yml" && ok "B11 pending closed FORGE_PARK_RESOLVED" || bad "B11 pending not resolved"
 [ -z "$(ls "$P"/.dev/forge-tmp/callbacks/p11-coding*.callback 2>/dev/null)" ] && ok "B11 PARKED callback archived (gone from callbacks/)" || bad "B11 callback still live"
 
-# B15 supersede consume-after-close + audit + callbacks GONE on success — DEFERRED.
-# The P12 supersede source (consume-after-close + SUPERSEDE_AUDIT) IS applied in C3, but
-# this assertion drives a *successful* `dispatch --supersede`, and dispatch's preflight
-# rejects a hermetic (no-tmux) env with "no such tmux session exists" BEFORE reaching the
-# supersede block (the block runs, then cmd_send needs a live pane). The FORGE_TMUX_LIST
-# seam only feeds identity RESOLUTION, not a live send target — so this suite cannot drive
-# a full dispatch. Deferred to live QA / a later group with a dispatch tmux-send stub,
-# alongside the already-deferred B12/B13/B18 (which only assert the pre-send guard).
+# B14 [P16] cmd_emit COMPLETE auto-qualifier + guard fail-safe on a malformed sibling log.
+# emit is ungated (no live session), so it exercises _completion_unresolved →
+# _unresolved_blocked_items hermetically. The malformed pbad/forge-log.yml MUST be skipped
+# (yaml.safe_load wrapped in try/except), never abort the count with a traceback.
+P="$(mkproj b14)"
+mkdir -p "$P/.dev/proposals/p14"
+{ echo "pipeline: p14"; echo "entries:"; echo "  - timestamp: \"2026-06-29T00:00:00Z\"";
+  echo "    stage: coding"; echo "    to: codex-a"; echo "    parked_at: 2026-06-29T00:00:00Z";
+  echo "    parked_reason: \"parked\""; echo "    uncommitted: false"; echo "    response: null"; } > "$P/.dev/proposals/p14/forge-log.yml"
+mkdir -p "$P/.dev/proposals/pbad"
+printf 'pipeline: pbad\nentries:\n  - timestamp: "x\n    stage: [unterminated\n  : : {{{\n' > "$P/.dev/proposals/pbad/forge-log.yml"
+out=$( cd "$P" && "$BRIDGE" emit COMPLETE --slug p14 2>&1 ); rc=$?
+echo "$out" | grep -qi 'Traceback' && bad "B14 guard tracebacked on a malformed log" || ok "B14 guard fail-safe on malformed log (no traceback)"
+grep -q 'qualifier=incomplete parked=1' "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null \
+  && ok "B14 cmd_emit COMPLETE auto-qualified parked=1" || bad "B14 no qualifier: $out $(cat "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null)"
+
+# B12/B13/B15/B17/B18 — DEFERRED (end-to-end dispatch/worker-send guard refusal).
+# The P15 work-start guard (bin/forge-bridge _work_start_guard) IS applied and verified:
+#   * its collector (_unresolved_blocked_items) is fail-safe on malformed logs — see B14;
+#   * driven through a REAL dispatch (live tmux session + valid .txt template) it refuses
+#     a cross-slug dispatch with "HOOK BLOCKED" and emits GUARD_BLOCK reason=unresolved-
+#     blocked-item (verified out-of-band during C5 coding).
+# These five assertions drive `dispatch`/worker-`send` to completion, which the infra-lock
+# suite cannot do hermetically: dispatch/send require identity class host-pane — a LIVE
+# forge session with the full pane count (require_identity + require_pane_count) — and the
+# post-guard delivery needs a real worker pane. That machinery lives only in
+# tests/forge-bridge/run.sh (its run_in_pane helper against a multi-pane session); the
+# spec's plain `cd $P && $BRIDGE dispatch …` bodies (mk_stage_stub even writes .md while
+# dispatch renders .txt) are not runnable here. B12/B13/B18 assert the pre-send refusal;
+# B15/B17 additionally need a *successful* dispatch (post-guard send to a live pane).
+# Deferred to live QA / a follow-up that ports the run_in_pane multi-pane harness.
 
 # B16 crash-safety: parked record + BLOCKED callback coexist → re-park self-heals
 P="$(mkproj b16)"; parked_pending "$P" p16 coding codex-a "2026-06-29T00:00:00Z" "parked" ""
@@ -574,14 +611,16 @@ after=$(cd "$P" && find .dev -type f | sort | xargs shasum 2>/dev/null | shasum)
 echo "$out" | grep -q '"origin": "worker"' && echo "$out" | grep -q '"origin": "ask"' && ok "M1 worker+ask classified" || bad "M1 classification wrong"
 [ "$before" = "$after" ] && ok "M1 blocked-audit mutated nothing" || bad "M1 mutated the tree"
 
-# B-acc help documents park+blocked-audit
-# NOTE: the empty --allow-blocked reject half is DEFERRED to C5 — the dispatch guard
-# wiring (P15b: --allow-blocked flag + "requires a non-empty reason") is not yet applied.
+# B-acc help documents park+blocked-audit + empty --allow-blocked reject
 # Capture-then-grep (harness idiom, cf. the infra-lock help block above): a bare
 # `"$BRIDGE" help | grep -q` trips SIGPIPE under `set -o pipefail` (grep -q exits on
 # the early match while help is still emitting), failing the pipeline spuriously.
 bahelp=$("$BRIDGE" help 2>&1)
 echo "$bahelp" | grep -q 'park' && echo "$bahelp" | grep -q 'blocked-audit' && ok "B-acc help documents park+blocked-audit" || bad "B-acc help missing"
+# empty --allow-blocked rejected at arg-parse (before any identity/tmux need)
+P="$(mkproj bacc)"; pending_entry "$P" p-b coding codex-a "2026-06-29T00:00:00Z"
+out=$( cd "$P" && env -u TMUX "$BRIDGE" dispatch --slug p-o --stage coding --worker codex-b --allow-blocked 2>&1 ); rc=$?
+[ "$rc" -ne 0 ] && echo "$out" | grep -qi 'requires a non-empty reason' && ok "B-acc empty --allow-blocked rejected" || bad "B-acc empty reason accepted"
 
 echo ""
 echo "═══════════════════════════════════════"

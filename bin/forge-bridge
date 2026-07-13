@@ -873,9 +873,19 @@ EOF
         _emit_event STAGE "$slug" "result_stage=$stage status=$status next=${next_stage:-pending-orchestrator-decision} worker=$worker"
     fi
 
-    # Heartbeat: pipeline complete — strict terminal condition.
+    # Heartbeat: pipeline complete — strict terminal condition. Qualified when the
+    # session-scoped unresolved set (parked + non-ask blocked) is non-empty (§3.4).
     if [ "$stage" = "verify" ] && [ "$status" = "done" ] && [ "$next_stage" = "complete" ]; then
-        _emit_event COMPLETE "$slug" "last_stage=$stage worker=$worker"
+        local _cpr; _cpr=$(_resolve_project_root "" 2>/dev/null)
+        local _cq=""
+        if [ -n "$_cpr" ]; then
+            local _cu; _cu=$(_completion_unresolved "$_cpr")
+            case "$_cu" in
+                "parked=0 blocked=0") : ;;
+                *) _cq=" qualifier=incomplete $_cu" ;;
+            esac
+        fi
+        _emit_event COMPLETE "$slug" "last_stage=$stage worker=$worker$_cq"
     fi
 }
 
@@ -1006,11 +1016,15 @@ _cancel_copy_mode() {
 cmd_send() {
     require_identity "send" host-pane || return 1
 
-    local FORCE=false
-    if [ "$1" = "--force" ]; then
-        FORCE=true
-        shift
-    fi
+    local FORCE=false ALLOW_BLOCKED="" SKIP_BLOCK_GUARD=0
+    while :; do
+        case "${1:-}" in
+            --force) FORCE=true; shift ;;
+            --allow-blocked) ALLOW_BLOCKED="$2"; shift 2 ;;
+            --_internal) SKIP_BLOCK_GUARD=1; shift ;;   # dispatch's own delivery send
+            *) break ;;
+        esac
+    done
 
     local PANE_NAME="$1"
     local PANE
@@ -1030,6 +1044,26 @@ cmd_send() {
                     echo "Run 'forge-bridge log --to $TARGET ...' before sending." >&2
                     echo "Or use 'forge-bridge send --force' to bypass for non-pipeline messages." >&2
                     return 1
+                fi
+                ;;
+        esac
+    fi
+
+    # All-boundary guard on WORKER sends (covers log+send, §3.4). --_internal (the
+    # dispatch delivery send) skips it — dispatch already ran its own guard. On a
+    # --force fix-and-continue, exempt the block held by THIS TARGET worker (keyed on
+    # the target, never glob order); a --force to a worker holding NO block, or a send
+    # while a DIFFERENT worker's block is unresolved, is refused.
+    if [ "$SKIP_BLOCK_GUARD" != 1 ]; then
+        case "$TARGET" in
+            codex-a|codex-b|claude-opus|claude-sonnet)
+                local _pr; _pr="$(_resolve_project_root "" 2>/dev/null)"
+                if [ -n "$_pr" ]; then
+                    if [ "$FORCE" = true ]; then
+                        _work_start_guard "$_pr" "send" "$ALLOW_BLOCKED" "" "" "$TARGET" || return 1
+                    else
+                        _work_start_guard "$_pr" "send" "$ALLOW_BLOCKED" "" "" "" || return 1
+                    fi
                 fi
                 ;;
         esac
@@ -1301,6 +1335,112 @@ except FileNotFoundError:
 PYEOF
     local rc=$?
     [ $rc -eq 0 ] || { echo "ERROR: _insert_parked_fields_by_ts failed slug=$slug ts=$target_ts" >&2; return 1; }
+}
+
+# Session-scoped (plus unowned-legacy, WARN) top-level BLOCKED callbacks whose
+# (slug,stage) has an open pending, EXCLUDING ask-origin. One python pass. Echoes
+# "slug\tstage\tcallback_id\tworker" per unresolved block.
+_unresolved_blocked_items() {   # <project_root> [exempt_slug] [exempt_stage]
+    local pr="$1" ex_slug="${2:-}" ex_stage="${3:-}"
+    local sess; sess="$(_resolve_session)"
+    FORGE_G_SESS="$sess" FORGE_G_EXSLUG="$ex_slug" FORGE_G_EXSTAGE="$ex_stage" \
+    python3 - "$pr" <<'PY'
+import os, sys, glob, re, json
+try: import yaml
+except Exception: yaml = None
+root=sys.argv[1]; sess=os.environ.get("FORGE_G_SESS") or ""
+ex_slug=os.environ.get("FORGE_G_EXSLUG") or ""; ex_stage=os.environ.get("FORGE_G_EXSTAGE") or ""
+dev=os.path.join(root, ".dev")
+openp=set()
+for logp in glob.glob(os.path.join(dev, "proposals", "*", "forge-log.yml")):
+    slug=os.path.basename(os.path.dirname(logp))
+    try: entries=(yaml.safe_load(open(logp)) or {}).get("entries", []) or [] if yaml else []
+    except Exception: entries=[]
+    for e in entries:
+        if isinstance(e, dict) and e.get("response") is None:
+            openp.add((slug, e.get("stage")))
+asks=set()
+for ap in glob.glob(os.path.join(dev, "attention", "ask-*.json")):
+    try: a=json.load(open(ap))
+    except Exception: continue
+    if a.get("event")=="ask" and a.get("slug") and a.get("mode")=="stage":
+        asks.add((a.get("slug"), a.get("stage")))
+for cbp in glob.glob(os.path.join(dev, "forge-tmp", "callbacks", "*.callback")):
+    hdr={}
+    for ln in open(cbp).read().splitlines():
+        if ln.startswith("message:"): break
+        m=re.match(r'^([a-z_]+):\s*(.*)$', ln)
+        if m: hdr[m.group(1)]=m.group(2).strip()
+    if (hdr.get("status") or "").upper() != "BLOCKED": continue
+    slug, stage = hdr.get("slug"), hdr.get("stage")
+    if (slug, stage) not in openp: continue
+    origin=hdr.get("origin")
+    if origin=="ask" or (not origin and (slug, stage) in asks): continue
+    csess=hdr.get("session")
+    sessq=bool(re.search(r'\.[^.]+\.callback$', os.path.basename(cbp)))
+    if sessq and csess and sess and csess != sess: continue     # another session
+    if not (sessq and csess): sys.stderr.write("WARN: guard counting unowned legacy BLOCKED %s\n" % os.path.basename(cbp))
+    if ex_slug and slug == ex_slug and (not ex_stage or stage == ex_stage): continue  # same-item
+    print("%s\t%s\t%s\t%s" % (slug, stage, hdr.get("callback_id") or "", hdr.get("worker") or ""))
+PY
+}
+
+# Refusal (or --allow-blocked bypass) for a boundary. Returns 1 to refuse, 0 to allow.
+# <exempt_worker> (send --force only): drop rows whose callback `worker:` == the send
+# TARGET — the fix-and-continue continuation for the worker's own held block.
+_work_start_guard() {   # <project_root> <ctx: dispatch|send> <allow_reason> <exempt_slug> <exempt_stage> [exempt_worker]
+    local pr="$1" ctx="$2" allow="$3" ex_slug="$4" ex_stage="$5" ex_worker="${6:-}"
+    local raw; raw="$(_unresolved_blocked_items "$pr" "$ex_slug" "$ex_stage")"
+    local items="" s st cid w
+    while IFS=$'\t' read -r s st cid w; do
+        [ -z "$s" ] && continue
+        [ -n "$ex_worker" ] && [ "$w" = "$ex_worker" ] && continue
+        items="${items}${s}"$'\t'"${st}"$'\t'"${cid}"$'\t'"${w}"$'\n'
+    done <<< "$raw"
+    [ -z "$items" ] && return 0
+    local n; n=$(printf '%s' "$items" | grep -c .)
+    if [ -n "$allow" ]; then
+        local keys; keys=$(printf '%s' "$items" | tr '\n' ';')
+        _emit_event GUARD_BLOCK "${ex_slug:-multi}" "stage=${ex_stage:-?} boundary=$ctx reason=allow-blocked-bypass n=$n bypassed=$keys allow_reason=$(_sanitize_event_value "$allow")"
+        echo "GUARD BYPASS (--allow-blocked): $allow — bypassed $n unresolved item(s): $keys" >&2
+        return 0
+    fi
+    {
+        echo "HOOK BLOCKED: $ctx refused — unresolved BLOCKED item(s):"
+        printf '%s' "$items" | while IFS=$'\t' read -r s st cid w; do
+            [ -n "$s" ] && echo "    - $s/$st (worker=$w callback_id=$cid): fix+continue (send --force + callback-consume) · dispatch --supersede · or forge-bridge park"
+        done
+        echo "  Or re-run with --allow-blocked \"<reason>\" (one-shot, logged)."
+    } >&2
+    _emit_event GUARD_BLOCK "${ex_slug:-multi}" "stage=${ex_stage:-?} boundary=$ctx reason=unresolved-blocked-item n=$n"
+    return 1
+}
+
+# Session-scoped unresolved-set counts for COMPLETE qualification (§3.4): parked
+# entries (open pendings carrying parked_at) + non-ask BLOCKED callbacks with open
+# pendings. Echoes "parked=<n> blocked=<m>".
+_completion_unresolved() {   # <project_root>
+    local pr="$1"
+    local blocked; blocked="$(_unresolved_blocked_items "$pr" 2>/dev/null | grep -c . )"
+    local sess; sess="$(_resolve_session)"
+    local parked
+    parked=$(FORGE_C_SESS="$sess" python3 - "$pr/.dev/proposals" <<'PY'
+import os, sys, glob
+try: import yaml
+except Exception: yaml=None
+base=sys.argv[1]; sess=os.environ.get("FORGE_C_SESS") or ""; n=0
+for logp in glob.glob(os.path.join(base, "*", "forge-log.yml")):
+    try: entries=(yaml.safe_load(open(logp)) or {}).get("entries", []) or [] if yaml else []
+    except Exception: entries=[]
+    for e in entries:
+        if isinstance(e, dict) and e.get('response') is None and e.get('parked_at'):
+            es=e.get('session') or ""
+            if not sess or not es or es == sess:
+                n += 1
+print(n)
+PY
+)
+    printf 'parked=%s blocked=%s' "${parked:-0}" "${blocked:-0}"
 }
 
 # Revalidate-under-lock: confirm the callback status+callback_id and the target
@@ -2126,7 +2266,7 @@ PYEOF
 # --clear: send /clear to the worker pane before the dispatch (Hard Rule 20).
 # --dry-run: print rendered prompt to stdout; do NOT write/log/send.
 cmd_dispatch() {
-    local slug="" stage="" worker="" do_clear=false dry_run=false supersede=false
+    local slug="" stage="" worker="" do_clear=false dry_run=false supersede=false allow_blocked=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --slug)      slug="$2";   shift 2 ;;
@@ -2135,6 +2275,8 @@ cmd_dispatch() {
             --clear)     do_clear=true; shift ;;
             --dry-run)   dry_run=true;  shift ;;
             --supersede) supersede=true; shift ;;
+            --allow-blocked) [ -n "${2:-}" ] || { echo "ERROR: --allow-blocked requires a non-empty reason" >&2; return 1; }
+                             allow_blocked="$2"; shift 2 ;;
             *)           shift ;;
         esac
     done
@@ -2279,6 +2421,15 @@ PYEOF
         return 1
     fi
 
+    # All-boundary guard: refuse a NEW dispatch while any OTHER-slug unresolved block
+    # exists (§3.4). --supersede for THIS slug is the same-item exemption. Identity was
+    # already gated at the top of the body (session-pin invariant) — do not re-gate.
+    if [ "$supersede" = true ]; then
+        _work_start_guard "$project_root" "dispatch" "$allow_blocked" "$slug" "" || return 1
+    else
+        _work_start_guard "$project_root" "dispatch" "$allow_blocked" "" "" || return 1
+    fi
+
     local prompt_file="$project_root/.dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
     mkdir -p "$(dirname "$prompt_file")"
     printf '%s' "$rendered" > "$prompt_file"
@@ -2364,7 +2515,7 @@ PYEOF
 
     local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
     cmd_log --slug "$slug" --stage "$stage" --from claude --to "$worker_canonical" --prompt "$ref_msg" >/dev/null
-    cmd_send "$worker_canonical" "$ref_msg" || {
+    cmd_send --_internal "$worker_canonical" "$ref_msg" || {
         _emit_event ERROR "$slug" "stage=$stage reason=send-failed worker=$worker_canonical"
         return 1
     }
@@ -3561,6 +3712,18 @@ cmd_emit() {
             fields="${passthrough[*]}"
         fi
     fi
+    # Completion gating (§3.4): auto-qualify a manual COMPLETE when the caller did not
+    # and the session-scoped unresolved set is non-empty.
+    if [ "$type" = COMPLETE ] && [[ "$fields" != *qualifier=* ]]; then
+        local _epr; _epr=$(_resolve_project_root "" 2>/dev/null)
+        if [ -n "$_epr" ]; then
+            local _eu; _eu=$(_completion_unresolved "$_epr")
+            case "$_eu" in
+                "parked=0 blocked=0") : ;;
+                *) fields="$fields qualifier=incomplete $_eu" ;;
+            esac
+        fi
+    fi
     _emit_event "$type" "$slug" "$fields"
 }
 
@@ -4617,7 +4780,12 @@ fi
 # ---- Main ----
 
 case "${1:-help}" in
-    send)            shift; cmd_send "$@" ;;
+    send)            shift
+                     # Strip a caller-supplied private bypass flag: only the in-process
+                     # dispatch delivery (cmd_send --_internal, which never traverses the
+                     # router) may set it. A top-level `send --_internal` must NOT bypass.
+                     _sa=(); for _a in "$@"; do [ "$_a" = "--_internal" ] || _sa+=("$_a"); done
+                     cmd_send ${_sa[@]+"${_sa[@]}"} ;;
     read)            shift; cmd_read "$@" ;;
     focus)           shift; cmd_focus "$@" ;;
     back)            cmd_back ;;
