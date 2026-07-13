@@ -3018,6 +3018,82 @@ PY
     echo "PARK RESOLVED slug=$slug stage=$stage"
 }
 
+cmd_blocked_audit() {
+    local root_override="" jsonout=0
+    while [ $# -gt 0 ]; do case "$1" in
+        --root) root_override="$2"; shift 2 ;;
+        --json) jsonout=1; shift ;;
+        *) shift ;;
+    esac; done
+    local project_root
+    if [ -n "$root_override" ]; then project_root="$root_override"; else project_root=$(_resolve_project_root ""); fi
+    [ -n "$project_root" ] || { echo "ERROR: blocked-audit requires a project root" >&2; return 1; }
+    FORGE_BA_JSON="$jsonout" python3 - "$project_root" <<'PY'
+import os, sys, glob, json, re
+root = sys.argv[1]; jsonout = os.environ.get("FORGE_BA_JSON") == "1"
+dev = os.path.join(root, ".dev"); items = []
+try:
+    import yaml; HAVE = True
+except Exception:
+    HAVE = False
+adir = os.path.join(dev, "attention")
+def ask_match(slug, stage):
+    for fp in glob.glob(os.path.join(adir, "ask-*.json")):
+        try: r = json.load(open(fp))
+        except Exception: continue
+        if r.get("event")=="ask" and r.get("slug")==slug and r.get("stage")==stage and r.get("mode")=="stage":
+            return True
+    return False
+for cbp in glob.glob(os.path.join(dev, "forge-tmp", "callbacks", "*.callback")):
+    raw = open(cbp).read()
+    def g(f):
+        m = re.search(rf'^{f}:\s*(.*?)\s*$', raw, re.M); return m.group(1).strip() if m else None
+    slug, stage, status, origin = g('slug'), g('stage'), (g('status') or '').upper(), g('origin')
+    base = os.path.basename(cbp)
+    legacy = bool(slug and stage and re.match(rf'^{re.escape(slug)}-{re.escape(stage)}\.callback$', base))
+    if status == 'BLOCKED':
+        isask = (origin == 'ask') or ask_match(slug, stage)
+        items.append({"kind": "blocked-callback", "slug": slug, "stage": stage,
+                      "origin": "ask" if isask else "worker", "legacy_filename": legacy,
+                      "suggest": "answer via dispatch --answers" if isask else "park / consume / supersede"})
+    elif status == 'PARKED':
+        items.append({"kind": "parked-callback", "slug": slug, "stage": stage,
+                      "legacy_filename": legacy, "suggest": "resolve or supersede"})
+for logp in glob.glob(os.path.join(dev, "proposals", "*", "forge-log.yml")):
+    slug = os.path.basename(os.path.dirname(logp))
+    if not HAVE: continue
+    try: d = yaml.safe_load(open(logp)) or {}
+    except Exception:
+        items.append({"kind": "unparseable-log", "slug": slug, "suggest": "manual"}); continue
+    by = {}
+    for e in (d.get('entries') or []):
+        if isinstance(e, dict) and e.get('response') is None:
+            by.setdefault(e.get('stage'), []).append(e)
+            if e.get('parked_at'):
+                items.append({"kind": "half-parked-record", "slug": slug, "stage": e.get('stage'),
+                              "suggest": "recover quadrant — verify callback flipped to PARKED"})
+    for stage, lst in by.items():
+        if len(lst) > 1:
+            items.append({"kind": "duplicate-open-pending", "slug": slug, "stage": stage,
+                          "count": len(lst), "suggest": "supersede (D2 newest authoritative)"})
+sf = os.path.join(os.path.expanduser("~/.cache/forge-watch"), "state.json")
+if os.path.exists(sf):
+    try:
+        st = json.load(open(sf))
+        for k in (st.get("conditions") or {}):
+            if "WORKER-BLOCKED" in k:
+                items.append({"kind": "stale-state-key", "key": k, "suggest": "orphans harmlessly after rename"})
+    except Exception: pass
+if jsonout:
+    print(json.dumps({"root": root, "items": items}, indent=2))
+else:
+    if not items: print("blocked-audit: clean (no residue)")
+    for it in items:
+        print("  " + " ".join(f"{k}={v}" for k, v in it.items()))
+    print(f"blocked-audit: {len(items)} item(s) — MUTATES NOTHING")
+PY
+}
+
 # ===========================================================================
 # infra-lock — cross-worktree mutex serializing infra-touching stages.
 #
@@ -4616,6 +4692,10 @@ case "${1:-help}" in
         echo "                                Terminal DONE/ERROR closes the pending FIRST then publishes atomically; non-terminal BLOCKED keeps the pending open"
         echo "  callback-consume --slug <s> --stage <s> [--status BLOCKED]"
         echo "                                Archive a consumed non-terminal (BLOCKED) callback AFTER a send --force continuation; structured no-op if none. See infra-lock Shape A."
+        echo "  park --slug <s> --stage <s> --reason <text> [--worker <w>] [--uncommitted]"
+        echo "                                Park an open BLOCKED item: keeps the pending open, writes a durable parked record, flips the callback to PARKED. Use 'park --resolve --slug <s> --stage <s> [--note <text>]' to close a parked item."
+        echo "  blocked-audit [--root <path>] [--json]"
+        echo "                                Read-only audit of BLOCKED/PARKED callbacks, half-parked records, duplicate open pendings, and stale state keys. MUTATES NOTHING."
         echo "  infra-lock <acquire|release|status> --slug <s> --stage <t> [--timeout N] [--interval I] [--force]"
         echo "                                Cross-worktree mutex for infra stages {coding,qa,qa-fix,qa-retry,verify}. acquire blocks (default ${FORGE_INFRA_LOCK_TIMEOUT_S:-1800}s ceiling, ${FORGE_INFRA_LOCK_INTERVAL_S:-15}s poll); release on stage terminality; status reports FREE/HELD/STALE/foreign."
         echo "  digest --slug <s> --stage <s> --template <name> [--worker <w>]"

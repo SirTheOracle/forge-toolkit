@@ -561,6 +561,28 @@ cb "$P" --slug p16 --stage coding --status BLOCKED --worker codex-a --message x 
 out=$( cd "$P" && "$BRIDGE" park --slug p16 --stage coding --reason r 2>&1 ); rc=$?
 [ "$(field "$(ls "$P"/.dev/forge-tmp/callbacks/p16-coding*.callback|head -1)")" = "PARKED" ] && ok "B16 re-park self-heals BLOCKED→PARKED" || bad "B16 re-park did not heal"
 
+# M1 migration classifications + zero mutations
+P="$(mkproj m1)"; mkdir -p "$P/.dev/attention"
+pending_entry "$P" pm coding codex-a "2026-06-29T00:00:00Z"
+cb "$P" --slug pm --stage coding --status BLOCKED --worker codex-a --message x >/dev/null 2>&1        # legacy worker
+printf '{"event":"ask","slug":"pa","stage":"qa","mode":"stage"}' > "$P/.dev/attention/ask-1.json"
+mkdir -p "$P/.dev/proposals/pa"; printf 'slug: pa\nstage: qa\nstatus: BLOCKED\nmessage: |\n  a\n' > "$P/.dev/forge-tmp/callbacks/pa-qa.callback"
+printf 'entries:\n  - timestamp: "t1"\n    stage: qa\n    response: null\n' > "$P/.dev/proposals/pa/forge-log.yml"
+before=$(cd "$P" && find .dev -type f | sort | xargs shasum 2>/dev/null | shasum)
+out=$( cd "$P" && "$BRIDGE" blocked-audit --json 2>&1 )
+after=$(cd "$P" && find .dev -type f | sort | xargs shasum 2>/dev/null | shasum)
+echo "$out" | grep -q '"origin": "worker"' && echo "$out" | grep -q '"origin": "ask"' && ok "M1 worker+ask classified" || bad "M1 classification wrong"
+[ "$before" = "$after" ] && ok "M1 blocked-audit mutated nothing" || bad "M1 mutated the tree"
+
+# B-acc help documents park+blocked-audit
+# NOTE: the empty --allow-blocked reject half is DEFERRED to C5 — the dispatch guard
+# wiring (P15b: --allow-blocked flag + "requires a non-empty reason") is not yet applied.
+# Capture-then-grep (harness idiom, cf. the infra-lock help block above): a bare
+# `"$BRIDGE" help | grep -q` trips SIGPIPE under `set -o pipefail` (grep -q exits on
+# the early match while help is still emitting), failing the pipeline spuriously.
+bahelp=$("$BRIDGE" help 2>&1)
+echo "$bahelp" | grep -q 'park' && echo "$bahelp" | grep -q 'blocked-audit' && ok "B-acc help documents park+blocked-audit" || bad "B-acc help missing"
+
 echo ""
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"
