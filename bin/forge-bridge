@@ -1871,6 +1871,7 @@ if slug and slug != '(none)':
                 response = None if resp_raw == 'null' else resp_raw.strip('"').replace('\\"', '"')
                 entries.append({
                     'timestamp': ts, 'stage': stage, 'to': to, 'response': response,
+                    'parked_at': grab('parked_at'),  # keep the PARKED tag through the fallback
                     'files': [],
                 })
 
@@ -1917,7 +1918,8 @@ for e in entries[-15:]:
     worker = e.get('to', '?')
     resp = e.get('response')
     if resp is None:
-        activity.append(f"  {ts}  · dispatched {stage:<14} → {worker} (PENDING)")
+        _pk = ' ⏸ PARKED' if e.get('parked_at') else ''
+        activity.append(f"  {ts}  · dispatched {stage:<14} → {worker} (PENDING{_pk})")
     else:
         rs = str(resp)
         if 'FORGE_DONE' in rs:
@@ -1953,7 +1955,8 @@ L.append("# Forge Pipeline Status")
 L.append("")
 L.append(f"Pipeline: {slug}")
 if pending:
-    L.append(f"Current stage: {current_stage} ({current_worker}, PENDING since {short_time(current_since)}){_stale_suffix(current_since)}")
+    _pk = ' ⏸ PARKED' if (pending[-1].get('parked_at')) else ''
+    L.append(f"Current stage: {current_stage} ({current_worker}, PENDING since {short_time(current_since)}){_pk}{_stale_suffix(current_since)}")
 else:
     L.append(f"Current stage: (idle) — last completed: {last_stage} → {last_status} by {last_worker}")
 L.append(f"Next stage: {next_stage}")
@@ -1969,7 +1972,8 @@ L.append("## Pending callbacks")
 L.append("")
 if pending:
     for e in pending:
-        L.append(f"  - {e.get('stage','?')} ({e.get('to','?')}, since {short_time(e.get('timestamp'))})")
+        _pk = ' ⏸ PARKED' if e.get('parked_at') else ''
+        L.append(f"  - {e.get('stage','?')} ({e.get('to','?')}, since {short_time(e.get('timestamp'))}){_pk}")
 else:
     L.append("  (none)")
 L.append("")
@@ -2319,16 +2323,43 @@ for e in (data.get('entries') or []):
     if ts: print(ts)
 PYEOF
 )
-        local _sup_ts _sup_now _sup_n
+        local _sup_ts _sup_now _sup_n _sup_fail=0
         _sup_now=$(timestamp)
-        printf '%s\n' "$_sup_pendings" | while IFS= read -r _sup_ts; do
+        # Close pendings first; collect failures (here-string, not a pipe subshell —
+        # the loop must set _sup_fail to gate the consume that follows, §3.3). The
+        # incarnation-scoped _sup_pendings gather above (session-pin R10) is preserved.
+        while IFS= read -r _sup_ts; do
             [ -z "$_sup_ts" ] && continue
-            _patch_response_by_ts "$slug" "$_sup_ts" \
-                "FORGE_SUPERSEDED: re-dispatched $stage (orphan-log-entries guard); auto-closed $_sup_now" \
-                || echo "WARN: --supersede: failed to close pending ts=$_sup_ts for slug=$slug" >&2
-        done
+            if ! _patch_response_by_ts "$slug" "$_sup_ts" \
+                "FORGE_SUPERSEDED: re-dispatched $stage (orphan-log-entries guard); auto-closed $_sup_now"; then
+                echo "WARN: --supersede: failed to close pending ts=$_sup_ts for slug=$slug (callbacks for its stage RETAINED)" >&2
+                _sup_fail=1
+            fi
+        done <<< "$_sup_pendings"
         _sup_n="$(printf '%s\n' "$_sup_pendings" | grep -c . || true)"
-        [ "$_sup_n" -gt 0 ] && _emit_event SUPERSEDE "$slug" "stage=$stage closed_pending=$_sup_n worker=$worker_canonical"
+        [ "$_sup_n" -gt 0 ] && _emit_event SUPERSEDE "$slug" "stage=$stage closed_pending=$_sup_n worker=$worker_canonical partial_fail=$_sup_fail"
+        if [ "$_sup_n" -gt 0 ] && [ "$_sup_fail" -eq 0 ]; then
+            # Only after ALL closes succeed: consume+audit each PARKED/BLOCKED callback
+            # of this slug (all stages, session-scoped glob), preserving disposition.
+            local _cb _sess; _sess="$(_resolve_session)"
+            for _cb in "$project_root/.dev/forge-tmp/callbacks/${slug}-"*.callback; do
+                [ -e "$_cb" ] || continue
+                local _st _cbid _reason _unco _cbstage
+                _st=$(grep '^status:' "$_cb" | awk '{print $2}')
+                case "$_st" in PARKED|BLOCKED) ;; *) continue ;; esac
+                _cbstage=$(grep '^stage:' "$_cb" | awk '{print $2}')
+                _cbid=$(grep '^callback_id:' "$_cb" | awk '{print $2}')
+                _reason=$(grep '^parked_reason:' "$_cb" | sed 's/^parked_reason:[[:space:]]*//')
+                _unco=$(grep '^uncommitted:' "$_cb" | awk '{print $2}')
+                _lifecycle_lock "$slug" "$_cbstage" || continue
+                _emit_event SUPERSEDE_AUDIT "$slug" "stage=$_cbstage prior_callback_id=$_cbid prior_status=$_st uncommitted=${_unco:-false} actor=$_sess reason=$(_sanitize_event_value "$_reason")"
+                [ "$_unco" = true ] && echo "WARN: --supersede: discarding PARKED callback with UNCOMMITTED work ($slug/$_cbstage, prior_callback_id=$_cbid)." >&2
+                ( cd "$project_root" && cmd_callback_consume --_no_lock --slug "$slug" --stage "$_cbstage" --status "$_st" >/dev/null 2>&1 ) || true
+                _lifecycle_unlock
+            done
+        elif [ "$_sup_fail" -ne 0 ]; then
+            echo "WARN: --supersede: partial close failure — callbacks RETAINED (not consumed) for slug=$slug." >&2
+        fi
     fi
 
     local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
@@ -2747,9 +2778,9 @@ cmd_callback_consume() {
     # Only non-terminal statuses are consumable. Terminal callbacks (DONE/ERROR)
     # are the stage's permanent record and are never archived here.
     case "$status" in
-        BLOCKED) ;;
+        BLOCKED|PARKED) ;;
         *)
-            echo "ERROR: callback-consume only consumes non-terminal callbacks (--status BLOCKED); got '$status'" >&2
+            echo "ERROR: callback-consume only consumes non-terminal callbacks (--status BLOCKED|PARKED); got '$status'" >&2
             return 1
             ;;
     esac
@@ -2821,6 +2852,170 @@ cmd_callback_consume() {
     [ "$_held" = 1 ] && _lifecycle_unlock
     _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=archived status=$status callback_id=$file_cb_id archive=$archive_file"
     echo "CALLBACK_CONSUME ARCHIVED stage=$stage slug=$slug status=$status → $archive_file"
+}
+
+cmd_park() {
+    # forge-bridge park --slug <s> --stage <s> --reason <text> [--worker <w>] [--uncommitted]
+    #  (and: park --resolve --slug <s> --stage <s> [--note …])
+    local resolve=false slug="" stage="" reason="" worker="" uncommitted=false note=""
+    while [ $# -gt 0 ]; do case "$1" in
+        --resolve)     resolve=true; shift ;;
+        --slug)        slug="$2";   shift 2 ;;
+        --stage)       stage="$2";  shift 2 ;;
+        --reason)      reason="$2"; shift 2 ;;
+        --worker)      worker="$2"; shift 2 ;;
+        --uncommitted) uncommitted=true; shift ;;
+        --note)        note="$2";   shift 2 ;;
+        *) shift ;;
+    esac; done
+    [ -n "$slug" ] && [ -n "$stage" ] || { echo "Usage: forge-bridge park --slug <s> --stage <s> --reason <text> [--worker <w>] [--uncommitted]" >&2; return 1; }
+
+    local project_root; project_root=$(_resolve_project_root "")
+    [ -n "$project_root" ] || { echo "ERROR: park requires forge-project.yml in cwd ancestry" >&2; return 1; }
+    local cb_dir="$project_root/.dev/forge-tmp/callbacks"
+    local sess; sess="$(_resolve_session)"
+    local pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
+
+    if [ "$resolve" = true ]; then cmd_park_resolve "$slug" "$stage" "$note"; return $?; fi
+    [ -n "$reason" ] || { echo "ERROR: park requires --reason" >&2; return 1; }
+
+    local cb_file; cb_file="$(_resolve_callback_file "$cb_dir" "$slug" "$stage" "$sess" 2>/dev/null)" || cb_file=""
+    local cb_status="" cb_id="" cb_origin=""
+    if [ -n "$cb_file" ] && [ -f "$cb_file" ]; then
+        cb_status=$(grep '^status:' "$cb_file" | awk '{print $2}')
+        cb_id=$(grep '^callback_id:' "$cb_file" | awk '{print $2}')
+        cb_origin=$(grep '^origin:' "$cb_file" | awk '{print $2}')
+    fi
+
+    if [ "$(_callback_ask_origin "$project_root" "$slug" "$stage" "$cb_origin")" = "ask" ]; then
+        echo "REFUSED: '$slug/$stage' is an operator ask — answer via 'forge dispatch @<session> --answers', not park." >&2
+        return 1
+    fi
+    if [ "$cb_status" = "PARKED" ]; then echo "PARK NOOP slug=$slug stage=$stage (already parked)"; return 0; fi
+    if [ -z "$cb_file" ] || [ -z "$cb_status" ]; then echo "PARK NOOP slug=$slug stage=$stage reason=no-blocked-callback"; return 0; fi
+    if [ "$cb_status" != "BLOCKED" ]; then echo "PARK NOOP slug=$slug stage=$stage reason=callback-status=$cb_status (not BLOCKED)"; return 0; fi
+
+    local park_ts
+    park_ts=$(FORGE_PK_STAGE="$stage" python3 - "$pipeline_log" <<'PY'
+import os, sys, yaml
+try: d = yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: sys.exit(3)
+c=[e for e in (d.get('entries') or []) if isinstance(e,dict) and e.get('response') is None and e.get('stage')==os.environ["FORGE_PK_STAGE"]]
+if not c: sys.exit(2)
+c.sort(key=lambda e: e.get('timestamp') or '')
+print(c[-1].get('timestamp') or '')
+if len(c) > 1:
+    older=" ".join((e.get('timestamp') or '?') for e in c[:-1])
+    sys.stderr.write("WARN park D2: newest of %d open entries at this stage chosen; older duplicates: %s\n" % (len(c), older))
+PY
+)
+    local prc=$?
+    if [ "$prc" -eq 3 ]; then echo "ERROR: park: cannot parse $pipeline_log" >&2; return 1; fi
+    if [ "$prc" -eq 2 ] || [ -z "$park_ts" ]; then
+        echo "ERROR: park: callback BLOCKED but no open pending at $slug/$stage — cannot park." >&2; return 1
+    fi
+
+    _lifecycle_lock "$slug" "$stage" || return 1
+    local rv; rv=$(_lifecycle_revalidate "$cb_file" BLOCKED "$cb_id" "$pipeline_log" "$park_ts")
+    if [ "$rv" != OK ]; then _lifecycle_unlock; echo "REFUSED: park revalidation failed ($rv) — no write performed." >&2; return 1; fi
+    local parked_at; parked_at=$(timestamp)
+    local unc_bool; unc_bool=$([ "$uncommitted" = true ] && echo true || echo false)
+    if ! _insert_parked_fields_by_ts "$slug" "$park_ts" "$parked_at" "$reason" "$unc_bool"; then
+        _lifecycle_unlock
+        echo "ERROR: park: failed to insert the durable parked record; callback left BLOCKED (re-park to retry)." >&2; return 1
+    fi
+    local cb_tmp="$cb_dir/.$(basename "$cb_file").tmp.$$"
+    FORGE_PK_AT="$parked_at" FORGE_PK_REASON="$reason" FORGE_PK_UNCO="$unc_bool" \
+    python3 - "$cb_file" "$cb_tmp" <<'PY'
+import os, sys
+src, dst = sys.argv[1], sys.argv[2]
+parked_at = os.environ["FORGE_PK_AT"]; unc = os.environ["FORGE_PK_UNCO"]
+reason = " ".join(os.environ.get("FORGE_PK_REASON","").splitlines()[0].split())[:120] if os.environ.get("FORGE_PK_REASON") else ""
+esc = reason.replace('\\','\\\\').replace('"','\\"')
+out = []
+for ln in open(src).read().splitlines(keepends=True):
+    if ln.startswith('status:'):
+        out.append('status: PARKED\n'); continue
+    if ln.startswith(('parked_at:', 'parked_reason:', 'uncommitted:')):
+        continue
+    if ln.startswith('message:'):
+        out.append(f'parked_at: {parked_at}\n')
+        out.append(f'parked_reason: "{esc}"\n')
+        out.append(f'uncommitted: {unc}\n')
+    out.append(ln)
+open(dst, 'w').write(''.join(out))
+PY
+    if ! mv -f "$cb_tmp" "$cb_file"; then
+        rm -f "$cb_tmp"; _lifecycle_unlock
+        echo "ERROR: park: durable record written but callback flip failed (PARK-INCONSISTENT will surface; re-run park)." >&2; return 1
+    fi
+    _lifecycle_unlock
+
+    # (4) infra-lock release — NOT best-effort; OUTSIDE the lifecycle lock (no nesting).
+    local il_out il_v park_rc=0 lock_release_state
+    il_out=$(cmd_infra_lock release --slug "$slug" --stage "$stage" 2>&1)
+    il_v=$(printf '%s' "$il_out" | sed -n 's/^INFRA_LOCK: \([A-Z_]*\).*/\1/p')
+    case "$il_v" in
+        RELEASED|FORCE_RELEASED) lock_release_state="RELEASED" ;;
+        RELEASE_NOOP)
+            case "$il_out" in
+                *reason=not-held*)  lock_release_state="RELEASE_NOOP_NOT_HELD" ;;   # success
+                *)                  lock_release_state="RELEASE_NOOP_NOT_OWNER"; park_rc=1 ;;
+            esac ;;
+        ESCALATE)                lock_release_state="ESCALATE"; park_rc=1 ;;
+        *)                       lock_release_state="IDENTITY_FAILURE"; park_rc=1 ;;
+    esac
+    if [ "$park_rc" -ne 0 ]; then
+        _emit_event PARK "$slug" "stage=$stage action=parked lock_release_state=$lock_release_state callback_id=$cb_id needs=manual-lock-release"
+        _emit_event ERROR "$slug" "stage=$stage reason=park-lock-release-$lock_release_state"
+        echo "PARK PARTIAL slug=$slug stage=$stage lock_release_state=$lock_release_state — parked record stands; infra lock needs manual release." >&2
+    else
+        _emit_event PARK "$slug" "stage=$stage action=parked lock_release_state=$lock_release_state callback_id=$cb_id uncommitted=$uncommitted"
+    fi
+
+    if [ -n "${TMUX:-}" ]; then
+        local s; s="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+        if [ -n "$s" ]; then
+            _cancel_copy_mode "$s:$WINDOW.1"
+            tmux send-keys -t "$s:$WINDOW.1" -l "FORGE_PARKED: $slug/$stage — $reason" 2>/dev/null || true
+            sleep 0.2; tmux send-keys -t "$s:$WINDOW.1" Enter 2>/dev/null || true
+        fi
+    fi
+    _render_status_file
+    echo "PARKED slug=$slug stage=$stage lock_release_state=$lock_release_state parked_at=$parked_at"
+    return $park_rc
+}
+
+cmd_park_resolve() {   # <slug> <stage> <note>   (acquires the lifecycle lock)
+    local slug="$1" stage="$2" note="$3"
+    local project_root; project_root=$(_resolve_project_root "")
+    [ -n "$project_root" ] || { echo "ERROR: park --resolve requires forge-project.yml" >&2; return 1; }
+    local cb_dir="$project_root/.dev/forge-tmp/callbacks"
+    local sess; sess="$(_resolve_session)"
+    local cb_file; cb_file="$(_resolve_callback_file "$cb_dir" "$slug" "$stage" "$sess" 2>/dev/null)" || cb_file=""
+    local pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
+    local ts
+    ts=$(FORGE_PK_STAGE="$stage" python3 - "$pipeline_log" <<'PY'
+import os, sys, yaml
+try: d = yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: sys.exit(2)
+c=[e for e in (d.get('entries') or []) if isinstance(e,dict) and e.get('response') is None and e.get('stage')==os.environ["FORGE_PK_STAGE"]]
+c.sort(key=lambda e: e.get('timestamp') or '')
+print(c[-1].get('timestamp') if c else '')
+PY
+)
+    [ -n "$ts" ] || { echo "ERROR: park --resolve: no open pending at $slug/$stage" >&2; return 1; }
+    _lifecycle_lock "$slug" "$stage" || return 1
+    if ! _patch_response_by_ts "$slug" "$ts" "FORGE_PARK_RESOLVED: ${note:-resolved}"; then
+        _lifecycle_unlock; echo "ERROR: park --resolve: failed to close pending" >&2; return 1
+    fi
+    if [ -n "$cb_file" ] && [ -f "$cb_file" ]; then
+        ( cd "$project_root" && cmd_callback_consume --_no_lock --slug "$slug" --stage "$stage" --status PARKED >/dev/null 2>&1 ) || true
+    fi
+    _lifecycle_unlock
+    _emit_event PARK "$slug" "stage=$stage action=resolved note=$(_sanitize_event_value "$note")"
+    _render_status_file
+    echo "PARK RESOLVED slug=$slug stage=$stage"
 }
 
 # ===========================================================================
@@ -4367,6 +4562,8 @@ case "${1:-help}" in
     dispatch)        shift; cmd_dispatch "$@" ;;
     callback)        shift; cmd_callback "$@" ;;
     callback-consume) shift; cmd_callback_consume "$@" ;;
+    park)            shift; cmd_park "$@" ;;
+    blocked-audit)   shift; cmd_blocked_audit "$@" ;;
     infra-lock)      shift; cmd_infra_lock "$@" ;;
     wait)            shift; cmd_wait "$@" ;;
     digest)          shift; cmd_digest "$@" ;;

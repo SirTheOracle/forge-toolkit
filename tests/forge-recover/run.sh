@@ -241,4 +241,24 @@ out=$(FORGE_RECOVER_TMUX_STATUS=no-server recov --root "/nonexistent-root-xyz" -
 echo "$out" | grep -q "skipped" && ok "missing root skipped with warning" || bad "no skip line"
 [ "$rc" -eq 2 ] && ok "other root still scanned (exit 2, candidates)" || bad "exit=$rc want 2"
 
+echo "── T21: P13 recover four-quadrant + catch-all ──"
+# ghost_fixtures seeds a dead-session candidate so the root is NON-clean — the FOLLOW-UP
+# render only fires on a non-clean root (same convention as T18); the parked-quadrant
+# classifier output is otherwise computed-but-unrendered on an all-clean root.
+new_root recq; ghost_fixtures "$R"; mkdir -p "$R/.dev/proposals/q1" "$R/.dev/proposals/q2" "$R/.dev/proposals/q4" "$R/.dev/forge-tmp/callbacks"
+printf 'entries:\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: coding\n    session: forge-1\n    parked_at: 2026-07-01T00:00:00Z\n    parked_reason: "x"\n    uncommitted: false\n    response: null\n' > "$R/.dev/proposals/q1/forge-log.yml"
+printf 'slug: q1\nstage: coding\nstatus: PARKED\nsession: forge-1\ncallback_id: q1-coding-x\nmessage: |\n  p\n' > "$R/.dev/forge-tmp/callbacks/q1-coding.forge-1.callback"
+printf 'entries:\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: coding\n    session: forge-1\n    parked_at: 2026-07-01T00:00:00Z\n    parked_reason: "y"\n    uncommitted: false\n    response: null\n' > "$R/.dev/proposals/q2/forge-log.yml"
+printf 'slug: q2\nstage: coding\nstatus: BLOCKED\nsession: forge-1\ncallback_id: q2-coding-x\nmessage: |\n  b\n' > "$R/.dev/forge-tmp/callbacks/q2-coding.forge-1.callback"
+printf 'slug: q3\nstage: coding\nstatus: PARKED\nsession: forge-1\ncallback_id: q3-coding-x\nmessage: |\n  p\n' > "$R/.dev/forge-tmp/callbacks/q3-coding.forge-1.callback"
+printf 'entries:\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: coding\n    response: null\n' > "$R/.dev/proposals/q4/forge-log.yml"
+printf 'slug: q5\nstage: coding\nstatus: BLOCKED\nsession: forge-1\ncallback_id: q5-coding-x\nmessage: |\n  bare-orphan\n' > "$R/.dev/forge-tmp/callbacks/q5-coding.forge-1.callback"
+out=$(FORGE_RECOVER_TMUX_STATUS=no-server recov --root "$R" --dry-run 2>&1 || true)
+echo "$out" | grep -q "FOLLOW-UP.*parked (deliberate) q1/coding" && ok "R1 quadrant1 deliberate" || bad "R1 missing"
+echo "$out" | grep -q "FOLLOW-UP.*parked (incomplete transition) q2/coding" && ok "R2 quadrant2 incomplete" || bad "R2 missing"
+echo "$out" | grep -q "FOLLOW-UP.*orphan PARKED callback q3/coding" && ok "R3 quadrant3 orphan" || bad "R3 missing"
+echo "$out" | grep -q "FOLLOW-UP.*manual disposition" && ok "R4 quadrant4 manual disposition" || bad "R4 missing"
+echo "$out" | grep -Eq "q[123]/coding.*manual disposition" && bad "R1-3 leaked manual disposition" || ok "R1-3 no manual disposition"
+echo "$out" | grep -q "FOLLOW-UP.*callback residue.*q5-coding" && ok "R5 bare BLOCKED orphan surfaced (catch-all)" || bad "R5 bare orphan dropped"
+
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]
