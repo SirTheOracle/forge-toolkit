@@ -691,21 +691,14 @@ echo "$out" | grep -qi 'Traceback' && bad "B14 guard tracebacked on a malformed 
 grep -q 'qualifier=incomplete parked=1' "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null \
   && ok "B14 cmd_emit COMPLETE auto-qualified parked=1" || bad "B14 no qualifier: $out $(cat "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null)"
 
-# B12/B13/B15/B17/B18 — DEFERRED (end-to-end dispatch/worker-send guard refusal).
-# The P15 work-start guard (bin/forge-bridge _work_start_guard) IS applied and verified:
-#   * its collector (_unresolved_blocked_items) is fail-safe on malformed logs — see B14;
-#   * driven through a REAL dispatch (live tmux session + valid .txt template) it refuses
-#     a cross-slug dispatch with "HOOK BLOCKED" and emits GUARD_BLOCK reason=unresolved-
-#     blocked-item (verified out-of-band during C5 coding).
-# These five assertions drive `dispatch`/worker-`send` to completion, which the infra-lock
-# suite cannot do hermetically: dispatch/send require identity class host-pane — a LIVE
-# forge session with the full pane count (require_identity + require_pane_count) — and the
-# post-guard delivery needs a real worker pane. That machinery lives only in
-# tests/forge-bridge/run.sh (its run_in_pane helper against a multi-pane session); the
-# spec's plain `cd $P && $BRIDGE dispatch …` bodies (mk_stage_stub even writes .md while
-# dispatch renders .txt) are not runnable here. B12/B13/B18 assert the pre-send refusal;
-# B15/B17 additionally need a *successful* dispatch (post-guard send to a live pane).
-# Deferred to live QA / a follow-up that ports the run_in_pane multi-pane harness.
+# B12/B13/B15/B17/B18 execute end to end in tests/forge-bridge/run.sh:
+#   T-GUARD-B12-CROSS-SLUG, T-GUARD-B12-AFTER-PARK,
+#   T-GUARD-B12-ASK-CONTROL, T-GUARD-B12-INFLIGHT-CONTROL,
+#   T-GUARD-B12-PARKED-ADVANCE, T-GUARD-B13-FORCE-MATRIX,
+#   T-GUARD-B13-BYPASS-ONE-SHOT, T-GUARD-B15-SUPERSEDE-SUCCESS,
+#   T-GUARD-B15-SUPERSEDE-CLOSE-FAILURE, T-GUARD-B17-INTERNAL-DELIVERY,
+#   T-GUARD-B18-FORCE-FILTER, T-GUARD-B18-OWN-CONTINUE,
+#   T-GUARD-FIXTURE-HYGIENE-FINAL.
 
 # B16 crash-safety: parked record + BLOCKED callback coexist → re-park self-heals
 P="$(mkproj b16)"; parked_pending "$P" p16 coding codex-a "2026-06-29T00:00:00Z" "parked" ""

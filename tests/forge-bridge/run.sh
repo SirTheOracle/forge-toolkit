@@ -18,8 +18,8 @@ bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 
 export FORGE_WATCH_TRIGGER=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fbid.XXXXXX")"; WORK="$(cd "$WORK" && pwd -P)"
-S1="fbid1-$$"; S2="fbid2-$$"; S3="fbid3-$$"; S4="fbid4-$$"
-trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; rm -rf "$WORK"' EXIT
+S1="fbid1-$$"; S2="fbid2-$$"; S3="fbid3-$$"; S4="fbid4-$$"; GS="fbguard-$$"
+trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # ---- Pure-helper extraction (no main dispatch) ----
 FNS="$WORK/fns.sh"
@@ -456,6 +456,249 @@ cp="$(cd "$WORK/aliasA" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION "$BRIDGE" pr
 printf '%s' "$cp" | grep -q "directory_state:    OK" \
     && ok "T-CANON-PREFLIGHT symlinked checkout → directory_state OK" \
     || bad "T-CANON-PREFLIGHT symlinked checkout → directory_state OK ($(printf '%s' "$cp" | grep directory_state))"
+
+# ---- Blocked-item all-boundary guard / supersede (P0 live debt) ----
+echo "== blocked-item live guard / supersede (P0) =="
+GROOT="$(mkR guard-root)"
+GLOCKS="$GROOT/.dev/forge-tmp/guard-infra-locks"; mkdir -p "$GLOCKS"
+tmux new-session -d -s "$GS" -x 220 -y 50 -c "$GROOT"
+i=0; while [ "$i" -lt 4 ]; do tmux split-window -d -t "$GS:0" -c "$GROOT"; tmux select-layout -t "$GS:0" tiled >/dev/null 2>&1; i=$((i+1)); done
+GINC="$(tmux display-message -p -t "$GS:0.0" '#{session_created}')"
+GPROMPTS="$WORK/guard-prompts"; mkdir -p "$GPROMPTS"
+printf 'P0 live guard prompt for {{slug}} at {{stage}} to {{worker}}\n' > "$GPROMPTS/adhoc.txt"
+
+guard_wait_pane_ready(){
+    local pane="$1" ready="$GROOT/.dev/forge-tmp/guard-pane-$1.ready" attempt=0 poll
+    rm -f "$ready"
+    while [ "$attempt" -lt 15 ]; do
+        tmux send-keys -t "$GS:0.$pane" -l ": > \"$ready\"" 2>/dev/null || true
+        tmux send-keys -t "$GS:0.$pane" Enter 2>/dev/null || true
+        poll=0
+        while [ "$poll" -lt 10 ]; do
+            [ -f "$ready" ] && return 0
+            sleep 0.1
+            poll=$((poll+1))
+        done
+        attempt=$((attempt+1))
+    done
+    return 1
+}
+guard_pane=0
+while [ "$guard_pane" -lt 5 ]; do
+    guard_wait_pane_ready "$guard_pane" \
+        || { bad "T-GUARD-PANE-READY-$guard_pane"; exit 1; }
+    guard_pane=$((guard_pane+1))
+done
+rm -f "$GROOT"/.dev/forge-tmp/guard-pane-*.ready
+
+guard_log(){
+    local slug="$1" stage="$2" worker="$3" tag="$4"
+    run_in_pane "$GS:0.0" "$tag-log" "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug $slug --stage $stage --from claude --to $worker --prompt p0-$tag )"
+    [ "$(rc_of "$tag-log")" = 0 ]
+}
+guard_block(){
+    local slug="$1" stage="$2" worker="$3" pane="$4" tag="$5" origin="${6:-worker}"
+    guard_log "$slug" "$stage" "$worker" "$tag" || return 1
+    if [ "$origin" = ask ]; then
+        run_in_pane "$GS:0.$pane" "$tag-cb" "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_INTERNAL_ASK_ORIGIN=1 $BRIDGE callback --slug $slug --stage $stage --status BLOCKED --origin ask --worker $worker --message p0-$tag --quiet )"
+    else
+        run_in_pane "$GS:0.$pane" "$tag-cb" "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug $slug --stage $stage --status BLOCKED --worker $worker --message p0-$tag --quiet )"
+    fi
+    [ "$(rc_of "$tag-cb")" = 0 ]
+}
+guard_done(){
+    local slug="$1" stage="$2" worker="$3" pane="$4" tag="$5"
+    tmux send-keys -t "$GS:0.$pane" C-c 2>/dev/null || return 1
+    sleep 0.2
+    run_in_pane "$GS:0.$pane" "$tag-done" "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug $slug --stage $stage --status DONE --worker $worker --message p0-done --quiet )"
+    [ "$(rc_of "$tag-done")" = 0 ]
+}
+guard_capture_has(){
+    local pane="$1" needle="$2" captured
+    captured="$(tmux capture-pane -p -S - -t "$GS:0.$pane" 2>/dev/null | tr -d '\n')" || return 1
+    case "$captured" in *"$needle"*) return 0 ;; *) return 1 ;; esac
+}
+guard_assert_clean(){
+    python3 - "$GROOT" <<'PY'
+import pathlib, sys, yaml
+root = pathlib.Path(sys.argv[1]); residue = []
+for path in (root / '.dev/proposals').glob('*/forge-log.yml'):
+    try: entries = (yaml.safe_load(path.read_text()) or {}).get('entries') or []
+    except Exception as exc: residue.append('%s parse=%s' % (path, exc)); continue
+    for entry in entries:
+        if entry.get('response') is None: residue.append('%s pending=%s/%s' % (path, entry.get('stage'), entry.get('to')))
+for path in (root / '.dev/forge-tmp/callbacks').glob('*.callback'):
+    try: status = str((yaml.safe_load(path.read_text()) or {}).get('status') or '')
+    except Exception as exc: residue.append('%s parse=%s' % (path, exc)); continue
+    if status in ('BLOCKED', 'PARKED'): residue.append('%s status=%s' % (path, status))
+if residue:
+    print('GUARD FIXTURE RESIDUE: ' + ' | '.join(residue)); sys.exit(1)
+PY
+}
+guard_require_clean(){
+    local id="$1"
+    if guard_assert_clean; then ok "$id"; else bad "$id"; return 1; fi
+}
+
+guard_block b12-block coding codex-a 2 b12-block || bad "T-GUARD-B12 setup"
+run_in_pane "$GS:0.0" b12-refuse "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b12-next --stage adhoc --worker codex-b )"
+if [ "$(rc_of b12-refuse)" != 0 ] && out_of b12-refuse | grep -q 'HOOK BLOCKED: dispatch refused' \
+   && [ ! -e "$GROOT/.dev/proposals/b12-next/forge-log.yml" ] \
+   && ! guard_capture_has 3 'codex-b-adhoc-b12-next.txt' \
+   && grep -q 'reason=unresolved-blocked-item' "$GROOT/.dev/forge-tmp/orchestrator-events.log"; then
+    ok "T-GUARD-B12-CROSS-SLUG"
+else bad "T-GUARD-B12-CROSS-SLUG"; fi
+run_in_pane "$GS:0.0" b12-park "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_INFRA_LOCK_DIR=$GLOCKS $BRIDGE park --slug b12-block --stage coding --reason p0-b12 )"
+run_in_pane "$GS:0.0" b12-after-park "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b12-next --stage adhoc --worker codex-b )"
+if [ "$(rc_of b12-park)" = 0 ] && [ "$(rc_of b12-after-park)" = 0 ] \
+   && grep -q 'parked_at:' "$GROOT/.dev/proposals/b12-block/forge-log.yml" \
+   && grep -q 'response: null' "$GROOT/.dev/proposals/b12-next/forge-log.yml" \
+   && guard_capture_has 3 'codex-b-adhoc-b12-next.txt'; then
+    ok "T-GUARD-B12-AFTER-PARK"
+else bad "T-GUARD-B12-AFTER-PARK"; fi
+guard_done b12-next adhoc codex-b 3 b12-next-clean || bad "B12 close replacement"
+run_in_pane "$GS:0.0" b12-resolve "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE park --resolve --slug b12-block --stage coding --note p0-clean )"
+guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B12-A" || exit 1
+
+guard_block b12-ask coding codex-a 2 b12-ask ask || bad "B12 ask setup"
+run_in_pane "$GS:0.0" b12-ask-pass "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b12-ask-next --stage adhoc --worker codex-b )"
+if [ "$(rc_of b12-ask-pass)" = 0 ] && guard_capture_has 3 'codex-b-adhoc-b12-ask-next.txt'; then
+    ok "T-GUARD-B12-ASK-CONTROL"
+else bad "T-GUARD-B12-ASK-CONTROL"; fi
+guard_done b12-ask-next adhoc codex-b 3 b12-ask-next-clean || bad "B12 close ask dispatch"
+guard_done b12-ask coding codex-a 2 b12-ask-clean || bad "B12 close ask"
+guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B12-ASK" || exit 1
+
+guard_log b12-flight coding codex-a b12-flight || bad "B12 in-flight setup"
+run_in_pane "$GS:0.0" b12-flight-pass "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b12-flight-next --stage adhoc --worker codex-b )"
+if [ "$(rc_of b12-flight-pass)" = 0 ] && guard_capture_has 3 'codex-b-adhoc-b12-flight-next.txt'; then
+    ok "T-GUARD-B12-INFLIGHT-CONTROL"
+else bad "T-GUARD-B12-INFLIGHT-CONTROL"; fi
+guard_done b12-flight-next adhoc codex-b 3 b12-flight-next-clean || bad "B12 close in-flight dispatch"
+guard_done b12-flight coding codex-a 2 b12-flight-clean || bad "B12 close in-flight"
+guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B12-FLIGHT" || exit 1
+
+guard_block b12-parked coding codex-a 2 b12-parked || bad "B12 parked setup"
+run_in_pane "$GS:0.0" b12-parked-do "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_INFRA_LOCK_DIR=$GLOCKS $BRIDGE park --slug b12-parked --stage coding --reason p0-parked )"
+run_in_pane "$GS:0.0" b12-parked-advance "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b12-parked --stage adhoc --worker codex-b )"
+if [ "$(rc_of b12-parked-do)" = 0 ] && [ "$(rc_of b12-parked-advance)" != 0 ] \
+   && out_of b12-parked-advance | grep -q 'open pending' && ! guard_capture_has 3 'codex-b-adhoc-b12-parked.txt'; then
+    ok "T-GUARD-B12-PARKED-ADVANCE"
+else bad "T-GUARD-B12-PARKED-ADVANCE"; fi
+run_in_pane "$GS:0.0" b12-parked-clean "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE park --resolve --slug b12-parked --stage coding --note p0-clean )"
+guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B12-PARKED" || exit 1
+
+guard_block b13-hold coding codex-a 2 b13-hold || bad "B13 setup holder"
+guard_log b13-send adhoc codex-b b13-send || bad "B13 setup logged send"
+run_in_pane "$GS:0.0" b13-normal "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send codex-b B13_NORMAL )"
+run_in_pane "$GS:0.0" b13-own "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-a B13_OWN )"
+run_in_pane "$GS:0.0" b13-other "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-b B13_OTHER )"
+if [ "$(rc_of b13-normal)" != 0 ] && out_of b13-normal | grep -q 'HOOK BLOCKED: send refused' \
+   && ! guard_capture_has 3 B13_NORMAL \
+   && [ "$(rc_of b13-own)" = 0 ] && guard_capture_has 2 B13_OWN \
+   && [ "$(rc_of b13-other)" != 0 ] && out_of b13-other | grep -q 'HOOK BLOCKED: send refused' \
+   && ! guard_capture_has 3 B13_OTHER; then
+    ok "T-GUARD-B13-FORCE-MATRIX"
+else bad "T-GUARD-B13-FORCE-MATRIX"; fi
+run_in_pane "$GS:0.0" b13-bypass "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --allow-blocked p0-b13 codex-b B13_BYPASS )"
+run_in_pane "$GS:0.0" b13-again "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send codex-b B13_AGAIN )"
+if [ "$(rc_of b13-bypass)" = 0 ] && guard_capture_has 3 B13_BYPASS \
+   && grep -Eq 'GUARD_BLOCK: pipeline=multi stage=\? boundary=send reason=allow-blocked-bypass n=1 .*bypassed=b13-hold.*allow_reason=p0-b13' "$GROOT/.dev/forge-tmp/orchestrator-events.log" \
+   && [ "$(rc_of b13-again)" != 0 ] && out_of b13-again | grep -q 'HOOK BLOCKED: send refused' \
+   && ! guard_capture_has 3 B13_AGAIN; then
+    ok "T-GUARD-B13-BYPASS-ONE-SHOT"
+else bad "T-GUARD-B13-BYPASS-ONE-SHOT"; fi
+guard_done b13-hold coding codex-a 2 b13-hold-clean || bad "B13 close holder"
+guard_done b13-send adhoc codex-b 3 b13-send-clean || bad "B13 close logged send"
+guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B13" || exit 1
+
+guard_block b15-ok coding codex-a 2 b15-ok || bad "B15 success setup"
+B15_OK_CB="$GROOT/.dev/forge-tmp/callbacks/b15-ok-coding.$GS.callback"
+B15_OK_ID="$(sed -n 's/^callback_id: //p' "$B15_OK_CB")"
+run_in_pane "$GS:0.0" b15-ok-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b15-ok --stage adhoc --worker codex-b --supersede )"
+if [ "$(rc_of b15-ok-dispatch)" = 0 ] && [ ! -f "$B15_OK_CB" ] \
+   && grep -q 'FORGE_SUPERSEDED' "$GROOT/.dev/proposals/b15-ok/forge-log.yml" \
+   && grep -Eq "SUPERSEDE_AUDIT: pipeline=b15-ok stage=coding prior_callback_id=$B15_OK_ID prior_status=BLOCKED .*actor=$GS" "$GROOT/.dev/forge-tmp/orchestrator-events.log" \
+   && guard_capture_has 3 'codex-b-adhoc-b15-ok.txt'; then
+    ok "T-GUARD-B15-SUPERSEDE-SUCCESS"
+else bad "T-GUARD-B15-SUPERSEDE-SUCCESS"; fi
+guard_done b15-ok adhoc codex-b 3 b15-ok-clean || bad "B15 close success replacement"
+guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B15-SUCCESS" || exit 1
+
+mkdir -p "$GROOT/.dev/proposals/b15-fail"
+cat > "$GROOT/.dev/proposals/b15-fail/forge-log.yml" <<EOF
+pipeline: b15-fail
+entries:
+  - timestamp: 2026-07-13T00:00:00Z
+    stage: coding
+    to: codex-a
+    session: $GS
+    incarnation: $GINC
+    response: null
+EOF
+B15_FAIL_CB="$GROOT/.dev/forge-tmp/callbacks/b15-fail-coding.$GS.callback"
+cat > "$B15_FAIL_CB" <<EOF
+slug: b15-fail
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: $GS
+origin:
+callback_id: b15-fail-callback
+timestamp: 2026-07-13T00:00:01Z
+message: deterministic close failure
+EOF
+before_audit=$(grep -c 'SUPERSEDE_AUDIT.*b15-fail' "$GROOT/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null || true)
+before_audit=${before_audit:-0}
+run_in_pane "$GS:0.0" b15-fail-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b15-fail --stage adhoc --worker codex-b --supersede )"
+after_audit=$(grep -c 'SUPERSEDE_AUDIT.*b15-fail' "$GROOT/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null || true)
+after_audit=${after_audit:-0}
+if [ "$(rc_of b15-fail-dispatch)" = 0 ] && out_of b15-fail-dispatch | grep -q 'partial close failure' \
+   && guard_capture_has 3 'codex-b-adhoc-b15-fail.txt' && [ -f "$B15_FAIL_CB" ] \
+   && [ "$(grep -c 'response: null' "$GROOT/.dev/proposals/b15-fail/forge-log.yml")" -ge 2 ] \
+   && [ "$before_audit" = "$after_audit" ] \
+   && [ -z "$(find "$GROOT/.dev/forge-tmp/callbacks/archive" -type f -name 'b15-fail-*' -print -quit 2>/dev/null)" ]; then
+    ok "T-GUARD-B15-SUPERSEDE-CLOSE-FAILURE"
+else bad "T-GUARD-B15-SUPERSEDE-CLOSE-FAILURE"; fi
+guard_done b15-fail adhoc codex-b 3 b15-fail-replacement-clean || bad "B15 close delivered replacement"
+sed -i '' 's/^  - timestamp: 2026-07-13T00:00:00Z$/  - timestamp: "2026-07-13T00:00:00Z"/' "$GROOT/.dev/proposals/b15-fail/forge-log.yml"
+run_in_pane "$GS:0.0" b15-fail-repair "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b15-fail --stage adhoc --worker codex-b --supersede )"
+[ "$(rc_of b15-fail-repair)" = 0 ] || bad "B15 repair supersede"
+guard_done b15-fail adhoc codex-b 3 b15-fail-repair-clean || bad "B15 close repair replacement"
+guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B15-FAILURE" || exit 1
+
+guard_block b17-hold coding codex-a 2 b17-hold || bad "B17 setup"
+run_in_pane "$GS:0.0" b17-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b17-next --stage adhoc --worker codex-b --allow-blocked p0-b17 )"
+if [ "$(rc_of b17-dispatch)" = 0 ] && guard_capture_has 3 'codex-b-adhoc-b17-next.txt' \
+   && grep -Eq 'GUARD_BLOCK: pipeline=multi stage=\? boundary=dispatch reason=allow-blocked-bypass n=1 .*bypassed=b17-hold.*allow_reason=p0-b17' "$GROOT/.dev/forge-tmp/orchestrator-events.log" \
+   && ! out_of b17-dispatch | grep -q 'HOOK BLOCKED: send refused'; then
+    ok "T-GUARD-B17-INTERNAL-DELIVERY"
+else bad "T-GUARD-B17-INTERNAL-DELIVERY"; fi
+guard_done b17-next adhoc codex-b 3 b17-next-clean || bad "B17 close dispatch"
+guard_done b17-hold coding codex-a 2 b17-hold-clean || bad "B17 close holder"
+guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B17" || exit 1
+
+guard_block z-b18-a coding codex-a 2 b18-a || bad "B18 setup A"
+guard_block a-b18-b coding codex-b 3 b18-b || bad "B18 setup B"
+run_in_pane "$GS:0.0" b18-force-a "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-a B18_FORCE_A )"
+run_in_pane "$GS:0.0" b18-force-b "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-b B18_FORCE_B )"
+b18_a_out="$(out_of b18-force-a)"; b18_b_out="$(out_of b18-force-b)"
+if [ "$(rc_of b18-force-a)" != 0 ] && [ "$(rc_of b18-force-b)" != 0 ] \
+   && printf '%s' "$b18_a_out" | grep -q 'a-b18-b/coding' && ! printf '%s' "$b18_a_out" | grep -q 'z-b18-a/coding' \
+   && printf '%s' "$b18_b_out" | grep -q 'z-b18-a/coding' && ! printf '%s' "$b18_b_out" | grep -q 'a-b18-b/coding' \
+   && ! guard_capture_has 2 B18_FORCE_A && ! guard_capture_has 3 B18_FORCE_B; then
+    ok "T-GUARD-B18-FORCE-FILTER"
+else bad "T-GUARD-B18-FORCE-FILTER"; fi
+guard_done a-b18-b coding codex-b 3 b18-b-clean || bad "B18 close B"
+run_in_pane "$GS:0.0" b18-own "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-a B18_AFTER_B )"
+if [ "$(rc_of b18-own)" = 0 ] && guard_capture_has 2 B18_AFTER_B; then
+    ok "T-GUARD-B18-OWN-CONTINUE"
+else bad "T-GUARD-B18-OWN-CONTINUE"; fi
+guard_done z-b18-a coding codex-a 2 b18-a-clean || bad "B18 close A"
+guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B18" || exit 1
+
+guard_require_clean "T-GUARD-FIXTURE-HYGIENE-FINAL" || exit 1
+tmux kill-session -t "$GS" 2>/dev/null
 
 # ---- Name-reuse / incarnation (R10, CG-6) ----
 echo "== name-reuse / incarnation (R10) =="
