@@ -111,7 +111,122 @@ parked_pending() {  # <root> <slug> <stage> <to> <ts> <reason> [session]
       echo "    response: null"; } > "$d/forge-log.yml"
 }
 mk_stage_stub() { export FORGE_PROMPTS_DIR="$1/prompts"; mkdir -p "$FORGE_PROMPTS_DIR"; : > "$FORGE_PROMPTS_DIR/coding.md"; : > "$FORGE_PROMPTS_DIR/qa.md"; }
+export FORGE_WATCH_TRIGGER=0  # hermetic suite: never poke the real board
 lifelock_path() { echo "$1/.dev/forge-tmp/locks/lifecycle-$2--$3.lock"; }  # matches _lifecycle_lock
+
+# One body serves short stress, the true product-default control, and full-suite B6.
+# b6_case <unique-label> <wait-seconds-or-empty-for-product-default>
+b6_case() {
+    local label="$1" wait_s="$2" expected_wait="${2:-5}"
+    local p slug="p6-$label" lk ready release hold i out rc t0 t1 elapsed_ok qaf caf infra parent_pid
+    p="$(mkproj "b6-$label")"
+    infra="$p/.dev/forge-tmp/b6-infra-locks"
+    mkdir -p "$infra"
+    pending_entry "$p" "$slug" coding codex-a "2026-06-29T00:00:00Z"
+    cb "$p" --slug "$slug" --stage coding --status BLOCKED --worker codex-a --message x >/dev/null 2>&1
+    lk="$(lifelock_path "$p" "$slug" coding)"
+    ready="$p/.dev/forge-tmp/b6-holder.ready"
+    release="$p/.dev/forge-tmp/b6-holder.release"
+    parent_pid=$$
+    mkdir -p "$(dirname "$lk")"
+    (
+        exec 9>"$lk"
+        flock 9
+        : > "$ready"
+        while [ ! -f "$release" ] && kill -0 "$parent_pid" 2>/dev/null; do sleep 0.05; done
+    ) &
+    hold=$!
+
+    i=0
+    while [ ! -f "$ready" ] && [ "$i" -lt 100 ] && kill -0 "$hold" 2>/dev/null; do
+        sleep 0.05
+        i=$((i+1))
+    done
+    if [ ! -f "$ready" ] || ! kill -0 "$hold" 2>/dev/null; then
+        bad "B6 $label holder died or did not become ready after flock"
+        : > "$release"
+        kill "$hold" 2>/dev/null
+        wait "$hold" 2>/dev/null
+        return 1
+    fi
+    ok "B6 $label holder reported post-flock readiness"
+
+    t0=$(python3 -c 'import time; print(time.time())')
+    if [ -n "$wait_s" ]; then
+        out=$(cd "$p" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION \
+            FORGE_INFRA_LOCK_DIR="$infra" FORGE_LIFECYCLE_LOCK_WAIT_S="$wait_s" \
+            FORGE_LOCK_SELF_HOST=h FORGE_LOCK_SELF_SESSION="b6-$label" \
+            FORGE_LOCK_SELF_SESSION_ID="b6-$label" FORGE_LOCK_SELF_SESSION_CREATED=1 \
+            "$BRIDGE" park --slug "$slug" --stage coding --reason later 2>&1); rc=$?
+    else
+        out=$(cd "$p" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION -u FORGE_LIFECYCLE_LOCK_WAIT_S \
+            FORGE_INFRA_LOCK_DIR="$infra" \
+            FORGE_LOCK_SELF_HOST=h FORGE_LOCK_SELF_SESSION="b6-$label" \
+            FORGE_LOCK_SELF_SESSION_ID="b6-$label" FORGE_LOCK_SELF_SESSION_CREATED=1 \
+            "$BRIDGE" park --slug "$slug" --stage coding --reason later 2>&1); rc=$?
+    fi
+    t1=$(python3 -c 'import time; print(time.time())')
+    elapsed_ok=$(python3 - "$t0" "$t1" "$expected_wait" <<'PY'
+import sys
+start, end, wait = map(float, sys.argv[1:])
+elapsed = end - start
+# The upper margin is a harness-sanity bound, not a lifecycle-lock semantic.
+print("yes" if elapsed >= max(0.0, wait - 0.25) and elapsed < wait + 5.0 else "no")
+PY
+)
+    [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'LIFECYCLE_LOCK: busy' \
+        && ok "B6 $label park refused while coding lock held" \
+        || bad "B6 $label contention refusal wrong: rc=$rc out=$out"
+    [ "$elapsed_ok" = yes ] \
+        && ok "B6 $label contention honored wait=$expected_wait" \
+        || bad "B6 $label elapsed outside wait=$expected_wait bounds (start=$t0 end=$t1)"
+
+    cat >> "$p/.dev/proposals/$slug/forge-log.yml" <<EOF
+  - timestamp: "2026-06-29T01:00:00Z"
+    stage: qa
+    to: codex-b
+    response: null
+EOF
+    cb "$p" --slug "$slug" --stage qa --status BLOCKED --worker codex-b --message qa-block >/dev/null 2>&1
+    out=$(cd "$p" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION \
+        FORGE_INFRA_LOCK_DIR="$infra" FORGE_LIFECYCLE_LOCK_WAIT_S=0.2 \
+        FORGE_LOCK_SELF_HOST=h FORGE_LOCK_SELF_SESSION="b6-$label" \
+        FORGE_LOCK_SELF_SESSION_ID="b6-$label" FORGE_LOCK_SELF_SESSION_CREATED=1 \
+        "$BRIDGE" park --slug "$slug" --stage qa --reason distinct-key 2>&1); rc=$?
+    qaf="$p/.dev/forge-tmp/callbacks/$slug-qa.callback"
+    caf="$p/.dev/forge-tmp/callbacks/$slug-coding.callback"
+    if [ "$rc" -eq 0 ] && [ "$(field "$qaf")" = PARKED ] \
+       && [ "$(field "$caf")" = BLOCKED ] && kill -0 "$hold" 2>/dev/null \
+       && python3 - "$p/.dev/proposals/$slug/forge-log.yml" <<'PY'
+import sys, yaml
+entries = yaml.safe_load(open(sys.argv[1]))['entries']
+coding = [e for e in entries if e.get('stage') == 'coding']
+qa = [e for e in entries if e.get('stage') == 'qa']
+assert len(coding) == 1 and coding[0].get('response') is None and not coding[0].get('parked_at')
+assert len(qa) == 1 and qa[0].get('response') is None and qa[0].get('parked_at')
+PY
+    then
+        ok "B6 $label qa lifecycle succeeds while coding key remains held"
+    else
+        bad "B6 $label distinct-key lifecycle/state failed: rc=$rc out=$out"
+    fi
+    : > "$release"
+    wait "$hold" 2>/dev/null
+}
+
+if [ "${1:-}" = "--b6-stress" ]; then
+    iterations="${2:-25}"
+    case "$iterations" in *[!0-9]*|'') red "--b6-stress requires a positive integer"; exit 2 ;; esac
+    [ "$iterations" -gt 0 ] || { red "--b6-stress requires a positive integer"; exit 2; }
+    n=1
+    while [ "$n" -le "$iterations" ]; do b6_case "stress-$n" 0.1; n=$((n+1)); done
+    b6_case default-control ""
+    echo ""
+    green "PASS: $PASS"
+    [ "$FAIL" -gt 0 ] && red "FAIL: $FAIL" || green "FAIL: 0"
+    [ "$FAIL" -eq 0 ]
+    exit $?
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo "══ SUITE 1: callback lifecycle ══"
@@ -475,9 +590,19 @@ echo "$out" | grep -q '"origin": "worker"' && ok "B4 different-stage ask does no
 
 # B5 [D4] insert-parked-fields via park: newest of 2 open entries + WARN + round-trip
 P="$(mkproj b5)"
-{ echo "pipeline: p5"; echo "entries:";
-  echo "  - timestamp: \"2026-06-29T00:00:00Z\""; echo "    stage: coding"; echo "    to: codex-a"; echo "    response: null";
-  echo "  - timestamp: \"2026-06-29T01:00:00Z\""; echo "    stage: coding"; echo "    to: codex-a"; echo "    response: null"; } > "$P/.dev/proposals/p5/forge-log.yml" 2>/dev/null || { mkdir -p "$P/.dev/proposals/p5"; { echo "pipeline: p5"; echo "entries:"; echo "  - timestamp: \"2026-06-29T00:00:00Z\""; echo "    stage: coding"; echo "    to: codex-a"; echo "    response: null"; echo "  - timestamp: \"2026-06-29T01:00:00Z\""; echo "    stage: coding"; echo "    to: codex-a"; echo "    response: null"; } > "$P/.dev/proposals/p5/forge-log.yml"; }
+mkdir -p "$P/.dev/proposals/p5"
+cat > "$P/.dev/proposals/p5/forge-log.yml" <<'EOF'
+pipeline: p5
+entries:
+  - timestamp: "2026-06-29T00:00:00Z"
+    stage: coding
+    to: codex-a
+    response: null
+  - timestamp: "2026-06-29T01:00:00Z"
+    stage: coding
+    to: codex-a
+    response: null
+EOF
 cb "$P" --slug p5 --stage coding --status BLOCKED --worker codex-a --message x >/dev/null 2>&1
 out=$( cd "$P" && "$BRIDGE" park --slug p5 --stage coding --reason 'colon: and "quote" here' 2>&1 ); rc=$?
 echo "$out" | grep -q 'older duplicates: 2026-06-29T00:00:00Z' && ok "B5 D2 WARN lists older ts" || bad "B5 no older-ts WARN"
@@ -491,18 +616,8 @@ assert "colon:" in new.get("parked_reason","") and '"quote"' in new.get("parked_
 assert not old.get("parked_at"), "older entry must NOT be parked"
 PY
 
-# B6 [D5] lifecycle-lock contention: external hold → park fails within wait; distinct keys don't contend
-P="$(mkproj b6)"; pending_entry "$P" p6 coding codex-a "2026-06-29T00:00:00Z"
-cb "$P" --slug p6 --stage coding --status BLOCKED --worker codex-a --message x >/dev/null 2>&1
-LK="$(lifelock_path "$P" p6 coding)"; mkdir -p "$(dirname "$LK")"
-( exec 9>"$LK"; flock 9; sleep 6 ) &  HOLD=$!
-sleep 0.5
-t0=$(date +%s); out=$( cd "$P" && "$BRIDGE" park --slug p6 --stage coding --reason later 2>&1 ); rc=$?; t1=$(date +%s)
-[ "$rc" -ne 0 ] && ok "B6 park refused while lock externally held" || bad "B6 park succeeded under contention"
-kill "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null
-# distinct (slug,stage) never contend: a park on p6/qa proceeds while p6/coding lock is free now
-pending_entry "$P" p6 qa codex-b "2026-06-29T00:00:00Z"   # note: same slug, different stage log entry
-: # (full distinct-key assertion: two backgrounded parks on different stages both succeed)
+# B6 [D5] deterministic lifecycle-lock contention + distinct-key non-contention.
+b6_case full-suite ""
 
 # B7 park basic + re-park idempotent
 P="$(mkproj b7)"; pending_entry "$P" p-pk coding codex-a "2026-06-29T00:00:00Z"
