@@ -2735,6 +2735,77 @@ EOF
     echo "CALLBACK $status stage=$stage slug=$slug worker=$worker_canonical → $cb_file"
 }
 
+# Pure P1-E validator. It constructs the only three eligible paths from bridge
+# identity and validates headers against that construction; it never splits a
+# dotted filename. rc: 0 one plausible path, 1 none, 2 ambiguous, 3 invalid,
+# 4 scanner dependency unavailable.
+_scan_callback_candidates() {   # <cb_dir> <slug> <stage> <session> <incarnation>
+    local d="$1" slug="$2" stage="$3" sess="$4" inc="$5"
+    FORGE_CB_DIR="$d" FORGE_CB_SLUG="$slug" FORGE_CB_STAGE="$stage" \
+          FORGE_CB_SESSION="$sess" FORGE_CB_INCARNATION="$inc" python3 - <<'PY'
+import datetime, os, re, sys
+try:
+    import yaml
+except Exception:
+    print('CALLBACK_SCANNER_DEPENDENCY: PyYAML missing',file=sys.stderr); sys.exit(4)
+d=os.environ['FORGE_CB_DIR']; slug=os.environ['FORGE_CB_SLUG']; stage=os.environ['FORGE_CB_STAGE']
+sess=os.environ.get('FORGE_CB_SESSION',''); inc=os.environ.get('FORGE_CB_INCARNATION','')
+base='%s-%s' % (slug, stage)
+spec=[]
+if sess and inc: spec.append(('exact', os.path.join(d, '%s.%s.%s.callback' % (base,sess,inc))))
+if sess: spec.append(('session-only', os.path.join(d, '%s.%s.callback' % (base,sess))))
+spec.append(('unqualified', os.path.join(d, base+'.callback')))
+# CALLBACK_SCHEMA_LOCKSTEP bridge-scanner known
+known={'slug','stage','status','worker','session','incarnation','origin','callback_id','timestamp','selected_pending_timestamp','message','parked_at','parked_reason','uncommitted'}
+# CALLBACK_SCHEMA_LOCKSTEP bridge-scanner required
+required={'slug','stage','status','worker','callback_id','timestamp','message'}
+plausible=[]; invalid=[]
+for shape,path in spec:
+    if not os.path.isfile(path): continue
+    try:
+        # BaseLoader preserves YAML timestamp-looking scalars as strings; callback
+        # headers are a textual wire format and current writers do not quote time.
+        raw=open(path).read()
+        doc=yaml.load(raw, Loader=yaml.BaseLoader)
+    except Exception as exc:
+        invalid.append('%s:yaml:%s' % (os.path.basename(path), type(exc).__name__)); continue
+    if not isinstance(doc,dict): invalid.append(os.path.basename(path)+':not-map'); continue
+    unknown=sorted(set(doc)-known)
+    header_names=re.findall(r'^([a-z_]+):',raw,re.M)
+    duplicates=sorted({k for k in header_names if header_names.count(k)>1})
+    hs=str(doc.get('session') or ''); hi=str(doc.get('incarnation') or '')
+    ts=doc.get('timestamp')
+    timestamp_ok=(isinstance(ts,str) and
+                  re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z',ts) is not None)
+    if timestamp_ok:
+        try: datetime.datetime.strptime(ts,'%Y-%m-%dT%H:%M:%SZ')
+        except ValueError: timestamp_ok=False
+    required_ok=(required.issubset(doc) and
+                 all(isinstance(doc.get(k),str) for k in required) and
+                 all(doc.get(k) for k in required-{'message'}) and
+                 isinstance(doc.get('worker'),str) and bool(doc.get('worker')) and
+                 isinstance(doc.get('callback_id'),str) and bool(doc.get('callback_id')) and
+                 timestamp_ok and
+                 isinstance(doc.get('message'),str))
+    common=(doc.get('slug')==slug and doc.get('stage')==stage and
+            str(doc.get('status') or '').upper() in {'DONE','BLOCKED','ERROR','PARKED'} and
+            required_ok and not unknown and not duplicates)
+    shape_ok=((shape=='exact' and hs==sess and hi==inc) or
+              (shape=='session-only' and hs==sess and not hi) or
+              (shape=='unqualified' and not hs and not hi))
+    if common and shape_ok: plausible.append(path)
+    else: invalid.append(os.path.basename(path)+':header-mismatch')
+if len(plausible)>1:
+    print('CALLBACK_IDENTITY_AMBIGUOUS '+','.join(sorted(map(os.path.basename,plausible))), file=sys.stderr)
+    sys.exit(2)
+if len(plausible)==1:
+    print(plausible[0], end=''); sys.exit(0)
+if invalid:
+    print('CALLBACK_HEADER_INVALID '+','.join(sorted(invalid)), file=sys.stderr); sys.exit(3)
+sys.exit(1)
+PY
+}
+
 # Resolve the callback file for (slug,stage) for the ACTING session. Prefers the
 # session-owned file, else an unowned legacy file, else empty (a different-session
 # owned file is NOT returned). §3.2 blast radius. NOTE: this is called on the wait
@@ -2825,7 +2896,27 @@ cmd_wait() {
     _emit_event WAIT "$slug" "stage=$stage worker=$worker_canonical"
 
     while true; do
-        if cb_file="$(_resolve_callback_file "$cb_dir" "$slug" "$stage" "$wait_session" 2>/dev/null)" && [ -n "$cb_file" ] && [ -f "$cb_file" ]; then
+        local cb_resolve_rc=1
+        # Contention is a quiet poll miss, not a stage failure. Deliberately fall
+        # through to the existing stall/timeout checks before the loop sleeps.
+        if _lifecycle_lock "$slug" "$stage" 2>/dev/null; then
+            cb_resolve_rc=0
+            cb_file="$(_scan_callback_candidates "$cb_dir" "$slug" "$stage" "$wait_session" "${ID_host_incarnation:-}")" || cb_resolve_rc=$?
+            _lifecycle_unlock
+        fi
+        if [ "$cb_resolve_rc" -eq 2 ] || [ "$cb_resolve_rc" -eq 3 ] || [ "$cb_resolve_rc" -eq 4 ]; then
+            local cb_reason
+            case "$cb_resolve_rc" in
+                2) cb_reason="CALLBACK_IDENTITY_AMBIGUOUS" ;;
+                3) cb_reason="CALLBACK_HEADER_INVALID" ;;
+                4) cb_reason="CALLBACK_SCANNER_DEPENDENCY" ;;
+            esac
+            _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=$(_sanitize_event_value "$cb_reason")"
+            printf 'STATUS: ERROR\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nDETAIL: %s\n' \
+                "$stage" "$slug" "$worker_canonical" "$cb_reason"
+            return 1
+        fi
+        if [ "$cb_resolve_rc" -eq 0 ] && [ -n "$cb_file" ] && [ -f "$cb_file" ]; then
             _wait_emit_callback "$cb_file" "$slug" "$stage" "$worker_canonical" \
                 "$digest_template" "$project_root"
             _render_status_file
@@ -3180,68 +3271,165 @@ cmd_blocked_audit() {
     if [ -n "$root_override" ]; then project_root="$root_override"; else project_root=$(_resolve_project_root ""); fi
     [ -n "$project_root" ] || { echo "ERROR: blocked-audit requires a project root" >&2; return 1; }
     FORGE_BA_JSON="$jsonout" python3 - "$project_root" <<'PY'
-import os, sys, glob, json, re
-root = sys.argv[1]; jsonout = os.environ.get("FORGE_BA_JSON") == "1"
-dev = os.path.join(root, ".dev"); items = []
+import datetime, glob, hashlib, json, os, re, subprocess, sys
+try: import yaml
+except Exception: yaml=None
+root=os.path.realpath(sys.argv[1]); dev=os.path.join(root,'.dev')
+# CALLBACK_SCHEMA_LOCKSTEP bridge-audit known
+known={'slug','stage','status','worker','session','incarnation','origin','callback_id','timestamp','selected_pending_timestamp','message','parked_at','parked_reason','uncommitted'}
+# CALLBACK_SCHEMA_LOCKSTEP bridge-audit required
+required={'slug','stage','status','worker','callback_id','timestamp','message'}
+live={}
+seam=os.environ.get('FORGE_BLOCKED_AUDIT_TMUX_LIST','')
 try:
-    import yaml; HAVE = True
-except Exception:
-    HAVE = False
-adir = os.path.join(dev, "attention")
-def ask_match(slug, stage):
-    for fp in glob.glob(os.path.join(adir, "ask-*.json")):
-        try: r = json.load(open(fp))
+    lines=(open(seam).read().splitlines() if seam else
+           subprocess.check_output(['tmux','list-sessions','-F',
+             '#{session_name}\t#{session_path}\t#{session_id}\t#{session_created}'],
+             text=True,stderr=subprocess.DEVNULL,timeout=5).splitlines())
+except Exception: lines=[]
+for line in lines:
+    cols=line.split('\t')
+    if len(cols)>=4:
+        live[cols[0]]=(os.path.realpath(cols[1]),str(cols[3]))
+
+adir=os.path.join(dev,'attention')
+def ask_match(slug,stage):
+    for path in sorted(glob.glob(os.path.join(adir,'ask-*.json'))):
+        try: rec=json.load(open(path))
         except Exception: continue
-        if r.get("event")=="ask" and r.get("slug")==slug and r.get("stage")==stage and r.get("mode")=="stage":
+        if rec.get('event')=='ask' and rec.get('slug')==slug and rec.get('stage')==stage and rec.get('mode')=='stage':
             return True
     return False
-for cbp in glob.glob(os.path.join(dev, "forge-tmp", "callbacks", "*.callback")):
-    raw = open(cbp).read()
-    def g(f):
-        m = re.search(rf'^{f}:\s*(.*?)\s*$', raw, re.M); return m.group(1).strip() if m else None
-    slug, stage, status, origin = g('slug'), g('stage'), (g('status') or '').upper(), g('origin')
-    base = os.path.basename(cbp)
-    legacy = bool(slug and stage and re.match(rf'^{re.escape(slug)}-{re.escape(stage)}\.callback$', base))
-    if status == 'BLOCKED':
-        isask = (origin == 'ask') or ask_match(slug, stage)
-        items.append({"kind": "blocked-callback", "slug": slug, "stage": stage,
-                      "origin": "ask" if isask else "worker", "legacy_filename": legacy,
-                      "suggest": "answer via dispatch --answers" if isask else "park / consume / supersede"})
-    elif status == 'PARKED':
-        items.append({"kind": "parked-callback", "slug": slug, "stage": stage,
-                      "legacy_filename": legacy, "suggest": "resolve or supersede"})
-for logp in glob.glob(os.path.join(dev, "proposals", "*", "forge-log.yml")):
-    slug = os.path.basename(os.path.dirname(logp))
-    if not HAVE: continue
-    try: d = yaml.safe_load(open(logp)) or {}
+
+rows=[]; valid=[]
+for path in sorted(glob.glob(os.path.join(dev,'forge-tmp','callbacks','*.callback'))):
+    base=os.path.basename(path)
+    try: raw=open(path,'rb').read()
+    except OSError: continue
+    row={'kind':'callback','file':base,'sha256':hashlib.sha256(raw).hexdigest()}
+    try: doc=yaml.load(raw,Loader=yaml.BaseLoader) if yaml else None
+    except Exception as exc:
+        doc=None; row.update(classification='malformed-header',detail=type(exc).__name__)
+    if not isinstance(doc,dict):
+        row.setdefault('classification','malformed-header'); rows.append(row); continue
+    slug,stage=doc.get('slug'),doc.get('stage')
+    sess,inc=str(doc.get('session') or ''),str(doc.get('incarnation') or '')
+    status=str(doc.get('status') or '').upper()
+    origin='ask' if doc.get('origin')=='ask' or ask_match(slug,stage) else 'worker'
+    row.update(slug=slug,stage=stage,status=status,session=sess or None,incarnation=inc or None,
+               origin=origin,callback_id=doc.get('callback_id'))
+    unknown=sorted(set(doc)-known)
+    header_names=re.findall(rb'^([a-z_]+):',raw,re.M)
+    duplicates=sorted({k.decode() for k in header_names if header_names.count(k)>1})
+    if unknown:
+        row.update(classification='unknown-header',unknown_headers=unknown); rows.append(row); continue
+    if duplicates:
+        row.update(classification='malformed-header',detail='duplicate-header',duplicate_headers=duplicates); rows.append(row); continue
+    ts=doc.get('timestamp')
+    timestamp_ok=(isinstance(ts,str) and
+                  re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z',ts) is not None)
+    if timestamp_ok:
+        try: datetime.datetime.strptime(ts,'%Y-%m-%dT%H:%M:%SZ')
+        except ValueError: timestamp_ok=False
+    if (not required.issubset(doc) or not all(isinstance(doc.get(k),str) for k in required)
+            or not all(doc.get(k) for k in required-{'message'})
+            or not timestamp_ok
+            or status not in {'DONE','BLOCKED','ERROR','PARKED'}):
+        row.update(classification='malformed-header',detail='required-header'); rows.append(row); continue
+    if inc and not sess:
+        row.update(classification='malformed-header',detail='incarnation-without-session'); rows.append(row); continue
+    stem='%s-%s' % (slug,stage)
+    expected=(stem+'.%s.%s.callback' % (sess,inc) if sess and inc else
+              stem+'.%s.callback' % sess if sess else stem+'.callback')
+    if base!=expected:
+        row.update(classification='header-filename-mismatch',expected=expected); rows.append(row); continue
+    if sess and inc:
+        ls=live.get(sess)
+        cls=('exact-current' if ls==(root,inc) else
+             'foreign-incarnation' if ls is not None and ls[0]!=root else
+             'dead-incarnation')
+    elif sess: cls='session-only-legacy'
+    else: cls='unqualified-legacy'
+    row['classification']=cls; rows.append(row); valid.append(row)
+
+# Cardinality is per acting owner, not per aggregate slug/stage. Two exact live
+# sessions sharing one root are distinct; exact+session/unqualified for either
+# owner is ambiguous. A lone legacy shape remains audit/history compatible.
+for exact in [r for r in valid if r['classification']=='exact-current']:
+    vals=[r for r in valid if r.get('slug')==exact.get('slug') and r.get('stage')==exact.get('stage') and
+          ((r['classification']=='exact-current' and r.get('session')==exact.get('session') and
+            str(r.get('incarnation') or '')==str(exact.get('incarnation') or '')) or
+           (r['classification']=='session-only-legacy' and r.get('session')==exact.get('session')) or
+           r['classification']=='unqualified-legacy')]
+    if len(vals)>1:
+        for r in vals: r['_ambiguous_count']=max(r.get('_ambiguous_count',0),len(vals))
+for legacy in [r for r in valid if r['classification']=='session-only-legacy']:
+    if any(r['classification']=='exact-current' and r.get('slug')==legacy.get('slug') and
+           r.get('stage')==legacy.get('stage') and r.get('session')==legacy.get('session') for r in valid):
+        continue
+    vals=[r for r in valid if r.get('slug')==legacy.get('slug') and r.get('stage')==legacy.get('stage') and
+          ((r['classification']=='session-only-legacy' and r.get('session')==legacy.get('session')) or
+           r['classification']=='unqualified-legacy')]
+    if len(vals)>1:
+        for r in vals: r['_ambiguous_count']=max(r.get('_ambiguous_count',0),len(vals))
+for r in valid:
+    n=r.pop('_ambiguous_count',0)
+    if n:
+        r['plausible_count']=n
+        r['classification']='ambiguous'
+
+# Only legacy shapes are eligible for today's legacy mutators. Exact, ambiguous,
+# foreign/dead, and invalid records require identity-aware manual disposition.
+legacy_classes={'session-only-legacy','unqualified-legacy'}
+for row in rows:
+    if row.get('kind')!='callback': continue
+    if row.get('classification') in legacy_classes:
+        row['suggest']='legacy-compatible: inspect; park / consume / supersede if disposition is required'
+    else:
+        row['suggest']='manual identity disposition; do not use legacy mutators'
+
+# Preserve the pre-P1-E read-only diagnostics.
+for logp in sorted(glob.glob(os.path.join(dev,'proposals','*','forge-log.yml'))):
+    slug=os.path.basename(os.path.dirname(logp))
+    if not yaml: continue
+    try: data=yaml.safe_load(open(logp)) or {}
     except Exception:
-        items.append({"kind": "unparseable-log", "slug": slug, "suggest": "manual"}); continue
-    by = {}
-    for e in (d.get('entries') or []):
-        if isinstance(e, dict) and e.get('response') is None:
-            by.setdefault(e.get('stage'), []).append(e)
-            if e.get('parked_at'):
-                items.append({"kind": "half-parked-record", "slug": slug, "stage": e.get('stage'),
-                              "suggest": "recover quadrant — verify callback flipped to PARKED"})
-    for stage, lst in by.items():
-        if len(lst) > 1:
-            items.append({"kind": "duplicate-open-pending", "slug": slug, "stage": stage,
-                          "count": len(lst), "suggest": "supersede (D2 newest authoritative)"})
-sf = os.path.join(os.path.expanduser("~/.cache/forge-watch"), "state.json")
+        rows.append({'kind':'unparseable-log','slug':slug,'suggest':'manual'}); continue
+    by={}
+    for entry in data.get('entries') or []:
+        if isinstance(entry,dict) and entry.get('response') is None:
+            by.setdefault(entry.get('stage'),[]).append(entry)
+            if entry.get('parked_at'):
+                rows.append({'kind':'half-parked-record','slug':slug,'stage':entry.get('stage'),
+                             'suggest':'recover quadrant — verify callback flipped to PARKED'})
+    for stage,entries in by.items():
+        if len(entries)>1:
+            rows.append({'kind':'duplicate-open-pending','slug':slug,'stage':stage,'count':len(entries),
+                         'suggest':'supersede (D2 newest authoritative)'})
+sf=os.path.join(os.path.expanduser('~/.cache/forge-watch'),'state.json')
 if os.path.exists(sf):
     try:
-        st = json.load(open(sf))
-        for k in (st.get("conditions") or {}):
-            if "WORKER-BLOCKED" in k:
-                items.append({"kind": "stale-state-key", "key": k, "suggest": "orphans harmlessly after rename"})
+        state=json.load(open(sf))
+        for key in sorted(state.get('conditions') or {}):
+            if 'WORKER-BLOCKED' in key:
+                rows.append({'kind':'stale-state-key','key':key,'suggest':'orphans harmlessly after rename'})
     except Exception: pass
-if jsonout:
-    print(json.dumps({"root": root, "items": items}, indent=2))
+
+rows.sort(key=lambda r:(str(r.get('slug') or ''),str(r.get('stage') or ''),str(r.get('file') or ''),str(r.get('kind') or '')))
+classes=['exact-current','session-only-legacy','unqualified-legacy','ambiguous','foreign-incarnation',
+         'dead-incarnation','header-filename-mismatch','malformed-header','unknown-header']
+summary={k:sum(1 for r in rows if r.get('classification')==k) for k in classes}
+summary['zero_ambiguity']=summary['ambiguous']==0
+summary['p1_wc_ready']=(summary['zero_ambiguity'] and summary['unqualified-legacy']==0 and
+                        summary['foreign-incarnation']==0 and summary['malformed-header']==0 and
+                        summary['unknown-header']==0 and summary['header-filename-mismatch']==0)
+out={'root':root,'items':rows,'summary':summary,
+     'zero_ambiguity':summary['zero_ambiguity'],'p1_wc_ready':summary['p1_wc_ready']}
+if os.environ.get('FORGE_BA_JSON')=='1': print(json.dumps(out,indent=2,sort_keys=True))
 else:
-    if not items: print("blocked-audit: clean (no residue)")
-    for it in items:
-        print("  " + " ".join(f"{k}={v}" for k, v in it.items()))
-    print(f"blocked-audit: {len(items)} item(s) — MUTATES NOTHING")
+    if not rows: print('blocked-audit: clean (no residue)')
+    for row in rows: print('  '+' '.join('%s=%s' % (k,row[k]) for k in sorted(row)))
+    print('blocked-audit: %d item(s) — MUTATES NOTHING' % len(rows))
 PY
 }
 

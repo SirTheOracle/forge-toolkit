@@ -730,6 +730,107 @@ P="$(mkproj bacc)"; pending_entry "$P" p-b coding codex-a "2026-06-29T00:00:00Z"
 out=$( cd "$P" && env -u TMUX "$BRIDGE" dispatch --slug p-o --stage coding --worker codex-b --allow-blocked 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && echo "$out" | grep -qi 'requires a non-empty reason' && ok "B-acc empty --allow-blocked rejected" || bad "B-acc empty reason accepted"
 
+# P1-E writer freeze + archive preservation.
+SCHEMA="$ROOT/orchestrator/schemas/callback.yml"
+python3 - "$SCHEMA" <<'PY' && ok "E1 schema validates three shapes and rejects boundary negatives" || bad "E1 schema"
+import copy,datetime,re,sys,yaml
+d=yaml.safe_load(open(sys.argv[1])); assert len(d['oneOf'])==3
+assert 'selected_pending_timestamp' in d['properties']
+assert d['properties']['timestamp']['description'].startswith('Callback publication')
+base=dict(slug='e1',stage='coding',status='BLOCKED',worker='codex-a',callback_id='id-1',
+          timestamp='2026-07-14T00:00:00Z',message='m')
+positives=[dict(base,session='s',incarnation='7'),dict(base,session='s'),dict(base)]
+negatives=[]
+x=copy.deepcopy(base); x.pop('worker'); negatives.append(x)
+x=dict(base,unknown_future='x'); negatives.append(x)
+x=dict(base,session='',incarnation='7'); negatives.append(x)
+x=dict(base,timestamp='2026-99-99T00:00:00Z'); negatives.append(x)
+known=set(d['properties']); required=set(d['required'])
+def semantic_timestamp(v):
+    ts=v.get('timestamp')
+    if not isinstance(ts,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z',ts): return False
+    try: datetime.datetime.strptime(ts,'%Y-%m-%dT%H:%M:%SZ')
+    except ValueError: return False
+    return True
+def semantic_shape(v):
+    s=str(v.get('session') or ''); i=str(v.get('incarnation') or '')
+    return bool((s and i) or (s and not i) or (not s and not i))
+try:
+    from jsonschema import Draft202012Validator,FormatChecker
+except ImportError:
+    # The repository has no Python dependency manifest. Exercise the exact
+    # contract dependency-free; environments that provide jsonschema also run
+    # the authoritative Draft 2020-12 engine below.
+    def valid(v):
+        if set(v)-known or not required.issubset(v): return False
+        return semantic_timestamp(v) and semantic_shape(v)
+else:
+    validator=Draft202012Validator(d,format_checker=FormatChecker())
+    def valid(v): return validator.is_valid(v) and semantic_timestamp(v) and semantic_shape(v)
+assert all(map(valid,positives)) and not any(map(valid,negatives))
+PY
+# The resolver body is a hard compatibility surface: compare it byte-for-byte
+# with the certified floor, including comments and its four-argument signature.
+python3 - "$ROOT" <<'PY' && ok "E3 four-argument resolver is byte-identical to certified floor" || bad "E3 resolver drift"
+import hashlib,pathlib,sys
+new=pathlib.Path(sys.argv[1],'bin/forge-bridge').read_text()
+def block(s):
+    start=s.index('# Resolve the callback file for (slug,stage) for the ACTING session.')
+    end=s.index('\n}',s.index('_resolve_callback_file()',start))+2
+    return s[start:end]
+# SHA-256 of the exact resolver/comment block at certified floor a558c52b.
+assert hashlib.sha256(block(new).encode()).hexdigest()=='e3aa76d6b4c9fc87bfc8de0c30ffd96194ac3013211b4c31838d143e05c67b50'
+PY
+P="$(mkproj p1e-writer)"; pending_entry "$P" p1e-writer coding codex-a "2026-07-14T00:00:00Z"
+cbS "$P" forge-p1e --slug p1e-writer --stage coding --status BLOCKED --worker codex-a --message freeze >/dev/null 2>&1
+WF="$P/.dev/forge-tmp/callbacks/p1e-writer-coding.forge-p1e.callback"
+[ -f "$WF" ] && ! grep -q '^incarnation:' "$WF" \
+  && [ -z "$(find "$P/.dev/forge-tmp/callbacks" -maxdepth 1 -name 'p1e-writer-coding.forge-p1e.*.callback' -print -quit)" ] \
+  && ok "E8 writer remains session-only with no incarnation header" || bad "E8 writer freeze"
+WID=$(sed -n 's/^callback_id: //p' "$WF"); BEFORE=$(shasum -a 256 "$WF" | awk '{print $1}')
+briS "$P" forge-p1e callback-consume --slug p1e-writer --stage coding --status BLOCKED >/dev/null 2>&1
+AF="$P/.dev/forge-tmp/callbacks/archive/p1e-writer-coding.${WID}.callback"
+AFTER=$(shasum -a 256 "$AF" | awk '{print $1}')
+[ "$BEFORE" = "$AFTER" ] && grep -q '^session: forge-p1e' "$AF" \
+  && ok "E4 archive move preserves every callback byte/header" || bad "E4 archive preservation"
+grep -q 'lifecycle-${slug}--${stage}.lock' "$BRIDGE" \
+  && ok "E3 physical lifecycle mutex key unchanged" || bad "E3 mutex key changed"
+
+# Ordinary and nested mutation callers remain on the unchanged four-argument
+# resolver. A short ceiling makes any accidental second-fd self-conflict loud.
+P="$(mkproj p1e-lock-callers)"; pending_entry "$P" p1e-ordinary coding codex-a "2026-07-14T00:01:00Z"
+cb "$P" --slug p1e-ordinary --stage coding --status BLOCKED --worker codex-a --message ordinary >/dev/null 2>&1
+out=$(cd "$P" && FORGE_LIFECYCLE_LOCK_WAIT_S=0.2 "$BRIDGE" callback-consume --slug p1e-ordinary --stage coding --status BLOCKED 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'LIFECYCLE_LOCK: busy' \
+  && ok "E3 ordinary consume has no nested-lock regression" || bad "E3 ordinary consume lock regression: $out"
+pending_entry "$P" p1e-nested coding codex-a "2026-07-14T00:02:00Z"
+cb "$P" --slug p1e-nested --stage coding --status BLOCKED --worker codex-a --message nested >/dev/null 2>&1
+(cd "$P" && "$BRIDGE" park --slug p1e-nested --stage coding --reason nested >/dev/null 2>&1)
+out=$(cd "$P" && FORGE_LIFECYCLE_LOCK_WAIT_S=0.2 "$BRIDGE" park --resolve --slug p1e-nested --stage coding --note done 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'LIFECYCLE_LOCK: busy' \
+  && ok "E3 nested park-resolve consume reuses caller lock" || bad "E3 nested --_no_lock regression: $out"
+
+# P1-E intentionally leaves a reader/mutator asymmetry for P1-WC: exact files
+# are readable by wait but are not yet mutation-eligible through the frozen resolver.
+P="$(mkproj p1e-exact-freeze)"; EF="$P/.dev/forge-tmp/callbacks/p1e-exact-freeze-coding.forge-p1e.777.callback"
+cat > "$EF" <<'EOF'
+slug: p1e-exact-freeze
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: forge-p1e
+incarnation: 777
+callback_id: exact-freeze
+timestamp: 2026-07-14T00:03:00Z
+message: exact remains outside legacy mutators
+EOF
+EB=$(shasum -a 256 "$EF" | awk '{print $1}')
+out=$(FORGE_LIFECYCLE_LOCK_WAIT_S=0.2 briS "$P" forge-p1e callback-consume --slug p1e-exact-freeze --stage coding --status BLOCKED 2>&1); rc=$?
+EA=$(shasum -a 256 "$EF" | awk '{print $1}')
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'CALLBACK_CONSUME NOOP' && [ "$EB" = "$EA" ] \
+  && [ ! -e "$P/.dev/forge-tmp/callbacks/archive/p1e-exact-freeze-coding.exact-freeze.callback" ] \
+  && ok "E8 exact callback remains outside frozen mutator eligibility" || bad "E8 exact/mutator asymmetry changed"
+
 echo ""
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"

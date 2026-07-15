@@ -802,6 +802,195 @@ run_in_pane "$S2:0.0" reusestatus "FORGE_WATCH_TRIGGER=0 $BRIDGE status"
     && ok "T-REUSE-ROUNDTRIP status renderer tolerates the incarnation field" \
     || bad "T-REUSE-ROUNDTRIP status renderer (rc=$(rc_of reusestatus))"
 
+# P1-E read-only audit matrix (fixture bytes must not change).
+ED="$rootA/.dev/forge-tmp/callbacks"; mkdir -p "$ED"; ES="p1e-audit"; EST="coding"
+S2INC="$(tmux display-message -p -t "$S2:0.0" '#{session_created}')"
+write_ecb(){ local f="$1" sess="$2" inc="$3" extra="$4"; cat > "$ED/$f" <<EOF
+slug: $ES
+stage: $EST
+status: BLOCKED
+worker: codex-a
+${sess:+session: $sess}
+${inc:+incarnation: $inc}
+origin:
+callback_id: $f-id
+timestamp: 2026-07-14T00:00:00Z
+$extra
+message: audit
+EOF
+}
+write_ecb "$ES-$EST.$S2.$S2INC.callback" "$S2" "$S2INC" ""
+dev_fingerprint(){ python3 - "$rootA/.dev" <<'PY'
+import hashlib,os,sys
+root=sys.argv[1]; h=hashlib.sha256()
+for base,dirs,files in os.walk(root):
+    dirs.sort(); files.sort()
+    for name in dirs:
+        h.update(b'D\0'+os.path.relpath(os.path.join(base,name),root).encode()+b'\0')
+    for name in files:
+        p=os.path.join(base,name); h.update(b'F\0'+os.path.relpath(p,root).encode()+b'\0')
+        with open(p,'rb') as f:
+            for chunk in iter(lambda:f.read(65536),b''): h.update(chunk)
+print(h.hexdigest())
+PY
+}
+before=$(dev_fingerprint)
+run_in_pane "$S2:0.0" e-audit-exact "FORGE_WATCH_TRIGGER=0 $BRIDGE blocked-audit --root $rootA --json"
+run_in_pane "$S2:0.0" e-audit-human "FORGE_WATCH_TRIGGER=0 $BRIDGE blocked-audit --root $rootA"
+after=$(dev_fingerprint)
+if [ "$(rc_of e-audit-exact)" = 0 ] && [ "$(rc_of e-audit-human)" = 0 ] \
+  && out_of e-audit-exact | grep -q '"classification": "exact-current"' \
+  && out_of e-audit-exact | grep -q '"zero_ambiguity": true' \
+  && out_of e-audit-human | grep -q 'classification=exact-current.*suggest=manual identity disposition; do not use legacy mutators' \
+  && out_of e-audit-human | grep -q 'MUTATES NOTHING' && [ "$before" = "$after" ]; then
+  ok "T-P1E-AUDIT-BOTH-MODES-WHOLE-DEV-NOMUTATION"
+else bad "T-P1E-AUDIT-BOTH-MODES-WHOLE-DEV-NOMUTATION"; fi
+S1INC="$(tmux display-message -p -t "$S1:0.0" '#{session_created}')"
+cat > "$ED/p1e-concurrent-coding.$S1.$S1INC.callback" <<EOF
+slug: p1e-concurrent
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: $S1
+incarnation: $S1INC
+callback_id: concurrent-other
+timestamp: 2026-07-14T00:00:00Z
+message: other live same-root owner
+EOF
+printf '%s\t%s\t$1\t%s\n%s\t%s\t$2\t%s\n' \
+  "$S1" "$rootA" "$S1INC" "$S2" "$rootA" "$S2INC" > "$WORK/p1e-concurrent-live.tsv"
+run_in_pane "$S2:0.0" e-audit-concurrent "FORGE_BLOCKED_AUDIT_TMUX_LIST=$WORK/p1e-concurrent-live.tsv FORGE_WATCH_TRIGGER=0 $BRIDGE blocked-audit --root $rootA --json"
+out_of e-audit-concurrent | sed '/^DONE_/d' | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["summary"]["ambiguous"]==0; assert any(r.get("file","").startswith("p1e-concurrent-coding.") and r.get("classification")=="exact-current" for r in d["items"])' \
+  && ok "T-P1E-AUDIT-CONCURRENT-SAME-ROOT" || bad "T-P1E-AUDIT-CONCURRENT-SAME-ROOT"
+rm -f "$ED/p1e-concurrent-coding.$S1.$S1INC.callback"
+write_ecb "$ES-$EST.$S2.callback" "$S2" "" ""
+run_in_pane "$S2:0.0" e-audit-amb "FORGE_WATCH_TRIGGER=0 $BRIDGE blocked-audit --root $rootA --json"
+out_of e-audit-amb | grep -q '"ambiguous": 2' && ok "T-P1E-AUDIT-CARDINALITY" || bad "T-P1E-AUDIT-CARDINALITY"
+rm -f "$ED/$ES-$EST.$S2.callback" "$ED/$ES-$EST.$S2.$S2INC.callback"
+write_ecb "$ES-$EST.$S2.111.callback" "$S2" 111 ""
+write_ecb "$ES-$EST.$S2.222.callback" "$S2" 222 ""
+write_ecb "$ES-$EST.dead-session.333.callback" "dead-session" 333 ""
+S3INC="$(tmux display-message -p -t "$S3:0.0" '#{session_created}')"
+write_ecb "$ES-$EST.$S3.$S3INC.callback" "$S3" "$S3INC" ""
+printf '%s\t%s\t$2\t%s\n%s\t%s\t$3\t%s\n' "$S2" "$rootA" 222 "$S3" "$rootC" "$S3INC" > "$WORK/p1e-live.tsv"
+FORGE_BLOCKED_AUDIT_TMUX_LIST="$WORK/p1e-live.tsv" run_in_pane "$S2:0.0" e-audit-rebirth "FORGE_BLOCKED_AUDIT_TMUX_LIST=$WORK/p1e-live.tsv FORGE_WATCH_TRIGGER=0 $BRIDGE blocked-audit --root $rootA --json"
+out_of e-audit-rebirth | grep -q 'foreign-incarnation' && out_of e-audit-rebirth | grep -q 'dead-incarnation' \
+  && ok "T-P1E-AUDIT-REBIRTH-FOREIGN-DEAD" || bad "T-P1E-AUDIT-REBIRTH-FOREIGN-DEAD"
+rm -f "$ED/$ES-$EST."*.callback
+write_ecb "$ES-$EST.wrong.callback" "$S2" "" ""
+printf 'slug: %s\nstage: %s\nstatus: BLOCKED\nunknown_future: x\nmessage: x\n' "$ES" "$EST" > "$ED/$ES-$EST.callback"
+printf 'slug: p1e-required\nstage: coding\nstatus: BLOCKED\nworker: codex-a\ntimestamp: 2026-07-14T00:00:00Z\nmessage: missing callback id\n' > "$ED/p1e-required-coding.callback"
+printf 'slug: p1e-inc-only\nstage: coding\nstatus: BLOCKED\nworker: codex-a\nincarnation: 404\ncallback_id: inc-only\ntimestamp: 2026-07-14T00:00:00Z\nmessage: invalid shape\n' > "$ED/p1e-inc-only-coding.callback"
+printf '[unterminated\n' > "$ED/p1e-malformed-coding.callback"
+run_in_pane "$S2:0.0" e-audit-invalid "FORGE_WATCH_TRIGGER=0 $BRIDGE blocked-audit --root $rootA --json"
+out_of e-audit-invalid | grep -q 'header-filename-mismatch' && out_of e-audit-invalid | grep -q 'unknown-header' \
+  && out_of e-audit-invalid | grep -q 'malformed-header' \
+  && out_of e-audit-invalid | grep -q 'incarnation-without-session' \
+  && out_of e-audit-invalid | grep -q '"p1_wc_ready": false' \
+  && ok "T-P1E-AUDIT-HEADER-NEGATIVES" || bad "T-P1E-AUDIT-HEADER-NEGATIVES"
+rm -f "$ED/$ES-$EST"*.callback
+rm -f "$ED/p1e-required-coding.callback" "$ED/p1e-inc-only-coding.callback" "$ED/p1e-malformed-coding.callback"
+
+# Human guidance remains actionable only for shapes today's mutators can see.
+write_ecb "$ES-$EST.$S2.callback" "$S2" "" ""
+run_in_pane "$S2:0.0" e-audit-legacy-human "FORGE_WATCH_TRIGGER=0 $BRIDGE blocked-audit --root $rootA"
+out_of e-audit-legacy-human | grep -q 'classification=session-only-legacy.*suggest=legacy-compatible: inspect; park / consume / supersede' \
+  && ok "T-P1E-AUDIT-LEGACY-GUIDANCE" || bad "T-P1E-AUDIT-LEGACY-GUIDANCE"
+rm -f "$ED/$ES-$EST.$S2.callback"
+CLEANROOT="$WORK/p1e-clean-root"; mkdir -p "$CLEANROOT/.dev/forge-tmp/callbacks"
+mkdir -p "$WORK/p1e-clean-home"
+out=$(HOME="$WORK/p1e-clean-home" FORGE_WATCH_TRIGGER=0 "$BRIDGE" blocked-audit --root "$CLEANROOT" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'blocked-audit: clean (no residue)' \
+  && ok "T-P1E-AUDIT-HUMAN-CLEAN" || bad "T-P1E-AUDIT-HUMAN-CLEAN"
+
+# The active wait reader, not only the audit, rejects a constructed-path file
+# missing one of worker/callback_id/timestamp/message before any status projection.
+cat > "$ED/$ES-$EST.$S2.$S2INC.callback" <<EOF
+slug: $ES
+stage: $EST
+status: BLOCKED
+session: $S2
+incarnation: $S2INC
+callback_id: scan-required
+timestamp: 2026-07-14T00:00:00Z
+message: missing worker
+EOF
+run_in_pane "$S2:0.0" e-scan-required "FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $ES --stage $EST --worker codex-a --timeout 1 --interval 0.1"
+[ "$(rc_of e-scan-required)" = 1 ] && out_of e-scan-required | grep -q 'CALLBACK_HEADER_INVALID' \
+  && ok "T-P1E-SCAN-REQUIRED-HEADERS" || bad "T-P1E-SCAN-REQUIRED-HEADERS"
+rm -f "$ED/$ES-$EST.$S2.$S2INC.callback"
+
+# The production wait path selects one valid exact candidate.
+write_ecb "$ES-$EST.$S2.$S2INC.callback" "$S2" "$S2INC" ""
+run_in_pane "$S2:0.0" e-scan-exact "FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $ES --stage $EST --worker codex-a --timeout 3 --interval 0.1"
+[ "$(rc_of e-scan-exact)" = 0 ] && out_of e-scan-exact | grep -q 'STATUS: BLOCKED' \
+  && ok "T-P1E-WAIT-EXACT" || bad "T-P1E-WAIT-EXACT"
+
+# A lock miss is a poll miss: release after one short acquisition ceiling and
+# the same wait proceeds to select the exact callback.
+LOCK="$rootA/.dev/forge-tmp/locks/lifecycle-${ES}--${EST}.lock"; mkdir -p "$(dirname "$LOCK")"
+READY="$WORK/p1e-busy-release-ready"
+python3 - "$LOCK" "$READY" <<'PY' &
+import fcntl,sys,time
+fd=open(sys.argv[1],'w'); fcntl.flock(fd,fcntl.LOCK_EX); open(sys.argv[2],'w').close(); time.sleep(.6)
+PY
+holder=$!; i=0; while [ ! -f "$READY" ] && [ "$i" -lt 40 ]; do sleep .05; i=$((i+1)); done
+run_in_pane "$S2:0.0" e-wait-busy-release "FORGE_LIFECYCLE_LOCK_WAIT_S=0.1 FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $ES --stage $EST --worker codex-a --timeout 3 --interval 0.1"
+wait "$holder"; rm -f "$READY"
+[ "$(rc_of e-wait-busy-release)" = 0 ] && out_of e-wait-busy-release | grep -q 'STATUS: BLOCKED' \
+  && ! out_of e-wait-busy-release | grep -q 'LIFECYCLE_LOCK: busy' \
+  && ok "T-P1E-WAIT-BUSY-THEN-RELEASE" || bad "T-P1E-WAIT-BUSY-THEN-RELEASE"
+
+# If contention outlives the stage timeout, the existing timeout path still
+# emits its structured block instead of returning an unstructured rc 1.
+READY="$WORK/p1e-busy-timeout-ready"
+python3 - "$LOCK" "$READY" <<'PY' &
+import fcntl,sys,time
+fd=open(sys.argv[1],'w'); fcntl.flock(fd,fcntl.LOCK_EX); open(sys.argv[2],'w').close(); time.sleep(2)
+PY
+holder=$!; i=0; while [ ! -f "$READY" ] && [ "$i" -lt 40 ]; do sleep .05; i=$((i+1)); done
+run_in_pane "$S2:0.0" e-wait-busy-timeout "FORGE_LIFECYCLE_LOCK_WAIT_S=0.1 FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $ES --stage $EST --worker codex-a --timeout 1 --interval 0.1"
+wait "$holder"; rm -f "$READY"
+[ "$(rc_of e-wait-busy-timeout)" = 0 ] && out_of e-wait-busy-timeout | grep -q 'STATUS: TIMEOUT' \
+  && ! out_of e-wait-busy-timeout | grep -q 'LIFECYCLE_LOCK: busy' \
+  && ok "T-P1E-WAIT-BUSY-STAGE-TIMEOUT" || bad "T-P1E-WAIT-BUSY-STAGE-TIMEOUT"
+
+# Hold the physical lifecycle mutex, create a second plausible shape inside the
+# transition, and release. wait must never observe the earlier sole-exact state;
+# after release it deterministically reports ambiguity within a hard ceiling.
+LOCK="$rootA/.dev/forge-tmp/locks/lifecycle-${ES}--${EST}.lock"; READY="$WORK/p1e-lock-ready"
+mkdir -p "$(dirname "$LOCK")"
+python3 - "$LOCK" "$READY" "$ED/$ES-$EST.$S2.$S2INC.callback" "$ED/$ES-$EST.$S2.callback" <<'PY' &
+import fcntl,os,shutil,sys,time
+fd=open(sys.argv[1],'w'); fcntl.flock(fd,fcntl.LOCK_EX); open(sys.argv[2],'w').close()
+time.sleep(.5); shutil.copyfile(sys.argv[3],sys.argv[4])
+raw=open(sys.argv[4]).read().replace('incarnation: '+os.environ.get('UNUSED','__never__')+'\n','')
+# Remove the actual incarnation without knowing its value and preserve all other headers.
+raw='\n'.join(x for x in raw.splitlines() if not x.startswith('incarnation:'))+'\n'
+open(sys.argv[4],'w').write(raw); time.sleep(.5)
+PY
+holder=$!; i=0; while [ ! -f "$READY" ] && [ "$i" -lt 40 ]; do sleep .05; i=$((i+1)); done
+run_in_pane "$S2:0.0" e-scan-transition "FORGE_LIFECYCLE_LOCK_WAIT_S=3 FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $ES --stage $EST --worker codex-a --timeout 3 --interval 0.1"
+wait "$holder"; rm -f "$READY"
+[ "$(rc_of e-scan-transition)" = 1 ] && out_of e-scan-transition | grep -q 'CALLBACK_IDENTITY_AMBIGUOUS' \
+  && ok "T-P1E-WAIT-LOCKED-TRANSITION" || bad "T-P1E-WAIT-LOCKED-TRANSITION"
+rm -f "$ED/$ES-$EST.$S2.$S2INC.callback" "$ED/$ES-$EST.$S2.callback"
+
+# Syntax, not scalar presence, is part of the wire contract.
+write_ecb "$ES-$EST.$S2.$S2INC.callback" "$S2" "$S2INC" ""
+sed -i '' 's/timestamp: 2026-07-14T00:00:00Z/timestamp: 2026-99-99T00:00:00Z/' "$ED/$ES-$EST.$S2.$S2INC.callback"
+run_in_pane "$S2:0.0" e-scan-bad-time "FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $ES --stage $EST --worker codex-a --timeout 1 --interval 0.1"
+[ "$(rc_of e-scan-bad-time)" = 1 ] && out_of e-scan-bad-time | grep -q 'CALLBACK_HEADER_INVALID' \
+  && ok "T-P1E-WAIT-TIMESTAMP-SYNTAX" || bad "T-P1E-WAIT-TIMESTAMP-SYNTAX"
+rm -f "$ED/$ES-$EST.$S2.$S2INC.callback"
+
+# Dependency failure is not mislabeled as corrupt callback data.
+mkdir -p "$WORK/p1e-no-yaml"; printf 'raise ImportError("shadowed for test")\n' > "$WORK/p1e-no-yaml/yaml.py"
+run_in_pane "$S2:0.0" e-scan-dependency "PYTHONPATH=$WORK/p1e-no-yaml FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $ES --stage $EST --worker codex-a --timeout 1 --interval 0.1"
+[ "$(rc_of e-scan-dependency)" = 1 ] && out_of e-scan-dependency | grep -q 'CALLBACK_SCANNER_DEPENDENCY: PyYAML missing' \
+  && out_of e-scan-dependency | grep -q 'DETAIL: CALLBACK_SCANNER_DEPENDENCY' \
+  && ok "T-P1E-SCAN-DEPENDENCY" || bad "T-P1E-SCAN-DEPENDENCY"
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

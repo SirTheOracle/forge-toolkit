@@ -1,0 +1,54 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "forge://schemas/callback/1"
+title: Forge callback
+type: object
+additionalProperties: false
+required: [slug, stage, status, worker, callback_id, timestamp, message]
+properties:
+  slug: {type: string, minLength: 1}
+  stage: {type: string, minLength: 1}
+  status: {type: string, enum: [DONE, BLOCKED, ERROR, PARKED]}
+  worker: {type: string, minLength: 1}
+  session: {type: [string, "null"]}
+  incarnation: {type: [string, integer, "null"]}
+  origin: {type: [string, "null"], enum: [ask, "", null]}
+  callback_id: {type: string, minLength: 1}
+  timestamp: {type: string, format: date-time, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", description: Callback publication timestamp; never pending identity.}
+  selected_pending_timestamp: {type: [string, "null"], format: date-time, description: Optional identity of the selected open pending.}
+  message: {type: string}
+  parked_at: {type: [string, "null"]}
+  parked_reason: {type: [string, "null"]}
+  uncommitted: {type: boolean}
+oneOf:
+  - title: exact session and incarnation
+    required: [session, incarnation]
+    properties:
+      session: {type: string, minLength: 1}
+      incarnation:
+        oneOf:
+          - {type: string, minLength: 1}
+          - {type: integer}
+  - title: session-only compatibility
+    required: [session]
+    properties:
+      session: {type: string, minLength: 1}
+      incarnation: {enum: ["", null]}
+  - title: unqualified legacy compatibility
+    properties:
+      session: {enum: ["", null]}
+      incarnation: {enum: ["", null]}
+    not:
+      anyOf:
+        - properties: {session: {type: string, minLength: 1}}
+          required: [session]
+        - properties:
+            incarnation:
+              oneOf:
+                - {type: string, minLength: 1}
+                - {type: integer}
+          required: [incarnation]
+x-forge-reader-policy:
+  unknown-fields: classify-header-invalid-and-preserve
+  malformed-files: classify-malformed-and-preserve
+  filename-identity: discovery-only
+  publication-timestamp-is-pending-identity: false
