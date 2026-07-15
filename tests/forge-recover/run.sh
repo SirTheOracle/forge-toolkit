@@ -247,18 +247,124 @@ echo "── T21: P13 recover four-quadrant + catch-all ──"
 # classifier output is otherwise computed-but-unrendered on an all-clean root.
 new_root recq; ghost_fixtures "$R"; mkdir -p "$R/.dev/proposals/q1" "$R/.dev/proposals/q2" "$R/.dev/proposals/q4" "$R/.dev/forge-tmp/callbacks"
 printf 'entries:\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: coding\n    session: forge-1\n    parked_at: 2026-07-01T00:00:00Z\n    parked_reason: "x"\n    uncommitted: false\n    response: null\n' > "$R/.dev/proposals/q1/forge-log.yml"
-printf 'slug: q1\nstage: coding\nstatus: PARKED\nsession: forge-1\ncallback_id: q1-coding-x\nmessage: |\n  p\n' > "$R/.dev/forge-tmp/callbacks/q1-coding.forge-1.callback"
+printf 'slug: q1\nstage: coding\nstatus: PARKED\nworker: codex-a\nsession: forge-1\ncallback_id: q1-coding-x\ntimestamp: 2026-07-14T00:00:00Z\nmessage: |\n  p\n' > "$R/.dev/forge-tmp/callbacks/q1-coding.forge-1.callback"
 printf 'entries:\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: coding\n    session: forge-1\n    parked_at: 2026-07-01T00:00:00Z\n    parked_reason: "y"\n    uncommitted: false\n    response: null\n' > "$R/.dev/proposals/q2/forge-log.yml"
-printf 'slug: q2\nstage: coding\nstatus: BLOCKED\nsession: forge-1\ncallback_id: q2-coding-x\nmessage: |\n  b\n' > "$R/.dev/forge-tmp/callbacks/q2-coding.forge-1.callback"
-printf 'slug: q3\nstage: coding\nstatus: PARKED\nsession: forge-1\ncallback_id: q3-coding-x\nmessage: |\n  p\n' > "$R/.dev/forge-tmp/callbacks/q3-coding.forge-1.callback"
+printf 'slug: q2\nstage: coding\nstatus: BLOCKED\nworker: codex-a\nsession: forge-1\ncallback_id: q2-coding-x\ntimestamp: 2026-07-14T00:00:01Z\nmessage: |\n  b\n' > "$R/.dev/forge-tmp/callbacks/q2-coding.forge-1.callback"
+printf 'slug: q3\nstage: coding\nstatus: PARKED\nworker: codex-a\nsession: forge-1\ncallback_id: q3-coding-x\ntimestamp: 2026-07-14T00:00:02Z\nmessage: |\n  p\n' > "$R/.dev/forge-tmp/callbacks/q3-coding.forge-1.callback"
 printf 'entries:\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: coding\n    response: null\n' > "$R/.dev/proposals/q4/forge-log.yml"
-printf 'slug: q5\nstage: coding\nstatus: BLOCKED\nsession: forge-1\ncallback_id: q5-coding-x\nmessage: |\n  bare-orphan\n' > "$R/.dev/forge-tmp/callbacks/q5-coding.forge-1.callback"
+printf 'slug: q5\nstage: coding\nstatus: BLOCKED\nworker: codex-a\nsession: forge-1\ncallback_id: q5-coding-x\ntimestamp: 2026-07-14T00:00:03Z\nmessage: |\n  bare-orphan\n' > "$R/.dev/forge-tmp/callbacks/q5-coding.forge-1.callback"
 out=$(FORGE_RECOVER_TMUX_STATUS=no-server recov --root "$R" --dry-run 2>&1 || true)
 echo "$out" | grep -q "FOLLOW-UP.*parked (deliberate) q1/coding" && ok "R1 quadrant1 deliberate" || bad "R1 missing"
 echo "$out" | grep -q "FOLLOW-UP.*parked (incomplete transition) q2/coding" && ok "R2 quadrant2 incomplete" || bad "R2 missing"
 echo "$out" | grep -q "FOLLOW-UP.*orphan PARKED callback q3/coding" && ok "R3 quadrant3 orphan" || bad "R3 missing"
 echo "$out" | grep -q "FOLLOW-UP.*manual disposition" && ok "R4 quadrant4 manual disposition" || bad "R4 missing"
-echo "$out" | grep -Eq "q[123]/coding.*manual disposition" && bad "R1-3 leaked manual disposition" || ok "R1-3 no manual disposition"
+echo "$out" | grep -Eq "(q1-coding|q2-coding|q3-coding|q[123]/coding).*manual disposition" && bad "R1-3 leaked manual disposition" || ok "R1-3 no manual disposition"
 echo "$out" | grep -q "FOLLOW-UP.*callback residue.*q5-coding" && ok "R5 bare BLOCKED orphan surfaced (catch-all)" || bad "R5 bare orphan dropped"
+
+echo "── T22: P1-E recovery reports incarnation/ambiguity and mutates no callbacks ──"
+new_root p1e22; ghost_fixtures "$R"; mkdir -p "$R/.dev/forge-tmp/callbacks"
+cat > "$R/.dev/forge-tmp/callbacks/r22-exact-coding.forge-1.200.callback" <<'EOF'
+slug: r22-exact
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: forge-1
+incarnation: 200
+callback_id: r22-exact
+timestamp: 2026-07-14T00:00:00Z
+message: exact residue
+EOF
+cat > "$R/.dev/forge-tmp/callbacks/r22-amb-coding.forge-1.201.callback" <<'EOF'
+slug: r22-amb
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: forge-1
+incarnation: 201
+callback_id: r22-amb-exact
+timestamp: 2026-07-14T00:00:01Z
+message: ambiguous residue
+EOF
+cat > "$R/.dev/forge-tmp/callbacks/r22-amb-coding.forge-1.callback" <<'EOF'
+slug: r22-amb
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: forge-1
+callback_id: r22-amb-session
+timestamp: 2026-07-14T00:00:02Z
+message: ambiguous legacy residue
+EOF
+cat > "$R/.dev/forge-tmp/callbacks/r22-mismatch-coding.wrong.callback" <<'EOF'
+slug: r22-mismatch
+stage: coding
+status: BLOCKED
+worker: codex-a
+callback_id: r22-mismatch
+timestamp: 2026-07-14T00:00:03Z
+message: filename mismatch
+EOF
+cat > "$R/.dev/forge-tmp/callbacks/r22-dead-coding.forge-1.199.callback" <<'EOF'
+slug: r22-dead
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: forge-1
+incarnation: 199
+callback_id: r22-dead
+timestamp: 2026-07-14T00:00:04Z
+message: dead predecessor
+EOF
+cat > "$R/.dev/forge-tmp/callbacks/r22-foreign-coding.forge-foreign.300.callback" <<'EOF'
+slug: r22-foreign
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: forge-foreign
+incarnation: 300
+callback_id: r22-foreign
+timestamp: 2026-07-14T00:00:05Z
+message: foreign root
+EOF
+cat > "$R/.dev/forge-tmp/callbacks/r22-inc-only-coding.callback" <<'EOF'
+slug: r22-inc-only
+stage: coding
+status: BLOCKED
+worker: codex-a
+incarnation: 404
+callback_id: r22-inc-only
+timestamp: 2026-07-14T00:00:06Z
+message: invalid incarnation without session
+EOF
+printf '[unterminated\n' > "$R/.dev/forge-tmp/callbacks/r22-invalid-coding.callback"
+printf 'forge-1\t%s\t$1\t200\nforge-foreign\t%s\t$2\t300\n' "$R" "$WORK/other-root" > "$WORK/t22-live.tsv"
+before=$(find "$R/.dev/forge-tmp/callbacks" -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256)
+out=$(FORGE_RECOVER_TMUX_LIST="$WORK/t22-live.tsv" recov --root "$R" --dry-run 2>&1 || true)
+after=$(find "$R/.dev/forge-tmp/callbacks" -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256)
+echo "$out" | grep -q 'incarnation callback residue r22-exact/coding' \
+  && echo "$out" | grep -q 'ambiguous callback residue r22-amb/coding' \
+  && echo "$out" | grep -q 'callback residue malformed-header.*r22-invalid-coding.callback' \
+  && echo "$out" | grep -q 'callback residue header-filename-mismatch.*r22-mismatch-coding.wrong.callback' \
+  && echo "$out" | grep -q 'r22-exact/coding.*classification=exact-current' \
+  && echo "$out" | grep -q 'r22-dead/coding.*classification=dead-incarnation' \
+  && echo "$out" | grep -q 'r22-foreign/coding.*classification=foreign-incarnation' \
+  && echo "$out" | grep -q 'callback residue malformed-header.*r22-inc-only-coding.callback' \
+  && [ "$before" = "$after" ] \
+  && ok "T22 exact+ambiguous incarnation residue reported without mutation" || bad "T22 recovery classification/no-mutation"
+
+# Post-all-source schema lockstep: this intentionally lives in Commit 2 after
+# bridge, watcher, and recovery new_strings all exist.
+python3 - "$ROOT" <<'PY' && ok "T23 callback schema known/required sets stay in reader lockstep" || bad "T23 callback schema lockstep"
+import ast,pathlib,re,sys,yaml
+root=pathlib.Path(sys.argv[1]); schema=yaml.safe_load((root/'orchestrator/schemas/callback.yml').read_text())
+want={'known':set(schema['properties']),'required':set(schema['required'])}; found={}
+pat=re.compile(r'# CALLBACK_SCHEMA_LOCKSTEP ([a-z-]+) (known|required)\n\s*(?:known|required)\s*=\s*(\{[^\n]+\})')
+for rel in ('bin/forge-bridge','bin/forge-watch','bin/forge'):
+    for reader,kind,literal in pat.findall((root/rel).read_text()):
+        key=(reader,kind); assert key not in found,key; found[key]=set(ast.literal_eval(literal))
+readers={'bridge-scanner','bridge-audit','forge-watch','forge-recovery'}
+assert set(r for r,_ in found)==readers and len(found)==8,found.keys()
+for (reader,kind),value in found.items(): assert value==want[kind],(reader,kind,value^want[kind])
+PY
 
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]

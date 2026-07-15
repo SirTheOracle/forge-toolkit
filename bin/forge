@@ -1395,95 +1395,131 @@ def is_dead(root_real, sess, ts, snap_status, snap):
         return None          # name live, record timestamp unknown → ambiguous
     return ts < live[1]      # predates live incarnation's session_created
 
-def followups(dev, sess_filter=None):
+def followups(dev, root_real, snap, sess_filter=None):
     """Residue classifier — four parked quadrants (§3.4) + plain pendings + a catch-all
     for unclassified callbacks. Report-only. Entry-by-entry YAML parse with a defensive
     regex fallback (never a raw-file parked_at-anywhere check). Keyed by
     (slug,stage,session); sess_filter (when given) limits to one recovery session,
     legacy-unowned (session None) always included."""
     out = []
-    cb_state = {}   # (slug,stage,session) -> status
-    for cbp in glob.glob(os.path.join(dev, "forge-tmp", "callbacks", "*.callback")):
+    def _identity_class(sess,inc):
+        if not sess or not inc: return 'legacy'
+        here=snap.get((root_real,sess))
+        if here is not None and str(here[1])==str(inc): return 'exact-current'
+        if any(s==sess and r!=root_real and str(v[1])==str(inc) for (r,s),v in snap.items()):
+            return 'foreign-incarnation'
+        return 'dead-incarnation'
+    cb_state = {}   # (slug,stage,session,incarnation) -> [(status,path)]
+    cb_invalid = [] # [(reason,path)] — report-only catch-all
+    # CALLBACK_SCHEMA_LOCKSTEP forge-recovery known
+    known={'slug','stage','status','worker','session','incarnation','origin','callback_id','timestamp','selected_pending_timestamp','message','parked_at','parked_reason','uncommitted'}
+    # CALLBACK_SCHEMA_LOCKSTEP forge-recovery required
+    required={'slug','stage','status','worker','callback_id','timestamp','message'}
+    for cbp in sorted(glob.glob(os.path.join(dev, "forge-tmp", "callbacks", "*.callback"))):
         try:
             raw = open(cbp).read()
         except OSError:
             continue
-        def _g(field):
-            m = re.search(rf'^{field}:\s*(.*?)\s*$', raw, re.M)
-            return m.group(1).strip() if m else None
-        s, st, status, csess = _g('slug'), _g('stage'), (_g('status') or '').upper(), _g('session')
-        if s and st:
-            cb_state[(s, st, csess)] = status
-    def _owned(sess):
-        return sess_filter is None or sess in (sess_filter, None, '')
-    def _cb(slug, stage, sess):
-        if (slug, stage, sess) in cb_state:
-            return cb_state[(slug, stage, sess)]
-        return cb_state.get((slug, stage, None))   # legacy unowned fallback
-    seen_entries = set()
-    for logp in glob.glob(os.path.join(dev, "proposals", "*", "forge-log.yml")):
-        slug = os.path.basename(os.path.dirname(logp))
-        try:
-            raw = open(logp).read()
-        except OSError:
-            continue
-        entries = None
         try:
             import yaml
-            entries = (yaml.safe_load(raw) or {}).get("entries", []) or []
+            doc=yaml.load(raw,Loader=yaml.BaseLoader)
         except Exception:
-            entries = None
-        def _emit(stage, parked, sess):
-            if not _owned(sess):
-                return
-            key = (slug, stage, sess); seen_entries.add(key)
-            cb = _cb(slug, stage, sess)
-            if parked and cb == 'PARKED':
-                out.append("parked (deliberate) %s/%s — see `forge parked`" % (slug, stage))
+            doc=None
+        if not isinstance(doc,dict):
+            cb_invalid.append(('malformed-header',cbp)); continue
+        names=re.findall(r'^([a-z_]+):',raw,re.M)
+        if len(names)!=len(set(names)):
+            cb_invalid.append(('duplicate-header',cbp)); continue
+        if set(doc)-known:
+            cb_invalid.append(('unknown-header',cbp)); continue
+        ts=doc.get('timestamp')
+        ts_ok=isinstance(ts,str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z',ts)
+        if ts_ok:
+            try: datetime.datetime.strptime(ts,'%Y-%m-%dT%H:%M:%SZ')
+            except ValueError: ts_ok=False
+        status=str(doc.get('status') or '').upper()
+        if (not required.issubset(doc) or not all(isinstance(doc.get(k),str) for k in required)
+                or not all(doc.get(k) for k in required-{'message'}) or not ts_ok
+                or status not in ('DONE','BLOCKED','ERROR','PARKED')):
+            cb_invalid.append(('malformed-header',cbp)); continue
+        s,st=doc.get('slug'),doc.get('stage')
+        csess,cinc=doc.get('session') or None,doc.get('incarnation') or None
+        if cinc and not csess:
+            cb_invalid.append(('malformed-header',cbp)); continue
+        stem='%s-%s' % (s,st)
+        expected=(stem+'.%s.%s.callback' % (csess,cinc) if csess and cinc else
+                  stem+'.%s.callback' % csess if csess else stem+'.callback')
+        if os.path.basename(cbp)!=expected:
+            cb_invalid.append(('header-filename-mismatch',cbp)); continue
+        cb_state.setdefault((s, st, csess, cinc), []).append((status, cbp))
+    def _owned(sess):
+        return sess_filter is None or sess in (sess_filter, None, '')
+    def _select(slug, stage, sess, inc):
+        keys=[]
+        if sess and inc: keys.append((slug,stage,sess,inc))
+        if sess: keys.append((slug,stage,sess,None))
+        keys.append((slug,stage,None,None))
+        vals=[]
+        for key in keys: vals.extend(cb_state.get(key,[]))
+        if len(vals)>1: return 'AMBIGUOUS',vals
+        return (vals[0][0],vals) if vals else (None,[])
+    seen_entries=set(); used_paths=set()
+    for reason,path in cb_invalid:
+        out.append("callback residue %s %s (manual disposition)" % (reason,path))
+    for logp in sorted(glob.glob(os.path.join(dev,"proposals","*","forge-log.yml"))):
+        slug=os.path.basename(os.path.dirname(logp))
+        try: raw=open(logp).read()
+        except OSError: continue
+        try:
+            import yaml
+            entries=(yaml.safe_load(raw) or {}).get('entries',[]) or []
+        except Exception: entries=None
+        def _emit(stage,parked,sess,inc):
+            sess=sess or None; inc=str(inc) if inc not in (None,'') else None
+            if not _owned(sess): return
+            key=(slug,stage,sess,inc); seen_entries.add(key)
+            status,vals=_select(slug,stage,sess,inc)
+            used_paths.update(v[1] for v in vals)
+            if status=='AMBIGUOUS':
+                out.append("ambiguous callback residue %s/%s session=%s incarnation=%s files=%s" %
+                           (slug,stage,sess or 'legacy',inc or 'legacy',','.join(os.path.basename(v[1]) for v in vals)))
+            elif parked and status=='PARKED':
+                out.append("parked (deliberate) %s/%s — see `forge parked`" % (slug,stage))
             elif parked:
-                out.append("parked (incomplete transition) %s/%s — repair: re-run park" % (slug, stage))
+                out.append("parked (incomplete transition) %s/%s — repair: re-run park" % (slug,stage))
             else:
-                out.append("open pending in %s (no session identity in schema — manual disposition)" % logp)
+                out.append("open pending in %s (session=%s incarnation=%s — manual disposition)" %
+                           (logp,sess or 'legacy',inc or 'legacy'))
         if entries is not None:
             for e in entries:
-                if isinstance(e, dict) and e.get('response') is None:
-                    _emit(e.get('stage'), bool(e.get('parked_at')), e.get('session'))
+                if isinstance(e,dict) and e.get('response') is None:
+                    _emit(e.get('stage'),bool(e.get('parked_at')),e.get('session'),e.get('incarnation'))
         else:
-            block_re = re.compile(r'^\s*-\s+timestamp:\s*"([^"]+)"', re.M)
-            starts = [m.start() for m in block_re.finditer(raw)]
-            for i, off in enumerate(starts):
-                blk = raw[off:(starts[i+1] if i+1 < len(starts) else len(raw))]
-                if not re.search(r'^\s+response:\s*null\s*$', blk, re.M):
-                    continue
-                st = re.search(r'^\s+stage:\s*(.*?)\s*$', blk, re.M)
-                se = re.search(r'^\s+session:\s*(.*?)\s*$', blk, re.M)
-                _emit(st.group(1).strip() if st else None,
-                      bool(re.search(r'^\s+parked_at:', blk, re.M)),
-                      se.group(1).strip() if se else None)
-    for (slug, stage, sess), status in cb_state.items():
-        if status == 'PARKED' and (slug, stage, sess) not in seen_entries \
-           and (slug, stage, None) not in seen_entries and _owned(sess):
-            out.append("orphan PARKED callback %s/%s — repair: consume or re-park" % (slug, stage))
-    # Catch-all: any callback neither matched to a pending (parked/plain — already
-    # reported) nor a PARKED orphan (reported above) is still surfaced — crash-orphaned
-    # BLOCKED callbacks and headerless/malformed files must not go silent (the
-    # crash-after-block fallback, §7 Q1).
-    for cbp in glob.glob(os.path.join(dev, "forge-tmp", "callbacks", "*.callback")):
-        try:
-            raw = open(cbp).read()
-        except OSError:
-            continue
-        def _h(field):
-            m = re.search(rf'^{field}:\s*(.*?)\s*$', raw, re.M)
-            return m.group(1).strip() if m else None
-        s, st, status, csess = _h('slug'), _h('stage'), (_h('status') or '').upper(), _h('session')
-        if s and st and (s, st, csess) in seen_entries:
-            continue
-        if status == 'PARKED':
-            continue
-        if not _owned(csess):
-            continue
-        out.append("callback residue %s (manual disposition)" % cbp)
+            starts=[m.start() for m in re.finditer(r'^\s*-\s+timestamp:\s*"([^"]+)"',raw,re.M)]
+            for i,off in enumerate(starts):
+                blk=raw[off:(starts[i+1] if i+1<len(starts) else len(raw))]
+                if not re.search(r'^\s+response:\s*null\s*$',blk,re.M): continue
+                def grab(field):
+                    m=re.search(r'^\s+'+field+r':\s*(.*?)\s*$',blk,re.M); return m.group(1).strip() if m else None
+                _emit(grab('stage'),bool(re.search(r'^\s+parked_at:',blk,re.M)),grab('session'),grab('incarnation'))
+    for (slug,stage,sess,inc),vals in sorted(cb_state.items(),key=lambda kv:tuple(str(x or '') for x in kv[0])):
+        if all(path in used_paths for _status,path in vals): continue
+        selected_status,selected_vals=_select(slug,stage,sess,inc)
+        fresh=[v for v in selected_vals if v[1] not in used_paths]
+        if len(fresh)>1:
+            out.append("ambiguous callback residue %s/%s session=%s incarnation=%s files=%s" %
+                       (slug,stage,sess or 'legacy',inc or 'legacy',','.join(os.path.basename(v[1]) for v in fresh)))
+            used_paths.update(v[1] for v in fresh); continue
+        for status,path in vals:
+            if path in used_paths or not _owned(sess): continue
+            if status=='PARKED':
+                out.append("orphan PARKED callback %s/%s session=%s incarnation=%s — repair: consume or re-park" %
+                           (slug,stage,sess or 'legacy',inc or 'legacy'))
+            elif inc:
+                out.append("incarnation callback residue %s/%s session=%s incarnation=%s status=%s classification=%s" %
+                           (slug,stage,sess,inc,status or 'UNKNOWN',_identity_class(sess,inc)))
+            else:
+                out.append("callback residue %s (manual disposition)" % path)
     return out
 
 def scan_one_root(display, snap_status, snap):
@@ -1613,7 +1649,7 @@ def scan_one_root(display, snap_status, snap):
                 base = os.path.basename(fp)
                 if base.startswith(("response.cc-", "cc-")):
                     r["payload_notes"].append("orphan payload (no owning record): %s" % rel)
-    r["followups"] = followups(dev)
+    r["followups"] = followups(dev, real, snap)
     if r["candidates"] or r["needs_manual"] or r["unknown"]:
         r["status"] = "candidates"
     return r

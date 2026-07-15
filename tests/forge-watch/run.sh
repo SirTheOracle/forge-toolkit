@@ -2016,6 +2016,211 @@ echo "$o" | grep -q '^parked_at=.*2026-07-11T10:05:00Z'   && ok "W15: 'parked_at
 echo "$o" | grep -q '^parked_reason=waiting on human$'    && ok "W15: 'parked_reason' retained + unquoted" || bad "W15: parked_reason lost ($o)"
 echo "$o" | grep -q '^uncommitted=True$'                  && ok "W15: 'uncommitted' normalized to bool True" || bad "W15: uncommitted wrong ($o)"
 
+echo "── W18: P1-E callback identity correlation ──"
+new_env w18; WR=$(mk_root w18); live_session forge-w16 "$WR"
+mkdir -p "$WR/.dev/proposals/e16"; cat > "$WR/.dev/proposals/e16/forge-log.yml" <<'EOF'
+entries:
+  - timestamp: "2026-07-14T00:00:00Z"
+    stage: coding
+    to: codex-a
+    session: forge-w16
+    incarnation: 200
+    response: null
+EOF
+cat > "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.200.callback" <<'EOF'
+slug: e16
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: forge-w16
+incarnation: 200
+callback_id: exact-1
+timestamp: 2026-07-14T00:00:01Z
+message: exact current
+EOF
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'blocked at coding: exact current' && ok "W18 exact current projects" || bad "W18 exact projection"
+
+# Persisted evidence resets on either callback id or incarnation while the
+# aggregate (slug,stage) compatibility key remains stable for context/stall users.
+"$WATCH" check >/dev/null 2>&1
+python3 - "$FORGE_WATCH_CACHE_DIR/state.json" "$WR" <<'PY' \
+  && ok "W18 evidence records callback id+incarnation" || bad "W18 evidence initial identity"
+import json,os,sys
+d=json.load(open(sys.argv[1])); prefix=os.path.realpath(sys.argv[2])+'\te16\tcoding\t'; rows=[v for k,v in d['blocked_evidence'].items() if k.startswith(prefix)]
+assert len(rows)==1 and rows[0]['callback_id']=='exact-1' and str(rows[0]['incarnation'])=='200'
+PY
+mv "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.200.callback" "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback"
+sed -i '' 's/incarnation: 200/incarnation: 201/' "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback"
+sed -i '' 's/incarnation: 200/incarnation: 201/' "$WR/.dev/proposals/e16/forge-log.yml"
+"$WATCH" check >/dev/null 2>&1
+python3 - "$FORGE_WATCH_CACHE_DIR/state.json" "$WR" <<'PY' \
+  && ok "W18 incarnation-only change resets evidence" || bad "W18 incarnation reset"
+import json,os,sys
+d=json.load(open(sys.argv[1])); prefix=os.path.realpath(sys.argv[2])+'\te16\tcoding\t'; rows=[v for k,v in d['blocked_evidence'].items() if k.startswith(prefix)]
+assert len(rows)==1 and rows[0]['callback_id']=='exact-1' and str(rows[0]['incarnation'])=='201' and rows[0]['later_other_dispatch'] is False
+PY
+sed -i '' 's/callback_id: exact-1/callback_id: exact-2/' "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback"
+"$WATCH" check >/dev/null 2>&1
+python3 - "$FORGE_WATCH_CACHE_DIR/state.json" "$WR" <<'PY' \
+  && ok "W18 callback-id-only change resets evidence" || bad "W18 callback-id reset"
+import json,os,sys
+d=json.load(open(sys.argv[1])); prefix=os.path.realpath(sys.argv[2])+'\te16\tcoding\t'; rows=[v for k,v in d['blocked_evidence'].items() if k.startswith(prefix)]
+assert len(rows)==1 and rows[0]['callback_id']=='exact-2' and str(rows[0]['incarnation'])=='201' and rows[0]['later_other_dispatch'] is False
+PY
+
+# Two exact owners sharing one root and slug/stage remain two scoped rows, while
+# the aggregate map continues to suppress only one stale/stall twin.
+cat >> "$WR/.dev/proposals/e16/forge-log.yml" <<'EOF'
+  - timestamp: "2026-07-14T00:00:03Z"
+    stage: coding
+    to: codex-b
+    session: forge-w17
+    incarnation: 301
+    response: null
+EOF
+cat > "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w17.301.callback" <<'EOF'
+slug: e16
+stage: coding
+status: BLOCKED
+worker: codex-b
+session: forge-w17
+incarnation: 301
+callback_id: concurrent-2
+timestamp: 2026-07-14T00:00:04Z
+message: concurrent exact
+EOF
+o=$("$WATCH" status 2>/dev/null)
+[ "$(printf '%s\n' "$o" | grep -c 'ITEM-BLOCKED')" -ge 2 ] \
+  && ! printf '%s' "$o" | grep -q 'CALLBACK-AMBIGUOUS' \
+  && ok "W18 concurrent exact owners remain distinct" || bad "W18 concurrent exact owners collapsed"
+rm "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w17.301.callback"
+python3 - "$WR/.dev/proposals/e16/forge-log.yml" <<'PY'
+import sys,yaml
+p=sys.argv[1]; d=yaml.safe_load(open(p)); d['entries']=[e for e in d['entries'] if e.get('session')!='forge-w17']
+open(p,'w').write(yaml.safe_dump(d,sort_keys=False))
+PY
+
+# Session-only and unqualified old-producer shapes remain readable one at a time.
+cp "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback" "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.callback"
+sed -i '' '/^incarnation:/d;s/callback_id: exact-2/callback_id: session-legacy/' "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.callback"
+rm "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback"
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'blocked at coding: exact current' && ok "W18 session-only legacy projects" || bad "W18 session legacy"
+mv "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.callback" "$WR/.dev/forge-tmp/callbacks/e16-coding.callback"
+sed -i '' '/^session:/d;s/callback_id: session-legacy/callback_id: unqualified-legacy/' "$WR/.dev/forge-tmp/callbacks/e16-coding.callback"
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'blocked at coding: exact current' && ok "W18 unqualified legacy projects" || bad "W18 unqualified legacy"
+rm "$WR/.dev/forge-tmp/callbacks/e16-coding.callback"
+
+# Same-name predecessor and header-negative callbacks never become current.
+cat > "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.199.callback" <<'EOF'
+slug: e16
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: forge-w16
+incarnation: 199
+callback_id: predecessor
+timestamp: 2026-07-14T00:00:01Z
+message: foreign predecessor
+EOF
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'foreign predecessor' && bad "W18 foreign rebirth projected" || ok "W18 same-name predecessor excluded"
+mv "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.199.callback" "$WR/.dev/forge-tmp/callbacks/e16-coding.wrong.callback"
+printf '\nunknown_future: x\n' >> "$WR/.dev/forge-tmp/callbacks/e16-coding.wrong.callback"
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'foreign predecessor' && bad "W18 invalid header projected" || ok "W18 filename/unknown-header negatives excluded"
+rm "$WR/.dev/forge-tmp/callbacks/e16-coding.wrong.callback"
+cat > "$WR/.dev/forge-tmp/callbacks/e16-coding.callback" <<'EOF'
+slug: e16
+stage: coding
+status: BLOCKED
+worker: codex-a
+incarnation: 201
+callback_id: inc-without-session
+timestamp: 2026-07-14T00:00:01Z
+message: must not project
+EOF
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'CALLBACK-INVALID' && ! echo "$o" | grep -q 'blocked at coding: must not project' \
+  && ok "W18 incarnation-without-session invalid" || bad "W18 incarnation-without-session projected"
+rm "$WR/.dev/forge-tmp/callbacks/e16-coding.callback"
+
+# Ask origin remains visible as blocked but is excluded from abandonment evidence.
+cat > "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback" <<EOF
+slug: e16
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: forge-w16
+incarnation: 201
+origin: ask
+callback_id: ask-1
+timestamp: $(iso_ago 1000)
+message: operator ask
+EOF
+"$WATCH" check >/dev/null 2>&1
+evlog_append "$WR" "DISPATCH: pipeline=e18-other stage=coding worker=codex-b"
+o=$(FORGE_BLOCKED_ABANDON_S=1 "$WATCH" check 2>/dev/null)
+echo "$o" | grep -q 'ITEM-BLOCKED-ABANDONED' && bad "W18 ask became abandoned" || ok "W18 ask suppression preserved"
+
+# Exact + session-only is ambiguous; glob order cannot select.
+cp "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback" "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.callback"
+sed -i '' '/^incarnation:/d;s/callback_id: ask-1/callback_id: legacy-2/;/^origin:/d' "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.callback"
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'CALLBACK-AMBIGUOUS' && ok "W18 exact+session cardinality is explicit" || bad "W18 ambiguity hidden"
+rm "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.callback"
+python3 - "$WR/.dev/proposals/e16/forge-log.yml" <<'PY'
+import sys,yaml
+p=sys.argv[1]; d=yaml.safe_load(open(p)); e=d['entries'][0]
+e.update(parked_at='2026-07-14T00:00:02Z',parked_reason='log wins',uncommitted=False)
+open(p,'w').write(yaml.safe_dump(d,sort_keys=False))
+PY
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'ITEM-PARKED' && echo "$o" | grep -q 'PARK-INCONSISTENT' \
+  && echo "$o" | grep -q 'ITEM-BLOCKED' \
+  && ok "W18 contradictory parked-log/BLOCKED coexistence pinned" || bad "W18 contradiction projection changed"
+sed -i '' 's/status: BLOCKED/status: PARKED/' "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback"
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'PARK-INCONSISTENT' && bad "W18 exact PARKED failed correlation" || ok "W18 exact PARKED correlates"
+
+# Exact + session-only PARKED is ambiguity only: no repair or foreign advice.
+cp "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback" "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.callback"
+sed -i '' '/^incarnation:/d;s/callback_id: ask-1/callback_id: parked-legacy/' "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.callback"
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'CALLBACK-AMBIGUOUS' && ! echo "$o" | grep -q 'PARK-INCONSISTENT' \
+  && ! echo "$o" | grep -q 'CALLBACK-FOREIGN' \
+  && ok "W18 ambiguous PARKED emits ambiguity only" || bad "W18 ambiguous PARKED emitted misleading advice"
+rm "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.callback"
+
+# Duplicate headers are invalid on the shared strict predicate.
+printf 'worker: duplicate\n' >> "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback"
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'invalid PARKED callback' && echo "$o" | grep -q 'PARK-INCONSISTENT' \
+  && ok "W18 duplicate PARKED header invalid" || bad "W18 duplicate PARKED header correlated"
+sed -i '' '$d' "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback"
+cp "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback" "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.199.callback"
+sed -i '' 's/incarnation: 201/incarnation: 199/;s/callback_id: ask-1/callback_id: foreign-park/' "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.199.callback"
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'CALLBACK-FOREIGN' && ok "W18 foreign PARKED classified" || bad "W18 foreign PARKED hidden"
+cp "$WR/.dev/forge-tmp/callbacks/e16-coding.forge-w16.201.callback" "$WR/.dev/forge-tmp/callbacks/e16-coding.invalid.callback"
+printf '\nunknown_future: x\n' >> "$WR/.dev/forge-tmp/callbacks/e16-coding.invalid.callback"
+o=$("$WATCH" status 2>/dev/null)
+echo "$o" | grep -q 'invalid PARKED callback' && ok "W18 header-invalid PARKED classified" || bad "W18 invalid PARKED hidden"
+
+# Two independently owned PARKED records for the same aggregate slug/stage
+# remain two rows, just as the BLOCKED case above does.
+new_env w18p; PR=$(mk_root w18p); live_session forge-p16a "$PR"; live_session forge-p16b "$PR"
+parked_entry "$PR" e16p coding codex-a "2026-07-14T00:10:00Z" "held a" false forge-p16a
+parked_entry_append "$PR" e16p coding codex-b "2026-07-14T00:11:00Z" "held b" forge-p16b
+parked_callback "$PR" e16p coding codex-a forge-p16a
+parked_callback "$PR" e16p coding codex-b forge-p16b
+sed -i '' 's/callback_id: e16p-coding-x/callback_id: e16p-coding-b/' "$PR/.dev/forge-tmp/callbacks/e16p-coding.forge-p16b.callback"
+o=$("$WATCH" status --board 2>/dev/null)
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert len([x for x in d.get("parked",[]) if x.get("slug")=="e16p"])==2' <<<"$o" \
+  && ok "W18 concurrent PARKED owners remain distinct" || bad "W18 concurrent PARKED owners collapsed"
+
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"
 [ "$FAIL" -gt 0 ] && red "FAIL: $FAIL" || green "FAIL: 0"

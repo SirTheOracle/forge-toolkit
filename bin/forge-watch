@@ -473,6 +473,7 @@ def pending_entries(root, path):
             entries.append({'timestamp': ts, 'stage': grab('stage'),
                             'to': grab('to'), 'response': resp,
                             'session': grab('session'),
+                            'incarnation': grab('incarnation'),
                             'parked_at': grab('parked_at'),
                             'parked_reason': grab('parked_reason'),
                             'uncommitted': (str(unc).strip().lower() == 'true') if unc else False})
@@ -487,6 +488,7 @@ def pending_entries(root, path):
             out.append({'stage': e.get('stage'), 'to': e.get('to'),
                         'timestamp': e.get('timestamp'),
                         'session': e.get('session'),
+                        'incarnation': e.get('incarnation'),
                         'parked_at': e.get('parked_at'),
                         'parked_reason': pr,
                         'uncommitted': bool(e.get('uncommitted'))})
@@ -532,6 +534,44 @@ def parse_callback(path):
                 fl = ln.strip()
                 break
     d['_first_line'] = fl
+    d['_path'] = path
+    d['_filename'] = os.path.basename(path)
+    # CALLBACK_SCHEMA_LOCKSTEP forge-watch known
+    known = {'slug','stage','status','worker','session','incarnation','origin','callback_id','timestamp','selected_pending_timestamp','message','parked_at','parked_reason','uncommitted'}
+    # CALLBACK_SCHEMA_LOCKSTEP forge-watch required
+    required = {'slug','stage','status','worker','callback_id','timestamp','message'}
+    d['_unknown_headers'] = sorted(k for k in d if not k.startswith('_') and k not in known)
+    header_names = re.findall(r'^([a-z_]+):', raw, re.M)
+    d['_duplicate_headers'] = sorted({k for k in header_names if header_names.count(k) > 1})
+    raw_ts = re.search(r'^timestamp:\s*([^\s#]+)\s*$', raw, re.M)
+    d['_timestamp_valid'] = False
+    if raw_ts and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', raw_ts.group(1)):
+        try:
+            import datetime as _datetime
+            _datetime.datetime.strptime(raw_ts.group(1), '%Y-%m-%dT%H:%M:%SZ')
+            d['_timestamp_valid'] = True
+        except ValueError:
+            pass
+    d['_required_headers_valid'] = (
+        required.issubset(d) and
+        all(isinstance(d.get(k), str) for k in required) and
+        all(d.get(k) for k in required-{'message'}) and
+        isinstance(d.get('worker'), str) and bool(d.get('worker')) and
+        isinstance(d.get('callback_id'), str) and bool(d.get('callback_id')) and
+        d['_timestamp_valid'] and
+        isinstance(d.get('message'), str))
+    slug, stage = d.get('slug'), d.get('stage')
+    sess, inc = str(d.get('session') or ''), str(d.get('incarnation') or '')
+    if slug and stage and not (inc and not sess):
+        stem = f'{slug}-{stage}'
+        d['_expected_filename'] = (f'{stem}.{sess}.{inc}.callback' if sess and inc else
+                                   f'{stem}.{sess}.callback' if sess else f'{stem}.callback')
+        d['_header_filename_match'] = d['_filename'] == d['_expected_filename']
+        d['_shape'] = 'exact' if sess and inc else 'session-only' if sess else 'unqualified'
+    else:
+        d['_expected_filename'] = ''
+        d['_header_filename_match'] = False
+        d['_shape'] = 'malformed'
     return d
 
 # ── findings ─────────────────────────────────────────────────────────────
@@ -580,86 +620,142 @@ def scan_root(root):
             return bool(pend)
         return any(p.get('stage') == stage for p in pend)
 
-    # --- callback files: live BLOCKED (open pending still present) ---
-    live_blocked = {}  # (slug,stage) -> callback dict
-    for cbp in glob.glob(os.path.join(tmp, 'callbacks', '*.callback')):
+    # --- callback files: header-validated, per-owner BLOCKED correlation ---
+    callback_groups = {}
+    for cbp in sorted(glob.glob(os.path.join(tmp, 'callbacks', '*.callback'))):
         cb = parse_callback(cbp)
-        if not cb:
+        if not cb or not cb.get('slug') or not cb.get('stage'):
             continue
-        if (cb.get('status') or '').upper() != 'BLOCKED':
+        callback_groups.setdefault((cb.get('slug'), cb.get('stage')), []).append(cb)
+
+    def _valid_callback(cb):
+        return not (cb.get('_unknown_headers') or cb.get('_duplicate_headers')
+                    or not cb.get('_required_headers_valid')
+                    or not cb.get('_header_filename_match'))
+
+    # Collapse duplicate pending records only within the same identity (D2 newest).
+    pending_owners = {}
+    for slug, plist in open_by_slug.items():
+        for p in plist:
+            key=(slug,p.get('stage'),str(p.get('session') or ''),str(p.get('incarnation') or ''))
+            if key not in pending_owners or str(p.get('timestamp') or '') > str(pending_owners[key].get('timestamp') or ''):
+                pending_owners[key]=p
+
+    def _matches_owner(cb, sess, inc):
+        cs,ci=str(cb.get('session') or ''),str(cb.get('incarnation') or '')
+        return ((cs and ci and cs==sess and ci==inc) or
+                (cs and not ci and cs==sess) or (not cs and not ci))
+
+    live_blocked_rows=[]
+    live_blocked={}  # aggregate compatibility map for stall/context consumers
+    used_blocked_paths=set()
+    for (slug,stage,sess,inc),p in sorted(pending_owners.items()):
+        cbs=[cb for cb in callback_groups.get((slug,stage),[]) if _valid_callback(cb) and _matches_owner(cb,sess,inc)]
+        # A legacy callback that can match multiple distinct pending owners cannot
+        # establish which incarnation/session it belongs to.
+        plausible=[]
+        for cb in cbs:
+            owners=[key for key in pending_owners if key[0]==slug and key[1]==stage and _matches_owner(cb,key[2],key[3])]
+            if len(owners)==1: plausible.append(cb)
+        unique={cb['_path']:cb for cb in plausible}
+        if len(cbs)>len(plausible) or len(unique)>1:
+            add_finding('CALLBACK-AMBIGUOUS',root,f'{slug}\t{stage}\t{sess}\t{inc}',
+                        f'{label} · {slug} — CALLBACK_IDENTITY_AMBIGUOUS at {stage}',
+                        policy='never',slug=slug,stage=stage,session=sess or None)
             continue
-        slug, stage = cb.get('slug'), cb.get('stage')
-        if slug and stage and has_open_pending(slug, stage):
-            live_blocked[(slug, stage)] = cb
+        if len(unique)!=1: continue
+        cb=next(iter(unique.values()))
+        if (cb.get('status') or '').upper()!='BLOCKED': continue
+        used_blocked_paths.add(cb['_path'])
+        live_blocked_rows.append((slug,stage,sess,inc,cb))
+        live_blocked.setdefault((slug,stage),cb)
 
-    for (slug, stage), cb in live_blocked.items():
-        first = cb.get('_first_line') or 'needs a human'
-        msg = f"{label} · {slug} — blocked at {stage}: {first}"
-        f = add_finding('ITEM-BLOCKED', root, f"{slug}\t{stage}", msg,
-                        slug=slug, stage=stage, session=cb.get('session'))
-        f['reason'] = first
-        f['blocked_at'] = cb.get('timestamp')
-        f['worker'] = cb.get('worker')
+    for slug,stage,sess,inc,cb in live_blocked_rows:
+        first=cb.get('_first_line') or 'needs a human'
+        msg=f"{label} · {slug} — blocked at {stage}: {first}"
+        f=add_finding('ITEM-BLOCKED',root,f"{slug}\t{stage}\t{sess}\t{inc}",msg,
+                      slug=slug,stage=stage,session=sess or cb.get('session'))
+        f['reason']=first; f['blocked_at']=cb.get('timestamp'); f['worker']=cb.get('worker')
+        f['incarnation']=inc or cb.get('incarnation'); f['callback_shape']=cb.get('_shape')
 
-    # --- PARKED (log-authoritative, §3.1): open pendings carrying parked_at ---
-    # Keyed by (slug, stage, session) — two sessions sharing one root with the SAME
-    # slug/stage are DISTINCT parked items, never each other's duplicate (§3.2).
-    parked = {}            # (slug,stage,session) -> newest parked pending dict
-    parked_dups = {}       # (slug,stage,session) -> count of older duplicates
-    parked_stages = set()  # (slug,stage) for stale-exclusion across all sessions
+    # Invalid and unmatched exact BLOCKED files remain explicit diagnostics but
+    # never suppress a worker stall or become the aggregate live callback.
+    for (slug,stage),cbs in sorted(callback_groups.items()):
+        for cb in cbs:
+            if (cb.get('status') or '').upper()!='BLOCKED' or cb.get('_path') in used_blocked_paths: continue
+            if not _valid_callback(cb):
+                add_finding('CALLBACK-INVALID',root,f"{slug}\t{stage}\t{cb.get('_filename')}",
+                            f"{label} · {slug} — invalid BLOCKED callback at {stage}",
+                            policy='never',slug=slug,stage=stage,session=cb.get('session'))
+            elif not any(f.get('condition')=='CALLBACK-AMBIGUOUS' and f.get('slug')==slug and f.get('stage')==stage for f in findings):
+                add_finding('CALLBACK-FOREIGN',root,f"{slug}\t{stage}\t{cb.get('_filename')}",
+                            f"{label} · {slug} — foreign callback at {stage}",
+                            policy='never',slug=slug,stage=stage,session=cb.get('session'))
+
+    # --- PARKED remains log-authoritative; callbacks only confirm identity ---
+    parked = {}            # (slug,stage,session,incarnation) -> newest pending
+    parked_dups = {}
+    parked_stages = set()
     for slug, plist in open_by_slug.items():
         by_key = {}
         for p in plist:
             if p.get('parked_at'):
-                by_key.setdefault((p.get('stage'), p.get('session')), []).append(p)
-        for (stage, sess), lst in by_key.items():
+                key=(p.get('stage'), str(p.get('session') or ''), str(p.get('incarnation') or ''))
+                by_key.setdefault(key, []).append(p)
+        for (stage, sess, inc), lst in by_key.items():
             lst.sort(key=lambda p: p.get('timestamp') or '')
-            parked[(slug, stage, sess)] = lst[-1]          # D2 newest
+            parked[(slug, stage, sess, inc)] = lst[-1]
             parked_stages.add((slug, stage))
-            if len(lst) > 1:
-                parked_dups[(slug, stage, sess)] = len(lst) - 1
+            if len(lst)>1: parked_dups[(slug,stage,sess,inc)] = len(lst)-1
 
-    parked_cbs = {}        # (slug,stage,session|None) -> cb
-    for cbp in glob.glob(os.path.join(tmp, 'callbacks', '*.callback')):
-        cb = parse_callback(cbp)
-        if not cb:
-            continue
-        if (cb.get('status') or '').upper() == 'PARKED':
-            s, st = cb.get('slug'), cb.get('stage')
-            if s and st:
-                parked_cbs[(s, st, cb.get('session'))] = cb
-
-    def _cb_for(slug, stage, sess):
-        if (slug, stage, sess) in parked_cbs:
-            return parked_cbs[(slug, stage, sess)]
-        return parked_cbs.get((slug, stage, None))   # legacy unowned fallback
-
-    for (slug, stage, sess), p in parked.items():
-        reason = p.get('parked_reason') or '(no reason recorded)'
-        unco = bool(p.get('uncommitted'))
-        worker = p.get('to')
-        entry_ts = p.get('timestamp')
-        dups = parked_dups.get((slug, stage, sess), 0)
-        cb = _cb_for(slug, stage, sess)
-        if cb is None or (cb.get('status') or '').upper() != 'PARKED':
-            add_finding('PARK-INCONSISTENT', root, f"{slug}\t{stage}\t{sess}\tentry",
+    used_callback_paths=set(); ambiguous_parked_paths=set()
+    for (slug, stage, sess, inc), p in sorted(parked.items()):
+        candidates=[]
+        for cb in callback_groups.get((slug,stage), []):
+            if (cb.get('status') or '').upper()!='PARKED': continue
+            if not _valid_callback(cb): continue
+            cs,ci=str(cb.get('session') or ''),str(cb.get('incarnation') or '')
+            if (cs and ci and cs==sess and ci==inc) or (cs and not ci and cs==sess) or (not cs and not ci):
+                candidates.append(cb)
+        candidates={cb['_path']:cb for cb in candidates}
+        cb=next(iter(candidates.values())) if len(candidates)==1 else None
+        if len(candidates)>1:
+            ambiguous_parked_paths.update(candidates)
+            add_finding('CALLBACK-AMBIGUOUS',root,f"{slug}\t{stage}\t{sess}\t{inc}\tparked",
+                        f"{label} · {slug} — ambiguous PARKED callbacks at {stage}",
+                        policy='never',slug=slug,stage=stage,session=sess)
+        elif cb:
+            used_callback_paths.add(cb['_path'])
+        else:
+            add_finding('PARK-INCONSISTENT',root,f"{slug}\t{stage}\t{sess}\t{inc}\tentry",
                         f"{label} · {slug} — incomplete park at {stage} — re-run park",
-                        slug=slug, stage=stage, session=sess)
-        umark = ' · UNCOMMITTED WORK' if unco else ''
-        dmark = f" · ×{dups+1} entries" if dups else ''
-        msg = f"{label} · {slug} — parked at {stage}{umark}{dmark}: {reason}"
-        f = add_finding('ITEM-PARKED', root, f"{slug}\t{stage}\t{sess}", msg,
-                        policy='daily', slug=slug, stage=stage, session=sess)
-        f['reason'] = reason; f['parked_at'] = p.get('parked_at')
-        f['uncommitted'] = unco; f['worker'] = worker
-        f['entry_ts'] = entry_ts; f['duplicates'] = dups
+                        slug=slug,stage=stage,session=sess)
+        reason=p.get('parked_reason') or '(no reason recorded)'; unco=bool(p.get('uncommitted'))
+        dups=parked_dups.get((slug,stage,sess,inc),0)
+        umark=' · UNCOMMITTED WORK' if unco else ''; dmark=f" · ×{dups+1} entries" if dups else ''
+        f=add_finding('ITEM-PARKED',root,f"{slug}\t{stage}\t{sess}\t{inc}",
+                      f"{label} · {slug} — parked at {stage}{umark}{dmark}: {reason}",
+                      policy='daily',slug=slug,stage=stage,session=sess)
+        f['reason']=reason; f['parked_at']=p.get('parked_at'); f['uncommitted']=unco
+        f['worker']=p.get('to'); f['entry_ts']=p.get('timestamp'); f['duplicates']=dups
+        f['incarnation']=inc or None
 
-    for (slug, stage, sess), cb in parked_cbs.items():
-        if (slug, stage, sess) not in parked and (slug, stage, None) not in parked \
-           and (slug, stage) not in parked_stages:
-            add_finding('PARK-INCONSISTENT', root, f"{slug}\t{stage}\t{sess}\torphan",
-                        f"{label} · {slug} — orphan PARKED callback at {stage} — consume or re-park",
-                        slug=slug, stage=stage, session=sess)
+    for (slug,stage), cbs in sorted(callback_groups.items()):
+        for cb in cbs:
+            if ((cb.get('status') or '').upper()!='PARKED' or cb.get('_path') in used_callback_paths
+                    or cb.get('_path') in ambiguous_parked_paths): continue
+            if not _valid_callback(cb):
+                add_finding('PARK-INCONSISTENT',root,f"{slug}\t{stage}\theader-invalid\t{cb.get('_filename')}",
+                            f"{label} · {slug} — invalid PARKED callback at {stage}",
+                            policy='never',slug=slug,stage=stage,session=cb.get('session'))
+            elif (slug,stage) not in parked_stages:
+                add_finding('PARK-INCONSISTENT',root,f"{slug}\t{stage}\torphan\t{cb.get('_filename')}",
+                            f"{label} · {slug} — orphan PARKED callback at {stage} — consume or re-park",
+                            slug=slug,stage=stage,session=cb.get('session'))
+            else:
+                add_finding('CALLBACK-FOREIGN',root,f"{slug}\t{stage}\t{cb.get('_filename')}",
+                            f"{label} · {slug} — foreign PARKED callback at {stage}",
+                            policy='never',slug=slug,stage=stage,session=cb.get('session'))
 
     # Ask set for ABANDONED exclusion — SAME predicate as the guard/audit (§3.5).
     _ask_keys = set()
@@ -674,21 +770,20 @@ def scan_root(root):
         o = cb.get('origin') or ''
         return o == 'ask' or (not o and (slug, stage) in _ask_keys)
 
-    # ITEM-BLOCKED-ABANDONED evidence (PERSIST-only): "{root}\t{slug}\t{stage}" ->
-    # {callback_id, blocked_at, later_other_dispatch}. Reset the WHOLE record on a new
-    # BLOCKED incarnation (new callback_id). §5.3.
+    # Evidence is session/incarnation scoped. `live_blocked` remains the aggregate
+    # compatibility map used by stall/context code outside this block.
     ev_map = state.setdefault('blocked_evidence', {}) if PERSIST else state.get('blocked_evidence', {})
     live_keys = set()
-    for (slug, stage), cb in live_blocked.items():
+    for slug, stage, sess, inc, cb in live_blocked_rows:
         if _is_ask(slug, stage, cb):
             continue
-        k = f"{root}\t{slug}\t{stage}"
+        k = f"{root}\t{slug}\t{stage}\t{sess}\t{inc}"
         live_keys.add(k)
-        cbid = cb.get('callback_id') or ''
+        cbid = cb.get('callback_id') or ''; cbinc = str(cb.get('incarnation') or '')
         rec = ev_map.get(k)
-        if rec is None or rec.get('callback_id') != cbid:
-            rec = {'callback_id': cbid, 'blocked_at': cb.get('timestamp') or '',
-                   'later_other_dispatch': False}
+        if rec is None or rec.get('callback_id') != cbid or str(rec.get('incarnation') or '') != cbinc:
+            rec = {'callback_id': cbid, 'incarnation': cbinc,
+                   'blocked_at': cb.get('timestamp') or '', 'later_other_dispatch': False}
         ev_map[k] = rec
     if PERSIST:
         for k in list(ev_map.keys()):
@@ -696,18 +791,20 @@ def scan_root(root):
                 del ev_map[k]
 
     ABANDON_S = cfg_int('FORGE_BLOCKED_ABANDON_S', 600)
-    for (slug, stage), cb in live_blocked.items():
+    for slug, stage, sess, inc, cb in live_blocked_rows:
         if _is_ask(slug, stage, cb):
             continue
-        rec = ev_map.get(f"{root}\t{slug}\t{stage}") or {}
+        rec = ev_map.get(f"{root}\t{slug}\t{stage}\t{sess}\t{inc}") or {}
         age = age_s(cb.get('timestamp'))
         if (rec.get('callback_id') == (cb.get('callback_id') or '')
+                and str(rec.get('incarnation') or '') == str(cb.get('incarnation') or '')
                 and rec.get('later_other_dispatch')
                 and age is not None and age >= ABANDON_S):
-            f = add_finding('ITEM-BLOCKED-ABANDONED', root, f"{slug}\t{stage}",
+            f = add_finding('ITEM-BLOCKED-ABANDONED', root,
+                            f"{slug}\t{stage}\t{sess}\t{inc}",
                             f"{label} · {slug} — blocked at {stage} and SKIPPED "
                             f"(guard bypassed, orchestrator moved on): {cb.get('_first_line') or ''}",
-                            slug=slug, stage=stage, session=cb.get('session'))
+                            slug=slug, stage=stage, session=sess or cb.get('session'))
             f['reason'] = cb.get('_first_line') or ''
             f['blocked_at'] = cb.get('timestamp')
 
@@ -1784,7 +1881,7 @@ if BOARD:
         for kx in ('pane', 'episode_id', 'first_at', 'last_at', 'turn_count',
                    'mid_turn', 'earlier',
                    'reason', 'parked_at', 'uncommitted', 'worker', 'entry_ts',
-                   'duplicates', 'blocked_at'):
+                   'duplicates', 'blocked_at', 'incarnation', 'callback_shape'):
             if kx in f:
                 v = f[kx]
                 # Board rows are JSON — coerce any datetime (unquoted YAML timestamps,
