@@ -10,6 +10,7 @@
 set -uo pipefail
 
 WATCH="$(cd "$(dirname "$0")/../.." && pwd)/bin/forge-watch"
+WATCH_SOURCE_BEFORE="$(shasum -a 256 "$WATCH" | awk '{print $1}')"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fw-tests.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -2158,6 +2159,7 @@ incarnation: 201
 origin: ask
 callback_id: ask-1
 timestamp: $(iso_ago 1000)
+selected_pending_timestamp: "2026-07-14T00:00:00Z"
 message: operator ask
 EOF
 "$WATCH" check >/dev/null 2>&1
@@ -2220,6 +2222,11 @@ sed -i '' 's/callback_id: e16p-coding-x/callback_id: e16p-coding-b/' "$PR/.dev/f
 o=$("$WATCH" status --board 2>/dev/null)
 python3 -c 'import json,sys; d=json.load(sys.stdin); assert len([x for x in d.get("parked",[]) if x.get("slug")=="e16p"])==2' <<<"$o" \
   && ok "W18 concurrent PARKED owners remain distinct" || bad "W18 concurrent PARKED owners collapsed"
+
+WATCH_SOURCE_AFTER="$(shasum -a 256 "$WATCH" | awk '{print $1}')"
+[ "$WATCH_SOURCE_BEFORE" = "$WATCH_SOURCE_AFTER" ] \
+  && ok "W19 watcher product source hash unchanged during P1-WC compatibility run" \
+  || bad "W19 watcher product source hash changed"
 
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"

@@ -5,6 +5,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 FORGE="$ROOT/bin/forge"; WATCH="$ROOT/bin/forge-watch"
+FORGE_SOURCE_BEFORE="$(shasum -a 256 "$FORGE" | awk '{print $1}')"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/frec.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 PASS=0; FAIL=0
@@ -272,6 +273,7 @@ session: forge-1
 incarnation: 200
 callback_id: r22-exact
 timestamp: 2026-07-14T00:00:00Z
+selected_pending_timestamp: "2026-07-14T00:00:00Z"
 message: exact residue
 EOF
 cat > "$R/.dev/forge-tmp/callbacks/r22-amb-coding.forge-1.201.callback" <<'EOF'
@@ -367,4 +369,8 @@ assert set(r for r,_ in found)==readers and len(found)==8,found.keys()
 for (reader,kind),value in found.items(): assert value==want[kind],(reader,kind,value^want[kind])
 PY
 
+FORGE_SOURCE_AFTER="$(shasum -a 256 "$FORGE" | awk '{print $1}')"
+[ "$FORGE_SOURCE_BEFORE" = "$FORGE_SOURCE_AFTER" ] \
+  && ok "T24 recovery product source hash unchanged during P1-WC compatibility run" \
+  || bad "T24 recovery product source hash changed"
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]
