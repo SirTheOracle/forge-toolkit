@@ -43,17 +43,25 @@ bad() { FAIL=$((FAIL+1)); red   "  FAIL: $1"; }
 command -v tmux >/dev/null 2>&1 || { red "tmux required for liveness tests"; exit 1; }
 
 LOCKDIR="$WORK/lockanchor"; mkdir -p "$LOCKDIR"
+WC_TEST_SESSION=forge-wc
+WC_TEST_INCARNATION=777
+WC_TMUX_LIST="$WORK/p1wc-tmux-list.tsv"
+: > "$WC_TMUX_LIST"
+export FORGE_TMUX_LIST="$WC_TMUX_LIST"
 
-# A hermetic project root (has .claude/forge-project.yml so _resolve_project_root
-# walks up to it; carries the .dev tree callbacks/logs live under).
+# Every hermetic root has one live exact identity in the shared topology seam.
 mkproj() {  # mkproj <name> -> echoes abs path
     local p="$WORK/$1"
     mkdir -p "$p/.claude" "$p/.dev/forge-tmp/callbacks" "$p/.dev/proposals"
     printf 'name: %s\n' "$1" > "$p/.claude/forge-project.yml"
+    if ! awk -F'\t' -v root="$p" '$2==root{found=1} END{exit !found}' "$WC_TMUX_LIST"; then
+        printf '%s\t%s\t%s\t%s\n' "$WC_TEST_SESSION" "$p" "$$" "$WC_TEST_INCARNATION" >> "$WC_TMUX_LIST"
+    fi
     printf '%s' "$p"
 }
 
-# An open (response: null) pending entry the terminal callback close will target.
+# An open pending. Identity is stamped by the publishing helper so tests that
+# intentionally have no matching stage remain negative fixtures.
 pending_entry() {  # pending_entry <root> <slug> <stage> <to> <ts>
     local d="$1/.dev/proposals/$2"; mkdir -p "$d"
     cat > "$d/forge-log.yml" <<EOF
@@ -66,19 +74,47 @@ entries:
 EOF
 }
 
-# callback / callback-consume run from inside the project root, TMUX unset so the
-# back-compat pane notify is inert regardless of where the suite itself runs.
-cb() {  # cb <root> <callback-args...>
-    local r="$1"; shift
-    ( cd "$r" && env -u TMUX "$BRIDGE" callback "$@" )
+arg_value() {  # <flag> followed by arguments
+    local want="$1"; shift
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "$want" ]; then printf '%s' "$2"; return 0; fi
+        shift
+    done
+    return 1
 }
-consume() {  # consume <root> <consume-args...>
+
+stamp_pending_identity() {  # <root> <slug> <stage> <session> <incarnation>
+    python3 - "$1/.dev/proposals/$2/forge-log.yml" "$3" "$4" "$5" <<'PY'
+import re,sys
+path,stage,session,incarnation=sys.argv[1:5]
+try: raw=open(path).read()
+except FileNotFoundError: sys.exit(0)
+parts=re.split(r'(?=^  - timestamp:)',raw,flags=re.M); changed=False
+for idx,block in enumerate(parts):
+    if not re.search(r'^    stage: '+re.escape(stage)+r'\s*$',block,re.M) or not re.search(r'^    response: null\s*$',block,re.M): continue
+    have_s=re.search(r'^    session: (.*)$',block,re.M); have_i=re.search(r'^    incarnation: (.*)$',block,re.M)
+    if have_s and have_s.group(1).strip()!=session: continue
+    if have_i and have_i.group(1).strip()!=incarnation: continue
+    if have_s: block=re.sub(r'^    session: .*$',f'    session: {session}',block,flags=re.M)
+    else: block=re.sub(r'(^    to: .*\n)',r'\1    session: '+session+'\n',block,count=1,flags=re.M)
+    if have_i: block=re.sub(r'^    incarnation: .*$',f'    incarnation: {incarnation}',block,flags=re.M)
+    else: block=re.sub(r'(^    session: .*\n)',r'\1    incarnation: '+incarnation+'\n',block,count=1,flags=re.M)
+    parts[idx]=block; changed=True
+if changed: open(path,'w').write(''.join(parts))
+PY
+}
+
+cb() {  # cb <root> followed by callback arguments
     local r="$1"; shift
-    ( cd "$r" && "$BRIDGE" callback-consume "$@" )
+    cbS "$r" "$WC_TEST_SESSION" "$@"
+}
+consume() {  # consume <root> followed by consume arguments
+    local r="$1"; shift
+    briS "$r" "$WC_TEST_SESSION" callback-consume "$@"
 }
 
 # infra-lock with an injected data-only identity.
-il() {  # il <host> <session> <sid> <created> <infra-lock args...>
+il() {  # il <host> <session> <sid> <created> followed by infra-lock arguments
     local host="$1" sess="$2" sid="$3" created="$4"; shift 4
     ( cd "$PROJ" && \
       FORGE_INFRA_LOCK_DIR="$LOCKDIR" \
@@ -88,16 +124,25 @@ il() {  # il <host> <session> <sid> <created> <infra-lock args...>
 }
 
 field() { grep '^status:' "$1" 2>/dev/null | awk '{print $2}'; }
+wc_callback_path() { printf '%s/.dev/forge-tmp/callbacks/%s-%s.%s.%s.callback' "$1" "$2" "$3" "${4:-$WC_TEST_SESSION}" "${5:-$WC_TEST_INCARNATION}"; }
 
-# session-injected callback publish (FORGE_TMUX_LIST seam → session-qualified filename)
-cbS() {  # cbS <root> <session> <callback-args...>
+cbS() {  # cbS <root> <session> followed by callback arguments
     local r="$1" s="$2"; shift 2
-    local tl; tl="$(mktemp)"; printf '%s\t%s\n' "$s" "$r" > "$tl"
+    local i="${FORGE_TEST_SESSION_INCARNATION:-$WC_TEST_INCARNATION}" slug stage
+    slug="$(arg_value --slug "$@")"; stage="$(arg_value --stage "$@")"
+    stamp_pending_identity "$r" "$slug" "$stage" "$s" "$i"
+    local tl; tl="$(mktemp)"; printf '%s\t%s\t%s\t%s\n' "$s" "$r" "$$" "$i" > "$tl"
     ( cd "$r" && env -u TMUX TMUX_SESSION="$s" FORGE_TMUX_LIST="$tl" "$BRIDGE" callback "$@" )
     local rc=$?; rm -f "$tl"; return $rc
 }
-# session-injected arbitrary bridge verb
-briS() {  # briS <root> <session> <verb+args...>
+briS() {  # briS <root> <session> followed by a verb and arguments
+    local r="$1" s="$2"; shift 2
+    local i="${FORGE_TEST_SESSION_INCARNATION:-$WC_TEST_INCARNATION}"
+    local tl; tl="$(mktemp)"; printf '%s\t%s\t%s\t%s\n' "$s" "$r" "$$" "$i" > "$tl"
+    ( cd "$r" && env -u TMUX TMUX_SESSION="$s" FORGE_TMUX_LIST="$tl" "$BRIDGE" "$@" )
+    local rc=$?; rm -f "$tl"; return $rc
+}
+briL() {  # all-legacy actor: session known, incarnation unavailable
     local r="$1" s="$2"; shift 2
     local tl; tl="$(mktemp)"; printf '%s\t%s\n' "$s" "$r" > "$tl"
     ( cd "$r" && env -u TMUX TMUX_SESSION="$s" FORGE_TMUX_LIST="$tl" "$BRIDGE" "$@" )
@@ -193,8 +238,8 @@ EOF
         FORGE_LOCK_SELF_HOST=h FORGE_LOCK_SELF_SESSION="b6-$label" \
         FORGE_LOCK_SELF_SESSION_ID="b6-$label" FORGE_LOCK_SELF_SESSION_CREATED=1 \
         "$BRIDGE" park --slug "$slug" --stage qa --reason distinct-key 2>&1); rc=$?
-    qaf="$p/.dev/forge-tmp/callbacks/$slug-qa.callback"
-    caf="$p/.dev/forge-tmp/callbacks/$slug-coding.callback"
+    qaf="$(wc_callback_path "$p" "$slug" qa)"
+    caf="$(wc_callback_path "$p" "$slug" coding)"
     if [ "$rc" -eq 0 ] && [ "$(field "$qaf")" = PARKED ] \
        && [ "$(field "$caf")" = BLOCKED ] && kill -0 "$hold" 2>/dev/null \
        && python3 - "$p/.dev/proposals/$slug/forge-log.yml" <<'PY'
@@ -213,6 +258,137 @@ PY
     : > "$release"
     wait "$hold" 2>/dev/null
 }
+
+wc_matrix_fingerprint() { # <project> <slug>
+    python3 - "$1" "$2" <<'PY'
+import hashlib,os,sys
+root,slug=sys.argv[1:3]; paths=[]
+log=os.path.join(root,'.dev','proposals',slug,'forge-log.yml')
+if os.path.isfile(log): paths.append(log)
+cb=os.path.join(root,'.dev','forge-tmp','callbacks')
+for base,_,files in os.walk(cb):
+    for name in files:
+        if name.startswith(slug+'-'): paths.append(os.path.join(base,name))
+print('|'.join(os.path.relpath(p,root)+':'+hashlib.sha256(open(p,'rb').read()).hexdigest() for p in sorted(paths)))
+PY
+}
+wc_matrix_replace() { python3 - "$1" "$2" "$3" <<'PY'
+import sys
+p,old,new=sys.argv[1:4]; raw=open(p).read(); assert raw.count(old)==1,(p,old,raw.count(old)); open(p,'w').write(raw.replace(old,new,1))
+PY
+}
+wc_matrix_wait_file() { # <path>
+    local path="$1" i=0
+    while [ ! -e "$path" ] && [ "$i" -lt 500 ]; do sleep 0.01; i=$((i + 1)); done
+    [ -e "$path" ]
+}
+wc_matrix_legacy_callback() { # <path> <slug> <session-or-empty> <selected-ts>
+    { echo "slug: $2"; echo 'stage: coding'; echo 'status: BLOCKED'; echo 'worker: codex-a';
+      [ -n "$3" ] && echo "session: $3"; echo "callback_id: legacy-$2"; echo 'timestamp: 2026-07-15T00:00:01Z';
+      echo "selected_pending_timestamp: \"$4\""; echo 'message: legacy'; } > "$1"
+}
+wc_matrix_race() { # <dimension>
+    local kind="$1" p slug="wc-race-$1" cb tl lk hready hrelease bready brelease holder consumer rc expected out
+    p="$(mkproj "$slug")"; pending_entry "$p" "$slug" coding codex-a "2026-07-15T00:00:00Z"
+    cb "$p" --slug "$slug" --stage coding --status BLOCKED --worker codex-a --message original >/dev/null 2>&1
+    cb="$(wc_callback_path "$p" "$slug" coding)"; tl="$p/.matrix-tmux.tsv"
+    printf '%s\t%s\t%s\t%s\n' "$WC_TEST_SESSION" "$p" "$$" "$WC_TEST_INCARNATION" > "$tl"
+    lk="$(lifelock_path "$p" "$slug" coding)"; hready="$p/.hready"; hrelease="$p/.hrelease"; bready="$p/.bready"; brelease="$p/.brelease"
+    ( exec 9>"$lk"; flock 9; : > "$hready"; wc_matrix_wait_file "$hrelease" ) & holder=$!
+    wc_matrix_wait_file "$hready" || { : > "$hrelease"; kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true; bad "MATRIX $kind holder barrier timed out"; return; }
+    ( cd "$p" && env -u TMUX TMUX_SESSION="$WC_TEST_SESSION" FORGE_TMUX_LIST="$tl" FORGE_LIFECYCLE_LOCK_WAIT_S=5 \
+        FORGE_CALLBACK_PRELOCK_READY="$bready" FORGE_CALLBACK_PRELOCK_RELEASE="$brelease" \
+        "$BRIDGE" callback-consume --slug "$slug" --stage coding --status BLOCKED >"$p/.matrix-out" 2>&1 ) & consumer=$!
+    wc_matrix_wait_file "$bready" || { : > "$brelease"; : > "$hrelease"; kill "$consumer" "$holder" 2>/dev/null || true; wait "$consumer" 2>/dev/null || true; wait "$holder" 2>/dev/null || true; bad "MATRIX $kind consumer barrier timed out"; return; }
+    case "$kind" in
+      session) wc_matrix_replace "$cb" "session: $WC_TEST_SESSION" 'session: changed-session' ;;
+      incarnation) wc_matrix_replace "$cb" "incarnation: $WC_TEST_INCARNATION" 'incarnation: 778' ;;
+      callback_id) wc_matrix_replace "$cb" 'callback_id:' 'callback_id: changed-' ;;
+      status) wc_matrix_replace "$cb" 'status: BLOCKED' 'status: PARKED' ;;
+      selected_pending) wc_matrix_replace "$cb" 'selected_pending_timestamp: "2026-07-15T00:00:00Z"' 'selected_pending_timestamp: "2026-07-15T00:00:09Z"' ;;
+      hash) printf '# hash-only-change\n' >> "$cb" ;;
+      pending_timestamp) wc_matrix_replace "$p/.dev/proposals/$slug/forge-log.yml" 'timestamp: "2026-07-15T00:00:00Z"' 'timestamp: "2026-07-15T00:00:09Z"' ;;
+      pending_status) wc_matrix_replace "$p/.dev/proposals/$slug/forge-log.yml" 'response: null' 'response: "external-close"' ;;
+      candidate_session) wc_matrix_legacy_callback "$p/.dev/forge-tmp/callbacks/$slug-coding.$WC_TEST_SESSION.callback" "$slug" "$WC_TEST_SESSION" '2026-07-15T00:00:00Z' ;;
+      candidate_unqualified) wc_matrix_legacy_callback "$p/.dev/forge-tmp/callbacks/$slug-coding.callback" "$slug" '' '2026-07-15T00:00:00Z' ;;
+      candidate_remove) rm -f "$cb" ;;
+      actor_incarnation) printf '%s\t%s\t%s\t778\n' "$WC_TEST_SESSION" "$p" "$$" > "$tl" ;;
+    esac
+    expected="$(wc_matrix_fingerprint "$p" "$slug")"; : > "$brelease"; sleep 0.05
+    kill -0 "$consumer" 2>/dev/null || bad "MATRIX $kind did not wait behind held lock"
+    : > "$hrelease"; wait "$holder"; wait "$consumer"; rc=$?; out="$(cat "$p/.matrix-out")"
+    [ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q 'LIFECYCLE_LOCK: busy' \
+      && [ "$expected" = "$(wc_matrix_fingerprint "$p" "$slug")" ] \
+      && ok "MATRIX lock-time $kind refusal is artifact-immutable" \
+      || bad "MATRIX lock-time $kind failed rc=$rc out=$out"
+}
+wc_matrix_legacy_case() { # <label> <known|legacy> <session|unqualified> <success|refuse>
+    local label="$1" actor="$2" shape="$3" expect="$4" p slug="wc-$1" ts=2026-07-15T01:00:00Z cbpath before out rc cbs=''
+    p="$(mkproj "$slug")"; mkdir -p "$p/.dev/proposals/$slug"; [ "$shape" = session ] && cbs="$WC_TEST_SESSION"
+    { echo "pipeline: $slug"; echo entries:; echo "  - timestamp: \"$ts\""; echo '    stage: coding'; echo '    to: codex-a';
+      [ -n "$cbs" ] && echo "    session: $cbs"; echo '    response: null'; } > "$p/.dev/proposals/$slug/forge-log.yml"
+    if [ -n "$cbs" ]; then cbpath="$p/.dev/forge-tmp/callbacks/$slug-coding.$cbs.callback"; else cbpath="$p/.dev/forge-tmp/callbacks/$slug-coding.callback"; fi
+    wc_matrix_legacy_callback "$cbpath" "$slug" "$cbs" "$ts"; before="$(wc_matrix_fingerprint "$p" "$slug")"
+    if [ "$actor" = known ]; then out="$(briS "$p" "$WC_TEST_SESSION" callback-consume --slug "$slug" --stage coding --status BLOCKED 2>&1)"; rc=$?;
+    else out="$(briL "$p" "$WC_TEST_SESSION" callback-consume --slug "$slug" --stage coding --status BLOCKED 2>&1)"; rc=$?; fi
+    if [ "$expect" = success ]; then
+      [ "$rc" -eq 0 ] && [ -f "$p/.dev/forge-tmp/callbacks/archive/$slug-coding.legacy-$slug.callback" ] \
+        && ok "MATRIX $label all-legacy success" || bad "MATRIX $label expected success: $out"
+    else
+      [ "$rc" -ne 0 ] && [ "$before" = "$(wc_matrix_fingerprint "$p" "$slug")" ] \
+        && ok "MATRIX $label known actor refusal immutable" || bad "MATRIX $label mutated legacy: $out"
+    fi
+}
+wc_matrix_exact_plus() { # <session|unqualified>
+    local shape="$1" p slug="wc-amb-$1" legacy before out rc cbs=''
+    p="$(mkproj "$slug")"; pending_entry "$p" "$slug" coding codex-a "2026-07-15T02:00:00Z"; cb "$p" --slug "$slug" --stage coding --status BLOCKED --worker codex-a --message exact >/dev/null 2>&1
+    [ "$shape" = session ] && cbs="$WC_TEST_SESSION"
+    if [ -n "$cbs" ]; then legacy="$p/.dev/forge-tmp/callbacks/$slug-coding.$cbs.callback"; else legacy="$p/.dev/forge-tmp/callbacks/$slug-coding.callback"; fi
+    wc_matrix_legacy_callback "$legacy" "$slug" "$cbs" '2026-07-15T02:00:00Z'; before="$(wc_matrix_fingerprint "$p" "$slug")"
+    out="$(consume "$p" --slug "$slug" --stage coding --status BLOCKED 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'AMBIGUOUS' && [ "$before" = "$(wc_matrix_fingerprint "$p" "$slug")" ] \
+      && ok "MATRIX exact+$shape ambiguity immutable" || bad "MATRIX exact+$shape ambiguity failed: $out"
+}
+wc_matrix_rebirth() { # <consume|park|resolve>
+    local verb="$1" p slug="wc-rebirth-$1" cb tl before out rc status=BLOCKED
+    [ "$verb" = resolve ] && status=PARKED; p="$(mkproj "$slug")"; mkdir -p "$p/.dev/proposals/$slug"
+    { echo "pipeline: $slug"; echo entries:; echo '  - timestamp: "2026-07-15T03:00:00Z"'; echo '    stage: coding'; echo '    to: codex-a';
+      echo "    session: $WC_TEST_SESSION"; echo '    incarnation: 776'; [ "$verb" = resolve ] && echo '    parked_at: "2026-07-15T03:00:01Z"'; echo '    response: null'; } > "$p/.dev/proposals/$slug/forge-log.yml"
+    cb="$p/.dev/forge-tmp/callbacks/$slug-coding.$WC_TEST_SESSION.776.callback"
+    { echo "slug: $slug"; echo 'stage: coding'; echo "status: $status"; echo 'worker: codex-a'; echo "session: $WC_TEST_SESSION"; echo 'incarnation: 776';
+      echo "callback_id: rebirth-$verb"; echo 'timestamp: 2026-07-15T03:00:02Z'; echo 'selected_pending_timestamp: "2026-07-15T03:00:00Z"'; echo 'message: predecessor'; } > "$cb"
+    tl="$p/.rebirth.tsv"; printf '%s\t%s\t%s\t%s\n' "$WC_TEST_SESSION" "$p" "$$" "$WC_TEST_INCARNATION" > "$tl"; before="$(wc_matrix_fingerprint "$p" "$slug")"
+    case "$verb" in
+      consume) out="$(cd "$p" && env -u TMUX TMUX_SESSION="$WC_TEST_SESSION" FORGE_TMUX_LIST="$tl" "$BRIDGE" callback-consume --slug "$slug" --stage coding --status BLOCKED 2>&1)"; rc=$? ;;
+      park) out="$(cd "$p" && env -u TMUX TMUX_SESSION="$WC_TEST_SESSION" FORGE_TMUX_LIST="$tl" "$BRIDGE" park --slug "$slug" --stage coding --reason no 2>&1)"; rc=$? ;;
+      resolve) out="$(cd "$p" && env -u TMUX TMUX_SESSION="$WC_TEST_SESSION" FORGE_TMUX_LIST="$tl" "$BRIDGE" park --resolve --slug "$slug" --stage coding --note no 2>&1)"; rc=$? ;;
+    esac
+    [ "$before" = "$(wc_matrix_fingerprint "$p" "$slug")" ] && ok "MATRIX rebirth $verb predecessor immutable" || bad "MATRIX rebirth $verb mutated predecessor: $out"
+}
+wc_matrix_empty_origin_delegate() {
+    local p slug=wc-empty-origin cb id before out rc archive
+    p="$(mkproj "$slug")"; pending_entry "$p" "$slug" coding codex-a "2026-07-15T04:00:00Z"; cb "$p" --slug "$slug" --stage coding --status BLOCKED --worker codex-a --message empty >/dev/null 2>&1
+    cb="$(wc_callback_path "$p" "$slug" coding)"; id="$(sed -n 's/^callback_id: //p' "$cb")"
+    ( cd "$p" && "$BRIDGE" park --slug "$slug" --stage coding --reason later >/dev/null 2>&1 )
+    before="$(shasum -a 256 "$cb" | awk '{print $1}')"
+    out="$(cd "$p" && "$BRIDGE" park --resolve --slug "$slug" --stage coding --note done 2>&1)"; rc=$?; archive="$p/.dev/forge-tmp/callbacks/archive/$slug-coding.$id.callback"
+    [ "$rc" -eq 0 ] && [ -f "$archive" ] && [ "$before" = "$(shasum -a 256 "$archive" | awk '{print $1}')" ] \
+      && ok 'MATRIX empty origin carries nonempty SHA through delegated archive' || bad "MATRIX empty-origin delegation failed: $out"
+}
+run_p1wc_matrix() {
+    local k
+    for k in session incarnation callback_id status selected_pending hash pending_timestamp pending_status candidate_session candidate_unqualified candidate_remove actor_incarnation; do wc_matrix_race "$k"; done
+    wc_matrix_legacy_case known-session known session refuse; wc_matrix_legacy_case known-unqualified known unqualified refuse
+    wc_matrix_legacy_case legacy-session legacy session success; wc_matrix_legacy_case legacy-unqualified legacy unqualified success
+    wc_matrix_exact_plus session; wc_matrix_exact_plus unqualified
+    wc_matrix_rebirth consume; wc_matrix_rebirth park; wc_matrix_rebirth resolve
+    wc_matrix_empty_origin_delegate
+}
+if [ "${1:-}" = "--p1wc-matrix" ]; then
+    run_p1wc_matrix
+    green "PASS: $PASS"; [ "$FAIL" -gt 0 ] && red "FAIL: $FAIL" || green "FAIL: 0"
+    [ "$FAIL" -eq 0 ]; exit $?
+fi
 
 if [ "${1:-}" = "--b6-stress" ]; then
     iterations="${2:-25}"
@@ -235,10 +411,11 @@ echo "══ SUITE 1: callback lifecycle ══"
 P="$(mkproj cb-done)"
 pending_entry "$P" p-done coding codex-a "2026-06-29T00:00:00Z"
 out=$(cb "$P" --slug p-done --stage coding --status DONE --worker codex-a --quiet 2>&1); rc=$?
-CBF="$P/.dev/forge-tmp/callbacks/p-done-coding.callback"
-[ "$rc" -eq 0 ] && [ -f "$CBF" ] && ok "DONE publishes the callback file (exit 0)" || bad "DONE did not publish: rc=$rc out=$out"
+CBF="$(wc_callback_path "$P" p-done coding)"
+[ "$rc" -eq 0 ] && [ -f "$CBF" ] && ok "DONE publishes the exact callback file (exit 0)" || bad "DONE did not publish: rc=$rc out=$out"
 [ "$(field "$CBF")" = "DONE" ] && ok "published callback carries status: DONE" || bad "callback status not DONE"
-grep -q '^callback_id:' "$CBF" && ok "callback carries a callback_id field" || bad "no callback_id field"
+grep -q '^callback_id:' "$CBF" && grep -q "^incarnation: $WC_TEST_INCARNATION$" "$CBF" \
+  && ok "callback carries callback_id+incarnation" || bad "callback identity fields missing"
 grep -q 'response: null' "$P/.dev/proposals/p-done/forge-log.yml" \
     && bad "pending still open after DONE (close did not run)" \
     || ok "DONE closed the pending log entry first (response no longer null)"
@@ -250,7 +427,7 @@ P="$(mkproj cb-abort)"
 pending_entry "$P" p-ab qa codex-a "2026-06-29T00:00:00Z"   # pending is qa, we DONE 'coding'
 out=$(cb "$P" --slug p-ab --stage coding --status DONE --worker codex-a --quiet 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ok "DONE with no matching open pending fails loud (nonzero)" || bad "failed close returned 0"
-[ ! -f "$P/.dev/forge-tmp/callbacks/p-ab-coding.callback" ] \
+[ -z "$(find "$P/.dev/forge-tmp/callbacks" -maxdepth 1 -name 'p-ab-coding*.callback' -print -quit)" ] \
     && ok "aborted terminal close did NOT publish a callback" || bad "callback published despite failed close"
 grep -q 'reason=terminal-close-failed' "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null \
     && ok "failed close emits ERROR terminal-close-failed event" || bad "no terminal-close-failed event"
@@ -259,7 +436,7 @@ grep -q 'reason=terminal-close-failed' "$P/.dev/forge-tmp/orchestrator-events.lo
 P="$(mkproj cb-err)"
 pending_entry "$P" p-er coding codex-a "2026-06-29T00:00:00Z"
 cb "$P" --slug p-er --stage coding --status ERROR --worker codex-a --quiet >/dev/null 2>&1
-EF="$P/.dev/forge-tmp/callbacks/p-er-coding.callback"
+EF="$(wc_callback_path "$P" p-er coding)"
 [ "$(field "$EF")" = "ERROR" ] && ok "ERROR publishes a terminal callback (status ERROR)" || bad "ERROR callback wrong"
 grep -q 'response: null' "$P/.dev/proposals/p-er/forge-log.yml" \
     && bad "ERROR left the pending open" || ok "ERROR closed the pending log entry"
@@ -268,7 +445,7 @@ grep -q 'response: null' "$P/.dev/proposals/p-er/forge-log.yml" \
 P="$(mkproj cb-blk)"
 pending_entry "$P" p-blk coding codex-a "2026-06-29T00:00:00Z"
 cb "$P" --slug p-blk --stage coding --status BLOCKED --worker codex-a --message "needs a human" --quiet >/dev/null 2>&1
-BF="$P/.dev/forge-tmp/callbacks/p-blk-coding.callback"
+BF="$(wc_callback_path "$P" p-blk coding)"
 [ "$(field "$BF")" = "BLOCKED" ] && ok "BLOCKED publishes the callback (status BLOCKED)" || bad "BLOCKED callback wrong"
 grep -q 'response: null' "$P/.dev/proposals/p-blk/forge-log.yml" \
     && ok "BLOCKED keeps the dispatch pending OPEN (response still null)" || bad "BLOCKED closed the pending"
@@ -293,10 +470,10 @@ out=$(consume "$P" --slug p-nope --stage coding --status BLOCKED 2>&1); rc=$?
 P="$(mkproj cb-mismatch)"
 pending_entry "$P" p-mm coding codex-a "2026-06-29T00:00:00Z"
 cb "$P" --slug p-mm --stage coding --status DONE --worker codex-a --quiet >/dev/null 2>&1
-DF="$P/.dev/forge-tmp/callbacks/p-mm-coding.callback"
+DF="$(wc_callback_path "$P" p-mm coding)"
 out=$(consume "$P" --slug p-mm --stage coding --status BLOCKED 2>&1); rc=$?
-{ [ "$rc" -eq 0 ] && [ -f "$DF" ] && echo "$out" | grep -q 'status-mismatch'; } \
-    && ok "consume leaves a terminal DONE callback in place (status-mismatch no-op)" \
+{ [ "$rc" -eq 0 ] && [ -f "$DF" ] && echo "$out" | grep -q 'reason=status-mismatch'; } \
+    && ok "consume preserves a terminal DONE callback as a structured no-op" \
     || bad "consume clobbered/mishandled a terminal callback: rc=$rc out=$out"
 
 # ── consume rejects a terminal --status ──
@@ -534,15 +711,15 @@ out=$(cb "$P" --slug bi-o2 --stage coding --status BLOCKED --origin ask --worker
 [ "$rc" -ne 0 ] && ok "callback --origin ask without internal token rejected" || bad "--origin ask accepted without token"
 P3="$(mkproj bi-origin3)"
 pending_entry "$P3" bi-o3 coding codex-a "2026-06-29T00:00:00Z"
-out=$( cd "$P3" && env -u TMUX FORGE_INTERNAL_ASK_ORIGIN=1 "$BRIDGE" callback --slug bi-o3 --stage coding --status BLOCKED --origin ask --worker codex-a --message "q?" --quiet 2>&1 ); rc=$?
-OF="$P3/.dev/forge-tmp/callbacks/bi-o3-coding.callback"
+out=$(FORGE_INTERNAL_ASK_ORIGIN=1 cb "$P3" --slug bi-o3 --stage coding --status BLOCKED --origin ask --worker codex-a --message "q?" --quiet 2>&1); rc=$?
+OF="$(wc_callback_path "$P3" bi-o3 coding)"
 { [ "$rc" -eq 0 ] && [ -f "$OF" ] && grep -q '^origin: ask' "$OF"; } && ok "internal ask origin stamps 'origin: ask'" || bad "internal ask origin not stamped (rc=$rc out=$out)"
 
 # ── B1(headers): P1b session:/origin: scalar headers present + yaml-parseable ──
 P="$(mkproj bi-hdr)"
 pending_entry "$P" bi-h coding codex-a "2026-06-29T00:00:00Z"
 cb "$P" --slug bi-h --stage coding --status BLOCKED --worker codex-a --message "needs a human" --quiet >/dev/null 2>&1
-HF="$P/.dev/forge-tmp/callbacks/bi-h-coding.callback"
+HF="$(wc_callback_path "$P" bi-h coding)"
 grep -q '^session:' "$HF" && ok "callback carries a session: header (P1b)" || bad "no session: header"
 grep -q '^origin:'  "$HF" && ok "callback carries an origin: header (P1b)"  || bad "no origin: header"
 grep -q '^callback_id:' "$HF" && ok "callback carries callback_id (identity)" || bad "no callback_id"
@@ -556,23 +733,48 @@ echo "══ SUITE 4: blocked-item lifecycle ══"
 # release resolves to a RELEASE_NOOP not-held instead of erroring on git-dir resolution.
 export FORGE_INFRA_LOCK_DIR="$WORK/suite4-locks"; mkdir -p "$FORGE_INFRA_LOCK_DIR"
 
-# B1 [D1] session-qualified filename + headers (identity seam)
+# B1: new production writer emits exact session+incarnation identity.
 P="$(mkproj b1)"; pending_entry "$P" p1 coding codex-a "2026-06-29T00:00:00Z"
 cbS "$P" forge-1 --slug p1 --stage coding --status BLOCKED --worker codex-a --message "x" >/dev/null 2>&1
-CBF="$P/.dev/forge-tmp/callbacks/p1-coding.forge-1.callback"
-[ -f "$CBF" ] && ok "B1 session-qualified filename" || bad "B1 filename not session-qualified"
-grep -q '^session: forge-1' "$CBF" && grep -q '^callback_id:' "$CBF" && ok "B1 session+callback_id headers" || bad "B1 headers missing"
+CBF="$(wc_callback_path "$P" p1 coding forge-1 "$WC_TEST_INCARNATION")"
+[ -f "$CBF" ] && ok "B1 exact filename" || bad "B1 filename not exact"
+grep -q '^session: forge-1' "$CBF" && grep -q "^incarnation: $WC_TEST_INCARNATION$" "$CBF" \
+  && grep -q '^selected_pending_timestamp:' "$CBF" && ok "B1 exact ownership headers" || bad "B1 headers missing"
 
-# B2 [D2] legacy resolve + foreign-session consume NOOP
-P="$(mkproj b2)"; pending_entry "$P" p2 coding codex-a "2026-06-29T00:00:00Z"
-# legacy (no session) file present; a session consume must resolve it with a WARN
-cb "$P" --slug p2 --stage coding --status BLOCKED --worker codex-a --message x >/dev/null 2>&1
-LEG="$P/.dev/forge-tmp/callbacks/p2-coding.callback"
-[ -f "$LEG" ] && ok "B2 legacy filename written when no session" || bad "B2 legacy filename missing"
-# foreign-session owned file → a different session's consume is a NOOP
-cbS "$P" forge-1 --slug p2 --stage coding --status BLOCKED --worker codex-a --message y >/dev/null 2>&1
-out=$(briS "$P" forge-2 callback-consume --slug p2 --stage coding --status BLOCKED 2>&1); rc=$?
-[ -f "$P/.dev/forge-tmp/callbacks/p2-coding.forge-1.callback" ] && ok "B2 foreign-session consume NOOP (owner file intact)" || bad "B2 foreign consume mutated owner file"
+# B2: all-legacy actor/callback/pending remains compatible only without incarnation.
+P="$(mkproj b2)"; mkdir -p "$P/.dev/proposals/p2"
+cat > "$P/.dev/proposals/p2/forge-log.yml" <<'EOF'
+pipeline: p2
+entries:
+  - timestamp: "2026-06-29T00:00:00Z"
+    stage: coding
+    to: codex-a
+    session: forge-legacy
+    response: null
+EOF
+LEG="$P/.dev/forge-tmp/callbacks/p2-coding.forge-legacy.callback"
+cat > "$LEG" <<'EOF'
+slug: p2
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: forge-legacy
+callback_id: legacy-b2
+timestamp: 2026-06-29T00:00:01Z
+message: old producer
+EOF
+out=$(briL "$P" forge-legacy callback-consume --slug p2 --stage coding --status BLOCKED 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ -f "$P/.dev/forge-tmp/callbacks/archive/p2-coding.legacy-b2.callback" ] \
+  && ok "B2 all-legacy triple remains consumable" || bad "B2 all-legacy compatibility failed: $out"
+
+# A different exact session cannot consume the exact owner callback.
+P="$(mkproj b2-foreign)"; pending_entry "$P" p2f coding codex-a "2026-06-29T00:00:00Z"
+cbS "$P" forge-1 --slug p2f --stage coding --status BLOCKED --worker codex-a --message y >/dev/null 2>&1
+FOREIGN="$(wc_callback_path "$P" p2f coding forge-1 "$WC_TEST_INCARNATION")"
+before=$(shasum -a 256 "$FOREIGN" | awk '{print $1}')
+out=$(briS "$P" forge-2 callback-consume --slug p2f --stage coding --status BLOCKED 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ "$before" = "$(shasum -a 256 "$FOREIGN" | awk '{print $1}')" ] \
+  && ok "B2 foreign exact consume NOOP" || bad "B2 foreign consume mutated owner file"
 
 # B4 [D3/P14] precise ask matcher via blocked-audit
 P="$(mkproj b4)"; mkdir -p "$P/.dev/attention"
@@ -603,18 +805,19 @@ entries:
     to: codex-a
     response: null
 EOF
-cb "$P" --slug p5 --stage coding --status BLOCKED --worker codex-a --message x >/dev/null 2>&1
-out=$( cd "$P" && "$BRIDGE" park --slug p5 --stage coding --reason 'colon: and "quote" here' 2>&1 ); rc=$?
-echo "$out" | grep -q 'older duplicates: 2026-06-29T00:00:00Z' && ok "B5 D2 WARN lists older ts" || bad "B5 no older-ts WARN"
-python3 - "$P/.dev/proposals/p5/forge-log.yml" <<'PY' && ok "B5 fields on NEWEST, response null, round-trips" || bad "B5 insert wrong"
-import sys, yaml
-d = yaml.safe_load(open(sys.argv[1]))
-new = [e for e in d["entries"] if e["timestamp"]=="2026-06-29T01:00:00Z"][0]
-old = [e for e in d["entries"] if e["timestamp"]=="2026-06-29T00:00:00Z"][0]
-assert new.get("parked_at") and new.get("response") is None, new
-assert "colon:" in new.get("parked_reason","") and '"quote"' in new.get("parked_reason",""), new
-assert not old.get("parked_at"), "older entry must NOT be parked"
+python3 - "$P/.dev/proposals/p5/forge-log.yml" "$WC_TEST_SESSION" "$WC_TEST_INCARNATION" <<'PY'
+import sys
+path,session,incarnation=sys.argv[1:4]
+raw=open(path).read()
+raw=raw.replace('    to: codex-a\n    response: null', '    to: codex-a\n    session: '+session+'\n    incarnation: '+incarnation+'\n    response: null')
+open(path,'w').write(raw)
 PY
+before=$(shasum -a 256 "$P/.dev/proposals/p5/forge-log.yml" | awk '{print $1}')
+out=$(cb "$P" --slug p5 --stage coding --status BLOCKED --worker codex-a --message x 2>&1); rc=$?
+after=$(shasum -a 256 "$P/.dev/proposals/p5/forge-log.yml" | awk '{print $1}')
+[ "$rc" -ne 0 ] && echo "$out" | grep -q 'CALLBACK_IDENTITY_AMBIGUOUS' \
+  && [ "$before" = "$after" ] && [ -z "$(find "$P/.dev/forge-tmp/callbacks" -name 'p5-coding*.callback' -print -quit)" ] \
+  && ok "B5 duplicate exact pending publication fails closed" || bad "B5 duplicate pending was selected"
 
 # B6 [D5] deterministic lifecycle-lock contention + distinct-key non-contention.
 b6_case full-suite ""
@@ -664,8 +867,8 @@ cbS "$P" forge-1 --slug pX --stage coding --status BLOCKED --worker codex-a --me
 cbS "$P" forge-2 --slug pX --stage coding --status BLOCKED --worker codex-b --message b >/dev/null 2>&1
 briS "$P" forge-2 park --slug pX --stage coding --reason "B parks" >/dev/null 2>&1
 # session-1's callback must remain BLOCKED (untouched)
-[ "$(field "$P/.dev/forge-tmp/callbacks/pX-coding.forge-1.callback")" = "BLOCKED" ] && ok "B10 session-A callback untouched by session-B park" || bad "B10 cross-session mutation"
-[ "$(field "$P/.dev/forge-tmp/callbacks/pX-coding.forge-2.callback")" = "PARKED" ] && ok "B10 session-B callback parked" || bad "B10 session-B not parked"
+[ "$(field "$(wc_callback_path "$P" pX coding forge-1 "$WC_TEST_INCARNATION")")" = "BLOCKED" ] && ok "B10 session-A callback untouched by session-B park" || bad "B10 cross-session mutation"
+[ "$(field "$(wc_callback_path "$P" pX coding forge-2 "$WC_TEST_INCARNATION")")" = "PARKED" ] && ok "B10 session-B callback parked" || bad "B10 session-B not parked"
 
 # B11 resolve closes pending + callback GONE + status ⏸ at 3 sites
 P="$(mkproj b11)"; pending_entry "$P" p11 coding codex-a "2026-06-29T00:00:00Z"
@@ -781,17 +984,18 @@ def block(s):
 # SHA-256 of the exact resolver/comment block at certified floor a558c52b.
 assert hashlib.sha256(block(new).encode()).hexdigest()=='e3aa76d6b4c9fc87bfc8de0c30ffd96194ac3013211b4c31838d143e05c67b50'
 PY
-P="$(mkproj p1e-writer)"; pending_entry "$P" p1e-writer coding codex-a "2026-07-14T00:00:00Z"
-cbS "$P" forge-p1e --slug p1e-writer --stage coding --status BLOCKED --worker codex-a --message freeze >/dev/null 2>&1
-WF="$P/.dev/forge-tmp/callbacks/p1e-writer-coding.forge-p1e.callback"
-[ -f "$WF" ] && ! grep -q '^incarnation:' "$WF" \
-  && [ -z "$(find "$P/.dev/forge-tmp/callbacks" -maxdepth 1 -name 'p1e-writer-coding.forge-p1e.*.callback' -print -quit)" ] \
-  && ok "E8 writer remains session-only with no incarnation header" || bad "E8 writer freeze"
+P="$(mkproj p1wc-writer)"; pending_entry "$P" p1wc-writer coding codex-a "2026-07-14T00:00:00Z"
+cbS "$P" forge-p1e --slug p1wc-writer --stage coding --status BLOCKED --worker codex-a --message exact >/dev/null 2>&1
+WF="$(wc_callback_path "$P" p1wc-writer coding forge-p1e "$WC_TEST_INCARNATION")"
+[ -f "$WF" ] && grep -q '^session: forge-p1e$' "$WF" \
+  && grep -q "^incarnation: $WC_TEST_INCARNATION$" "$WF" \
+  && grep -q '^selected_pending_timestamp: "2026-07-14T00:00:00Z"$' "$WF" \
+  && ok "E8 writer emits exact callback identity" || bad "E8 writer exact floor"
 WID=$(sed -n 's/^callback_id: //p' "$WF"); BEFORE=$(shasum -a 256 "$WF" | awk '{print $1}')
-briS "$P" forge-p1e callback-consume --slug p1e-writer --stage coding --status BLOCKED >/dev/null 2>&1
-AF="$P/.dev/forge-tmp/callbacks/archive/p1e-writer-coding.${WID}.callback"
+briS "$P" forge-p1e callback-consume --slug p1wc-writer --stage coding --status BLOCKED >/dev/null 2>&1
+AF="$P/.dev/forge-tmp/callbacks/archive/p1wc-writer-coding.${WID}.callback"
 AFTER=$(shasum -a 256 "$AF" | awk '{print $1}')
-[ "$BEFORE" = "$AFTER" ] && grep -q '^session: forge-p1e' "$AF" \
+[ "$BEFORE" = "$AFTER" ] && grep -q "^incarnation: $WC_TEST_INCARNATION$" "$AF" \
   && ok "E4 archive move preserves every callback byte/header" || bad "E4 archive preservation"
 grep -q 'lifecycle-${slug}--${stage}.lock' "$BRIDGE" \
   && ok "E3 physical lifecycle mutex key unchanged" || bad "E3 mutex key changed"
@@ -810,26 +1014,124 @@ out=$(cd "$P" && FORGE_LIFECYCLE_LOCK_WAIT_S=0.2 "$BRIDGE" park --resolve --slug
 [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'LIFECYCLE_LOCK: busy' \
   && ok "E3 nested park-resolve consume reuses caller lock" || bad "E3 nested --_no_lock regression: $out"
 
-# P1-E intentionally leaves a reader/mutator asymmetry for P1-WC: exact files
-# are readable by wait but are not yet mutation-eligible through the frozen resolver.
-P="$(mkproj p1e-exact-freeze)"; EF="$P/.dev/forge-tmp/callbacks/p1e-exact-freeze-coding.forge-p1e.777.callback"
+# P1-WC makes the exact current callback mutable under its matching lifecycle lock.
+P="$(mkproj p1wc-exact-current)"
+mkdir -p "$P/.dev/proposals/p1wc-exact-current"
+cat > "$P/.dev/proposals/p1wc-exact-current/forge-log.yml" <<'EOF'
+pipeline: p1wc-exact-current
+entries:
+  - timestamp: "2026-07-14T00:03:00Z"
+    stage: coding
+    to: codex-a
+    session: forge-p1e
+    incarnation: 777
+    response: null
+EOF
+EF="$P/.dev/forge-tmp/callbacks/p1wc-exact-current-coding.forge-p1e.777.callback"
 cat > "$EF" <<'EOF'
-slug: p1e-exact-freeze
+slug: p1wc-exact-current
 stage: coding
 status: BLOCKED
 worker: codex-a
 session: forge-p1e
 incarnation: 777
-callback_id: exact-freeze
-timestamp: 2026-07-14T00:03:00Z
-message: exact remains outside legacy mutators
+callback_id: exact-current
+timestamp: 2026-07-14T00:03:01Z
+selected_pending_timestamp: "2026-07-14T00:03:00Z"
+message: exact current mutator fixture
 EOF
 EB=$(shasum -a 256 "$EF" | awk '{print $1}')
-out=$(FORGE_LIFECYCLE_LOCK_WAIT_S=0.2 briS "$P" forge-p1e callback-consume --slug p1e-exact-freeze --stage coding --status BLOCKED 2>&1); rc=$?
-EA=$(shasum -a 256 "$EF" | awk '{print $1}')
-[ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'CALLBACK_CONSUME NOOP' && [ "$EB" = "$EA" ] \
-  && [ ! -e "$P/.dev/forge-tmp/callbacks/archive/p1e-exact-freeze-coding.exact-freeze.callback" ] \
-  && ok "E8 exact callback remains outside frozen mutator eligibility" || bad "E8 exact/mutator asymmetry changed"
+out=$(FORGE_LIFECYCLE_LOCK_WAIT_S=0.2 briS "$P" forge-p1e callback-consume --slug p1wc-exact-current --stage coding --status BLOCKED 2>&1); rc=$?
+AF="$P/.dev/forge-tmp/callbacks/archive/p1wc-exact-current-coding.exact-current.callback"
+[ "$rc" -eq 0 ] && [ -f "$AF" ] && [ "$EB" = "$(shasum -a 256 "$AF" | awk '{print $1}')" ] \
+  && ok "E8 exact current callback is byte-preserving mutation input" || bad "E8 exact current mutation failed: $out"
+
+wc_artifact_fingerprint() { # <project> <slug>
+    python3 - "$1" "$2" <<'PY'
+import hashlib,os,sys
+root,slug=sys.argv[1:3]; rows=[]
+log=os.path.join(root,'.dev','proposals',slug,'forge-log.yml')
+paths=[log] if os.path.isfile(log) else []
+cb=os.path.join(root,'.dev','forge-tmp','callbacks')
+for base,_,files in os.walk(cb):
+    for name in files:
+        if name.startswith(slug+'-'): paths.append(os.path.join(base,name))
+for path in sorted(paths):
+    rows.append(os.path.relpath(path,root)+':'+hashlib.sha256(open(path,'rb').read()).hexdigest())
+print('|'.join(rows))
+PY
+}
+
+# PARKED log authority permits resolution when the owned parked pending has no callback.
+P="$(mkproj p1wc-log-authority)"; mkdir -p "$P/.dev/proposals/logonly"
+cat > "$P/.dev/proposals/logonly/forge-log.yml" <<EOF
+pipeline: logonly
+entries:
+  - timestamp: "2026-07-14T00:03:30Z"
+    stage: coding
+    to: codex-a
+    session: $WC_TEST_SESSION
+    incarnation: $WC_TEST_INCARNATION
+    parked_at: "2026-07-14T00:03:31Z"
+    parked_reason: "log is authoritative"
+    response: null
+EOF
+out="$(briS "$P" "$WC_TEST_SESSION" park --resolve --slug logonly --stage coding --note done 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && grep -q 'response: "FORGE_PARK_RESOLVED:' "$P/.dev/proposals/logonly/forge-log.yml" \
+  && ok "WC PARKED resolution is log-authoritative without callback" \
+  || bad "WC log-authoritative resolve failed: $out"
+
+# P1-WC private delegation flags never cross the public command router.
+P="$(mkproj p1wc-private-flags)"; PF="$(wc_callback_path "$P" private coding)"
+cat > "$PF" <<EOF
+slug: private
+stage: coding
+status: BLOCKED
+worker: codex-a
+session: $WC_TEST_SESSION
+incarnation: $WC_TEST_INCARNATION
+callback_id: private-id
+timestamp: 2026-07-14T00:04:00Z
+selected_pending_timestamp: "2026-07-14T00:03:59Z"
+message: no matching pending
+EOF
+PB="$(shasum -a 256 "$PF" | awk '{print $1}')"; PSET="$(wc_artifact_fingerprint "$P" private)"
+fabricated="$PF|BLOCKED|private-id|2026-07-14T00:03:59Z|$WC_TEST_SESSION|$WC_TEST_INCARNATION||$PB"
+out="$(briS "$P" "$WC_TEST_SESSION" callback-consume --_no_lock --_closed-selection "$fabricated" --slug private --stage coding --status BLOCKED 2>&1)"; rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'private callback-consume delegation' \
+  && [ "$PSET" = "$(wc_artifact_fingerprint "$P" private)" ] \
+  && ok "WC private delegation flags cannot bypass ownership selection" \
+  || bad "WC public private-flag bypass changed callback: $out"
+
+# Actor incarnation is re-read after waiting for the physical lifecycle lock.
+P="$(mkproj p1wc-incarnation-race)"; pending_entry "$P" race coding codex-a "2026-07-14T00:05:00Z"
+cb "$P" --slug race --stage coding --status BLOCKED --worker codex-a --message race >/dev/null 2>&1
+RF="$(wc_callback_path "$P" race coding)"; RB="$(wc_artifact_fingerprint "$P" race)"
+TL="$P/.race-tmux.tsv"; printf '%s\t%s\t%s\t%s\n' "$WC_TEST_SESSION" "$P" "$$" "$WC_TEST_INCARNATION" > "$TL"
+LK="$(lifelock_path "$P" race coding)"; HREADY="$P/.holder-ready"; HRELEASE="$P/.holder-release"; BREADY="$P/.barrier-ready"; BRELEASE="$P/.barrier-release"
+wc_race_wait_file() { local path="$1" i=0; while [ ! -f "$path" ] && [ "$i" -lt 500 ]; do sleep 0.02; i=$((i + 1)); done; [ -f "$path" ]; }
+( exec 9>"$LK"; flock 9; : > "$HREADY"; wc_race_wait_file "$HRELEASE" ) & holder=$!
+if ! wc_race_wait_file "$HREADY"; then
+    : > "$HRELEASE"; kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+    bad "WC lifecycle-lock holder barrier timed out"
+else
+    ( cd "$P" && env -u TMUX TMUX_SESSION="$WC_TEST_SESSION" FORGE_TMUX_LIST="$TL" FORGE_LIFECYCLE_LOCK_WAIT_S=5 \
+        FORGE_CALLBACK_PRELOCK_READY="$BREADY" FORGE_CALLBACK_PRELOCK_RELEASE="$BRELEASE" \
+        "$BRIDGE" callback-consume --slug race --stage coding --status BLOCKED >"$P/.race-out" 2>&1 ) & consumer=$!
+    if ! wc_race_wait_file "$BREADY"; then
+        : > "$BRELEASE"; : > "$HRELEASE"; kill "$consumer" "$holder" 2>/dev/null || true
+        wait "$consumer" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+        bad "WC callback pre-lock barrier timed out"
+    else
+        printf '%s\t%s\t%s\t%s\n' "$WC_TEST_SESSION" "$P" "$$" "$((WC_TEST_INCARNATION + 1))" > "$TL"
+        : > "$BRELEASE"; sleep 0.1; kill -0 "$consumer" 2>/dev/null || bad "WC consumer did not wait on held lifecycle lock"
+        : > "$HRELEASE"; wait "$holder"; wait "$consumer"; rc=$?
+        [ "$rc" -ne 0 ] && ! grep -q 'LIFECYCLE_LOCK: busy' "$P/.race-out" \
+          && [ "$RB" = "$(wc_artifact_fingerprint "$P" race)" ] \
+          && ok "WC under-lock incarnation refresh rejects same-name rebirth" \
+          || bad "WC rebirth during lock wait mutated predecessor: $(cat "$P/.race-out")"
+    fi
+fi
 
 echo ""
 echo "═══════════════════════════════════════"

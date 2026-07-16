@@ -332,43 +332,37 @@ fi
 # ---- Callback / terminal-close isolation ----
 echo "== callback / terminal-close =="
 
-# pending_entry <root> <slug> <stage> <to> <ts> [session]
+# pending_entry <root> <slug> <stage> <to> <ts> [session] [incarnation]
 pending_entry(){
     local d="$1/.dev/proposals/$2"; mkdir -p "$d"
-    if [ -n "${6:-}" ]; then
-        cat > "$d/forge-log.yml" <<EOF
-pipeline: $2
-entries:
-  - timestamp: "$5"
-    stage: $3
-    to: $4
-    session: $6
-    response: null
-EOF
-    else
-        cat > "$d/forge-log.yml" <<EOF
-pipeline: $2
-entries:
-  - timestamp: "$5"
-    stage: $3
-    to: $4
-    response: null
-EOF
-    fi
+    {
+        echo "pipeline: $2"
+        echo "entries:"
+        echo "  - timestamp: \"$5\""
+        echo "    stage: $3"
+        echo "    to: $4"
+        [ -n "${6:-}" ] && echo "    session: $6"
+        [ -n "${7:-}" ] && echo "    incarnation: $7"
+        echo "    response: null"
+    } > "$d/forge-log.yml"
 }
 
-# T-CB-HEADLESS-DONE: headless caller, zero live same-root, empty-session pending, enforce=1
+# T-CB-HEADLESS-DONE: publication requires both target session and incarnation.
 pending_entry "$rootD" hdl coding codex-a "2026-07-11T00:00:00Z"
+hdl_before=$(shasum -a 256 "$rootD/.dev/proposals/hdl/forge-log.yml" | awk '{print $1}')
 cbh="$(cd "$rootD" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_IDENTITY_ENFORCE=1 "$BRIDGE" callback --slug hdl --stage coding --status DONE --worker codex-a --quiet 2>&1)"; cbhrc=$?
-if [ "$cbhrc" -eq 0 ] && [ -f "$rootD/.dev/forge-tmp/callbacks/hdl-coding.callback" ] \
-   && ! grep -q "response: null" "$rootD/.dev/proposals/hdl/forge-log.yml"; then
-    ok "T-CB-HEADLESS-DONE headless callback proceeds under enforce (host-degrade)"
+hdl_after=$(shasum -a 256 "$rootD/.dev/proposals/hdl/forge-log.yml" | awk '{print $1}')
+if [ "$cbhrc" -ne 0 ] && [ "$hdl_before" = "$hdl_after" ] \
+   && [ -z "$(find "$rootD/.dev/forge-tmp/callbacks" -type f -name 'hdl-coding*.callback' -print -quit 2>/dev/null)" ]; then
+    ok "T-CB-HEADLESS-DONE missing incarnation fails before callback/log mutation"
 else
-    bad "T-CB-HEADLESS-DONE headless callback proceeds under enforce (rc=$cbhrc out=$cbh)"
+    bad "T-CB-HEADLESS-DONE missing incarnation fail-closed (rc=$cbhrc out=$cbh)"
 fi
 
 # T-CLOSE-ISOLATION: two same-slug/stage/to pendings for S1 and S2; close from S1 pane
 d="$rootA/.dev/proposals/xiso"; mkdir -p "$d"
+S1_CALLBACK_INC="$(tmux display-message -p -t "$S1:0.0" '#{session_created}')"
+S2_CALLBACK_INC="$(tmux display-message -p -t "$S2:0.0" '#{session_created}')"
 cat > "$d/forge-log.yml" <<EOF
 pipeline: xiso
 entries:
@@ -376,11 +370,13 @@ entries:
     stage: coding
     to: codex-a
     session: $S1
+    incarnation: $S1_CALLBACK_INC
     response: null
   - timestamp: "2026-07-11T00:00:02Z"
     stage: coding
     to: codex-a
     session: $S2
+    incarnation: $S2_CALLBACK_INC
     response: null
 EOF
 run_in_pane "$S1:0.0" closeiso "FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug xiso --stage coding --status DONE --worker codex-a --quiet"
@@ -422,7 +418,7 @@ else
 fi
 
 # T-CB-NOTIFY-HOST: non-quiet self-callback notifies the HOST's pane 1 (target==host)
-pending_entry "$rootA" ntfy coding codex-a "2026-07-11T00:00:05Z" "$S1"
+pending_entry "$rootA" ntfy coding codex-a "2026-07-11T00:00:05Z" "$S1" "$S1_CALLBACK_INC"
 run_in_pane "$S1:0.0" notify "FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug ntfy --stage coding --status DONE --worker codex-a --message notify-marker-xyz"
 sleep 1
 if [ "$(rc_of notify)" = "0" ] && tmux capture-pane -p -t "$S1:0.1" | grep -q "notify-marker-xyz"; then
@@ -613,7 +609,7 @@ guard_done b13-send adhoc codex-b 3 b13-send-clean || bad "B13 close logged send
 guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B13" || exit 1
 
 guard_block b15-ok coding codex-a 2 b15-ok || bad "B15 success setup"
-B15_OK_CB="$GROOT/.dev/forge-tmp/callbacks/b15-ok-coding.$GS.callback"
+B15_OK_CB="$GROOT/.dev/forge-tmp/callbacks/b15-ok-coding.$GS.$GINC.callback"
 B15_OK_ID="$(sed -n 's/^callback_id: //p' "$B15_OK_CB")"
 run_in_pane "$GS:0.0" b15-ok-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b15-ok --stage adhoc --worker codex-b --supersede )"
 if [ "$(rc_of b15-ok-dispatch)" = 0 ] && [ ! -f "$B15_OK_CB" ] \
@@ -636,34 +632,38 @@ entries:
     incarnation: $GINC
     response: null
 EOF
-B15_FAIL_CB="$GROOT/.dev/forge-tmp/callbacks/b15-fail-coding.$GS.callback"
+B15_FAIL_CB="$GROOT/.dev/forge-tmp/callbacks/b15-fail-coding.$GS.$GINC.callback"
 cat > "$B15_FAIL_CB" <<EOF
 slug: b15-fail
 stage: coding
 status: BLOCKED
 worker: codex-a
 session: $GS
+incarnation: $GINC
 origin:
 callback_id: b15-fail-callback
 timestamp: 2026-07-13T00:00:01Z
+selected_pending_timestamp: "2026-07-13T00:00:00Z"
 message: deterministic close failure
 EOF
 before_audit=$(grep -c 'SUPERSEDE_AUDIT.*b15-fail' "$GROOT/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null || true)
 before_audit=${before_audit:-0}
+before_log=$(shasum -a 256 "$GROOT/.dev/proposals/b15-fail/forge-log.yml" | awk '{print $1}')
+before_cb=$(shasum -a 256 "$B15_FAIL_CB" | awk '{print $1}')
 run_in_pane "$GS:0.0" b15-fail-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b15-fail --stage adhoc --worker codex-b --supersede )"
 after_audit=$(grep -c 'SUPERSEDE_AUDIT.*b15-fail' "$GROOT/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null || true)
 after_audit=${after_audit:-0}
-if [ "$(rc_of b15-fail-dispatch)" = 0 ] && out_of b15-fail-dispatch | grep -q 'partial close failure' \
-   && guard_capture_has 3 'codex-b-adhoc-b15-fail.txt' && [ -f "$B15_FAIL_CB" ] \
-   && [ "$(grep -c 'response: null' "$GROOT/.dev/proposals/b15-fail/forge-log.yml")" -ge 2 ] \
-   && [ "$before_audit" = "$after_audit" ] \
+after_log=$(shasum -a 256 "$GROOT/.dev/proposals/b15-fail/forge-log.yml" | awk '{print $1}')
+after_cb=$(shasum -a 256 "$B15_FAIL_CB" | awk '{print $1}')
+if [ "$(rc_of b15-fail-dispatch)" != 0 ] && [ "$before_log" = "$after_log" ] \
+   && [ "$before_cb" = "$after_cb" ] && [ "$before_audit" = "$after_audit" ] \
+   && ! guard_capture_has 3 'codex-b-adhoc-b15-fail.txt' \
    && [ -z "$(find "$GROOT/.dev/forge-tmp/callbacks/archive" -type f -name 'b15-fail-*' -print -quit 2>/dev/null)" ]; then
     ok "T-GUARD-B15-SUPERSEDE-CLOSE-FAILURE"
 else bad "T-GUARD-B15-SUPERSEDE-CLOSE-FAILURE"; fi
-guard_done b15-fail adhoc codex-b 3 b15-fail-replacement-clean || bad "B15 close delivered replacement"
 sed -i '' 's/^  - timestamp: 2026-07-13T00:00:00Z$/  - timestamp: "2026-07-13T00:00:00Z"/' "$GROOT/.dev/proposals/b15-fail/forge-log.yml"
 run_in_pane "$GS:0.0" b15-fail-repair "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b15-fail --stage adhoc --worker codex-b --supersede )"
-[ "$(rc_of b15-fail-repair)" = 0 ] || bad "B15 repair supersede"
+[ "$(rc_of b15-fail-repair)" = 0 ] && [ ! -f "$B15_FAIL_CB" ] || bad "B15 repair supersede"
 guard_done b15-fail adhoc codex-b 3 b15-fail-repair-clean || bad "B15 close repair replacement"
 guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B15-FAILURE" || exit 1
 
@@ -749,8 +749,8 @@ else
     bad "T-REUSE-LEGACY legacy pending still blocks (rc=$(rc_of reuselegacy))"
 fi
 
-# T-REUSE-SUPERSEDE: --supersede closes the caller-session orphan regardless of
-# incarnation, but NEVER a different-named session's pending.
+# T-REUSE-SUPERSEDE: a reborn name cannot supersede its predecessor incarnation
+# and never reaches a different-named session's pending.
 drs="$rootA/.dev/proposals/rs1"; mkdir -p "$drs"
 cat > "$drs/forge-log.yml" <<EOF
 pipeline: rs1
@@ -771,19 +771,35 @@ entries:
     response: null
     files: []
 EOF
+REUSE_CB="$rootA/.dev/forge-tmp/callbacks/rs1-adhoc.$S2.2222222.callback"
+cat > "$REUSE_CB" <<EOF
+slug: rs1
+stage: adhoc
+status: BLOCKED
+worker: codex-a
+session: $S2
+incarnation: 2222222
+callback_id: reuse-predecessor
+timestamp: 2026-07-11T00:03:02Z
+selected_pending_timestamp: "2026-07-11T00:03:00Z"
+message: predecessor
+EOF
+REUSE_CB_BEFORE="$(shasum -a 256 "$REUSE_CB" | awk '{print $1}')"
 run_in_pane "$S2:0.0" reusesup "FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR $BRIDGE dispatch --slug rs1 --stage adhoc --worker codex-a --supersede"
-supok=$(python3 - "$drs/forge-log.yml" "$S1" "$S2" <<'PY'
-import sys, yaml
-d = yaml.safe_load(open(sys.argv[1]))
-s1, s2 = sys.argv[2], sys.argv[3]
-orphan = [e for e in d['entries'] if e.get('session') == s2 and str(e.get('incarnation','')) == '2222222']
-other  = [e for e in d['entries'] if e.get('session') == s1]
-print('OK' if orphan and orphan[0]['response'] and 'FORGE_SUPERSEDED' in str(orphan[0]['response'])
-      and other and other[0]['response'] is None else 'NO')
+reuse_inc="$(tmux display-message -p -t "$S2:0.0" '#{session_created}')"
+supok=$(python3 - "$drs/forge-log.yml" "$S1" "$S2" "$reuse_inc" <<'PY'
+import sys,yaml
+d=yaml.safe_load(open(sys.argv[1])); s1,s2,cur=sys.argv[2:5]
+orphan=[e for e in d['entries'] if e.get('session')==s2 and str(e.get('incarnation',''))=='2222222']
+other=[e for e in d['entries'] if e.get('session')==s1]
+current=[e for e in d['entries'] if e.get('session')==s2 and str(e.get('incarnation',''))==cur]
+print('OK' if orphan and orphan[0]['response'] is None and other and other[0]['response'] is None and len(current)==1 and current[0]['response'] is None else 'NO')
 PY
 )
-if [ "$(rc_of reusesup)" = "0" ] && [ "$supok" = "OK" ]; then
-    ok "T-REUSE-SUPERSEDE closes own-name orphan cross-incarnation, other session untouched"
+if [ "$(rc_of reusesup)" = "0" ] && [ "$supok" = "OK" ] \
+   && [ "$REUSE_CB_BEFORE" = "$(shasum -a 256 "$REUSE_CB" | awk '{print $1}')" ] \
+   && [ -z "$(find "$rootA/.dev/forge-tmp/callbacks/archive" -name 'rs1-*' -print -quit 2>/dev/null)" ]; then
+    ok "T-REUSE-SUPERSEDE predecessor and other session remain immutable"
 else
     bad "T-REUSE-SUPERSEDE (rc=$(rc_of reusesup) supok=$supok)"
 fi
@@ -990,6 +1006,34 @@ run_in_pane "$S2:0.0" e-scan-dependency "PYTHONPATH=$WORK/p1e-no-yaml FORGE_WATC
 [ "$(rc_of e-scan-dependency)" = 1 ] && out_of e-scan-dependency | grep -q 'CALLBACK_SCANNER_DEPENDENCY: PyYAML missing' \
   && out_of e-scan-dependency | grep -q 'DETAIL: CALLBACK_SCANNER_DEPENDENCY' \
   && ok "T-P1E-SCAN-DEPENDENCY" || bad "T-P1E-SCAN-DEPENDENCY"
+
+# P1-WC production writer: exact name, exact headers, and selected pending anchor.
+WC_SLUG=p1wc-writer; WC_STAGE=coding
+pending_entry "$rootA" "$WC_SLUG" "$WC_STAGE" codex-a "2026-07-15T00:00:00Z" "$S2" "$S2INC"
+run_in_pane "$S2:0.0" p1wc-writer "FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug $WC_SLUG --stage $WC_STAGE --status BLOCKED --worker codex-a --message exact --quiet"
+WC_CB="$rootA/.dev/forge-tmp/callbacks/$WC_SLUG-$WC_STAGE.$S2.$S2INC.callback"
+if [ "$(rc_of p1wc-writer)" = 0 ] && [ -f "$WC_CB" ] \
+   && grep -q "^session: $S2$" "$WC_CB" && grep -q "^incarnation: $S2INC$" "$WC_CB" \
+   && grep -q '^selected_pending_timestamp: "2026-07-15T00:00:00Z"$' "$WC_CB"; then
+    ok "T-P1WC-WRITER-EXACT"
+else bad "T-P1WC-WRITER-EXACT"; fi
+
+# A known actor cannot mutate a coincident legacy shape; both files remain byte-identical.
+cp "$WC_CB" "$rootA/.dev/forge-tmp/callbacks/$WC_SLUG-$WC_STAGE.$S2.callback"
+sed -i '' '/^incarnation:/d;/^selected_pending_timestamp:/d' "$rootA/.dev/forge-tmp/callbacks/$WC_SLUG-$WC_STAGE.$S2.callback"
+wc_before=$(find "$rootA/.dev/forge-tmp/callbacks" -maxdepth 1 -name "$WC_SLUG-$WC_STAGE*.callback" -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256)
+run_in_pane "$S2:0.0" p1wc-amb "FORGE_WATCH_TRIGGER=0 $BRIDGE callback-consume --slug $WC_SLUG --stage $WC_STAGE --status BLOCKED"
+wc_after=$(find "$rootA/.dev/forge-tmp/callbacks" -maxdepth 1 -name "$WC_SLUG-$WC_STAGE*.callback" -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256)
+[ "$(rc_of p1wc-amb)" != 0 ] && out_of p1wc-amb | grep -q 'CALLBACK_IDENTITY_AMBIGUOUS' && [ "$wc_before" = "$wc_after" ] \
+  && ok "T-P1WC-MUTATION-AMBIGUOUS" || bad "T-P1WC-MUTATION-AMBIGUOUS"
+rm -f "$rootA/.dev/forge-tmp/callbacks/$WC_SLUG-$WC_STAGE.$S2.callback"
+
+# Exact current consume is a byte-preserving move.
+wc_hash=$(shasum -a 256 "$WC_CB" | awk '{print $1}'); wc_id=$(sed -n 's/^callback_id: //p' "$WC_CB")
+run_in_pane "$S2:0.0" p1wc-consume "FORGE_WATCH_TRIGGER=0 $BRIDGE callback-consume --slug $WC_SLUG --stage $WC_STAGE --status BLOCKED"
+WC_ARCH="$rootA/.dev/forge-tmp/callbacks/archive/$WC_SLUG-$WC_STAGE.$wc_id.callback"
+[ "$(rc_of p1wc-consume)" = 0 ] && [ "$wc_hash" = "$(shasum -a 256 "$WC_ARCH" | awk '{print $1}')" ] \
+  && grep -q "^incarnation: $S2INC$" "$WC_ARCH" && ok "T-P1WC-CONSUME-BYTE-PRESERVE" || bad "T-P1WC-CONSUME-BYTE-PRESERVE"
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"

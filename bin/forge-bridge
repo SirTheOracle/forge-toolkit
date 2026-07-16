@@ -118,12 +118,12 @@ except Exception: pass
 # seam FORGE_TMUX_LIST names a 'name<TAB>path' file (seat/forge-watch convention,
 # bin/forge:67-75). One name per line. bash-3.2-safe.
 _same_root_sessions() {
-    local dir="$1" want inject _sn _sp
+    local dir="$1" want inject _sn _sp _sid _si
     want="$(ownership_root "$dir")"
     [ -n "$want" ] || return 0
     inject="${FORGE_TMUX_LIST:-}"
     if [ -n "$inject" ]; then
-        while IFS=$'\t' read -r _sn _sp; do
+        while IFS=$'\t' read -r _sn _sp _sid _si; do
             [ -n "$_sn" ] || continue
             [ "$(ownership_root "$_sp")" = "$want" ] && printf '%s\n' "$_sn"
         done < "$inject"
@@ -145,9 +145,18 @@ _same_root_sessions() {
 # read is consistent. The charset guard applies to session NAMES only, never to paths.
 _valid_session_name() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_.-]+$'; }
 
+session_incarnation_of() {   # <session>; empty when unavailable
+    local inject="${FORGE_TMUX_LIST:-}"
+    if [ -n "$inject" ]; then
+        awk -F'\t' -v s="$1" '$1==s && NF>=4{print $4; exit}' "$inject"
+    else
+        tmux display-message -p -t "$1" '#{session_created}' 2>/dev/null || true
+    fi
+}
+
 _forge_identity() {
     ID_host_session=""; ID_host_pane=""; ID_host_root=""; ID_host_incarnation=""
-    ID_target_session=""; ID_target_source="none"; ID_target_root=""
+    ID_target_session=""; ID_target_source="none"; ID_target_root=""; ID_target_incarnation=""
     ID_legacy_file_session=""; ID_state=""; ID_ambiguous_list=""
     local env_stamp="${TMUX_SESSION:-}"
     [ -n "$env_stamp" ] && ! _valid_session_name "$env_stamp" && env_stamp=""
@@ -233,6 +242,13 @@ _forge_identity() {
         ID_target_session=""
     fi
     [ "$ID_target_session" = "__nosession__" ] && ID_target_session=""
+    if [ -n "$ID_target_session" ]; then
+        if [ "$ID_target_session" = "$ID_host_session" ] && [ -n "$ID_host_incarnation" ]; then
+            ID_target_incarnation="$ID_host_incarnation"
+        else
+            ID_target_incarnation="$(session_incarnation_of "$ID_target_session")"
+        fi
+    fi
     return 0
 }
 
@@ -1446,30 +1462,118 @@ PY
 # Revalidate-under-lock: confirm the callback status+callback_id and the target
 # pending (open + timestamp) match what the operation validated before acquiring.
 # Echoes "OK" or "MISMATCH:<detail>"; caller refuses on mismatch.
-_lifecycle_revalidate() {   # <cb_file> <want_status> <want_cb_id> <pipeline_log> <want_ts>
-    local cbf="$1" want_status="$2" want_cbid="$3" plog="$4" want_ts="$5"
-    if [ ! -f "$cbf" ]; then echo "MISMATCH:callback-gone"; return 0; fi
-    local now_status now_cbid
-    now_status=$(grep '^status:' "$cbf" 2>/dev/null | awk '{print $2}')
-    now_cbid=$(grep '^callback_id:' "$cbf" 2>/dev/null | awk '{print $2}')
-    if [ -n "$want_status" ] && [ "$now_status" != "$want_status" ]; then
-        echo "MISMATCH:status-changed have=$now_status want=$want_status"; return 0
-    fi
-    if [ -n "$want_cbid" ] && [ "$now_cbid" != "$want_cbid" ]; then
-        echo "MISMATCH:callback_id-changed have=$now_cbid want=$want_cbid"; return 0
-    fi
-    if [ -n "$want_ts" ]; then
-        grep -q "timestamp: \"$want_ts\"" "$plog" 2>/dev/null || { echo "MISMATCH:pending-gone"; return 0; }
-        python3 - "$plog" "$want_ts" <<'PY' || { echo "MISMATCH:pending-closed"; return 0; }
-import re, sys
-plog, ts = sys.argv[1], sys.argv[2]
-raw = open(plog).read()
-pat = re.compile(r'timestamp:\s*"' + re.escape(ts) + r'"[^\n]*\n(?:\s+[^\n]*\n)*?\s+response:\s*(null|"[^"]*")', re.M)
-m = pat.search(raw)
-sys.exit(0 if (m and m.group(1) == 'null') else 1)
+_callback_prelock_barrier() {
+    local ready="${FORGE_CALLBACK_PRELOCK_READY:-}" release="${FORGE_CALLBACK_PRELOCK_RELEASE:-}"
+    [ -n "$ready" ] && [ -n "$release" ] || return 0
+    : > "$ready"
+    while [ ! -e "$release" ]; do sleep 0.01; done
+}
+
+_callback_pending_select_exact() {   # <log> <stage> <worker> <session> <incarnation>
+    python3 - "$@" <<'PY'
+import sys, yaml
+path, stage, worker, session, incarnation = sys.argv[1:6]
+aliases={'inline':'claude-opus','general':'claude-opus','claude-general':'claude-opus','opus':'claude-opus','codex':'codex-a','orchestrator':'claude','claude-orchestrator':'claude','sonnet':'claude-sonnet'}
+canonical=lambda value: aliases.get(value,value)
+try: entries=(yaml.safe_load(open(path)) or {}).get('entries') or []
+except Exception as exc: print('CALLBACK_PENDING_INVALID:'+str(exc),file=sys.stderr); sys.exit(3)
+c=[e for e in entries if isinstance(e,dict) and e.get('response') is None and e.get('stage')==stage and canonical(str(e.get('to') or ''))==worker and str(e.get('session') or '')==session and str(e.get('incarnation') or '')==incarnation]
+if len(c)!=1:
+    print('CALLBACK_IDENTITY_AMBIGUOUS: exact pending cardinality='+str(len(c)),file=sys.stderr)
+    sys.exit(2)
+ts=str(c[0].get('timestamp') or '')
+if not ts: print('CALLBACK_PENDING_INVALID: missing timestamp',file=sys.stderr); sys.exit(3)
+print(ts)
 PY
+}
+
+_callback_mutation_select() {   # <cb_dir> <slug> <stage> <session> <incarnation> <statuses> <log>
+    local cb_dir="$1" slug="$2" stage="$3" session="$4" incarnation="$5" statuses="$6" plog="$7"
+    local cb_file scan_rc=0
+    cb_file="$(_scan_callback_candidates "$cb_dir" "$slug" "$stage" "$session" "$incarnation")" || scan_rc=$?
+    case "$scan_rc" in
+        0) ;;
+        1) return 1 ;;
+        2) echo "CALLBACK_IDENTITY_AMBIGUOUS" >&2; return 2 ;;
+        3) echo "CALLBACK_HEADER_INVALID" >&2; return 3 ;;
+        4) echo "CALLBACK_SCANNER_DEPENDENCY" >&2; return 4 ;;
+        *) echo "CALLBACK_IDENTITY_CHANGED" >&2; return 3 ;;
+    esac
+    python3 - "$cb_file" "$slug" "$stage" "$session" "$incarnation" "$statuses" "$plog" <<'PY'
+import hashlib,sys,yaml
+cbf,slug,stage,actor_s,actor_i,statuses,plog=sys.argv[1:8]
+try:
+    raw=open(cbf,'rb').read(); cb=yaml.safe_load(raw) or {}
+    entries=(yaml.safe_load(open(plog)) or {}).get('entries') or []
+except Exception as exc: print('CALLBACK_HEADER_INVALID:'+str(exc),file=sys.stderr); sys.exit(3)
+cb_s=str(cb.get('session') or ''); cb_i=str(cb.get('incarnation') or '')
+if str(cb.get('slug') or '')!=slug or str(cb.get('stage') or '')!=stage:
+    print('CALLBACK_IDENTITY_CHANGED',file=sys.stderr); sys.exit(3)
+if actor_i:
+    if cb_s!=actor_s or cb_i!=actor_i:
+        print('CALLBACK_IDENTITY_AMBIGUOUS',file=sys.stderr); sys.exit(2)
+else:
+    # Legacy mutation is valid only when the callback does not introduce identity.
+    # An unqualified callback therefore remains compatible with an identity-less
+    # actor; a session-only callback must name that actor.
+    if cb_i or (cb_s and cb_s!=actor_s):
+        print('CALLBACK_IDENTITY_AMBIGUOUS',file=sys.stderr); sys.exit(2)
+status=str(cb.get('status') or ''); allowed=set(x for x in statuses.split(',') if x)
+if status not in allowed: print('CALLBACK_STATUS_INELIGIBLE:'+status,file=sys.stderr); sys.exit(5)
+aliases={'inline':'claude-opus','general':'claude-opus','claude-general':'claude-opus','opus':'claude-opus','codex':'codex-a','orchestrator':'claude','claude-orchestrator':'claude','sonnet':'claude-sonnet'}
+canonical=lambda value: aliases.get(value,value)
+cb_worker=canonical(str(cb.get('worker') or ''))
+pending=[e for e in entries if isinstance(e,dict) and e.get('response') is None and e.get('stage')==stage and canonical(str(e.get('to') or ''))==cb_worker and str(e.get('session') or '')==cb_s and str(e.get('incarnation') or '')==cb_i]
+selected=str(cb.get('selected_pending_timestamp') or '')
+if actor_i and not selected:
+    print('CALLBACK_IDENTITY_CHANGED: missing selected_pending_timestamp',file=sys.stderr); sys.exit(3)
+if selected: pending=[e for e in pending if str(e.get('timestamp') or '')==selected]
+if len(pending)!=1:
+    print('CALLBACK_IDENTITY_AMBIGUOUS: pending cardinality='+str(len(pending)),file=sys.stderr); sys.exit(2)
+selected=str(pending[0].get('timestamp') or '')
+if not selected: print('CALLBACK_IDENTITY_CHANGED: pending timestamp missing',file=sys.stderr); sys.exit(3)
+fields=[cbf,status,str(cb.get('callback_id') or ''),selected,cb_s,cb_i,str(cb.get('origin') or ''),hashlib.sha256(raw).hexdigest()]
+if not fields[2]: print('CALLBACK_HEADER_INVALID: callback_id missing',file=sys.stderr); sys.exit(3)
+print('|'.join(fields))
+PY
+}
+
+_parked_pending_select() { # <log> <stage> <session> <incarnation>
+    python3 - "$@" <<'PY'
+import sys,yaml
+path,stage,actor_s,actor_i=sys.argv[1:5]
+try: entries=(yaml.safe_load(open(path)) or {}).get('entries') or []
+except Exception as exc: print('CALLBACK_PENDING_INVALID:'+str(exc),file=sys.stderr); sys.exit(3)
+rows=[]; mixed=False
+for e in entries:
+    if not isinstance(e,dict) or e.get('response') is not None or e.get('stage')!=stage or not e.get('parked_at'): continue
+    es=str(e.get('session') or ''); ei=str(e.get('incarnation') or '')
+    if actor_i:
+        if es==actor_s and ei==actor_i: rows.append(e)
+        elif not ei and (not es or es==actor_s): mixed=True
+    else:
+        if ei and (not es or es==actor_s): mixed=True
+        elif not ei and (not es or es==actor_s): rows.append(e)
+if mixed or len(rows)!=1: sys.exit(2 if mixed or len(rows)>1 else 1)
+print('%s\t%s' % (str(rows[0].get('timestamp') or ''),str(rows[0].get('to') or '')))
+PY
+}
+
+_callback_selection_unchanged() {   # <before tuple> plus selector args
+    local before="$1"; shift
+    local cb_dir="$1" slug="$2" stage="$3" actor_s="$4" actor_i="$5"
+    local live_i
+    live_i="$(session_incarnation_of "$actor_s")"
+    if { [ -n "$actor_i" ] && [ "$live_i" != "$actor_i" ]; } || \
+       { [ -z "$actor_i" ] && [ -n "$live_i" ]; }; then
+        echo "CALLBACK_IDENTITY_CHANGED" >&2
+        return 1
     fi
-    echo "OK"
+    local after rc=0; after="$(_callback_mutation_select "$@")" || rc=$?
+    [ "$rc" -eq 0 ] && [ "$after" = "$before" ] || {
+        echo "CALLBACK_IDENTITY_CHANGED" >&2
+        return 1
+    }
 }
 
 cmd_log_response() {
@@ -2453,64 +2557,101 @@ PYEOF
     # cmd_log_response closes only candidates[-1], so a single delegated call
     # would silently leave duplicates open on a multi-pending slug.
     if [ "$supersede" = true ]; then
-        # Session-scoped, incarnation-AGNOSTIC (R10): close same-slug pendings of the
-        # caller's OWN session name regardless of incarnation, so a reborn same-name
-        # session can clean its dead predecessor's orphan — but never reach a
-        # DIFFERENT-named same-root session's pending. Re-gather here (NOT the guard's
-        # incarnation-scoped list), else supersede would be incarnation-strict and
-        # strand the dead orphan.
+        # P1-WC: supersede is incarnation-strict. Re-gather only pendings owned by
+        # the acting target session+incarnation, carry stage+timestamp together,
+        # and perform every close/archive under that stage's unchanged lifecycle
+        # mutex. A reborn same-name session never cleans its predecessor's state.
         local _sup_pendings
-        _sup_pendings=$(python3 - "$guard_log" "$ID_target_session" <<'PYEOF'
-import sys, yaml
-guard_log = sys.argv[1]; cur_session = sys.argv[2] if len(sys.argv) > 2 else ''
-try:
-    with open(guard_log) as f: data = yaml.safe_load(f) or {}
-except Exception: sys.exit(0)
-for e in (data.get('entries') or []):
-    if e.get('response') is not None: continue
-    es = e.get('session', '') or ''
-    if es and cur_session and es != cur_session: continue
-    ts = e.get('timestamp', '')
-    if ts: print(ts)
+        _sup_pendings=$(python3 - "$guard_log" "$ID_target_session" "$ID_target_incarnation" <<'PYEOF'
+import sys,yaml
+path,actor_s,actor_i=sys.argv[1:4]
+aliases={'inline':'claude-opus','general':'claude-opus','claude-general':'claude-opus','opus':'claude-opus','codex':'codex-a','orchestrator':'claude','claude-orchestrator':'claude','sonnet':'claude-sonnet'}
+canonical=lambda value: aliases.get(value,value)
+try: entries=(yaml.safe_load(open(path)) or {}).get('entries') or []
+except Exception as exc: print('ERR_PARSE:'+str(exc),file=sys.stderr); sys.exit(3)
+owned=[]; mixed=False
+for e in entries:
+    if not isinstance(e,dict) or e.get('response') is not None: continue
+    es=str(e.get('session') or ''); ei=str(e.get('incarnation') or '')
+    if actor_i:
+        if es==actor_s and ei==actor_i: owned.append(e)
+        elif not ei and (not es or es==actor_s): mixed=True
+    else:
+        if ei and (not es or es==actor_s): mixed=True
+        elif not ei and (not es or es==actor_s): owned.append(e)
+if mixed: print('CALLBACK_IDENTITY_AMBIGUOUS: mixed pending identity',file=sys.stderr); sys.exit(2)
+if len(owned)>1:
+    print('CALLBACK_IDENTITY_AMBIGUOUS: supersede is restricted to one owned open pending',file=sys.stderr); sys.exit(2)
+stages=[str(e.get('stage') or '') for e in owned]
+if any(not s for s in stages):
+    print('CALLBACK_IDENTITY_AMBIGUOUS: supersede pending stage missing',file=sys.stderr); sys.exit(2)
+for e in owned:
+    if e.get('timestamp'):
+        print('%s\t%s\t%s' % (e['stage'],canonical(str(e.get('to') or '')),e['timestamp']))
 PYEOF
-)
-        local _sup_ts _sup_now _sup_n _sup_fail=0
+) || { echo "ERROR: --supersede could not select owned pendings" >&2; return 1; }
+        local _sup_stage _sup_to _sup_ts _sup_now _sup_n=0
         _sup_now=$(timestamp)
-        # Close pendings first; collect failures (here-string, not a pipe subshell —
-        # the loop must set _sup_fail to gate the consume that follows, §3.3). The
-        # incarnation-scoped _sup_pendings gather above (session-pin R10) is preserved.
-        while IFS= read -r _sup_ts; do
-            [ -z "$_sup_ts" ] && continue
-            if ! _patch_response_by_ts "$slug" "$_sup_ts" \
-                "FORGE_SUPERSEDED: re-dispatched $stage (orphan-log-entries guard); auto-closed $_sup_now"; then
-                echo "WARN: --supersede: failed to close pending ts=$_sup_ts for slug=$slug (callbacks for its stage RETAINED)" >&2
-                _sup_fail=1
+        while IFS=$'\t' read -r _sup_stage _sup_to _sup_ts; do
+            [ -n "$_sup_ts" ] || continue
+            local _selection="" _select_rc=0
+            _selection="$(_callback_mutation_select "$project_root/.dev/forge-tmp/callbacks" "$slug" "$_sup_stage" "$ID_target_session" "$ID_target_incarnation" BLOCKED,PARKED "$guard_log")" || _select_rc=$?
+            [ "$_select_rc" -eq 0 ] || [ "$_select_rc" -eq 1 ] || {
+                echo "REFUSED: --supersede callback ownership is ambiguous for $slug/$_sup_stage" >&2
+                return 1
+            }
+            _callback_prelock_barrier
+            _lifecycle_lock "$slug" "$_sup_stage" || return 1
+            local _live_sup_incarnation
+            _live_sup_incarnation="$(session_incarnation_of "$ID_target_session")"
+            if { [ -n "$ID_target_incarnation" ] && [ "$_live_sup_incarnation" != "$ID_target_incarnation" ]; } || \
+               { [ -z "$ID_target_incarnation" ] && [ -n "$_live_sup_incarnation" ]; }; then
+                _lifecycle_unlock
+                echo "REFUSED: --supersede actor incarnation changed for $slug/$_sup_stage" >&2
+                return 1
             fi
-        done <<< "$_sup_pendings"
-        _sup_n="$(printf '%s\n' "$_sup_pendings" | grep -c . || true)"
-        [ "$_sup_n" -gt 0 ] && _emit_event SUPERSEDE "$slug" "stage=$stage closed_pending=$_sup_n worker=$worker_canonical partial_fail=$_sup_fail"
-        if [ "$_sup_n" -gt 0 ] && [ "$_sup_fail" -eq 0 ]; then
-            # Only after ALL closes succeed: consume+audit each PARKED/BLOCKED callback
-            # of this slug (all stages, session-scoped glob), preserving disposition.
-            local _cb _sess; _sess="$(_resolve_session)"
-            for _cb in "$project_root/.dev/forge-tmp/callbacks/${slug}-"*.callback; do
-                [ -e "$_cb" ] || continue
-                local _st _cbid _reason _unco _cbstage
-                _st=$(grep '^status:' "$_cb" | awk '{print $2}')
-                case "$_st" in PARKED|BLOCKED) ;; *) continue ;; esac
-                _cbstage=$(grep '^stage:' "$_cb" | awk '{print $2}')
-                _cbid=$(grep '^callback_id:' "$_cb" | awk '{print $2}')
+            if [ "$_select_rc" -eq 0 ]; then
+                local _cb _st _cbid _selected_ts _cbs _cbi _origin _hash
+                IFS='|' read -r _cb _st _cbid _selected_ts _cbs _cbi _origin _hash <<< "$_selection"
+                if [ "$_selected_ts" != "$_sup_ts" ] || ! _callback_selection_unchanged "$_selection" "$project_root/.dev/forge-tmp/callbacks" "$slug" "$_sup_stage" "$ID_target_session" "$ID_target_incarnation" BLOCKED,PARKED "$guard_log"; then
+                    _lifecycle_unlock
+                    echo "REFUSED: --supersede identity changed for $slug/$_sup_stage; no close performed" >&2
+                    return 1
+                fi
+            else
+                local _pending_now
+                _pending_now="$(_callback_pending_select_exact "$guard_log" "$_sup_stage" "$_sup_to" "$ID_target_session" "$ID_target_incarnation")" || {
+                    _lifecycle_unlock
+                    echo "REFUSED: --supersede pending identity changed for $slug/$_sup_stage" >&2
+                    return 1
+                }
+                if [ "$_pending_now" != "$_sup_ts" ]; then
+                    _lifecycle_unlock
+                    echo "REFUSED: --supersede pending timestamp changed for $slug/$_sup_stage" >&2
+                    return 1
+                fi
+            fi
+            if ! _patch_response_by_ts "$slug" "$_sup_ts" "FORGE_SUPERSEDED: re-dispatched $stage (orphan-log-entries guard); auto-closed $_sup_now"; then
+                _lifecycle_unlock
+                echo "ERROR: --supersede close failed for $slug/$_sup_stage; callback retained" >&2
+                return 1
+            fi
+            if [ "$_select_rc" -eq 0 ]; then
+                local _reason _unco
                 _reason=$(grep '^parked_reason:' "$_cb" | sed 's/^parked_reason:[[:space:]]*//')
                 _unco=$(grep '^uncommitted:' "$_cb" | awk '{print $2}')
-                _lifecycle_lock "$slug" "$_cbstage" || continue
-                _emit_event SUPERSEDE_AUDIT "$slug" "stage=$_cbstage prior_callback_id=$_cbid prior_status=$_st uncommitted=${_unco:-false} actor=$_sess reason=$(_sanitize_event_value "$_reason")"
-                [ "$_unco" = true ] && echo "WARN: --supersede: discarding PARKED callback with UNCOMMITTED work ($slug/$_cbstage, prior_callback_id=$_cbid)." >&2
-                ( cd "$project_root" && cmd_callback_consume --_no_lock --slug "$slug" --stage "$_cbstage" --status "$_st" >/dev/null 2>&1 ) || true
-                _lifecycle_unlock
-            done
-        elif [ "$_sup_fail" -ne 0 ]; then
-            echo "WARN: --supersede: partial close failure — callbacks RETAINED (not consumed) for slug=$slug." >&2
-        fi
+                _emit_event SUPERSEDE_AUDIT "$slug" "stage=$_sup_stage prior_callback_id=$_cbid prior_status=$_st uncommitted=${_unco:-false} actor=$ID_target_session reason=$(_sanitize_event_value "$_reason")"
+                [ "$_unco" = true ] && echo "WARN: --supersede: discarding PARKED callback with UNCOMMITTED work ($slug/$_sup_stage, prior_callback_id=$_cbid)." >&2
+                if ! (cd "$project_root" && cmd_callback_consume --_no_lock --_closed-selection "$_selection" --slug "$slug" --stage "$_sup_stage" --status "$_st" >/dev/null); then
+                    _lifecycle_unlock
+                    echo "ERROR: --supersede pending closed but selected callback archive failed" >&2
+                    return 1
+                fi
+            fi
+            _lifecycle_unlock
+            _sup_n=$((_sup_n + 1))
+        done <<< "$_sup_pendings"
+        [ "$_sup_n" -gt 0 ] && _emit_event SUPERSEDE "$slug" "stage=$stage closed_pending=$_sup_n worker=$worker_canonical partial_fail=0"
     fi
 
     local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
@@ -2614,18 +2755,23 @@ cmd_callback() {
         return 1
     fi
 
+    local cb_session="${ID_target_session:-}" cb_incarnation="${ID_target_incarnation:-}"
+    if [ -z "$cb_session" ] || [ -z "$cb_incarnation" ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=callback-identity-unavailable session=${cb_session:-none} incarnation=${cb_incarnation:-none}"
+        echo "ERROR: callback publication requires a live target session and incarnation; no lifecycle state was changed." >&2
+        return 1
+    fi
+    local pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
+    local selected_pending_timestamp
+    selected_pending_timestamp="$(_callback_pending_select_exact "$pipeline_log" "$stage" "$worker_canonical" "$cb_session" "$cb_incarnation")" || {
+        case "$status" in
+            DONE|ERROR) _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=terminal-close-failed status=$status" ;;
+        esac
+        return 1
+    }
     local cb_dir="$project_root/.dev/forge-tmp/callbacks"
     mkdir -p "$cb_dir"
-    # Session-qualified filename when the session resolves; legacy path otherwise
-    # (§3.2). Readers glob ${slug}-${stage}*.callback (_resolve_callback_file); a
-    # session-qualified file is OWNED by its session, a legacy file is unowned.
-    local cb_session; cb_session="$(_resolve_session)"
-    local cb_file
-    if [ -n "$cb_session" ]; then
-        cb_file="$cb_dir/${slug}-${stage}.${cb_session}.callback"
-    else
-        cb_file="$cb_dir/${slug}-${stage}.callback"
-    fi
+    local cb_file="$cb_dir/${slug}-${stage}.${cb_session}.${cb_incarnation}.callback"
     local ts cb_id
     ts=$(timestamp)
     cb_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
@@ -2636,10 +2782,12 @@ slug: $slug
 stage: $stage
 status: $status
 worker: $worker_canonical
-session: ${cb_session:-}
+session: $cb_session
+incarnation: $cb_incarnation
 origin: ${origin:-}
 callback_id: $cb_id
 timestamp: $ts
+selected_pending_timestamp: "$selected_pending_timestamp"
 message: $(yaml_escape "$message")
 EOF
 )
@@ -2655,7 +2803,26 @@ EOF
     local cb_tmp="$cb_dir/.$(basename "$cb_file").tmp.$$"
     # §3.3: serialize publication against park/resolve/supersede/consume on the same
     # (slug,stage). Acquire before close-then-publish; release after the mv.
+    _callback_prelock_barrier
     _lifecycle_lock "$slug" "$stage" || return 1
+    local live_cb_incarnation
+    live_cb_incarnation="$(session_incarnation_of "$cb_session")"
+    if [ -z "$live_cb_incarnation" ] || [ "$live_cb_incarnation" != "$cb_incarnation" ]; then
+        _lifecycle_unlock
+        echo "REFUSED: callback actor incarnation changed before lock; no callback was published." >&2
+        return 1
+    fi
+    local selected_under_lock
+    selected_under_lock="$(_callback_pending_select_exact "$pipeline_log" "$stage" "$worker_canonical" "$cb_session" "$cb_incarnation")" || {
+        _lifecycle_unlock
+        echo "REFUSED: callback pending identity changed before lock; no callback was published." >&2
+        return 1
+    }
+    if [ "$selected_under_lock" != "$selected_pending_timestamp" ]; then
+        _lifecycle_unlock
+        echo "REFUSED: callback selected pending timestamp changed before lock; no callback was published." >&2
+        return 1
+    fi
     case "$status" in
         DONE|ERROR)
             # R4-2 (terminal path — used by EVERY stage, highest blast radius):
@@ -2664,8 +2831,8 @@ EOF
             # so a polling `wait` can never observe DONE/ERROR before the pending
             # is closed — which would let the orchestrator release the infra lock
             # and race the next dispatch against the open-pending guard.
-            if ! (cd "$project_root" && cmd_log_response --slug "$slug" --stage "$stage" \
-                    --to "$worker_canonical" --response "$legacy" >/dev/null 2>&1); then
+            if ! (cd "$project_root" && _patch_response_by_ts "$slug" "$selected_pending_timestamp" "$legacy" \
+                    && update_context "$slug" "$stage" "$(printf '%s' "$status" | tr '[:upper:]' '[:lower:]')" "$worker_canonical") >/dev/null 2>&1; then
                 _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=terminal-close-failed status=$status"
                 echo "ERROR: callback $status: failed to close the pending log entry for slug=$slug stage=$stage; terminal callback NOT published (no matching open pending, or patch failed). Resolve the log state and retry." >&2
                 rm -f "$cb_tmp"
@@ -3003,88 +3170,73 @@ print(d.get('message', '') or '')
 #     non-terminal status) -> STRUCTURED NO-OP (exit 0) so the orchestrator does
 #     not re-wait blindly.
 cmd_callback_consume() {
-    local slug="" stage="" status="BLOCKED" _no_lock=0
+    local slug="" stage="" status="BLOCKED" _no_lock=0 _closed_selection=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            --slug)     slug="$2";   shift 2 ;;
-            --stage)    stage="$2";  shift 2 ;;
-            --status)   status="$2"; shift 2 ;;
-            --_no_lock) _no_lock=1;  shift ;;   # caller already holds the lifecycle lock
-            *)          shift ;;
+            --slug)               slug="$2"; shift 2 ;;
+            --stage)              stage="$2"; shift 2 ;;
+            --status)             status="$2"; shift 2 ;;
+            --_no_lock)           _no_lock=1; shift ;;
+            --_closed-selection)  _closed_selection="$2"; shift 2 ;;
+            *)                    shift ;;
         esac
     done
     if [ -z "$slug" ] || [ -z "$stage" ]; then
         echo "Usage: forge-bridge callback-consume --slug <s> --stage <s> [--status BLOCKED]" >&2
         return 1
     fi
-    # Only non-terminal statuses are consumable. Terminal callbacks (DONE/ERROR)
-    # are the stage's permanent record and are never archived here.
     case "$status" in
         BLOCKED|PARKED) ;;
-        *)
-            echo "ERROR: callback-consume only consumes non-terminal callbacks (--status BLOCKED|PARKED); got '$status'" >&2
-            return 1
-            ;;
+        *) echo "ERROR: callback-consume only consumes BLOCKED|PARKED; got '$status'" >&2; return 1 ;;
     esac
-
-    local project_root
-    project_root=$(_resolve_project_root "")
-    if [ -z "$project_root" ]; then
-        _emit_event ERROR "$slug" "stage=$stage reason=project-root-unresolvable"
-        echo "ERROR: callback-consume requires forge-project.yml in cwd ancestry" >&2
-        return 1
-    fi
-
+    require_identity "callback-consume" host-degrade || return 1
+    local project_root; project_root=$(_resolve_project_root "")
+    [ -n "$project_root" ] || { echo "ERROR: callback-consume requires forge-project.yml in cwd ancestry" >&2; return 1; }
     local cb_dir="$project_root/.dev/forge-tmp/callbacks"
-    local consume_session; consume_session="$(_resolve_session)"
-    local cb_file
-    cb_file="$(_resolve_callback_file "$cb_dir" "$slug" "$stage" "$consume_session" 2>/dev/null)" || cb_file=""
-    [ -z "$cb_file" ] && cb_file="$cb_dir/${slug}-${stage}.${consume_session}.callback"
-    # Un-suppressed decision-point WARN (the resolver is silent on the poll path):
-    # consuming a legacy unqualified file that no session owns.
-    case "$cb_file" in
-        "$cb_dir/${slug}-${stage}.callback")
-            [ -f "$cb_file" ] && echo "WARN: callback-consume: archiving unowned legacy callback $cb_file (no session identity)" >&2 ;;
-    esac
-
-    # Structured no-op: nothing to consume.
-    if [ ! -f "$cb_file" ]; then
-        _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=noop reason=no-canonical-callback status=$status"
-        echo "CALLBACK_CONSUME NOOP stage=$stage slug=$slug reason=no-canonical-callback (nothing to archive)"
-        return 0
+    local pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
+    local selection select_rc=0
+    if [ -n "$_closed_selection" ]; then
+        [ "$_no_lock" = 1 ] || { echo "ERROR: delegated closed selection requires --_no_lock" >&2; return 1; }
+        selection="$_closed_selection"
+    else
+        selection="$(_callback_mutation_select "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" "$status" "$pipeline_log")" || select_rc=$?
+        if [ "$select_rc" -eq 1 ]; then
+            _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=noop reason=no-canonical-callback status=$status"
+            echo "CALLBACK_CONSUME NOOP stage=$stage slug=$slug reason=no-canonical-callback (nothing to archive)"
+            return 0
+        fi
+        if [ "$select_rc" -eq 5 ]; then
+            _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=noop reason=status-mismatch status=$status"
+            echo "CALLBACK_CONSUME NOOP stage=$stage slug=$slug reason=status-mismatch (nothing to archive)"
+            return 0
+        fi
+        [ "$select_rc" -eq 0 ] || return 1
     fi
-
-    # Verify the on-disk status matches the requested non-terminal status. If the
-    # worker already advanced to a terminal callback (DONE/ERROR) at the same
-    # path, this is NOT ours to consume — leave it, no-op (R4-1: continuation
-    # fails / nothing fresh to consume).
-    local file_status file_cb_id
-    file_status=$(grep '^status:' "$cb_file" | awk '{print $2}')
-    if [ "$file_status" != "$status" ]; then
-        _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=noop reason=status-mismatch want=$status have=$file_status"
-        echo "CALLBACK_CONSUME NOOP stage=$stage slug=$slug reason=status-mismatch (canonical status=$file_status, not $status; left in place)"
-        return 0
-    fi
-
-    file_cb_id=$(grep '^callback_id:' "$cb_file" | awk '{print $2}')
-    if [ -z "$file_cb_id" ]; then
-        # Defensive: a callback written before callback_id existed. Synthesize a
-        # filename-safe unique id so the archive name is still unique.
-        file_cb_id="legacy-$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
-    fi
-
-    local archive_dir="$cb_dir/archive"
-    mkdir -p "$archive_dir"
-    local archive_file="$archive_dir/${slug}-${stage}.${file_cb_id}.callback"
-    if [ -e "$archive_file" ]; then
-        archive_file="$archive_dir/${slug}-${stage}.${file_cb_id}.$$-${RANDOM}.callback"
-    fi
-    # §3.3: serialize the archive mv against a concurrent transition. Callers that
-    # ALREADY hold the lifecycle lock (park-resolve, supersede) pass --_no_lock so a
-    # fresh subshell OFD does not self-conflict. Never nest _lifecycle_lock in one
-    # process — hold at most one fd 9 at a time.
+    local cb_file file_status file_cb_id selected_ts cb_session cb_incarnation cb_origin selected_hash
+    IFS='|' read -r cb_file file_status file_cb_id selected_ts cb_session cb_incarnation cb_origin selected_hash <<< "$selection"
+    [ "$file_status" = "$status" ] || { echo "CALLBACK_IDENTITY_CHANGED" >&2; return 1; }
     local _held=0
-    if [ "$_no_lock" != 1 ]; then _lifecycle_lock "$slug" "$stage" || return 1; _held=1; fi
+    if [ "$_no_lock" != 1 ]; then
+        _callback_prelock_barrier
+        _lifecycle_lock "$slug" "$stage" || return 1
+        _held=1
+        if ! _callback_selection_unchanged "$selection" "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" "$status" "$pipeline_log"; then
+            _lifecycle_unlock
+            echo "REFUSED: callback-consume revalidation failed; no bytes changed." >&2
+            return 1
+        fi
+    else
+        local current_hash
+        current_hash=$(shasum -a 256 "$cb_file" 2>/dev/null | awk '{print $1}')
+        if [ -z "$current_hash" ] || [ "$current_hash" != "$selected_hash" ]; then
+            echo "CALLBACK_IDENTITY_CHANGED" >&2
+            return 1
+        fi
+    fi
+    local archive_dir="$cb_dir/archive" archive_file
+    mkdir -p "$archive_dir"
+    archive_file="$archive_dir/${slug}-${stage}.${file_cb_id}.callback"
+    [ ! -e "$archive_file" ] || archive_file="$archive_dir/${slug}-${stage}.${file_cb_id}.$$-${RANDOM}.callback"
     if ! mv -f "$cb_file" "$archive_file"; then
         [ "$_held" = 1 ] && _lifecycle_unlock
         _emit_event ERROR "$slug" "stage=$stage reason=callback-archive-failed status=$status"
@@ -3121,13 +3273,13 @@ cmd_park() {
     if [ "$resolve" = true ]; then cmd_park_resolve "$slug" "$stage" "$note"; return $?; fi
     [ -n "$reason" ] || { echo "ERROR: park requires --reason" >&2; return 1; }
 
-    local cb_file; cb_file="$(_resolve_callback_file "$cb_dir" "$slug" "$stage" "$sess" 2>/dev/null)" || cb_file=""
-    local cb_status="" cb_id="" cb_origin=""
-    if [ -n "$cb_file" ] && [ -f "$cb_file" ]; then
-        cb_status=$(grep '^status:' "$cb_file" | awk '{print $2}')
-        cb_id=$(grep '^callback_id:' "$cb_file" | awk '{print $2}')
-        cb_origin=$(grep '^origin:' "$cb_file" | awk '{print $2}')
-    fi
+    require_identity "park" host-degrade || return 1
+    local selection select_rc=0
+    selection="$(_callback_mutation_select "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" BLOCKED,PARKED "$pipeline_log")" || select_rc=$?
+    if [ "$select_rc" -eq 1 ]; then echo "PARK NOOP slug=$slug stage=$stage reason=no-blocked-callback"; return 0; fi
+    [ "$select_rc" -eq 0 ] || return 1
+    local cb_file cb_status cb_id park_ts cb_session cb_incarnation cb_origin cb_hash
+    IFS='|' read -r cb_file cb_status cb_id park_ts cb_session cb_incarnation cb_origin cb_hash <<< "$selection"
 
     if [ "$(_callback_ask_origin "$project_root" "$slug" "$stage" "$cb_origin")" = "ask" ]; then
         echo "REFUSED: '$slug/$stage' is an operator ask — answer via 'forge dispatch @<session> --answers', not park." >&2
@@ -3137,29 +3289,13 @@ cmd_park() {
     if [ -z "$cb_file" ] || [ -z "$cb_status" ]; then echo "PARK NOOP slug=$slug stage=$stage reason=no-blocked-callback"; return 0; fi
     if [ "$cb_status" != "BLOCKED" ]; then echo "PARK NOOP slug=$slug stage=$stage reason=callback-status=$cb_status (not BLOCKED)"; return 0; fi
 
-    local park_ts
-    park_ts=$(FORGE_PK_STAGE="$stage" python3 - "$pipeline_log" <<'PY'
-import os, sys, yaml
-try: d = yaml.safe_load(open(sys.argv[1])) or {}
-except Exception: sys.exit(3)
-c=[e for e in (d.get('entries') or []) if isinstance(e,dict) and e.get('response') is None and e.get('stage')==os.environ["FORGE_PK_STAGE"]]
-if not c: sys.exit(2)
-c.sort(key=lambda e: e.get('timestamp') or '')
-print(c[-1].get('timestamp') or '')
-if len(c) > 1:
-    older=" ".join((e.get('timestamp') or '?') for e in c[:-1])
-    sys.stderr.write("WARN park D2: newest of %d open entries at this stage chosen; older duplicates: %s\n" % (len(c), older))
-PY
-)
-    local prc=$?
-    if [ "$prc" -eq 3 ]; then echo "ERROR: park: cannot parse $pipeline_log" >&2; return 1; fi
-    if [ "$prc" -eq 2 ] || [ -z "$park_ts" ]; then
-        echo "ERROR: park: callback BLOCKED but no open pending at $slug/$stage — cannot park." >&2; return 1
-    fi
-
+    _callback_prelock_barrier
     _lifecycle_lock "$slug" "$stage" || return 1
-    local rv; rv=$(_lifecycle_revalidate "$cb_file" BLOCKED "$cb_id" "$pipeline_log" "$park_ts")
-    if [ "$rv" != OK ]; then _lifecycle_unlock; echo "REFUSED: park revalidation failed ($rv) — no write performed." >&2; return 1; fi
+    if ! _callback_selection_unchanged "$selection" "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" BLOCKED "$pipeline_log"; then
+        _lifecycle_unlock
+        echo "REFUSED: park revalidation failed (CALLBACK_IDENTITY_CHANGED) — no write performed." >&2
+        return 1
+    fi
     local parked_at; parked_at=$(timestamp)
     local unc_bool; unc_bool=$([ "$uncommitted" = true ] && echo true || echo false)
     if ! _insert_parked_fields_by_ts "$slug" "$park_ts" "$parked_at" "$reason" "$unc_bool"; then
@@ -3230,29 +3366,39 @@ PY
 
 cmd_park_resolve() {   # <slug> <stage> <note>   (acquires the lifecycle lock)
     local slug="$1" stage="$2" note="$3"
+    require_identity "park-resolve" host-degrade || return 1
     local project_root; project_root=$(_resolve_project_root "")
     [ -n "$project_root" ] || { echo "ERROR: park --resolve requires forge-project.yml" >&2; return 1; }
     local cb_dir="$project_root/.dev/forge-tmp/callbacks"
-    local sess; sess="$(_resolve_session)"
-    local cb_file; cb_file="$(_resolve_callback_file "$cb_dir" "$slug" "$stage" "$sess" 2>/dev/null)" || cb_file=""
     local pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
-    local ts
-    ts=$(FORGE_PK_STAGE="$stage" python3 - "$pipeline_log" <<'PY'
-import os, sys, yaml
-try: d = yaml.safe_load(open(sys.argv[1])) or {}
-except Exception: sys.exit(2)
-c=[e for e in (d.get('entries') or []) if isinstance(e,dict) and e.get('response') is None and e.get('stage')==os.environ["FORGE_PK_STAGE"]]
-c.sort(key=lambda e: e.get('timestamp') or '')
-print(c[-1].get('timestamp') if c else '')
-PY
-)
-    [ -n "$ts" ] || { echo "ERROR: park --resolve: no open pending at $slug/$stage" >&2; return 1; }
+    local parked ts parked_worker
+    parked="$(_parked_pending_select "$pipeline_log" "$stage" "$ID_target_session" "$ID_target_incarnation")" || {
+        echo "ERROR: park --resolve: no single owned parked pending at $slug/$stage" >&2; return 1;
+    }
+    IFS=$'\t' read -r ts parked_worker <<< "$parked"
+    local selection="" select_rc=0
+    selection="$(_callback_mutation_select "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" PARKED "$pipeline_log")" || select_rc=$?
+    [ "$select_rc" -eq 0 ] || [ "$select_rc" -eq 1 ] || return "$select_rc"
+    _callback_prelock_barrier
     _lifecycle_lock "$slug" "$stage" || return 1
+    local live_i parked_now
+    live_i="$(session_incarnation_of "$ID_target_session")"
+    if { [ -n "$ID_target_incarnation" ] && [ "$live_i" != "$ID_target_incarnation" ]; } || \
+       { [ -z "$ID_target_incarnation" ] && [ -n "$live_i" ]; }; then
+        _lifecycle_unlock; echo "REFUSED: park --resolve actor identity changed" >&2; return 1
+    fi
+    parked_now="$(_parked_pending_select "$pipeline_log" "$stage" "$ID_target_session" "$ID_target_incarnation")" || parked_now=""
+    if [ "$parked_now" != "$parked" ]; then
+        _lifecycle_unlock; echo "REFUSED: park --resolve pending changed" >&2; return 1
+    fi
+    if [ -n "$selection" ] && ! _callback_selection_unchanged "$selection" "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" PARKED "$pipeline_log"; then
+        _lifecycle_unlock; echo "REFUSED: park --resolve callback changed" >&2; return 1
+    fi
     if ! _patch_response_by_ts "$slug" "$ts" "FORGE_PARK_RESOLVED: ${note:-resolved}"; then
         _lifecycle_unlock; echo "ERROR: park --resolve: failed to close pending" >&2; return 1
     fi
-    if [ -n "$cb_file" ] && [ -f "$cb_file" ]; then
-        ( cd "$project_root" && cmd_callback_consume --_no_lock --slug "$slug" --stage "$stage" --status PARKED >/dev/null 2>&1 ) || true
+    if [ -n "$selection" ] && ! (cd "$project_root" && cmd_callback_consume --_no_lock --_closed-selection "$selection" --slug "$slug" --stage "$stage" --status PARKED >/dev/null); then
+        _lifecycle_unlock; echo "ERROR: park --resolve: pending closed but selected callback archive failed" >&2; return 1
     fi
     _lifecycle_unlock
     _emit_event PARK "$slug" "stage=$stage action=resolved note=$(_sanitize_event_value "$note")"
@@ -4993,7 +5139,15 @@ case "${1:-help}" in
     status)          shift; cmd_status "$@" ;;
     dispatch)        shift; cmd_dispatch "$@" ;;
     callback)        shift; cmd_callback "$@" ;;
-    callback-consume) shift; cmd_callback_consume "$@" ;;
+    callback-consume) shift
+                      for _cca in "$@"; do
+                          case "$_cca" in
+                              --_no_lock|--_closed-selection)
+                                  echo "ERROR: private callback-consume delegation flags are not accepted by the public command" >&2
+                                  exit 2 ;;
+                          esac
+                      done
+                      cmd_callback_consume "$@" ;;
     park)            shift; cmd_park "$@" ;;
     blocked-audit)   shift; cmd_blocked_audit "$@" ;;
     infra-lock)      shift; cmd_infra_lock "$@" ;;
