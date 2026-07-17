@@ -839,20 +839,25 @@ if command -v tmux >/dev/null 2>&1; then
   RELSESS="fccrel-$$"
   mkdir -p "$R/.claude" "$R/.dev/proposals/p-rr" "$R/.dev/forge-tmp/callbacks"
   printf 'name: rr1\n' > "$R/.claude/forge-project.yml"
-  printf 'entries:\n  - timestamp: "2026-07-11T00:00:01Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$R/.dev/proposals/p-rr/forge-log.yml"
   tmux new-session -d -s "$RELSESS" -x 200 -y 50 -c "$R"
+  RELINC="$(tmux display-message -p -t "$RELSESS" '#{session_created}')"
+  printf 'entries:\n  - timestamp: "2026-07-11T00:00:01Z"\n    stage: coding\n    to: codex-a\n    session: %s\n    incarnation: %s\n    response: null\n' "$RELSESS" "$RELINC" > "$R/.dev/proposals/p-rr/forge-log.yml"
   _i=0; while [ "$_i" -lt 4 ]; do tmux split-window -d -t "$RELSESS:0" -c "$R"; tmux select-layout -t "$RELSESS:0" tiled >/dev/null 2>&1; _i=$((_i+1)); done
   env -u TMUX -u TMUX_PANE FORGE_WATCH_TRIGGER=0 TMUX_SESSION="$RELSESS" \
     "$FORGE" ask --slug p-rr --stage coding --worker codex-a "report-only relay?" --root "$R" >/dev/null 2>&1
-  RR_CB="$R/.dev/forge-tmp/callbacks/p-rr-coding.${RELSESS}.callback"
+  RR_CB="$R/.dev/forge-tmp/callbacks/p-rr-coding.${RELSESS}.${RELINC}.callback"
+  RR_OLD_CB="$R/.dev/forge-tmp/callbacks/p-rr-coding.${RELSESS}.callback"
   { [ -f "$RR_CB" ] \
-    && grep -q '^status: BLOCKED' "$RR_CB" \
-    && grep -q "^session: ${RELSESS}$" "$RR_CB" \
-    && grep -q '^origin: ask$' "$RR_CB" \
-    && grep -Eq '^callback_id: .+' "$RR_CB" \
-    && grep -q 'response: null' "$R/.dev/proposals/p-rr/forge-log.yml"; } \
-    && ok "out-of-tmux declared relay publishes qualified ask callback (BLOCKED keeps pending open)" \
-    || bad "real-bridge relay refused or callback not published"
+    && [ ! -e "$RR_OLD_CB" ] \
+    && grep -Fqx 'status: BLOCKED' "$RR_CB" \
+    && grep -Fqx "session: ${RELSESS}" "$RR_CB" \
+    && grep -Fqx "incarnation: ${RELINC}" "$RR_CB" \
+    && grep -Fqx 'origin: ask' "$RR_CB" \
+    && grep -Eq '^callback_id: .+$' "$RR_CB" \
+    && grep -Fqx 'selected_pending_timestamp: "2026-07-11T00:00:01Z"' "$RR_CB" \
+    && grep -Fqx '    response: null' "$R/.dev/proposals/p-rr/forge-log.yml"; } \
+    && ok "out-of-tmux declared relay publishes incarnation-qualified ask callback (BLOCKED keeps pending open; legacy path absent)" \
+    || bad "real-bridge relay refused or callback contract mismatch"
   tmux kill-session -t "$RELSESS" 2>/dev/null
 else
   echo "  (skip T-SEAT-RELAY-REPORTONLY: no tmux)"
