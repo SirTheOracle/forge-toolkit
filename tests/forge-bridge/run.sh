@@ -1035,6 +1035,171 @@ WC_ARCH="$rootA/.dev/forge-tmp/callbacks/archive/$WC_SLUG-$WC_STAGE.$wc_id.callb
 [ "$(rc_of p1wc-consume)" = 0 ] && [ "$wc_hash" = "$(shasum -a 256 "$WC_ARCH" | awk '{print $1}')" ] \
   && grep -q "^incarnation: $S2INC$" "$WC_ARCH" && ok "T-P1WC-CONSUME-BYTE-PRESERVE" || bad "T-P1WC-CONSUME-BYTE-PRESERVE"
 
+# ---- Per-callback usage observation (Codex parity V2) ----
+echo "== per-callback usage observation (Codex parity V2) =="
+UFILE="$rootA/.dev/forge-usage.$S2.yml"
+UINC="$(tmux display-message -p -t "$S2:0.0" '#{session_created}')"
+UFIX="$WORK/usage-fixtures"; mkdir -p "$UFIX"
+printf 'gpt-5.5 xhigh fast · Context 73%% left · ~/repo\n' > "$UFIX/codex-73.txt"
+printf '\033[36mgpt-5.5 medium fast · Context 64%% left · ~/repo\033[0m\n' > "$UFIX/codex-ansi.txt"
+printf 'gpt-5.5 xhigh fast · Context 88%% left · ~/old\ngpt-5.5 xhigh fast · Context 41%% left · ~/new\n' > "$UFIX/codex-last.txt"
+printf 'gpt-5.5 xhigh fast · ~/repo · main\n' > "$UFIX/codex-missing.txt"
+printf 'gpt-5.5 xhigh fast · Context 140%% left · ~/repo\n' > "$UFIX/codex-bad.txt"
+printf 'Claude Opus ctx: 42k (81%%)\n' > "$UFIX/claude-opus.txt"
+printf '\033[35mClaude Sonnet ctx: 7k (5%%)\033[0m\n' > "$UFIX/claude-sonnet.txt"
+: > "$UFIX/empty.txt"
+
+usage_callback(){
+  local slug="$1" worker="$2" fixture="$3" status="${4:-BLOCKED}"
+  pending_entry "$rootA" "$slug" coding "$worker" "2026-07-20T00:00:${5:-00}Z" "$S2" "$UINC"
+  run_in_pane "$S2:0.0" "$slug" "FORGE_USAGE_FIXTURE=$fixture FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug $slug --stage coding --status $status --worker $worker --message usage-test --quiet"
+}
+
+# A real terminal callback survives a forced snapshot write failure. The usage
+# path is a directory, so the observer's atomic replace fails inside its fail-open
+# boundary while callback publication, log closure, status rendering, and rc stay healthy.
+# Earlier callback tests may have created a snapshot through the existing observer;
+# reset only this hermetic test root immediately before forcing the failure.
+rm -f "$UFILE" "$UFILE.lock" "$UFILE.tmp"
+rm -f "$rootA/.dev/forge-status.$S2.md"
+mkdir "$UFILE"
+usage_callback usage-observer-failure codex-a "$UFIX/codex-73.txt" DONE 01
+uclose=$(python3 - "$rootA/.dev/proposals/usage-observer-failure/forge-log.yml" <<'PY'
+import sys,yaml
+entry=(yaml.safe_load(open(sys.argv[1])) or {})['entries'][0]
+print('closed' if entry.get('response') is not None else 'open')
+PY
+)
+if [ "$(rc_of usage-observer-failure)" = 0 ] \
+   && [ -f "$rootA/.dev/forge-tmp/callbacks/usage-observer-failure-coding.$S2.$UINC.callback" ] \
+   && [ "$uclose" = closed ] && [ -f "$rootA/.dev/forge-status.$S2.md" ] \
+   && grep -q 'CALLBACK: pipeline=usage-observer-failure ' "$rootA/.dev/forge-tmp/orchestrator-events.log" \
+   && grep -q 'USAGE: pipeline=usage-observer-failure ' "$rootA/.dev/forge-tmp/orchestrator-events.log"; then
+  ok "T-USAGE-OBSERVER-FAILURE callback contract remains successful"
+else
+  bad "T-USAGE-OBSERVER-FAILURE callback contract changed (rc=$(rc_of usage-observer-failure) close=$uclose)"
+fi
+rmdir "$UFILE"
+rm -f "$UFILE.tmp"
+
+usage_callback usage-codex-success codex-a "$UFIX/codex-73.txt" BLOCKED 02
+python3 - "$UFILE" <<'PY' \
+  && ok "T-USAGE-CODEX-SUCCESS snapshot fields" || bad "T-USAGE-CODEX-SUCCESS snapshot fields"
+import sys,yaml
+r=(yaml.safe_load(open(sys.argv[1])) or {})['workers']['codex-a']
+assert r['family']=='codex' and r['headroom']==73 and r['pct']==27
+assert r['tokens'] is None and r['source']=='pane-footer' and r['confidence']=='high'
+assert r['reason'] is None and r['raw'].endswith('Context 73% left · ~/repo')
+PY
+usage_event_count=$(grep -Ec 'USAGE: pipeline=usage-codex-success .*worker=codex-a family=codex pct=27 tokens=null headroom=73 source=pane-footer confidence=high' "$rootA/.dev/forge-tmp/orchestrator-events.log")
+[ "$usage_event_count" = 1 ] \
+  && ok "T-USAGE-CODEX-SUCCESS exactly one matching USAGE event" || bad "T-USAGE-CODEX-SUCCESS expected one matching USAGE event (got $usage_event_count)"
+run_in_pane "$S2:0.0" usage-codex-read "FORGE_WATCH_TRIGGER=0 $BRIDGE usage codex-a"
+out_of usage-codex-read | grep -q 'codex-a.*headroom=73.*confidence=high.*pct=27 tokens=None' \
+  && ok "T-USAGE-CODEX-SUCCESS public reader uses existing numeric branch" \
+  || bad "T-USAGE-CODEX-SUCCESS public reader did not show numeric record"
+
+usage_callback usage-codex-ansi codex-b "$UFIX/codex-ansi.txt" BLOCKED 03
+python3 - "$UFILE" <<'PY' \
+  && ok "T-USAGE-CODEX-ANSI normalized footer parses" || bad "T-USAGE-CODEX-ANSI normalized footer parses"
+import sys,yaml
+r=yaml.safe_load(open(sys.argv[1]))['workers']['codex-b']
+assert r['headroom']==64 and r['pct']==36 and r['confidence']=='high' and '\x1b' not in r['raw']
+PY
+
+usage_callback usage-codex-last codex-a "$UFIX/codex-last.txt" BLOCKED 04
+python3 - "$UFILE" <<'PY' \
+  && ok "T-USAGE-CODEX-LAST newest anchor wins" || bad "T-USAGE-CODEX-LAST newest anchor wins"
+import sys,yaml
+r=yaml.safe_load(open(sys.argv[1]))['workers']['codex-a']
+assert r['headroom']==41 and r['pct']==59 and r['raw'].endswith('~/new')
+PY
+
+usage_callback usage-codex-capture-failed codex-b "$UFIX/empty.txt" BLOCKED 10
+python3 - "$UFILE" <<'PY' \
+  && ok "T-USAGE-CODEX-CAPTURE-FAILED empty capture degrades honestly" || bad "T-USAGE-CODEX-CAPTURE-FAILED empty capture did not degrade"
+import sys,yaml
+r=yaml.safe_load(open(sys.argv[1]))['workers']['codex-b']
+assert r['headroom']=='unknown' and r['pct'] is None and r['tokens'] is None
+assert r['confidence']=='none' and r['source']=='pane-footer'
+assert r['reason']=='capture-failed' and r['raw'] is None
+PY
+
+usage_callback usage-codex-missing codex-b "$UFIX/codex-missing.txt" BLOCKED 05
+python3 - "$UFILE" <<'PY' \
+  && ok "T-USAGE-CODEX-MISSING degrades without callback failure" || bad "T-USAGE-CODEX-MISSING degrades without callback failure"
+import sys,yaml
+r=yaml.safe_load(open(sys.argv[1]))['workers']['codex-b']
+assert r['headroom']=='unknown' and r['pct'] is None and r['tokens'] is None
+assert r['confidence']=='none' and r['source']=='pane-footer'
+assert r['reason']=='codex-context-anchor-missing'
+PY
+[ "$(rc_of usage-codex-missing)" = 0 ] || bad "T-USAGE-CODEX-MISSING callback returned nonzero"
+
+usage_callback usage-codex-bad codex-a "$UFIX/codex-bad.txt" BLOCKED 06
+python3 - "$UFILE" <<'PY' \
+  && ok "T-USAGE-CODEX-BAD invalid percent cannot become routing headroom" || bad "T-USAGE-CODEX-BAD invalid percent cannot become routing headroom"
+import sys,yaml
+r=yaml.safe_load(open(sys.argv[1]))['workers']['codex-a']
+assert r['headroom']=='unknown' and r['pct'] is None and r['tokens'] is None
+assert r['confidence']=='none' and r['reason']=='bad-percent'
+assert r['raw'].endswith('Context 140% left · ~/repo')
+PY
+run_in_pane "$S2:0.0" usage-bad-read "FORGE_WATCH_TRIGGER=0 $BRIDGE usage codex-a"
+out_of usage-bad-read | grep -q 'headroom=unknown.*reason=bad-percent' \
+  && ok "T-USAGE-CODEX-BAD public read stays unknown" || bad "T-USAGE-CODEX-BAD public read stays unknown"
+
+usage_callback usage-claude-opus claude-opus "$UFIX/claude-opus.txt" BLOCKED 07
+usage_callback usage-claude-sonnet claude-sonnet "$UFIX/claude-sonnet.txt" BLOCKED 08
+python3 - "$UFILE" <<'PY' \
+  && ok "T-USAGE-CLAUDE-NONREG Opus and Sonnet semantics pinned" || bad "T-USAGE-CLAUDE-NONREG Opus and Sonnet semantics pinned"
+import sys,yaml
+w=yaml.safe_load(open(sys.argv[1]))['workers']
+o=w['claude-opus']; s=w['claude-sonnet']
+assert (o['pct'],o['tokens'],o['headroom'],o['source'],o['confidence'])==(81,'42k',19,'pane-footer','high')
+assert (s['pct'],s['tokens'],s['headroom'],s['source'],s['confidence'])==(5,'7k',95,'pane-footer','high')
+PY
+
+# A final Codex keyed upsert must preserve both Claude records and the other
+# Codex worker's degraded record in the same session snapshot.
+usage_callback usage-codex-merge codex-a "$UFIX/codex-73.txt" BLOCKED 09
+python3 - "$UFILE" <<'PY' \
+  && ok "T-USAGE-MULTI-WORKER keyed upsert preserves all workers" || bad "T-USAGE-MULTI-WORKER keyed upsert preserves all workers"
+import sys,yaml
+w=yaml.safe_load(open(sys.argv[1]))['workers']
+assert set(('codex-a','codex-b','claude-opus','claude-sonnet')).issubset(w)
+assert w['codex-a']['headroom']==73 and w['codex-b']['reason']=='codex-context-anchor-missing'
+assert w['claude-opus']['headroom']==19 and w['claude-sonnet']['headroom']==95
+PY
+
+observer_body=$(sed -n '/^_observe_usage()/,/^}/p' "$BRIDGE" | sed '/^[[:space:]]*#/d')
+if printf '%s\n' "$observer_body" | grep -Eq 'tmux[[:space:]]+send-keys|/clear|/new|/compact'; then
+  bad "T-USAGE-READ-ONLY observer contains worker-facing mutation"
+else
+  ok "T-USAGE-READ-ONLY observer contains no worker-facing mutation"
+fi
+
+ACTIVE_USAGE_DOCS="$ROOT/docs/forge-operator-guide.md $ROOT/docs/forge-technical-reference.md $ROOT/skills/forge-orchestrator/SKILL.md $ROOT/agents/forge-orchestrator.md"
+if grep -Eiq 'Codex is always unknown|Codex.*always.*unknown|codex-no-pane-usage|CLI exposes no usage in pane text|no pane-text usage signal' $ACTIVE_USAGE_DOCS; then
+  bad "T-USAGE-DOC-OBSOLETE active docs retain obsolete Codex contract"
+else
+  ok "T-USAGE-DOC-OBSOLETE obsolete Codex contract removed"
+fi
+sed -n '/^4\. \*\*Usage awareness\*\*/,/^5\. \*\*If no one is available\*\*/p' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/usage-skill.txt"
+sed -n '/^4\. \*\*Usage awareness\*\*/,/^5\. \*\*If no one is available\*\*/p' "$ROOT/agents/forge-orchestrator.md" > "$WORK/usage-agent.txt"
+if [ -s "$WORK/usage-skill.txt" ] && diff -q "$WORK/usage-skill.txt" "$WORK/usage-agent.txt" >/dev/null; then
+  ok "T-USAGE-DOC-LOCKSTEP skill and agent Usage Awareness agree"
+else
+  bad "T-USAGE-DOC-LOCKSTEP skill and agent Usage Awareness drifted"
+fi
+grep -F 'A valid Codex `Context N% left` footer now supplies that numeric signal' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/usage-route-skill.txt"
+grep -F 'A valid Codex `Context N% left` footer now supplies that numeric signal' "$ROOT/agents/forge-orchestrator.md" > "$WORK/usage-route-agent.txt"
+if [ -s "$WORK/usage-route-skill.txt" ] && diff -q "$WORK/usage-route-skill.txt" "$WORK/usage-route-agent.txt" >/dev/null; then
+  ok "T-USAGE-DOC-ROUTE-LOCKSTEP skill and agent implementation routes agree"
+else
+  bad "T-USAGE-DOC-ROUTE-LOCKSTEP skill and agent implementation routes drifted"
+fi
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

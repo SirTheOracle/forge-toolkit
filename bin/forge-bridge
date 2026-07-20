@@ -526,12 +526,10 @@ _emit_event() {
 # sends keystrokes and NEVER issues /clear, /new, or /compact: it only
 # `capture-pane`s (read-only) and writes an advisory snapshot + a USAGE event.
 #
-# Claude panes carry usage in the persistent footer `[Model] ctx: Nk (P%)` — the
-# same line stall-check's idle_prompt_anchor matches (shared `ctx: Nk (P%)` shape,
-# so a footer-format drift breaks both in lockstep). Codex panes expose NO usage
-# in pane text on the current gpt-5.5 build (the trailing `· …` segment is the
-# git branch, not usage) → recorded as honest unknown, no capture, no regex.
-# See .dev/proposals/per-task-usage-reporting/final-plan.md.
+# Claude panes carry usage in the persistent footer `[Model] ctx: Nk (P%)`.
+# Forge-launched Codex panes carry `Context N% left`. Both families use the same
+# bounded read-only capture and persistence path; an absent or malformed anchor
+# degrades to unknown. See .dev/proposals/codex-usage-parity-v2/final-plan.md.
 _observe_usage() {
     local worker="$1" slug="$2" stage="$3" worker_idx="$4" project_root="$5"
 
@@ -554,63 +552,8 @@ _observe_usage() {
     local measured_at; measured_at=$(timestamp)
     local fields=""
 
-    if [ "$family" = "codex" ]; then
-        # No usage in pane text — honest unknown. No capture, no regex.
-        fields="pct=null tokens=null headroom=unknown source=unsupported confidence=none reason=codex-no-pane-usage"
-        FORGE_U_FAMILY="$family" FORGE_U_WORKER="$worker" FORGE_U_STAGE="$stage" \
-        FORGE_U_AT="$measured_at" FORGE_U_RAWFILE="" \
-            python3 - "$usage_file" >/dev/null 2>&1 <<'PYEOF' || true
-import os, sys, re, yaml, fcntl
-usage_file = sys.argv[1]
-fam   = os.environ.get("FORGE_U_FAMILY", "")
-wk    = os.environ.get("FORGE_U_WORKER", "")
-stage = os.environ.get("FORGE_U_STAGE", "")
-at    = os.environ.get("FORGE_U_AT", "")
-rawf  = os.environ.get("FORGE_U_RAWFILE", "")
-
-record = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
-          "source": "unsupported", "confidence": "none",
-          "reason": "codex-no-pane-usage", "stage": stage, "measured_at": at}
-
-def upsert(path, worker, rec, updated):
-    d = os.path.dirname(path) or "."
-    os.makedirs(d, exist_ok=True)
-    lp = path + ".lock"
-    with open(lp, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            data = {}
-            if os.path.exists(path):
-                try:
-                    with open(path) as f:
-                        data = yaml.safe_load(f) or {}
-                except Exception:
-                    data = {}
-            if not isinstance(data, dict):
-                data = {}
-            workers = data.get("workers")
-            if not isinstance(workers, dict):
-                workers = {}
-            workers[worker] = rec
-            data["workers"] = workers
-            data["updated"] = updated
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
-            os.replace(tmp, path)
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
-
-try:
-    upsert(usage_file, wk, record, at)
-except Exception:
-    pass
-PYEOF
-        _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
-        return 0
-    fi
-
-    # Claude: capture the pane footer (read-only) and parse the ctx usage.
+    # Capture the pane footer for either family (read-only) and parse its
+    # provider-specific context anchor.
     # Test seam: FORGE_USAGE_FIXTURE points at a pre-captured pane file and
     # bypasses tmux entirely (used by T1 unit tests; never set in production).
     local raw_file="" fixture_mode=""
@@ -687,10 +630,11 @@ def upsert(path, worker, rec, updated):
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
 
-# Defaults → unknown; refined on a successful parse.
+# Defaults → unknown; refined on a successful family-specific parse.
 rec = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
        "raw": None, "source": "pane-footer", "confidence": "none",
-       "reason": "no-anchor", "stage": stage, "measured_at": at}
+       "reason": ("codex-context-anchor-missing" if fam == "codex" else "no-anchor"),
+       "stage": stage, "measured_at": at}
 try:
     raw = ""
     if rawf and os.path.exists(rawf):
@@ -699,23 +643,41 @@ try:
     if not raw.strip():
         rec["reason"] = "capture-failed"
     else:
-        # Strip ANSI/OSC, then find the LAST `ctx: Nk (P%)` footer line.
+        # Strip ANSI/OSC, then scan the last twelve non-empty lines newest-first.
         norm = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', raw)
         norm = re.sub(r'\x1b\][0-9;]*\x07', '', norm)
-        found = None
-        for line in reversed([l for l in norm.splitlines() if l.strip()][-12:]):
-            mm = re.search(r'ctx:\s*(\d+)(k?)\s*\((\d+)%\)', line)
-            if mm:
-                found = (mm, line.strip()); break
-        if found:
-            mm, line = found
-            pct = int(mm.group(3))
-            tokens = mm.group(1) + (mm.group(2) or "")
-            headroom = max(0, min(100, 100 - pct))
-            rec.update({"pct": pct, "tokens": tokens, "headroom": headroom,
-                        "raw": line, "source": "pane-footer",
-                        "confidence": ("high" if 0 <= pct <= 100 else "low"),
-                        "reason": None})
+        lines = [line for line in norm.splitlines() if line.strip()][-12:]
+        if fam == "claude":
+            found = None
+            for line in reversed(lines):
+                mm = re.search(r'ctx:\s*(\d+)(k?)\s*\((\d+)%\)', line)
+                if mm:
+                    found = (mm, line.strip()); break
+            if found:
+                mm, line = found
+                pct = int(mm.group(3))
+                tokens = mm.group(1) + (mm.group(2) or "")
+                headroom = max(0, min(100, 100 - pct))
+                rec.update({"pct": pct, "tokens": tokens, "headroom": headroom,
+                            "raw": line, "source": "pane-footer",
+                            "confidence": ("high" if 0 <= pct <= 100 else "low"),
+                            "reason": None})
+        elif fam == "codex":
+            found = None
+            for line in reversed(lines):
+                mm = re.search(r'\bContext\s+(\d{1,3})%\s+left\b', line)
+                if mm:
+                    found = (mm, line.strip()); break
+            if found:
+                mm, line = found
+                remaining = int(mm.group(1))
+                if 0 <= remaining <= 100:
+                    rec.update({"pct": 100 - remaining, "tokens": None,
+                                "headroom": remaining, "raw": line,
+                                "source": "pane-footer", "confidence": "high",
+                                "reason": None})
+                else:
+                    rec.update({"raw": line, "reason": "bad-percent"})
 except Exception:
     rec = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
            "raw": None, "source": "pane-footer", "confidence": "none",

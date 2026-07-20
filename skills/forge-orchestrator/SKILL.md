@@ -646,7 +646,7 @@ proposal → review → incorporate → implementation → impl-review → codin
 
 **implementation** — codex-a preferred, **claude-opus (pane 0) fallback**
 - Template: `~/.config/forge/prompts/implementation.txt` (skill: `adversarial-implementation`)
-- HIGH-tier stage (Hard Rule 22): the only valid workers are `codex-a` and `claude-opus`; the bridge rejects `codex-b`/`claude-sonnet` here. Fall back to **claude-opus** (never a throughput pane) only if codex-a's recorded usage shows high fill (`forge-bridge usage` → codex-a `headroom` known and ≤ 20) — Hard Rule 9, never silent fallback. Codex `headroom` is currently always `unknown` (no pane-text usage signal), so this stays a surfaced, human-confirmed decision, not an automatic one.
+- HIGH-tier stage (Hard Rule 22): the only valid workers are `codex-a` and `claude-opus`; the bridge rejects `codex-b`/`claude-sonnet` here. Fall back to **claude-opus** (never a throughput pane) only if codex-a's recorded usage shows high fill (`forge-bridge usage` → codex-a `headroom` known and ≤ 20) — Hard Rule 9, never silent fallback. A valid Codex `Context N% left` footer now supplies that numeric signal; an absent or malformed footer remains `unknown` and never triggers substitution.
 - Output: `.dev/proposals/{slug}/implementation.md`
 - Dispatch (preferred — codex-a):
   ```bash
@@ -891,15 +891,16 @@ Routing starts from **reasoning tier** (Hard Rule 22), then availability:
    - `verify` → NOT whoever did QA (check the log)
 4. **Usage awareness**: Usage is recorded per task. Read `~/bin/forge-bridge usage`
    for a per-worker snapshot (normalized `headroom` 0-100 = % capacity remaining,
-   plus `confidence`). Route normally to the stage's default worker. Only when a
-   worker's `headroom` is **known and ≤ 20** (≥80% used) AND the stage allows an
-   alternative, prefer the alternative — and surface that substitution (Hard Rule 9,
-   never silent). `headroom: unknown` / `confidence: none` (always the case for
-   **Codex**, whose CLI exposes no usage in pane text) means *no usage-based
-   substitution* — route the default worker as usual, do NOT warn on a normal route,
-   and never treat `unknown` as "fine" or "exhausted." Usage is **observed, never
-   reset** — a high reading is never license to `/clear` (Hard Rule 20 stays the
-   only clear path)
+   plus `confidence`). Claude parses `ctx: Nk (P%)`; Codex parses `Context N% left`
+   when rendered. A valid anchor for either provider publishes numeric headroom with
+   `confidence=high`. Route normally to the stage's default worker. Only when a worker's
+   `headroom` is **known and ≤ 20** (≥80% used) AND the stage allows an alternative,
+   prefer the alternative — and surface that substitution (Hard Rule 9, never silent).
+   `headroom: unknown` / `confidence: none` can occur for either provider when its
+   footer is absent or malformed and means *no usage-based substitution* — route the
+   default worker as usual, do NOT warn on a normal route, and never treat `unknown`
+   as "fine" or "exhausted." Usage is **observed, never reset** — a high reading is
+   never license to `/clear` or `/compact` (Hard Rule 20 stays the only clear path)
 5. **If no one is available**: Tell the user. Don't wait silently.
 
 ---

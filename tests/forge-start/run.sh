@@ -49,6 +49,20 @@ else
 fi
 [ "$prc" -eq 0 ] && ok "T-START-PLAIN-EXITS-ZERO: plain run exits 0" || bad "plain run exited $prc"
 grep 'send-keys' "$TMLOG" | grep -q 'FORGE_ROLE' && bad "plain launch strings carry FORGE_ROLE (byte drift)" || ok "plain launch strings unstamped"
+CODEX_STATUS_OVERRIDE="-c 'tui.status_line=[\"model-with-reasoning\",\"context-remaining\",\"current-dir\"]'"
+for _pane in 2 3; do
+  _launch_line=$(grep "send-keys -t forge-1:.$_pane " "$TMLOG")
+  _override_count=$(printf '%s\n' "$_launch_line" | grep -oF -- "$CODEX_STATUS_OVERRIDE" | wc -l | tr -d ' ')
+  [ "$_override_count" = 1 ] \
+    && ok "T-START-CODEX-STATUS-$_pane: override appears exactly once" \
+    || bad "T-START-CODEX-STATUS-$_pane: override count=$_override_count line=$_launch_line"
+  case "$_launch_line" in
+    *'"context-remaining","current-dir"'*)
+      ok "T-START-CODEX-ORDER-$_pane: context-remaining precedes current-dir" ;;
+    *)
+      bad "T-START-CODEX-ORDER-$_pane: routing field order drifted" ;;
+  esac
+done
 rm -rf "$D"
 
 echo "── T-START-POP-VALIDATE: populate refuses a non-1-pane session ──"
