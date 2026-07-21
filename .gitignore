@@ -6,6 +6,9 @@ docs/*
 .DS_Store
 *.swp
 *.swo
+# Local pre-edit safety backups (forge global-edit protocol) — never committed
+*.bak
+*.bak-*
 
 # Session scratch — pipeline artifacts belong under .dev/proposals/<slug>/ (already ignored)
 .tmpFiles/
