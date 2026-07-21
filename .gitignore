@@ -1,5 +1,8 @@
 .dev/
-docs/
+# docs/ is ignored by default (internal/generated), EXCEPT the hand-maintained operator guide.
+# forge-technical-reference.md and qa-skill-audit-2026-07/ stay internal (private-repo references).
+docs/*
+!docs/forge-operator-guide.md
 .DS_Store
 *.swp
 *.swo
