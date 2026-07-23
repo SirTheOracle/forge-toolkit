@@ -1,12 +1,15 @@
-# Provider reset-proof capability + anchor table (Step 0/1). `proven: false` forces
-# the family to RESET_UNAVAILABLE in enforce unless HYGIENE_DEGRADED is on.
+# Provider reset-proof capability + anchor table (Step 0/1). Anchors pinned from the LIVE
+# reset-proof spike of 2026-07-23 (Claude Code v2.1.218, codex-cli v0.144.6) — the fixture
+# pairs in this directory are sanitized real captures from that gate. `proven: false`
+# forces the family to RESET_UNAVAILABLE in enforce unless HYGIENE_DEGRADED is on
+# (codex stays false HERE so the unavailable/degraded test scenarios stay exercisable).
 version: 1
 families:
   claude:
     proven: true
-    new_conversation_anchor: '(?m)^.*Welcome to Claude Code.*$|^\s*/help for help'
+    new_conversation_anchor: '(?m)Claude Code v[0-9]+\.[0-9]|Welcome to Claude Code|^\s*/help for help'
     session_id_capture: ''          # claude exposes no stable in-pane session id
   codex:
-    proven: false                   # DEFAULT OFF until the Step 0 spike proves it
-    new_conversation_anchor: '(?m)^\s*OpenAI Codex.*$|^\s*To get started'
-    session_id_capture: ''
+    proven: false                   # kept false for the enforce-unavailable test family
+    new_conversation_anchor: '(?m)>_ OpenAI Codex|^\s*OpenAI Codex.*$|^\s*To get started'
+    session_id_capture: 'codex resume ([0-9a-f-]{8,})'

@@ -1326,9 +1326,9 @@ sed -n '/^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p' "$BRIDGE" |
   probe_pair "T-HYG-RESET-PAIR-PROVEN claude-sonnet" claude \
     "$HFIX/claude-sonnet-clear-before.txt" "$HFIX/claude-sonnet-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
   probe_pair "T-HYG-RESET-PAIR-PROVEN codex-a" codex \
-    "$HFIX/codex-a-clear-before.txt" "$HFIX/codex-a-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
+    "$HFIX/codex-a-clear-before.txt" "$HFIX/codex-a-clear-after.txt" '^PROVEN kind=session-id-change'
   probe_pair "T-HYG-RESET-PAIR-PROVEN codex-b" codex \
-    "$HFIX/codex-b-clear-before.txt" "$HFIX/codex-b-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
+    "$HFIX/codex-b-clear-before.txt" "$HFIX/codex-b-clear-after.txt" '^PROVEN kind=session-id-change'
   probe_pair "T-HYG-RESET-DEEP-BASELINE >120-line baseline" claude \
     "$HFIX/deep-conversation-before.txt" "$HFIX/claude-opus-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
   probe_pair "T-HYG-RESET-IDLE-FAIL ignored clear (idle==idle)" claude \
@@ -1953,19 +1953,19 @@ clear_count(){ grep -c -- '-l /clear' "$RSPY" 2>/dev/null | tr -d ' '; }
 export WINDOW=0 FORGE_CACHE_DIR="$RCACHE" FORGE_SEND_COMMIT_WAIT_S=0.01
 cat > "$WORK/hyg-idle-prompts.yml" <<'YML'
 claude-opus:
-  idle_prompt_anchor: '│ >'
+  idle_prompt_anchor: '❯'
   active_work_marker: 'ESC to interrupt'
   approval_prompt: 'Do you want'
 claude-sonnet:
-  idle_prompt_anchor: '│ >'
+  idle_prompt_anchor: '❯'
   active_work_marker: 'ESC to interrupt'
   approval_prompt: 'Do you want'
 codex-a:
-  idle_prompt_anchor: '▌ Send a message'
+  idle_prompt_anchor: '›'
   active_work_marker: 'Working…'
   approval_prompt: 'Approve'
 codex-b:
-  idle_prompt_anchor: '▌ Send a message'
+  idle_prompt_anchor: '›'
   active_work_marker: 'Working…'
   approval_prompt: 'Approve'
 YML
@@ -2476,7 +2476,7 @@ families:
     new_conversation_anchor: '(?m)^\s*OpenAI Codex.*$|^\s*To get started'
     session_id_capture: ''
 YML
-  printf '│ >\n▌ Send a message\n' > "$WORK/hyg-idle-all.txt"
+  printf '❯\n›\n' > "$WORK/hyg-idle-all.txt"
   cat > "$WORK/hyg-proof-all.txt" <<'EOF2'
 │ ✻ Welcome to Claude Code!
   OpenAI Codex (v0.9)

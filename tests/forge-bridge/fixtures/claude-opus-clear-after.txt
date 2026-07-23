@@ -1,11 +1,25 @@
-╭──────────────────────────────────────────────────────────────╮
-│ ✻ Welcome to Claude Code!                                    │
-│                                                              │
-│   /help for help, /status for your current setup             │
-│                                                              │
-│   cwd: /Users/op/project                                     │
-╰──────────────────────────────────────────────────────────────╯
 
-╭──────────────────────────────────────────────────────────────╮
-│ >                                                            │
-╰──────────────────────────────────────────────────────────────╯
+╭─── Claude Code v2.1.218 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                                                                                                        │
+│                  Welcome back Op!                  │ Run /init to create a CLAUDE.md file with instructions for Claude                                                                               │
+│                                                    │ ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                                                                                                      │
+│                      ▝▜█████▛▘                     │ Changed `/code-review` to run as a background subagent, so review work no longer fills your conversation and keeps stacked slash commands as i… │
+│                        ▘▘ ▝▝                       │ Added screen-reader announcements of deleted text for word and line deletions (`Option+Delete`, `Ctrl+W`, `Cmd+Backspace`, `Ctrl+U`, `Ctrl+K`)… │
+│      Fable 5 with high effort · Claude Max ·       │ Fixed Windows paths with `\u`-prefixed segments (like `C:\Users\unicorn`) being corrupted into CJK characters in tool inputs, which made those… │
+│      operator@example.com's Organization           │ /release-notes for more                                                                                                                         │
+│            /tmp/spike-project                  │                                                                                                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ /clear
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [Fable 5] ctx: 0k (0%)
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents

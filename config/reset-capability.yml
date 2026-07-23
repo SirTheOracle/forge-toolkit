@@ -1,15 +1,16 @@
 # Provider reset-proof capability + anchor table — RUNTIME SEED (worker-context-hygiene).
 # Installed to $HOME/.config/forge/reset-capability.yml only if absent (never clobbered).
-# FAIL-CLOSED: both families ship `proven: false`; no automatic /clear is admissible under
-# enforce until the operator completes the Step-0 spike + live gate for a family and flips
-# its `proven` to true here (see docs/forge-operator-guide.md, Worker Context Hygiene).
+# Anchors pinned from the live reset-proof spike of 2026-07-23 (Claude Code v2.1.218,
+# codex-cli v0.144.6). FAIL-CLOSED: both families ship `proven: false`; flip a family to
+# true only after re-running the live gate on YOUR install (CLI versions drift — the
+# 2026-07-23 spike caught exactly such drift). See docs/forge-operator-guide.md.
 version: 1
 families:
   claude:
     proven: false
-    new_conversation_anchor: '(?m)^.*Welcome to Claude Code.*$|^\s*/help for help'
-    session_id_capture: ''          # claude exposes no stable in-pane session id
+    new_conversation_anchor: '(?m)Claude Code v[0-9]+\.[0-9]|Welcome to Claude Code|^\s*/help for help'
+    session_id_capture: ''
   codex:
     proven: false
-    new_conversation_anchor: '(?m)^\s*OpenAI Codex.*$|^\s*To get started'
-    session_id_capture: ''
+    new_conversation_anchor: '(?m)>_ OpenAI Codex|^\s*OpenAI Codex.*$|^\s*To get started'
+    session_id_capture: 'codex resume ([0-9a-f-]{8,})'
