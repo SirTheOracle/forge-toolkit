@@ -1366,7 +1366,7 @@ except:
             impl-review)         next_stage="coding" ;;
             coding)              next_stage="qa" ;;
             qa|qa-fix|qa-retry)  next_stage="" ;;       # orchestrator decides
-            verify)              next_stage="complete" ;;
+            verify)              if [ "$FORGE_WORKER_HYGIENE_MODE" = enforce ]; then next_stage="awaiting-verify-decision"; else next_stage="complete"; fi ;;
             commit-review)       next_stage="" ;;       # side-channel, not a pipeline stage
             *)                   next_stage="unknown" ;;
         esac
@@ -1410,8 +1410,10 @@ EOF
         _emit_event STAGE "$slug" "result_stage=$stage status=$status next=${next_stage:-pending-orchestrator-decision} worker=$worker"
     fi
 
-    # Heartbeat: pipeline complete — strict terminal condition. Qualified when the
-    # session-scoped unresolved set (parked + non-ask blocked) is non-empty (§3.4).
+    # Heartbeat: pipeline complete. In ENFORCE, verify/DONE never emits bare COMPLETE
+    # (next_stage is awaiting-verify-decision above, so the guard is already false); it
+    # defers to verify-decision → finalize. In OBSERVE, legacy completion is preserved
+    # and a loud HYGIENE_BYPASSED is emitted (kill-switch fidelity, R2-2).
     if [ "$stage" = "verify" ] && [ "$status" = "done" ] && [ "$next_stage" = "complete" ]; then
         local _cpr; _cpr=$(_resolve_project_root "" 2>/dev/null)
         local _cq=""
@@ -1423,6 +1425,7 @@ EOF
             esac
         fi
         _emit_event COMPLETE "$slug" "last_stage=$stage worker=$worker$_cq"
+        [ "$FORGE_WORKER_HYGIENE_MODE" != enforce ] && _emit_event HYGIENE_BYPASSED "$slug" "reason=observe-mode last_stage=$stage worker=$worker"
     fi
 }
 
@@ -2315,6 +2318,60 @@ if len(pending)!=1:
     print('CALLBACK_IDENTITY_AMBIGUOUS: pending cardinality='+str(len(pending)),file=sys.stderr); sys.exit(2)
 selected=str(pending[0].get('timestamp') or '')
 if not selected: print('CALLBACK_IDENTITY_CHANGED: pending timestamp missing',file=sys.stderr); sys.exit(3)
+fields=[cbf,status,str(cb.get('callback_id') or ''),selected,cb_s,cb_i,str(cb.get('origin') or ''),hashlib.sha256(raw).hexdigest()]
+if not fields[2]: print('CALLBACK_HEADER_INVALID: callback_id missing',file=sys.stderr); sys.exit(3)
+print('|'.join(fields))
+PY
+}
+
+# Worker-context-hygiene (Step 8c): terminal-callback selector. Same identity contract as
+# _callback_mutation_select, but binds against the CLOSED pending a terminal DONE callback
+# already patched (a DONE callback closes its pending before publishing, so the open-pending
+# cardinality the mutation selector demands is 0 by design). Echoes the same tuple shape:
+# file|status|callback_id|selected_ts|session|incarnation|origin|sha256. Deterministic, so a
+# revalidation is a byte-compare of two invocations.
+_callback_terminal_select() {   # <cb_dir> <slug> <stage> <session> <incarnation> <statuses> <log>
+    local cb_dir="$1" slug="$2" stage="$3" session="$4" incarnation="$5" statuses="$6" plog="$7"
+    local cb_file scan_rc=0
+    cb_file="$(_scan_callback_candidates "$cb_dir" "$slug" "$stage" "$session" "$incarnation")" || scan_rc=$?
+    case "$scan_rc" in
+        0) ;;
+        1) return 1 ;;
+        2) echo "CALLBACK_IDENTITY_AMBIGUOUS" >&2; return 2 ;;
+        3) echo "CALLBACK_HEADER_INVALID" >&2; return 3 ;;
+        4) echo "CALLBACK_SCANNER_DEPENDENCY" >&2; return 4 ;;
+        *) echo "CALLBACK_IDENTITY_CHANGED" >&2; return 3 ;;
+    esac
+    python3 - "$cb_file" "$slug" "$stage" "$session" "$incarnation" "$statuses" "$plog" <<'PY'
+import hashlib,sys,yaml
+cbf,slug,stage,actor_s,actor_i,statuses,plog=sys.argv[1:8]
+try:
+    raw=open(cbf,'rb').read(); cb=yaml.safe_load(raw) or {}
+    entries=(yaml.safe_load(open(plog)) or {}).get('entries') or []
+except Exception as exc: print('CALLBACK_HEADER_INVALID:'+str(exc),file=sys.stderr); sys.exit(3)
+cb_s=str(cb.get('session') or ''); cb_i=str(cb.get('incarnation') or '')
+if str(cb.get('slug') or '')!=slug or str(cb.get('stage') or '')!=stage:
+    print('CALLBACK_IDENTITY_CHANGED',file=sys.stderr); sys.exit(3)
+if actor_i:
+    if cb_s!=actor_s or cb_i!=actor_i:
+        print('CALLBACK_IDENTITY_AMBIGUOUS',file=sys.stderr); sys.exit(2)
+else:
+    if cb_i or (cb_s and cb_s!=actor_s):
+        print('CALLBACK_IDENTITY_AMBIGUOUS',file=sys.stderr); sys.exit(2)
+status=str(cb.get('status') or ''); allowed=set(x for x in statuses.split(',') if x)
+if status not in allowed: print('CALLBACK_STATUS_INELIGIBLE:'+status,file=sys.stderr); sys.exit(5)
+aliases={'inline':'claude-opus','general':'claude-opus','claude-general':'claude-opus','opus':'claude-opus','codex':'codex-a','orchestrator':'claude','claude-orchestrator':'claude','sonnet':'claude-sonnet'}
+canonical=lambda value: aliases.get(value,value)
+cb_worker=canonical(str(cb.get('worker') or ''))
+selected=str(cb.get('selected_pending_timestamp') or '')
+if not selected:
+    print('CALLBACK_IDENTITY_CHANGED: missing selected_pending_timestamp',file=sys.stderr); sys.exit(3)
+bound=[e for e in entries if isinstance(e,dict) and e.get('stage')==stage
+       and canonical(str(e.get('to') or ''))==cb_worker
+       and str(e.get('session') or '')==cb_s and str(e.get('incarnation') or '')==cb_i
+       and str(e.get('timestamp') or '')==selected]
+if len(bound)!=1:
+    print('CALLBACK_IDENTITY_AMBIGUOUS: bound cardinality='+str(len(bound)),file=sys.stderr); sys.exit(2)
 fields=[cbf,status,str(cb.get('callback_id') or ''),selected,cb_s,cb_i,str(cb.get('origin') or ''),hashlib.sha256(raw).hexdigest()]
 if not fields[2]: print('CALLBACK_HEADER_INVALID: callback_id missing',file=sys.stderr); sys.exit(3)
 print('|'.join(fields))
@@ -4184,8 +4241,11 @@ with open('$cb_file') as f:
 print(d.get('message', '') or '')
 " 2>/dev/null)
 
-    printf 'STATUS: %s\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nCALLBACK: %s\n' \
-        "$status" "$stage" "$slug" "$worker_canonical" "$message"
+    local _cbid _selpt
+    _cbid=$(grep '^callback_id:' "$cb_file" | awk '{print $2}')
+    _selpt=$(grep '^selected_pending_timestamp:' "$cb_file" | sed 's/^selected_pending_timestamp:[[:space:]]*//; s/^"//; s/"$//')
+    printf 'STATUS: %s\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nCALLBACK: %s\nCALLBACK_ID: %s\nPENDING_TIMESTAMP: %s\n' \
+        "$status" "$stage" "$slug" "$worker_canonical" "$message" "$_cbid" "$_selpt"
 
     if [ -n "$digest_template" ] && [ "$status" = "DONE" ]; then
         local digest_tmpl="$FORGE_DIGESTS_DIR/$digest_template.txt"
@@ -4454,7 +4514,102 @@ cmd_park_resolve() {   # <slug> <stage> <note>   (acquires the lifecycle lock)
     _lifecycle_unlock
     _emit_event PARK "$slug" "stage=$stage action=resolved note=$(_sanitize_event_value "$note")"
     _render_status_file
+    # After releasing the lifecycle lock, consult the stored clean verify decision. NEVER
+    # acquire worker locks or call finalize inline (H1). P0-1: the terminal-cleanup transition
+    # is written under the terminal mutex (acquired AFTER the lifecycle lock is released, so no
+    # ordering inversion), and residue is re-read under it so a concurrent finalize/verify cannot
+    # interleave. Return after the handoff line so the legacy line does not also print.
+    if [ "$(_hygiene_mode 2>/dev/null)" = enforce ]; then
+        if _terminal_lock; then
+            local _pst; _pst="$(_terminal_state "$project_root")"
+            local _pcu; _pcu="$(_completion_unresolved "$project_root")"
+            if [ "$_pst" = verified-incomplete ] && [ "$_pcu" = "parked=0 blocked=0" ]; then
+                if _hygiene_write "$project_root" terminal "" "state=terminal-cleanup"; then
+                    _terminal_unlock; echo "PARK_RESOLVED FINALIZE_READY slug=$slug stage=$stage"; return 0
+                fi
+                _terminal_unlock; echo "PARK_RESOLVED FINALIZE_DEFERRED slug=$slug stage=$stage (terminal-cleanup write failed; retry finalize)" >&2; return 0
+            elif [ "$_pst" = verified-incomplete ]; then
+                _terminal_unlock; echo "PARK_RESOLVED FINALIZE_DEFERRED slug=$slug stage=$stage $_pcu"; return 0
+            fi
+            _terminal_unlock
+        fi
+    fi
     echo "PARK RESOLVED slug=$slug stage=$stage"
+}
+
+cmd_verify_decision() {
+    require_identity "verify-decision" host-session || return 1
+    # P0-9: enforce-only terminal command. In observe it must NOT persist the new terminal
+    # vocabulary; an invalid mode is a hard error, never a silent observe fall-through.
+    _hygiene_enforcing || { echo "ERROR: verify-decision is an enforce-mode command (mode=$FORGE_WORKER_HYGIENE_MODE); in observe, verify/DONE closes via legacy completion." >&2; return 1; }
+    local slug="" callback_id="" pending_ts=""
+    while [ $# -gt 0 ]; do case "$1" in
+        --slug) slug="$2"; shift 2 ;;
+        --callback-id) callback_id="$2"; shift 2 ;;
+        --pending-timestamp) pending_ts="$2"; shift 2 ;;
+        *) shift ;;
+    esac; done
+    [ -n "$slug" ] && [ -n "$callback_id" ] && [ -n "$pending_ts" ] || {
+        echo "Usage: forge-bridge verify-decision --slug <s> --callback-id <id> --pending-timestamp <ts>" >&2; return 1; }
+    local pr; pr="$(_resolve_project_root "")"; [ -n "$pr" ] || { echo "ERROR: no project root" >&2; return 1; }
+    # P0-1/P0-4: terminal mutex + single cleanup path. Serializes against finalize/abandon/park.
+    trap _hygiene_release_all RETURN
+    _terminal_lock || { echo "REFUSED: verify-decision busy — another terminal operation is running." >&2; return 1; }
+    # P1-7: refuse if the slug has already reached a finished/abandoned terminal state (a
+    # verify-decision cannot re-decide a published or abandoned slug).
+    case "$(_terminal_state "$pr")" in
+        complete|complete-qualified|cleanup-abandoned)
+            echo "REFUSED: slug is already terminal ($(_terminal_state "$pr")) — verify-decision is not valid." >&2; return 1 ;;
+    esac
+    local report="$pr/.dev/qa/$slug/verification-report.yaml"
+    local cb_dir="$pr/.dev/forge-tmp/callbacks" plog="$pr/.dev/proposals/$slug/forge-log.yml"
+    local sel rc=0
+    sel="$(_callback_terminal_select "$cb_dir" "$slug" verify "$ID_target_session" "$ID_target_incarnation" DONE "$plog")" || rc=$?
+    [ "$rc" -eq 0 ] || { echo "REFUSED: no owned verify/DONE callback (rc=$rc)" >&2; return 1; }
+    local _cbf _st _cbid _selpt _cbs _cbi _org _hash
+    IFS='|' read -r _cbf _st _cbid _selpt _cbs _cbi _org _hash <<< "$sel"
+    [ "$_cbid" = "$callback_id" ] && [ "$_selpt" = "$pending_ts" ] || { echo "REFUSED: callback id / pending timestamp mismatch" >&2; return 1; }
+    # P1-7: the worker identity for the journal is the callback's `worker:` header, NOT the
+    # selection's status field (`_st` is DONE|ERROR|... — a schema bug in R2).
+    local _cbwk; _cbwk="$(grep '^worker:' "$_cbf" | awk '{print $2}')"
+    _lifecycle_lock "$slug" verify || return 1
+    # Deterministic selector → revalidation is an exact re-select + tuple compare.
+    [ "$(_callback_terminal_select "$cb_dir" "$slug" verify "$ID_target_session" "$ID_target_incarnation" DONE "$plog" 2>/dev/null)" = "$sel" ] || {
+        _lifecycle_unlock; echo "REFUSED: callback identity changed" >&2; return 1; }
+    [ -f "$report" ] || { _lifecycle_unlock; echo "REFUSED: verification-report.yaml missing" >&2; return 1; }
+    local _verdict _rhash
+    _verdict="$(python3 - "$report" <<'PY'
+import sys,yaml
+try: d=yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: print("MALFORMED"); sys.exit(0)
+v=str(d.get("verdict") or d.get("result") or "MALFORMED").upper()
+print(v if v in ("CLEAR","ISSUES_REMAIN") else "MALFORMED")
+PY
+)"
+    _rhash="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
+    case "$_verdict" in CLEAR) ;; *) _lifecycle_unlock; echo "REFUSED: verdict='$_verdict' (not CLEAR) — no cleanup." >&2; return 1 ;; esac
+    local _rhash2; _rhash2="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
+    [ "$_rhash" = "$_rhash2" ] || { _lifecycle_unlock; echo "REFUSED: report changed during decision" >&2; return 1; }
+    # P0-3/P1-7: the decision + terminal transition are HARD — a silent journal failure must
+    # not leave the caller believing the decision was recorded. Written under the verify
+    # lifecycle lock (serializes against callback publication / park-resolve on this stage).
+    _hygiene_write "$pr" terminal "" "slug=$slug verify_callback_id=$callback_id verify_pending_ts=$pending_ts report_sha256=$_rhash verdict=CLEAR worker=$_cbwk decided_at=$(timestamp)" \
+        || { _lifecycle_unlock; echo "ERROR: verify-decision: could not persist the CLEAR decision (journal write failed) — no transition." >&2; return 1; }
+    local _cu; _cu="$(_completion_unresolved "$pr")"
+    case "$_cu" in
+        "parked=0 blocked=0")
+            _hygiene_write "$pr" terminal "" "state=terminal-cleanup" \
+                || { _lifecycle_unlock; echo "ERROR: verify-decision: terminal-cleanup write failed — retry." >&2; return 1; }
+            _lifecycle_unlock
+            _emit_event STAGE "$slug" "result_stage=verify status=decided next=terminal-cleanup"
+            echo "FINALIZE_READY slug=$slug state=terminal-cleanup" ;;
+        *)
+            _hygiene_write "$pr" terminal "" "state=verified-incomplete" \
+                || { _lifecycle_unlock; echo "ERROR: verify-decision: verified-incomplete write failed — retry." >&2; return 1; }
+            _lifecycle_unlock
+            _emit_event COMPLETE "$slug" "last_stage=verify qualifier=incomplete $_cu"
+            echo "VERIFIED_INCOMPLETE slug=$slug $_cu" ;;
+    esac
 }
 
 cmd_blocked_audit() {
@@ -6210,6 +6365,7 @@ case "${1:-help}" in
     alias-self-test)     shift; cmd_alias_self_test "$@" ;;
     identity)            cmd_identity ;;
     health)              cmd_health ;;
+    verify-decision)     shift; cmd_verify_decision "$@" ;;
     hygiene-status)      shift; cmd_hygiene_status "$@" ;;
     hygiene-gc)          shift; cmd_hygiene_gc "$@" ;;
     help|*)

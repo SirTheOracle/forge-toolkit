@@ -19,7 +19,7 @@ bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 export FORGE_WATCH_TRIGGER=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fbid.XXXXXX")"; WORK="$(cd "$WORK" && pwd -P)"
 S1="fbid1-$$"; S2="fbid2-$$"; S3="fbid3-$$"; S4="fbid4-$$"; GS="fbguard-$$"
-trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; tmux kill-session -t "${HS:-none}" 2>/dev/null; tmux kill-session -t "${DS:-none}" 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; tmux kill-session -t "${HS:-none}" 2>/dev/null; tmux kill-session -t "${DS:-none}" 2>/dev/null; tmux kill-session -t "${VS:-none}" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # ---- Pure-helper extraction (no main dispatch) ----
 FNS="$WORK/fns.sh"
@@ -2326,6 +2326,134 @@ if command -v tmux >/dev/null 2>&1; then
   tmux kill-session -t "$DS" 2>/dev/null
 else
   echo "  (skip HYG §Dispatch: tmux unavailable)"
+fi
+
+echo "── HYG §V: verify-decision + terminal vocabulary (real tmux) ──"
+if command -v tmux >/dev/null 2>&1; then
+  VS="fbhygv-$$"
+  VC="$(mkR hygv)"
+  tmux new-session -d -s "$VS" -x 220 -y 50 -c "$VC"
+  i=0; while [ "$i" -lt 4 ]; do tmux split-window -d -t "$VS:0" -c "$VC"; tmux select-layout -t "$VS:0" tiled >/dev/null 2>&1; i=$((i+1)); done
+  VINC="$(tmux display-message -p -t "$VS:0.0" '#{session_created}')"
+  sleep 1
+  vclean(){ rm -rf "$VC/.dev"; mkdir -p "$VC/.dev/proposals" "$VC/.dev/forge-tmp/callbacks"; }
+  vterm(){ ID_target_session="$VS" ID_target_incarnation="$VINC" _terminal_state "$VC"; }
+  vwrite(){ ID_target_session="$VS" ID_target_incarnation="$VINC" _hygiene_write "$VC" "$@"; }
+  VCTX="$VC/.dev/forge-context.$VS.yml"
+  VEV="$VC/.dev/forge-tmp/orchestrator-events.log"
+  VENF="FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=enforce"
+  VOBS="FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe"
+  # V2 — OBSERVE: verify/DONE keeps legacy completion + loud HYGIENE_BYPASSED.
+  run_in_pane "$VS:0.1" hygv2-log "( cd $VC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug v2 --stage verify --from claude --to codex-a --prompt p )"
+  run_in_pane "$VS:0.2" hygv2-cb "( cd $VC && $VOBS $BRIDGE callback --slug v2 --stage verify --status DONE --worker codex-a --message ok --quiet )"
+  if [ "$(rc_of hygv2-cb)" = 0 ] && grep -q 'next_stage: complete' "$VCTX" \
+     && grep -q '^COMPLETE: pipeline=v2' "$VEV" && grep -q '^HYGIENE_BYPASSED: pipeline=v2' "$VEV"; then
+    ok "T-HYG-V observe verify/DONE → legacy complete + COMPLETE + HYGIENE_BYPASSED"
+  else
+    bad "T-HYG-V observe legacy: rc=$(rc_of hygv2-cb) ctx=$(grep next_stage "$VCTX" 2>/dev/null)"
+  fi
+  # V1+V4 — ENFORCE: verify/DONE → awaiting-verify-decision, NO bare COMPLETE; then exact CLEAR.
+  vclean
+  run_in_pane "$VS:0.1" hygv1-log "( cd $VC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug v1 --stage verify --from claude --to codex-a --prompt p )"
+  tmux send-keys -t "$VS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$VS:0.2" hygv1-cb "( cd $VC && $VENF $BRIDGE callback --slug v1 --stage verify --status DONE --worker codex-a --message ok --quiet )"
+  if [ "$(rc_of hygv1-cb)" = 0 ] && grep -q 'next_stage: awaiting-verify-decision' "$VCTX" \
+     && ! grep -q '^COMPLETE: ' "$VEV"; then
+    ok "T-HYG-V enforce verify/DONE → awaiting-verify-decision, no bare COMPLETE"
+  else
+    bad "T-HYG-V vd-await: rc=$(rc_of hygv1-cb) ctx=$(grep next_stage "$VCTX" 2>/dev/null)"
+  fi
+  VCB="$VC/.dev/forge-tmp/callbacks/v1-verify.$VS.$VINC.callback"
+  vcbid="$(grep '^callback_id:' "$VCB" | awk '{print $2}')"
+  vpt="$(grep '^selected_pending_timestamp:' "$VCB" | sed 's/^selected_pending_timestamp:[[:space:]]*//; s/^\"//; s/\"$//')"
+  [ -n "$vcbid" ] && [ -n "$vpt" ] || bad "T-HYG-V callback id/ts extraction failed ($VCB)"
+  mkdir -p "$VC/.dev/qa/v1"
+  printf 'verdict: CLEAR\nsummary: all good\n' > "$VC/.dev/qa/v1/verification-report.yaml"
+  # Wrong id / wrong ts refused first.
+  run_in_pane "$VS:0.1" hygv4-bad "( cd $VC && $VENF $BRIDGE verify-decision --slug v1 --callback-id WRONG --pending-timestamp $vpt )"
+  [ "$(rc_of hygv4-bad)" != 0 ] && out_of hygv4-bad | grep -q 'mismatch' \
+    && ok "T-HYG-V verify-decision refuses a mismatched callback id" \
+    || bad "T-HYG-V vd mismatch: rc=$(rc_of hygv4-bad)"
+  run_in_pane "$VS:0.1" hygv4 "( cd $VC && $VENF $BRIDGE verify-decision --slug v1 --callback-id $vcbid --pending-timestamp \"$vpt\" )"
+  if [ "$(rc_of hygv4)" = 0 ] && out_of hygv4 | grep -q '^FINALIZE_READY slug=v1' \
+     && [ "$(vterm)" = terminal-cleanup ]; then
+    ok "T-HYG-V exact CLEAR + zero residue → terminal-cleanup + FINALIZE_READY"
+  else
+    bad "T-HYG-V vd-clear: rc=$(rc_of hygv4) state=$(vterm) $(out_of hygv4 | tail -1)"
+  fi
+  # V3 — wait output carries CALLBACK_ID + PENDING_TIMESTAMP.
+  vclean
+  run_in_pane "$VS:0.1" hygv3-log "( cd $VC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug v3 --stage adhoc --from claude --to codex-a --prompt p )"
+  tmux send-keys -t "$VS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$VS:0.2" hygv3-cb "( cd $VC && $VOBS $BRIDGE callback --slug v3 --stage adhoc --status DONE --worker codex-a --message ok --quiet )"
+  run_in_pane "$VS:0.1" hygv3-wait "( cd $VC && FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug v3 --stage adhoc --worker codex-a --timeout 10 )"
+  out_of hygv3-wait | grep -q '^CALLBACK_ID: ..*' && out_of hygv3-wait | grep -q '^PENDING_TIMESTAMP: ..*' \
+    && ok "T-HYG-V wait prints CALLBACK_ID + PENDING_TIMESTAMP" \
+    || bad "T-HYG-V vd-wait-output: $(out_of hygv3-wait | grep -E 'CALLBACK_ID|PENDING_TIMESTAMP')"
+  # V6 — refusals: observe-mode hard error; ISSUES_REMAIN; missing report; already-terminal.
+  vclean
+  run_in_pane "$VS:0.1" hygv6-log "( cd $VC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug v6 --stage verify --from claude --to codex-a --prompt p )"
+  tmux send-keys -t "$VS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$VS:0.2" hygv6-cb "( cd $VC && $VENF $BRIDGE callback --slug v6 --stage verify --status DONE --worker codex-a --message ok --quiet )"
+  VCB6="$VC/.dev/forge-tmp/callbacks/v6-verify.$VS.$VINC.callback"
+  vcbid6="$(grep '^callback_id:' "$VCB6" | awk '{print $2}')"
+  vpt6="$(grep '^selected_pending_timestamp:' "$VCB6" | sed 's/^selected_pending_timestamp:[[:space:]]*//; s/^\"//; s/\"$//')"
+  run_in_pane "$VS:0.1" hygv6-obs "( cd $VC && $VOBS $BRIDGE verify-decision --slug v6 --callback-id $vcbid6 --pending-timestamp \"$vpt6\" )"
+  [ "$(rc_of hygv6-obs)" != 0 ] && out_of hygv6-obs | grep -q 'enforce-mode command' \
+    && ok "T-HYG-V verify-decision hard-refuses in observe" \
+    || bad "T-HYG-V observe refusal: rc=$(rc_of hygv6-obs)"
+  run_in_pane "$VS:0.1" hygv6-noreport "( cd $VC && $VENF $BRIDGE verify-decision --slug v6 --callback-id $vcbid6 --pending-timestamp \"$vpt6\" )"
+  [ "$(rc_of hygv6-noreport)" != 0 ] && out_of hygv6-noreport | grep -q 'verification-report.yaml missing' \
+    && ok "T-HYG-V missing report refused" || bad "T-HYG-V missing report: rc=$(rc_of hygv6-noreport)"
+  mkdir -p "$VC/.dev/qa/v6"
+  printf 'verdict: ISSUES_REMAIN\n' > "$VC/.dev/qa/v6/verification-report.yaml"
+  run_in_pane "$VS:0.1" hygv6-issues "( cd $VC && $VENF $BRIDGE verify-decision --slug v6 --callback-id $vcbid6 --pending-timestamp \"$vpt6\" )"
+  [ "$(rc_of hygv6-issues)" != 0 ] && out_of hygv6-issues | grep -q "verdict='ISSUES_REMAIN'" \
+    && [ "$(vterm)" != terminal-cleanup ] \
+    && ok "T-HYG-V ISSUES_REMAIN verdict → no cleanup transition" \
+    || bad "T-HYG-V issues-remain: rc=$(rc_of hygv6-issues) state=$(vterm)"
+  printf 'verdict: garbage\n' > "$VC/.dev/qa/v6/verification-report.yaml"
+  run_in_pane "$VS:0.1" hygv6-mal "( cd $VC && $VENF $BRIDGE verify-decision --slug v6 --callback-id $vcbid6 --pending-timestamp \"$vpt6\" )"
+  [ "$(rc_of hygv6-mal)" != 0 ] && out_of hygv6-mal | grep -q "verdict='MALFORMED'" \
+    && ok "T-HYG-V malformed verdict refused" || bad "T-HYG-V malformed verdict: rc=$(rc_of hygv6-mal)"
+  vwrite terminal "" "state=complete" >/dev/null
+  run_in_pane "$VS:0.1" hygv6-term "( cd $VC && $VENF $BRIDGE verify-decision --slug v6 --callback-id $vcbid6 --pending-timestamp \"$vpt6\" )"
+  [ "$(rc_of hygv6-term)" != 0 ] && out_of hygv6-term | grep -q 'already terminal' \
+    && ok "T-HYG-V re-deciding a published slug refused" || bad "T-HYG-V already-terminal: rc=$(rc_of hygv6-term)"
+  # V5 — CLEAR + parked residue → verified-incomplete; park-resolve hands off to FINALIZE_READY.
+  vclean
+  run_in_pane "$VS:0.1" hygv5-plog "( cd $VC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug vp --stage coding --from claude --to codex-b --prompt p )"
+  tmux send-keys -t "$VS:0.3" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$VS:0.3" hygv5-pblk "( cd $VC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug vp --stage coding --status BLOCKED --worker codex-b --message hold --quiet )"
+  run_in_pane "$VS:0.1" hygv5-park "( cd $VC && FORGE_WATCH_TRIGGER=0 $BRIDGE park --slug vp --stage coding --reason hold )" || true
+  grep -q 'parked_at:' "$VC/.dev/proposals/vp/forge-log.yml" || bad "T-HYG-V park setup failed"
+  run_in_pane "$VS:0.1" hygv5-log "( cd $VC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug v5 --stage verify --from claude --to codex-a --prompt p )"
+  tmux send-keys -t "$VS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$VS:0.2" hygv5-cb "( cd $VC && $VENF $BRIDGE callback --slug v5 --stage verify --status DONE --worker codex-a --message ok --quiet )"
+  VCB5="$VC/.dev/forge-tmp/callbacks/v5-verify.$VS.$VINC.callback"
+  vcbid5="$(grep '^callback_id:' "$VCB5" | awk '{print $2}')"
+  vpt5="$(grep '^selected_pending_timestamp:' "$VCB5" | sed 's/^selected_pending_timestamp:[[:space:]]*//; s/^\"//; s/\"$//')"
+  mkdir -p "$VC/.dev/qa/v5"
+  printf 'verdict: CLEAR\n' > "$VC/.dev/qa/v5/verification-report.yaml"
+  run_in_pane "$VS:0.1" hygv5-vd "( cd $VC && $VENF $BRIDGE verify-decision --slug v5 --callback-id $vcbid5 --pending-timestamp \"$vpt5\" )"
+  if [ "$(rc_of hygv5-vd)" = 0 ] && out_of hygv5-vd | grep -q '^VERIFIED_INCOMPLETE slug=v5' \
+     && [ "$(vterm)" = verified-incomplete ] \
+     && grep -q '^COMPLETE: pipeline=v5 .*qualifier=incomplete' "$VEV"; then
+    ok "T-HYG-V CLEAR + parked residue → verified-incomplete + one qualified-incomplete"
+  else
+    bad "T-HYG-V vd-incomplete: rc=$(rc_of hygv5-vd) state=$(vterm)"
+  fi
+  run_in_pane "$VS:0.1" hygv5-res "( cd $VC && $VENF $BRIDGE park --resolve --slug vp --stage coding --note done )"
+  if [ "$(rc_of hygv5-res)" = 0 ] && out_of hygv5-res | grep -q '^PARK_RESOLVED FINALIZE_READY slug=vp' \
+     && ! out_of hygv5-res | grep -q '^PARK RESOLVED ' \
+     && [ "$(vterm)" = terminal-cleanup ]; then
+    ok "T-HYG-V last park-resolve hands off: PARK_RESOLVED FINALIZE_READY (single line)"
+  else
+    bad "T-HYG-V park-resolve-handoff: rc=$(rc_of hygv5-res) state=$(vterm) $(out_of hygv5-res | tail -1)"
+  fi
+  tmux kill-session -t "$VS" 2>/dev/null
+else
+  echo "  (skip HYG §V: tmux unavailable)"
 fi
 
 echo

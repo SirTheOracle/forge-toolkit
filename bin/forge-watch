@@ -1021,12 +1021,44 @@ def _handle_event_line(root, label, line):
         add_finding('WORKER-STALL-EVENT', root, f"{slug}\t{stage}\t{st}", msg,
                     slug=slug, stage=stage)
     elif typ == 'COMPLETE' and NOTIFY_COMPLETE:
-        if fields.get('qualifier') == 'incomplete':
+        q = fields.get('qualifier')
+        if q == 'incomplete':
             pk = fields.get('parked', '0'); bl = fields.get('blocked', '0')
             msg = f"{label} · {slug} — complete — {pk} parked, {bl} blocked (incomplete)"
+        elif q == 'hygiene-disabled':
+            wd = fields.get('workers_dirty', '?')
+            add_finding('PIPELINE-COMPLETE-QUALIFIED', root, slug,
+                        f"{label} · {slug} — shipped, workers left dirty ({wd}) — hygiene-disabled",
+                        policy='once', slug=slug)
+            return
         else:
             msg = f"{label} · {slug} — pipeline COMPLETE"
         add_finding('PIPELINE-COMPLETE', root, slug, msg, policy='once', slug=slug)
+    elif typ == 'RESET_UNAVAILABLE':
+        add_finding('RESET-UNAVAILABLE', root, slug,
+                    f"{label} · {slug} — reset unavailable ({fields.get('family', '?')}) — actionable",
+                    policy='digest', slug=slug)
+    elif typ == 'HYGIENE_ABANDON':
+        add_finding('CLEANUP-ABANDONED', root, slug,
+                    f"{label} · {slug} — cleanup abandoned ({fields.get('reason', '?')}) — workers unproven, NOT complete",
+                    policy='once', slug=slug)
+
+def _has_hygiene_terminal_vocab(root, slug):
+    """Worker-context-hygiene: has this slug ever produced enforce-mode hygiene
+    evidence at this root? Minimal wiring per plan Step 11: any HYGIENE_DECISION
+    or RESET event for the slug in the orchestrator events log. A pure legacy /
+    observe pipeline has neither and stays on the back-compat green path."""
+    ev = os.path.join(root, '.dev', 'forge-tmp', 'orchestrator-events.log')
+    try:
+        with open(ev) as f:
+            for ln in f:
+                if ln.startswith(('HYGIENE_DECISION:', 'RESET:')) and \
+                        (f'pipeline={slug} ' in ln or ln.rstrip().endswith(f'pipeline={slug}')):
+                    return True
+    except Exception:
+        return False
+    return False
+
 
 def _eval_context(root, label, cp, embedded, is_live,
                   has_open_pending, open_by_slug, live_blocked, has_live_pending):
@@ -1046,6 +1078,30 @@ def _eval_context(root, label, cp, embedded, is_live,
         # no COMPLETE event seen. Same slug key as the event source, so the two
         # dedup; the context source persists the condition so the event-consumed
         # finding does not re-fire on the next scan.
+        # Worker-context-hygiene: these are NOT completion and NOT zombies.
+        if nxt in ('awaiting-verify-decision', 'verified-incomplete', 'terminal-cleanup'):
+            add_finding('HYGIENE-CLEANUP', root, slug,
+                        f"{label} · {slug} — {nxt} — awaiting verify-decision/finalize",
+                        policy='digest', slug=slug)
+            return
+        if nxt == 'cleanup-abandoned':
+            return  # surfaced via HYGIENE_ABANDON; not a zombie, not complete
+        cid = ctx.get('completion_id')
+        if nxt == 'complete-qualified':
+            # P0-5: qualified (hygiene-disabled) completion is shipped-but-unclean, NEVER green.
+            add_finding('PIPELINE-COMPLETE-QUALIFIED', root, slug,
+                        f"{label} · {slug} — shipped, workers left dirty — hygiene-disabled",
+                        policy='once', slug=slug)
+            return
+        # P0-5: an enforce completion is green ONLY with a published completion_id in context.
+        # A context that reads `complete` with NO completion_id AND no hygiene terminal vocab is a
+        # legacy/observe completion (kept green for back-compat); a `complete` that DROPPED its id
+        # is a torn/partial write and must NOT go green.
+        if nxt == 'complete' and not cid and _has_hygiene_terminal_vocab(root, slug):
+            add_finding('HYGIENE-CLEANUP', root, slug,
+                        f"{label} · {slug} — complete without a published completion_id — partial finalize, retry",
+                        policy='digest', slug=slug)
+            return
         if nxt == 'complete' and NOTIFY_COMPLETE:
             # Qualify (non-green) when parked/blocked work is still open for THIS session
             # at this root — mirror the event-path qualifier (P16d) so a later tick (event
@@ -1096,8 +1152,8 @@ def _eval_context(root, label, cp, embedded, is_live,
         return
 
     # --- zombie: context whose session is not live at this root ---
-    if nxt == 'complete':
-        return  # finished; not a zombie
+    if nxt in ('complete', 'complete-qualified', 'cleanup-abandoned'):
+        return  # finished / audited-terminal; not a zombie
     evidence = (has_open_pending(slug) or
                 any(s == slug for (s, _st) in live_blocked) or
                 status == 'error')
