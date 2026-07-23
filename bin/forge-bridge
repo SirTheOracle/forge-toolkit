@@ -1780,6 +1780,55 @@ PYEOF
         _emit_event WARN_DUP_PENDING "$slug" "stage=$target_stage_resolved to=$target_to closed_ts=$target_ts skipped=$n_skipped skipped_ts=$skipped_ts"
     fi
 
+    # stale-alert-lifecycle D2: surface cross-identity orphan pendings for this
+    # (slug, stage) that matches() EXCLUDED (different to/session) so a mis-dispatched
+    # twin becomes a durable audit signal, not a silent future WORKER-STALLED.
+    # Audit-only: NEVER auto-closes (incarnation-strict, P1-WC). Non-fatal; rc unchanged.
+    local _orphan_ts
+    _orphan_ts=$(FORGE_OP_LOG="$pipeline_log" FORGE_OP_STAGE="$target_stage_resolved" \
+                 FORGE_OP_TO="$target_canonical" FORGE_OP_SESS="$ID_target_session" \
+                 FORGE_OP_CLOSED_TS="$target_ts" python3 - <<'PY' 2>/dev/null || true
+import os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(0)
+try:
+    with open(os.environ["FORGE_OP_LOG"]) as f:
+        data=yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(0)
+stage=os.environ["FORGE_OP_STAGE"]; closed_ts=os.environ["FORGE_OP_CLOSED_TS"]
+to=os.environ.get("FORGE_OP_TO",""); sess=os.environ.get("FORGE_OP_SESS","")
+out=[]
+for e in data.get("entries", []) or []:
+    if not (isinstance(e, dict) and e.get("stage")==stage and e.get("response") is None):
+        continue
+    ets=str(e.get("timestamp") or "")
+    if ets==closed_ts:
+        continue
+    e_to=str(e.get("to") or ""); e_sess=str(e.get("session") or "")
+    # Only report entries matches() would have EXCLUDED (different identity) —
+    # same-identity older dups are WARN_DUP_PENDING's job.
+    if (to and e_to and e_to!=to) or (sess and e_sess and e_sess!=sess):
+        out.append(ets)
+print(",".join(t for t in out if t))
+PY
+)
+    if [ -n "$_orphan_ts" ]; then
+        echo "WARN: log-response closed $slug/$target_stage_resolved but cross-identity orphan pending(s) remain OPEN (ts: $_orphan_ts). Not auto-closed (incarnation-strict). Run 'dispatch --supersede' to clear them." >&2
+        _emit_event WARN_ORPHAN_PENDING "$slug" "stage=$target_stage_resolved closed_ts=$target_ts orphan_ts=$_orphan_ts"
+    fi
+
+    # stale-alert-lifecycle D1: on a terminal close, archive any resolved operator
+    # ask for this (slug, stage) so it stops rendering as a false NEEDS-ASK and stops
+    # `park` refusing on it. Non-fatal; gated inside on no-open-pending.
+    if [ "$status" = "done" ] || [ "$status" = "error" ]; then
+        local _ar_root; _ar_root=$(_resolve_project_root "" 2>/dev/null || true)
+        [ -n "$_ar_root" ] || _ar_root="$PWD"
+        _archive_resolved_asks "$_ar_root" "$slug" "$target_stage_resolved"
+    fi
+
     # Hook 2: auto-update forge-context.yml using the resolved entry.
     if [ -n "$target_stage_resolved" ] && [ -n "$status" ]; then
         update_context "$slug" "$target_stage_resolved" "$status" "$target_to"
@@ -2610,6 +2659,9 @@ PYEOF
                     return 1
                 fi
             fi
+            # stale-alert-lifecycle D1: archive a resolved ask for the superseded stage
+            # (the FORGE_SUPERSEDED close path; mirrors --answers archival). Non-fatal.
+            _archive_resolved_asks "$project_root" "$slug" "$_sup_stage"
             _lifecycle_unlock
             _sup_n=$((_sup_n + 1))
         done <<< "$_sup_pendings"
@@ -2948,6 +3000,58 @@ _resolve_callback_file() {   # <cb_dir> <slug> <stage> <session>
     if [ -n "$sess" ] && [ -f "$owned" ]; then printf '%s' "$owned"; return 0; fi
     if [ -f "$legacy" ]; then printf '%s' "$legacy"; return 0; fi
     return 1
+}
+
+# stale-alert-lifecycle D1: archive resolved operator asks on terminal stage close.
+# Mirrors `forge dispatch --answers` archival so an ask answered in-pane or via
+# supersede stops rendering as a false NEEDS-ASK (and stops `park` refusing on it via
+# _callback_ask_origin). Gate: refuse while ANY open pending for (slug, stage) remains
+# under any identity. Unparseable log => do not archive. Idempotent, NON-FATAL: never
+# changes the caller's exit code.
+_archive_resolved_asks() {   # <project_root> <slug> <stage>
+    local pr="$1" slug="$2" stage="$3"
+    [ -n "$pr" ] && [ -n "$slug" ] && [ -n "$stage" ] || return 0
+    FORGE_AR_ROOT="$pr" FORGE_AR_SLUG="$slug" FORGE_AR_STAGE="$stage" python3 - <<'PY' 2>/dev/null || true
+import os, glob, json, sys
+try:
+    import yaml
+except Exception:
+    yaml = None
+root=os.environ["FORGE_AR_ROOT"]; slug=os.environ["FORGE_AR_SLUG"]; stage=os.environ["FORGE_AR_STAGE"]
+logp=os.path.join(root, ".dev", "proposals", slug, "forge-log.yml")
+try:
+    with open(logp) as f:
+        raw=f.read()
+except OSError:
+    sys.exit(0)
+entries=None
+if yaml is not None:
+    try:
+        entries=(yaml.safe_load(raw) or {}).get("entries", []) or []
+    except Exception:
+        entries=None
+if entries is None:
+    sys.exit(0)   # unparseable => keep the ask hot (fail-safe)
+for e in entries:
+    if isinstance(e, dict) and e.get("stage")==stage and e.get("response") is None:
+        sys.exit(0)   # an open pending for this stage remains => gate holds
+adir=os.path.join(root, ".dev", "attention")
+arch=os.path.join(adir, "archive")
+for fp in glob.glob(os.path.join(adir, "ask-*.json")):
+    try:
+        r=json.load(open(fp))
+    except Exception:
+        continue
+    if (r.get("event")=="ask" and r.get("slug")==slug and r.get("stage")==stage
+            and r.get("mode")=="stage"):
+        try:
+            os.makedirs(arch, exist_ok=True)
+            os.replace(fp, os.path.join(arch, os.path.basename(fp)))
+            sys.stderr.write("forge-bridge: archived resolved ask %s (%s/%s)\n"
+                             % (os.path.basename(fp), slug, stage))
+        except OSError:
+            pass
+PY
 }
 
 # Legacy ask carve-out: a pre-origin BLOCKED callback is ask-origin iff its explicit

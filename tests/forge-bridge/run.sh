@@ -621,6 +621,23 @@ else bad "T-GUARD-B15-SUPERSEDE-SUCCESS"; fi
 guard_done b15-ok adhoc codex-b 3 b15-ok-clean || bad "B15 close success replacement"
 guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B15-SUCCESS" || exit 1
 
+# stale-alert-lifecycle D1: the --supersede (FORGE_SUPERSEDED) close archives a
+# resolved operator ask for the superseded (slug, stage) — the Round-3 supersede gap.
+mkdir -p "$GROOT/.dev/attention/archive"
+guard_block d1sup coding codex-a 2 d1sup || bad "D1-SUP setup"
+cat > "$GROOT/.dev/attention/ask-d1sup.json" <<JSON
+{"schema":"cc-attention/1","event":"ask","variant":"ask","session":"forge-1","root":"$GROOT","emitted_at":"2026-07-19T13:24:52Z","ask_id":"ask-d1sup","mode":"stage","slug":"d1sup","stage":"coding","worker":"codex-a","question_snippet":"drop or keep?"}
+JSON
+run_in_pane "$GS:0.0" d1sup-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug d1sup --stage adhoc --worker codex-b --supersede )"
+if [ "$(rc_of d1sup-dispatch)" = 0 ] \
+   && grep -q 'FORGE_SUPERSEDED' "$GROOT/.dev/proposals/d1sup/forge-log.yml" \
+   && [ ! -f "$GROOT/.dev/attention/ask-d1sup.json" ] \
+   && [ -f "$GROOT/.dev/attention/archive/ask-d1sup.json" ]; then
+    ok "T-D1-SUPERSEDE-ARCHIVE ask archived on the FORGE_SUPERSEDED close"
+else bad "T-D1-SUPERSEDE-ARCHIVE (ask not archived on supersede)"; fi
+guard_done d1sup adhoc codex-b 3 d1sup-clean || bad "D1-SUP close replacement"
+guard_require_clean "T-GUARD-HYGIENE-D1SUP" || exit 1
+
 mkdir -p "$GROOT/.dev/proposals/b15-fail"
 cat > "$GROOT/.dev/proposals/b15-fail/forge-log.yml" <<EOF
 pipeline: b15-fail
@@ -699,6 +716,41 @@ guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B18" || exit 1
 
 guard_require_clean "T-GUARD-FIXTURE-HYGIENE-FINAL" || exit 1
 tmux kill-session -t "$GS" 2>/dev/null
+
+# ---- stale-alert-lifecycle D1/D2 (headless log-response close) ----
+echo "== stale-alert D1 ask-archival / D2 orphan-audit =="
+mkS(){ local d="$WORK/$1"; mkdir -p "$d/.claude" "$d/.dev/proposals/$2" "$d/.dev/forge-tmp/callbacks" "$d/.dev/attention/archive"; printf 'name: %s\nforge:\n  expected_root: %s\n' "$1" "$d" > "$d/.claude/forge-project.yml"; printf '%s' "$d"; }
+seed_ask(){ printf '{"schema":"cc-attention/1","event":"ask","variant":"ask","session":"forge-1","root":"%s","emitted_at":"2026-07-20T00:00:00Z","ask_id":"%s","mode":"stage","slug":"%s","stage":"%s","worker":"codex-a","question_snippet":"q"}\n' "$1" "$2" "$3" "$4" > "$1/.dev/attention/$2.json"; }
+
+# D1: a terminal DONE close archives a resolved ask (no other open pending).
+SD1="$(mkS sd1 s1)"
+printf 'pipeline: s1\nentries:\n  - timestamp: "2026-07-20T00:00:00Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$SD1/.dev/proposals/s1/forge-log.yml"
+seed_ask "$SD1" ask-d1 s1 coding
+( cd "$SD1" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" log-response --slug s1 --response "FORGE_DONE: coding" --to codex-a --stage coding ) >/dev/null 2>&1
+if [ ! -f "$SD1/.dev/attention/ask-d1.json" ] && [ -f "$SD1/.dev/attention/archive/ask-d1.json" ]; then
+    ok "T-D1-ARCHIVE-ON-CLOSE resolved ask archived on terminal close"
+else bad "T-D1-ARCHIVE-ON-CLOSE"; fi
+
+# D1 gate-negative: a second open pending on the stage → ask NOT archived.
+SD1N="$(mkS sd1n s1)"
+printf 'pipeline: s1\nentries:\n  - timestamp: "2026-07-20T00:00:00Z"\n    stage: coding\n    to: codex-a\n    response: null\n  - timestamp: "2026-07-20T00:05:00Z"\n    stage: coding\n    to: codex-a\n    response: null\n' > "$SD1N/.dev/proposals/s1/forge-log.yml"
+seed_ask "$SD1N" ask-d1n s1 coding
+( cd "$SD1N" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" log-response --slug s1 --response "FORGE_DONE: coding" --to codex-a --stage coding ) >/dev/null 2>&1
+if [ -f "$SD1N/.dev/attention/ask-d1n.json" ] && [ ! -f "$SD1N/.dev/attention/archive/ask-d1n.json" ]; then
+    ok "T-D1-GATE-NEGATIVE ask NOT archived while an open pending remains"
+else bad "T-D1-GATE-NEGATIVE (ask archived despite open pending)"; fi
+
+# D2: closing a twin with a DIFFERENT `to` emits WARN_ORPHAN_PENDING and leaves the
+# cross-identity orphan OPEN (never auto-closed, P1-WC).
+SD2="$(mkS sd2 s2)"
+printf 'pipeline: s2\nentries:\n  - timestamp: "2026-07-19T16:17:29Z"\n    stage: fix-code\n    to: claude\n    response: null\n  - timestamp: "2026-07-19T16:19:50Z"\n    stage: fix-code\n    to: claude-sonnet\n    response: null\n' > "$SD2/.dev/proposals/s2/forge-log.yml"
+: > "$SD2/.dev/forge-tmp/orchestrator-events.log"
+( cd "$SD2" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" log-response --slug s2 --response "FORGE_DONE: fix-code" --to claude-sonnet --stage fix-code ) >/dev/null 2>&1
+n_orphan_open=$(grep -c 'response: null' "$SD2/.dev/proposals/s2/forge-log.yml")
+if grep -q 'WARN_ORPHAN_PENDING: pipeline=s2 stage=fix-code .*orphan_ts=2026-07-19T16:17:29Z' "$SD2/.dev/forge-tmp/orchestrator-events.log" \
+   && [ "$n_orphan_open" = 1 ]; then
+    ok "T-D2-ORPHAN-AUDIT WARN_ORPHAN_PENDING emitted; cross-identity orphan left OPEN"
+else bad "T-D2-ORPHAN-AUDIT (audit=$(grep -c WARN_ORPHAN_PENDING "$SD2/.dev/forge-tmp/orchestrator-events.log") open=$n_orphan_open)"; fi
 
 # ---- Name-reuse / incarnation (R10, CG-6) ----
 echo "== name-reuse / incarnation (R10) =="
