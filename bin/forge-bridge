@@ -5515,8 +5515,9 @@ cmd_emit() {
     local type="$1"; shift
     case "$type" in
         DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE) ;;
+        RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY) ;;
         *)
-            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE; got '$type'" >&2
+            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY; got '$type'" >&2
             return 1
             ;;
     esac
@@ -6752,7 +6753,13 @@ case "${1:-help}" in
         echo "  digest --slug <s> --stage <s> --template <name> [--worker <w>]"
         echo "                                Render digest prompt to .dev/forge-tmp/ for ad-hoc Agent dispatch"
         echo "  emit <TYPE> --slug <s> [--stage <s>] [key=value …]"
-        echo "                                Orchestrator-driven heartbeat emit (TYPE: DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE)"
+        echo "                                Orchestrator-driven heartbeat emit (TYPE: DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY)"
+        echo "  verify-decision --slug <s> --callback-id <id> --pending-timestamp <ts>"
+        echo "                                Bind verify/DONE to .dev/qa/<slug>/verification-report.yaml, hash it, transition terminal state; prints FINALIZE_READY"
+        echo "  finalize --slug <s> [--dry-run]  Clear all four workers (proven) + publish the single bare COMPLETE via a durable outbox"
+        echo "  hygiene-status                Print mode, per-family reset capability, thresholds, residue, terminal state, activation preflight, journal"
+        echo "  hygiene-gc [--days N] [--dry-run]  Reap dead-incarnation terminal journals + locks (conservative)"
+        echo "  hygiene-abandon --slug <s> --reason <text>  Audited cleanup non-completion escape from a stuck terminal state"
         echo ""
         echo "Panes: claude-opus/opus/inline/general (0), claude/orchestrator/claude-orchestrator (1), codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)"
         echo ""

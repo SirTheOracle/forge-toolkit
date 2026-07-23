@@ -1244,8 +1244,8 @@ if [ -s "$WORK/usage-skill.txt" ] && diff -q "$WORK/usage-skill.txt" "$WORK/usag
 else
   bad "T-USAGE-DOC-LOCKSTEP skill and agent Usage Awareness drifted"
 fi
-grep -F 'A valid Codex `Context N% left` footer now supplies that numeric signal' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/usage-route-skill.txt"
-grep -F 'A valid Codex `Context N% left` footer now supplies that numeric signal' "$ROOT/agents/forge-orchestrator.md" > "$WORK/usage-route-agent.txt"
+grep -F 'Fallback to the other HIGH pane is an availability decision (Hard Rule 9), not a usage-threshold decision; the bridge owns context hygiene' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/usage-route-skill.txt"
+grep -F 'Fallback to the other HIGH pane is an availability decision (Hard Rule 9), not a usage-threshold decision; the bridge owns context hygiene' "$ROOT/agents/forge-orchestrator.md" > "$WORK/usage-route-agent.txt"
 if [ -s "$WORK/usage-route-skill.txt" ] && diff -q "$WORK/usage-route-skill.txt" "$WORK/usage-route-agent.txt" >/dev/null; then
   ok "T-USAGE-DOC-ROUTE-LOCKSTEP skill and agent implementation routes agree"
 else
@@ -2674,6 +2674,21 @@ PY
 else
   echo "  (skip HYG §F/§O: tmux unavailable)"
 fi
+
+echo "── HYG §M: emit whitelist round-trip ──"
+MR="$(mkR hygm)"
+for et in RESET HYGIENE_DECISION HYGIENE_ABANDON HYGIENE_BYPASSED RESET_UNAVAILABLE OBSERVE_ONLY; do
+  ( cd "$MR" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" emit "$et" --slug m1 worker=codex-a ) >/dev/null 2>&1; rc=$?
+  if [ "$rc" = 0 ] && grep -q "^$et: pipeline=m1 " "$MR/.dev/forge-tmp/orchestrator-events.log"; then
+    ok "T-HYG-EMIT $et round-trips cmd_emit"
+  else
+    bad "T-HYG-EMIT $et failed rc=$rc"
+  fi
+done
+o=$( cd "$MR" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" emit BOGUS --slug m1 2>&1 ); rc=$?
+[ "$rc" != 0 ] && echo "$o" | grep -q 'OBSERVE_ONLY; got' \
+  && ok "T-HYG-EMIT BOGUS rejected with the updated whitelist error" \
+  || bad "T-HYG-EMIT BOGUS: rc=$rc $o"
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"

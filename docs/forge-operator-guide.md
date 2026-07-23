@@ -635,3 +635,69 @@ process matching the project's expected dev-server shape, and **escalate** rathe
 than kill an unknown process on a configured port). `coding` relies on Playwright
 autostart (set `reuseExistingServer: false` so its tests start fresh); `qa-fix`
 runs no live tests.
+
+## Worker Context Hygiene
+
+The bridge — not you, and not the orchestrator prose — owns worker `/clear`. A worker
+pane is reset at safe boundaries only: **before a dispatch** (when its evidence says the
+context is dirty or unproven) and at **terminal cleanup** (all four panes, before the
+pipeline's single bare `COMPLETE` is published). You never type `/clear` into a worker
+pane, and `dispatch --clear` no longer sends a raw clear — it coalesces into the same
+confirmed-reset decision.
+
+### Modes
+
+- `FORGE_WORKER_HYGIENE_MODE=observe` (default) — every boundary computes and audits its
+  decision (`HYGIENE_DECISION` events) but never blocks, never resets, and closes
+  pipelines the legacy way (with a loud `HYGIENE_BYPASSED` alongside each legacy
+  completion). This is the rollout kill switch: exporting it rolls the feature back.
+- `enforce` — the accepted steady state. Dirty/unproven panes are reset (with semantic
+  proof) before new work; a clean verify closes via `verify-decision` → `finalize`.
+
+A typo'd mode is a hard error, never a silent fall-through.
+
+### Activation preflight (before flipping to enforce)
+
+Run `forge-bridge hygiene-status`. It refuses to advise `enforce` while any of these
+exist: an open pending, a verify/DONE callback awaiting interpretation, or nonzero
+parked/blocked residue. It also shows each family's reset capability. A fresh install is
+fail-closed: `~/.config/forge/reset-capability.yml` ships both families `proven: false`;
+flip a family to `proven: true` only after the reset-proof spike + a live gate in a
+disposable session proved that family's `/clear` semantics (banner redraw or session-id
+change — idle alone never counts).
+
+### Closing a pipeline under enforce
+
+1. `verify` returns DONE → context reads `awaiting-verify-decision` (all worker sends,
+   including `--force`, are blocked from here until resolution).
+2. `forge-bridge wait` output now includes `CALLBACK_ID:` and `PENDING_TIMESTAMP:` —
+   pass them to `forge-bridge verify-decision --slug <s> --callback-id <id>
+   --pending-timestamp <ts>`. A CLEAR report with zero residue prints `FINALIZE_READY`;
+   with parked/blocked residue it prints `VERIFIED_INCOMPLETE` (resolve each item; the
+   last `park --resolve` hands off with `PARK_RESOLVED FINALIZE_READY`).
+3. `forge-bridge finalize --slug <s>` — preflights all four panes first (nothing is
+   cleared if any pane is busy), clears only panes lacking proven coverage, then
+   publishes the completion through a durable outbox. The single bare
+   `COMPLETE completion_id=…` is the only green completion signal.
+
+### Retrying finalize
+
+`finalize` is idempotent and crash-safe: every retry converges to the same
+`completion_id`, re-uses already-proven resets (no redundant `/clear`), and a partially
+published outbox (`outbox-pending`) simply resumes. If it keeps failing, **stop the
+retries first**, then decide:
+
+- fix the cause (pane busy, report changed, residue appeared) and retry, or
+- `forge-bridge hygiene-abandon --slug <s> --reason "<why>"` — the audited escape hatch.
+  It marks the run `cleanup-abandoned` (never "complete"), invalidates every worker's
+  cleanliness evidence, and unblocks unrelated work. It refuses once a completion has
+  been published.
+
+### Rollback / downgrade
+
+Set `FORGE_WORKER_HYGIENE_MODE=observe` (or unset it). Existing journals are inert;
+a missing journal is normal and just means "unproven". Contexts already at
+`next_stage: complete` are legacy completions and are not retroactively finalized. If a
+downgraded bridge needs to reconstruct context, run the older bridge's
+`set-context --slug <slug>` from the owning session. `forge-bridge hygiene-gc` reaps
+dead-incarnation terminal journals conservatively (malformed files are always retained).

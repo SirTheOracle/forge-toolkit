@@ -288,6 +288,15 @@ done
 
 echo ""
 
+# Worker context-hygiene reset-capability seed (worker-context-hygiene). Copy the
+# fail-closed seed to the runtime path only if the operator has none; never clobber.
+_rcf="${FORGE_RESET_CAPABILITY_FILE:-$HOME/.config/forge/reset-capability.yml}"
+if [ ! -f "$_rcf" ]; then
+    mkdir -p "$(dirname "$_rcf")"
+    cp "$SCRIPT_DIR/config/reset-capability.yml" "$_rcf"
+    echo "installed fail-closed reset-capability seed -> $_rcf (edit proven:true after the spike + live gate)"
+fi
+
 # ── Step 4: Hooks config ─────────────────────────────────
 
 info "Step 4: Claude Code hooks setup"

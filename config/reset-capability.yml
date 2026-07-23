@@ -1,0 +1,15 @@
+# Provider reset-proof capability + anchor table — RUNTIME SEED (worker-context-hygiene).
+# Installed to $HOME/.config/forge/reset-capability.yml only if absent (never clobbered).
+# FAIL-CLOSED: both families ship `proven: false`; no automatic /clear is admissible under
+# enforce until the operator completes the Step-0 spike + live gate for a family and flips
+# its `proven` to true here (see docs/forge-operator-guide.md, Worker Context Hygiene).
+version: 1
+families:
+  claude:
+    proven: false
+    new_conversation_anchor: '(?m)^.*Welcome to Claude Code.*$|^\s*/help for help'
+    session_id_capture: ''          # claude exposes no stable in-pane session id
+  codex:
+    proven: false
+    new_conversation_anchor: '(?m)^\s*OpenAI Codex.*$|^\s*To get started'
+    session_id_capture: ''
