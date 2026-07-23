@@ -1037,7 +1037,7 @@ def _handle_event_line(root, label, line):
     elif typ == 'RESET_UNAVAILABLE':
         add_finding('RESET-UNAVAILABLE', root, slug,
                     f"{label} · {slug} — reset unavailable ({fields.get('family', '?')}) — actionable",
-                    policy='digest', slug=slug)
+                    policy='standard', slug=slug)
     elif typ == 'HYGIENE_ABANDON':
         add_finding('CLEANUP-ABANDONED', root, slug,
                     f"{label} · {slug} — cleanup abandoned ({fields.get('reason', '?')}) — workers unproven, NOT complete",
@@ -1082,7 +1082,7 @@ def _eval_context(root, label, cp, embedded, is_live,
         if nxt in ('awaiting-verify-decision', 'verified-incomplete', 'terminal-cleanup'):
             add_finding('HYGIENE-CLEANUP', root, slug,
                         f"{label} · {slug} — {nxt} — awaiting verify-decision/finalize",
-                        policy='digest', slug=slug)
+                        policy='never', slug=slug)
             return
         if nxt == 'cleanup-abandoned':
             return  # surfaced via HYGIENE_ABANDON; not a zombie, not complete
@@ -1100,7 +1100,7 @@ def _eval_context(root, label, cp, embedded, is_live,
         if nxt == 'complete' and not cid and _has_hygiene_terminal_vocab(root, slug):
             add_finding('HYGIENE-CLEANUP', root, slug,
                         f"{label} · {slug} — complete without a published completion_id — partial finalize, retry",
-                        policy='digest', slug=slug)
+                        policy='daily', slug=slug)
             return
         if nxt == 'complete' and NOTIFY_COMPLETE:
             # Qualify (non-green) when parked/blocked work is still open for THIS session
@@ -1139,7 +1139,10 @@ def _eval_context(root, label, cp, embedded, is_live,
                         session=embedded, slug=slug, stage=last)
         # NEEDS-DECISION: decision predicate + no open pending + dwelled.
         decision = (nxt == 'pending-orchestrator-decision' or
-                    (last in QA_FAMILY and status == 'done' and nxt != 'complete'))
+                    (last in QA_FAMILY and status == 'done' and
+                     nxt not in ('complete', 'complete-qualified', 'cleanup-abandoned',
+                                 'awaiting-verify-decision', 'verified-incomplete',
+                                 'terminal-cleanup')))
         # D3: use has_live_pending here so a superseded orphan cannot hide a live
         # decision. The zombie-evidence path below keeps raw has_open_pending.
         if decision and not has_live_pending(slug):
@@ -1845,7 +1848,9 @@ NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
           'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK',
           'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'STATE-UNPARSEABLE',
-          'RECOVER-PENDING']
+          'RECOVER-PENDING',
+          'RESET-UNAVAILABLE', 'PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED',
+          'HYGIENE-CLEANUP']
 order = {c: i for i, c in enumerate(
     NOTIFY + ['ITEM-PARKED',
               'SESSION-QUEUED', 'SESSION-WORKING', 'EPISODE-ACTIVE', 'SESSION-DONE',
@@ -1858,7 +1863,7 @@ HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
        'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'ITEM-BLOCKED', 'NEEDS-PERMISSION',
        'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
-       'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING'}
+       'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING', 'RESET-UNAVAILABLE'}
 ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE',
           'EPISODE-ACTIVE', 'EPISODE-SETTLED'}
 STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
@@ -2212,11 +2217,16 @@ if PRETTY:
             print(paint('2', f"  … {older} older task(s) in maintenance"))
 
     pipes = [f for f in active if f['condition'] == 'PIPELINE-COMPLETE']
-    if pipes:
+    qpipes = [f for f in findings
+              if f['condition'] in ('PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED')]
+    if pipes or qpipes:
         print()
         print(sect('PIPELINES'))
         for f in pipes:
             print('  ' + paint('32', '+ ') + clip(flat(f['msg']), R_WIDTH - 4))
+        for f in qpipes:
+            # Worker-context-hygiene: shipped-but-unclean / abandoned — NEVER green.
+            print('  ' + paint('33', '! ') + clip(flat(f['msg']), R_WIDTH - 4))
 
     if maint:
         print()

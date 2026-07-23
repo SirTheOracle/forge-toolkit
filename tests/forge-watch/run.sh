@@ -2376,6 +2376,99 @@ o=$("$WATCH" status --board 2>/dev/null)
 python3 -c 'import json,sys; d=json.load(sys.stdin); assert len([x for x in d.get("parked",[]) if x.get("slug")=="e16p"])==2' <<<"$o" \
   && ok "W18 concurrent PARKED owners remain distinct" || bad "W18 concurrent PARKED owners collapsed"
 
+echo "── W-HYG: worker-context-hygiene vocabulary ──"
+# Green only for a published (completion_id) or legacy completion.
+new_env whyg1
+R=$(mk_root proj); live_session forge-1 "$R"
+evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "COMPLETE: pipeline=ph1 completion_id=abc123def"
+run_check >/dev/null
+assert_notified "ph1 — pipeline COMPLETE" "W-HYG published completion (completion_id) stays green"
+new_env whyg1b
+R=$(mk_root proj); live_session forge-1 "$R"
+ctx "$R" forge-1 <<EOF
+active_pipeline: ph1b
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete
+completion_id: abc123def
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_notified "ph1b — pipeline COMPLETE" "W-HYG context complete WITH id is green"
+# A torn complete (hygiene vocab present, id dropped) must NOT go green.
+new_env whyg1c
+R=$(mk_root proj); live_session forge-1 "$R"
+evlog_append "$R" "HYGIENE_DECISION: pipeline=ph1c stage=verify worker=codex-a action=RESET_CONFIRMED reason=threshold threshold=75 confidence=none mode=enforce generation=3"
+ctx "$R" forge-1 <<EOF
+active_pipeline: ph1c
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_not_notified "ph1c — pipeline COMPLETE" "W-HYG torn complete (id dropped) never green"
+assert_status_has "partial finalize" "W-HYG torn complete surfaces as HYGIENE-CLEANUP"
+# Qualified completion: shipped-but-unclean, never green.
+new_env whyg2
+R=$(mk_root proj); live_session forge-1 "$R"
+evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "COMPLETE: pipeline=ph2 completion_id=beef qualifier=hygiene-disabled workers_dirty=codex-a,codex-b"
+run_check >/dev/null
+assert_notified "ph2 — shipped, workers left dirty" "W-HYG hygiene-disabled completion is qualified"
+assert_not_notified "ph2 — pipeline COMPLETE" "W-HYG qualified completion is NOT plain green"
+new_env whyg2b
+R=$(mk_root proj); live_session forge-1 "$R"
+ctx "$R" forge-1 <<EOF
+active_pipeline: ph2b
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete-qualified
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_notified "ph2b — shipped, workers left dirty" "W-HYG context complete-qualified renders qualified"
+# RESET_UNAVAILABLE is actionable.
+new_env whyg3
+R=$(mk_root proj); live_session forge-1 "$R"
+evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "RESET_UNAVAILABLE: pipeline=ph3 stage=coding worker=codex-a family=codex reason=auto-reset-disabled"
+run_check >/dev/null
+assert_notified "ph3 — reset unavailable" "W-HYG RESET_UNAVAILABLE fires actionable"
+# Abandoned cleanup: audited, distinct, not a zombie, not complete.
+new_env whyg4
+R=$(mk_root proj); live_session forge-1 "$R"
+evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "HYGIENE_ABANDON: pipeline=ph4 reason=operator-stuck parked=1 blocked=0 state_was=terminal-cleanup workers=x"
+run_check >/dev/null
+assert_notified "ph4 — cleanup abandoned" "W-HYG HYGIENE_ABANDON surfaces CLEANUP-ABANDONED"
+new_env whyg4b
+R=$(mk_root proj)   # session NOT live -> zombie scan path
+ctx "$R" ghost-1 <<EOF
+active_pipeline: ph4b
+last_stage_completed: verify
+last_stage_status: done
+next_stage: cleanup-abandoned
+updated_at: "$(iso_ago 120)"
+EOF
+run_check >/dev/null
+assert_not_notified "ph4b" "W-HYG cleanup-abandoned context is not a ZOMBIE and not green"
+# Transient terminal states: no notify, no NEEDS-DECISION, not zombie.
+for tstate in awaiting-verify-decision verified-incomplete terminal-cleanup; do
+  new_env "whyg5-$tstate"
+  R=$(mk_root proj); live_session forge-1 "$R"
+  ctx "$R" forge-1 <<EOF
+active_pipeline: ph5
+last_stage_completed: qa
+last_stage_status: done
+next_stage: $tstate
+updated_at: "$(iso_ago 600)"
+EOF
+  run_check >/dev/null
+  assert_not_notified "ph5" "W-HYG $tstate is transient: no notify, no NEEDS-DECISION"
+done
+
 WATCH_SOURCE_AFTER="$(shasum -a 256 "$WATCH" | awk '{print $1}')"
 [ "$WATCH_SOURCE_BEFORE" = "$WATCH_SOURCE_AFTER" ] \
   && ok "W19 watcher product source hash unchanged during P1-WC compatibility run" \
