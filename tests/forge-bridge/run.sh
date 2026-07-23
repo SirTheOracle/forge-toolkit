@@ -1252,6 +1252,108 @@ else
   bad "T-USAGE-DOC-ROUTE-LOCKSTEP skill and agent implementation routes drifted"
 fi
 
+# ═════════ Worker-context-hygiene (worker-context-hygiene proposal) ═════════
+# §0 harness: pure-helper extraction (FNS idiom), fixture seams, env defaults.
+echo "── HYG §0: pure-helper extraction ──"
+HFNS="$WORK/hfns.sh"
+sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p' "$BRIDGE" > "$HFNS"
+grep -q '_reset_proof_probe' "$HFNS" && ok "HYG helper extraction non-empty" || bad "HYG helper extraction empty"
+HFIX="$ROOT/tests/forge-bridge/fixtures"
+# Shared env for every hygiene subshell: hermetic defaults + capability fixture.
+hyg_env() {
+  export FORGE_WORKER_HYGIENE_MODE="${1:-observe}"
+  export FORGE_WORKER_AUTO_RESET_CLAUDE=1 FORGE_WORKER_AUTO_RESET_CODEX=1
+  export FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE=0 FORGE_WORKER_HYGIENE_DEGRADED_CODEX=0
+  export FORGE_WORKER_RESET_PROOF_TIMEOUT_S=1 FORGE_WORKER_LOCK_WAIT_S=2
+  export FORGE_HYGIENE_LOCK_WAIT_S=2 FORGE_WORKER_MIN_HEADROOM=75
+  export FORGE_RESET_CAPABILITY_FILE="$HFIX/reset-capability.yml"
+}
+
+echo "── HYG §D: threshold/mode config errors + capability gate ──"
+# Source into the MAIN shell (FNS idiom) so ok/bad counters propagate to the tally.
+# shellcheck disable=SC1090
+. "$HFNS"
+hyg_env
+  [ "$(FORGE_WORKER_MIN_HEADROOM=75 _worker_min_headroom claude-opus)" = 75 ] \
+    && ok "T-HYG-CFG shared 75 resolves" || bad "T-HYG-CFG shared 75 wrong"
+  [ "$(FORGE_WORKER_MIN_HEADROOM=75 FORGE_WORKER_MIN_HEADROOM_CODEX=60 _worker_min_headroom codex-a)" = 60 ] \
+    && ok "T-HYG-CFG family override wins" || bad "T-HYG-CFG family override lost"
+  [ "$(FORGE_WORKER_MIN_HEADROOM=75 _worker_min_headroom codex-b)" = 75 ] \
+    && ok "T-HYG-CFG unset family inherits shared" || bad "T-HYG-CFG inherit broken"
+  [ "$(FORGE_WORKER_MIN_HEADROOM=0 _worker_min_headroom claude-opus)" = 0 ] \
+    && [ "$(FORGE_WORKER_MIN_HEADROOM=100 _worker_min_headroom claude-opus)" = 100 ] \
+    && ok "T-HYG-CFG 0/100 boundary valid" || bad "T-HYG-CFG boundary rejected"
+  o=$(FORGE_WORKER_MIN_HEADROOM=abc _worker_min_headroom claude-opus 2>&1); rc=$?
+  [ "$rc" = 1 ] && echo "$o" | grep -q CONFIG_ERROR \
+    && ok "T-HYG-CFG shared=abc CONFIG_ERROR rc1" || bad "T-HYG-CFG abc accepted: rc=$rc $o"
+  o=$(FORGE_WORKER_MIN_HEADROOM=150 _worker_min_headroom claude-opus 2>&1); rc=$?
+  [ "$rc" = 1 ] && ok "T-HYG-CFG shared=150 rejected" || bad "T-HYG-CFG 150 accepted"
+  o=$(FORGE_WORKER_MIN_HEADROOM=75 FORGE_WORKER_MIN_HEADROOM_CLAUDE=xyz _worker_min_headroom claude-sonnet 2>&1); rc=$?
+  [ "$rc" = 1 ] && echo "$o" | grep -q 'CONFIG_ERROR: FORGE_WORKER_MIN_HEADROOM_CLAUDE' \
+    && ok "T-HYG-CFG family=xyz CONFIG_ERROR rc1" || bad "T-HYG-CFG family xyz accepted: $o"
+  o=$(FORGE_WORKER_HYGIENE_MODE=enforc _hygiene_mode 2>&1); rc=$?
+  [ "$rc" = 1 ] && echo "$o" | grep -q CONFIG_ERROR \
+    && ok "T-HYG-MODE typo is a hard error (never silent observe)" || bad "T-HYG-MODE typo fell through: rc=$rc"
+  [ "$(FORGE_WORKER_HYGIENE_MODE=enforce _hygiene_mode)" = enforce ] \
+    && [ "$(FORGE_WORKER_HYGIENE_MODE=observe _hygiene_mode)" = observe ] \
+    && ok "T-HYG-MODE valid modes echo" || bad "T-HYG-MODE valid mode broken"
+  FORGE_WORKER_HYGIENE_MODE=enforc _hygiene_enforcing 2>/dev/null; rc=$?
+  [ "$rc" = 2 ] && ok "T-HYG-MODE _hygiene_enforcing rc2 on invalid" || bad "T-HYG-MODE enforcing rc=$rc on invalid"
+  # Capability gate (P4): fixture-driven, fail-closed.
+  o=$(_reset_automation_enabled claude); rc=$?
+  [ "$rc" = 0 ] && [ "$o" = enabled ] && ok "T-HYG-CAP claude proven+on => enabled" || bad "T-HYG-CAP claude: rc=$rc $o"
+  o=$(_reset_automation_enabled codex); rc=$?
+  [ "$rc" = 1 ] && echo "$o" | grep -q 'disabled:unproven' && ok "T-HYG-CAP codex unproven => disabled (family-disabled)" || bad "T-HYG-CAP codex: rc=$rc $o"
+  o=$(FORGE_WORKER_AUTO_RESET_CLAUDE=0 _reset_automation_enabled claude); rc=$?
+  [ "$rc" = 1 ] && [ "$o" = "disabled:operator-off" ] && ok "T-HYG-CAP operator-off wins" || bad "T-HYG-CAP operator-off: $o"
+  o=$(FORGE_RESET_CAPABILITY_FILE=/nonexistent-cap.yml _reset_automation_enabled claude); rc=$?
+  [ "$rc" = 1 ] && echo "$o" | grep -q 'no-fixture' && ok "T-HYG-CAP missing fixture fail-closed" || bad "T-HYG-CAP missing fixture: $o"
+
+echo "── HYG §R: reset-proof probe (before/after fixture pairs) ──"
+# Visible-only pin: neither capture in baseline/probe may use scrollback (-S).
+sed -n '/^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p' "$BRIDGE" | grep 'capture-pane' | grep -q -- '-S' \
+  && bad "T-HYG-RESET-SCROLLBACK-ONLY capture uses -S (scrollback leaks into proof)" \
+  || ok "T-HYG-RESET-SCROLLBACK-ONLY captures are visible-screen only (no -S)"
+  probe_pair() {  # <name> <family> <before> <after> <expect-grep>
+    local name="$1" fam="$2" b="$3" a="$4" want="$5" bl bfp bpres bsid bh o rc
+    bl="$(FORGE_RESET_BASELINE_FIXTURE="$b" _reset_baseline s 0 "$fam")" || { bad "$name baseline failed"; return; }
+    IFS=$'\t' read -r bfp bpres bsid bh <<< "$bl"
+    o=$(FORGE_RESET_PROOF_FIXTURE="$a" _reset_proof_probe s 0 "$fam" "$bfp" "$bpres" "$bsid"); rc=$?
+    if echo "$o" | grep -q "$want"; then ok "$name → $o"; else bad "$name wanted '$want' got rc=$rc '$o'"; fi
+  }
+  probe_pair "T-HYG-RESET-PAIR-PROVEN claude-opus" claude \
+    "$HFIX/claude-opus-clear-before.txt" "$HFIX/claude-opus-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
+  probe_pair "T-HYG-RESET-PAIR-PROVEN claude-sonnet" claude \
+    "$HFIX/claude-sonnet-clear-before.txt" "$HFIX/claude-sonnet-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
+  probe_pair "T-HYG-RESET-PAIR-PROVEN codex-a" codex \
+    "$HFIX/codex-a-clear-before.txt" "$HFIX/codex-a-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
+  probe_pair "T-HYG-RESET-PAIR-PROVEN codex-b" codex \
+    "$HFIX/codex-b-clear-before.txt" "$HFIX/codex-b-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
+  probe_pair "T-HYG-RESET-DEEP-BASELINE >120-line baseline" claude \
+    "$HFIX/deep-conversation-before.txt" "$HFIX/claude-opus-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
+  probe_pair "T-HYG-RESET-IDLE-FAIL ignored clear (idle==idle)" claude \
+    "$HFIX/ignored-clear-idle.txt" "$HFIX/ignored-clear-idle.txt" '^UNPROVEN:no-redraw'
+  probe_pair "T-HYG-RESET-HISTORICAL-FAIL banner already visible" claude \
+    "$HFIX/claude-opus-clear-after.txt" "$HFIX/claude-opus-clear-after.txt" 'anchor-was-present-pre-clear'
+  # Scrollback-only anchor: the visible proof screen has NO banner (banner lives only in
+  # scrollback, which the probe never captures) — redraw alone must not prove.
+  printf '● cleared? screen redrew but no banner visible\n> \n' > "$WORK/scrollback-visible.txt"
+  probe_pair "T-HYG-RESET-SCROLLBACK-ONLY visible-no-banner" claude \
+    "$HFIX/claude-opus-clear-before.txt" "$WORK/scrollback-visible.txt" '^UNPROVEN:no-new-anchor'
+  # Session-id change proof path.
+  cat > "$WORK/cap-sid.yml" <<'YML'
+version: 1
+families:
+  claude:
+    proven: true
+    new_conversation_anchor: ''
+    session_id_capture: 'session: ([a-f0-9]+)'
+YML
+  printf 'working…\nsession: abc123\n> \n' > "$WORK/sid-before.txt"
+  printf 'fresh…\nsession: def456\n> \n'   > "$WORK/sid-after.txt"
+  FORGE_RESET_CAPABILITY_FILE="$WORK/cap-sid.yml" \
+    probe_pair "T-HYG-RESET-SIDCHANGE" claude "$WORK/sid-before.txt" "$WORK/sid-after.txt" '^PROVEN kind=session-id-change'
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -60,6 +60,28 @@ SESSION=""   # populated by require_identity() (=$ID_target_session) for session
 # Required pane count (Phase 2: 5 panes)
 FORGE_REQUIRED_PANES="${FORGE_REQUIRED_PANES:-5}"
 
+# ---- Worker context-hygiene controls (worker-context-hygiene feature) ----
+# Rollout kill switch / migration mode. observe = compute+audit, never block or reset,
+# never persist new terminal vocabulary. enforce = accepted steady state.
+FORGE_WORKER_HYGIENE_MODE="${FORGE_WORKER_HYGIENE_MODE:-observe}"
+FORGE_WORKER_AUTO_RESET_CLAUDE="${FORGE_WORKER_AUTO_RESET_CLAUDE:-1}"
+FORGE_WORKER_AUTO_RESET_CODEX="${FORGE_WORKER_AUTO_RESET_CODEX:-1}"
+# Explicit hygiene-degraded opt-in: that family may dispatch without reset proof in
+# enforce, is excluded from the all-four gate, and yields only a qualified completion.
+FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE="${FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE:-0}"
+FORGE_WORKER_HYGIENE_DEGRADED_CODEX="${FORGE_WORKER_HYGIENE_DEGRADED_CODEX:-0}"
+# Per-post-clear proof poll ceiling (seconds), bounded 1..30.
+FORGE_WORKER_RESET_PROOF_TIMEOUT_S="${FORGE_WORKER_RESET_PROOF_TIMEOUT_S:-5}"
+# Worker-lock wait (seconds). Fail-closed for dispatch/send; callback path is fail-open.
+FORGE_WORKER_LOCK_WAIT_S="${FORGE_WORKER_LOCK_WAIT_S:-5}"
+# Journal (fd-8 leaf) lock wait (seconds). Distinct tunable read by _hygiene_write (P2-1).
+FORGE_HYGIENE_LOCK_WAIT_S="${FORGE_HYGIENE_LOCK_WAIT_S:-5}"
+# Shared min-headroom threshold; family overrides inherit when unset. Inclusive:
+# headroom > min may reuse; headroom <= min must reset.
+FORGE_WORKER_MIN_HEADROOM="${FORGE_WORKER_MIN_HEADROOM:-75}"
+# Capability/anchor fixture path (data-driven; never hard-coded).
+FORGE_RESET_CAPABILITY_FILE="${FORGE_RESET_CAPABILITY_FILE:-$HOME/.config/forge/reset-capability.yml}"
+
 # --- Session Detection (called explicitly by tmux-required commands) ---
 
 require_pane_count() {
@@ -435,6 +457,181 @@ pane_name() {
         4) echo "claude-sonnet" ;;
         *) echo "pane-$1" ;;
     esac
+}
+
+# ---- Worker context-hygiene helpers (worker-context-hygiene) ----
+
+_worker_family() {
+    case "$1" in
+        claude-opus|claude-sonnet) printf 'claude' ;;
+        codex-a|codex-b)           printf 'codex'  ;;
+        *)                         printf '' ;;
+    esac
+}
+_hygiene_worker_ok() {   # rc0 iff a policy-covered worker pane (never pane 1)
+    case "$1" in claude-opus|codex-a|codex-b|claude-sonnet) return 0 ;; *) return 1 ;; esac
+}
+_hygiene_valid_pct() {   # <val> rc0 iff integer 0..100
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 0 ] && [ "$1" -le 100 ]
+}
+# P2-2: mode must be exactly observe|enforce. Echoes the mode; a typo (e.g. `enforc`) is a
+# HARD config error (rc1) so it can never silently fall through to observe in a mutating
+# path. Every enforce/observe branch resolves the mode through this helper.
+_hygiene_mode() {
+    case "${FORGE_WORKER_HYGIENE_MODE:-observe}" in
+        observe|enforce) printf '%s' "${FORGE_WORKER_HYGIENE_MODE:-observe}" ;;
+        *) echo "CONFIG_ERROR: FORGE_WORKER_HYGIENE_MODE='$FORGE_WORKER_HYGIENE_MODE' must be observe|enforce" >&2; return 1 ;;
+    esac
+}
+# rc0 iff the resolved mode is enforce; rc2 on invalid mode (caller aborts).
+_hygiene_enforcing() {
+    local m; m="$(_hygiene_mode)" || return 2
+    [ "$m" = enforce ]
+}
+# Test-only crash injector (P0-5). NO-OP unless BOTH FORGE_HYGIENE_TEST=1 AND
+# FORGE_HYGIENE_CRASH_AT names <phase>. Neither is ever set in production, so it cannot
+# fire accidentally. On a match it `exit 99`s, simulating a hard crash at that exact point.
+# Phase names (delivery): pending | activity | send-text | send-enter | delivered.
+# Phase names (finalize outbox): fin-pane | fin-resets | fin-resets-confirmed |
+#   fin-context | fin-event-pending | fin-event | fin-published.
+_hygiene_crash_at() {   # <phase>
+    [ "${FORGE_HYGIENE_TEST:-0}" = 1 ] || return 0
+    [ "${FORGE_HYGIENE_CRASH_AT:-}" = "$1" ] || return 0
+    echo "FORGE_HYGIENE_CRASH_INJECTED phase=$1" >&2
+    exit 99
+}
+
+# Effective min-headroom for a worker. Echoes the integer; a present-but-invalid shared
+# OR family value is a hard config error (rc1, CONFIG_ERROR) — never a silent fallback.
+_worker_min_headroom() {   # <worker_canonical>
+    local fam; fam="$(_worker_family "$1")"
+    local shared="$FORGE_WORKER_MIN_HEADROOM" fam_raw=""
+    case "$fam" in
+        claude) fam_raw="${FORGE_WORKER_MIN_HEADROOM_CLAUDE-}" ;;
+        codex)  fam_raw="${FORGE_WORKER_MIN_HEADROOM_CODEX-}"  ;;
+    esac
+    if ! _hygiene_valid_pct "$shared"; then
+        echo "CONFIG_ERROR: FORGE_WORKER_MIN_HEADROOM='$shared' not integer 0..100" >&2; return 1
+    fi
+    if [ -n "$fam_raw" ]; then
+        if ! _hygiene_valid_pct "$fam_raw"; then
+            echo "CONFIG_ERROR: FORGE_WORKER_MIN_HEADROOM_$(printf '%s' "$fam" | tr a-z A-Z)='$fam_raw' not integer 0..100" >&2; return 1
+        fi
+        printf '%s' "$fam_raw"; return 0
+    fi
+    printf '%s' "$shared"
+}
+
+_reset_proof_timeout() {
+    local t="${FORGE_WORKER_RESET_PROOF_TIMEOUT_S:-5}"
+    case "$t" in ''|*[!0-9]*) t=5 ;; esac
+    [ "$t" -lt 1 ] && t=1; [ "$t" -gt 30 ] && t=30
+    printf '%s' "$t"
+}
+
+# Auto-reset admissible for a family? Combines the operator env flag with the checked-in
+# capability fixture's `proven` bit. Fail-closed. Echoes enabled/disabled:<reason>.
+_reset_automation_enabled() {   # <family>
+    local fam="$1" flag cap
+    case "$fam" in
+        claude) flag="$FORGE_WORKER_AUTO_RESET_CLAUDE" ;;
+        codex)  flag="$FORGE_WORKER_AUTO_RESET_CODEX"  ;;
+        *)      echo "disabled:unknown-family"; return 1 ;;
+    esac
+    if [ "$flag" != "1" ]; then echo "disabled:operator-off"; return 1; fi
+    cap="$(FORGE_RCF="$FORGE_RESET_CAPABILITY_FILE" python3 - "$fam" 2>/dev/null <<'PY'
+import os,sys,yaml
+fam=sys.argv[1]
+try: d=yaml.safe_load(open(os.environ["FORGE_RCF"])) or {}
+except Exception: print("unproven:no-fixture"); sys.exit(0)
+f=((d.get("families") or {}).get(fam) or {})
+print("proven" if f.get("proven") is True else "unproven:fixture")
+PY
+)"
+    case "$cap" in proven) echo "enabled"; return 0 ;; *) echo "disabled:${cap:-unproven}"; return 1 ;; esac
+}
+
+# Baseline capture BEFORE /clear. P1-8: captures the VISIBLE SCREEN ONLY (no -S, so no
+# scrollback) — a historical banner that scrolled off is not captured and cannot satisfy
+# the "new anchor" test. Echoes "<screen_fp>\t<anchor_present:0|1>\t<session_id>\t<history_size>".
+_reset_baseline() {   # <session> <idx> <family>
+    local sess="$1" idx="$2" fam="$3" cap hsize
+    cap=$(mktemp -t forge-baseline-XXXXXX 2>/dev/null) || return 1
+    if [ -n "${FORGE_RESET_BASELINE_FIXTURE:-}" ] && [ -f "${FORGE_RESET_BASELINE_FIXTURE}" ]; then
+        cp "$FORGE_RESET_BASELINE_FIXTURE" "$cap"; hsize="${FORGE_RESET_BASELINE_HISTORY:-0}"
+    else
+        tmux capture-pane -p -t "$sess:$WINDOW.$idx" > "$cap" 2>/dev/null || true   # visible screen only
+        hsize="$(tmux display-message -p -t "$sess:$WINDOW.$idx" '#{history_size}' 2>/dev/null || echo 0)"
+    fi
+    FORGE_RCF="$FORGE_RESET_CAPABILITY_FILE" python3 - "$cap" "$fam" "${hsize:-0}" <<'PY'
+import sys,re,hashlib,os,yaml
+raw=open(sys.argv[1]).read(); fam=sys.argv[2]; hsize=sys.argv[3]
+norm=re.sub(r'\x1b\[[0-9;]*[A-Za-z]','',raw); norm=re.sub(r'\x1b\][0-9;]*\x07','',norm)
+lines=[l for l in norm.splitlines() if l.strip()]; window="\n".join(lines[-40:])
+try: d=yaml.safe_load(open(os.environ["FORGE_RCF"])) or {}
+except Exception: d={}
+f=((d.get("families") or {}).get(fam) or {})
+anchor=f.get("new_conversation_anchor") or ""
+present=1 if (anchor and re.search(anchor,window,re.M)) else 0
+sid=""; sidpat=f.get("session_id_capture") or ""
+if sidpat:
+    m=re.search(sidpat,norm,re.M)
+    if m: sid=(m.group(1) if m.groups() else m.group(0)).strip()
+print("%s\t%d\t%s\t%s" % (hashlib.sha256(window.encode()).hexdigest()[:16],present,sid,hsize))
+PY
+    rm -f "$cap" 2>/dev/null
+}
+
+# Reset-proof probe. Runs AFTER /clear+Enter; polls a fresh VISIBLE-SCREEN capture (same
+# region as the baseline, P1-8 — no scrollback). PROVEN iff a changed provider session id,
+# OR (anchor present now AND absent at baseline AND the screen fingerprint changed). Idle
+# alone is never success; a scrollback-only anchor cannot appear. Seam: FORGE_RESET_PROOF_FIXTURE.
+_reset_proof_probe() {   # <session> <idx> <family> <base_fp> <base_anchor_present> <base_sid>
+    local sess="$1" idx="$2" fam="$3" base_fp="$4" base_present="$5" base_sid="$6"
+    local deadline; deadline="$(_reset_proof_timeout)"
+    local cap_file; cap_file=$(mktemp -t forge-reset-XXXXXX 2>/dev/null) || return 1
+    local start; start=$(date +%s) result="UNPROVEN:timeout"
+    while :; do
+        if [ -n "${FORGE_RESET_PROOF_FIXTURE:-}" ] && [ -f "${FORGE_RESET_PROOF_FIXTURE}" ]; then
+            cp "$FORGE_RESET_PROOF_FIXTURE" "$cap_file"
+        else
+            tmux capture-pane -p -t "$sess:$WINDOW.$idx" > "$cap_file" 2>/dev/null || true   # visible screen only
+        fi
+        result="$(FORGE_RCF="$FORGE_RESET_CAPABILITY_FILE" FORGE_BFP="$base_fp" FORGE_BPRES="$base_present" FORGE_BSID="$base_sid" \
+            python3 - "$fam" "$cap_file" 2>/dev/null <<'PY'
+import os,sys,re,hashlib,yaml
+fam=sys.argv[1]; cap=open(sys.argv[2]).read()
+norm=re.sub(r'\x1b\[[0-9;]*[A-Za-z]','',cap); norm=re.sub(r'\x1b\][0-9;]*\x07','',norm)
+lines=[l for l in norm.splitlines() if l.strip()]; window="\n".join(lines[-40:])
+try: d=yaml.safe_load(open(os.environ["FORGE_RCF"])) or {}
+except Exception: print("UNPROVEN:no-fixture"); sys.exit(0)
+f=((d.get("families") or {}).get(fam) or {})
+base_sid=os.environ.get("FORGE_BSID") or ""
+sidpat=f.get("session_id_capture") or ""
+if sidpat:
+    m=re.search(sidpat,norm,re.M)
+    cur=(m.group(1) if (m and m.groups()) else (m.group(0) if m else "")).strip()
+    if cur and cur!=base_sid:
+        print("PROVEN kind=session-id-change hash="+hashlib.sha256(cur.encode()).hexdigest()[:16]); sys.exit(0)
+anchor=f.get("new_conversation_anchor") or ""
+base_present=os.environ.get("FORGE_BPRES")=="1"; base_fp=os.environ.get("FORGE_BFP") or ""
+cur_fp=hashlib.sha256(window.encode()).hexdigest()[:16]
+cur_present=bool(anchor) and bool(re.search(anchor,window,re.M))
+if cur_present and not base_present and cur_fp!=base_fp:
+    print("PROVEN kind=post-baseline-anchor hash="+cur_fp); sys.exit(0)
+if cur_present and base_present: print("UNPROVEN:anchor-was-present-pre-clear"); sys.exit(0)
+if cur_fp==base_fp: print("UNPROVEN:no-redraw"); sys.exit(0)
+print("UNPROVEN:no-new-anchor")
+PY
+)"
+        case "$result" in PROVEN*) break ;; esac
+        [ $(( $(date +%s) - start )) -ge "$deadline" ] && break
+        sleep 0.3
+    done
+    rm -f "$cap_file" 2>/dev/null
+    case "$result" in PROVEN*) printf '%s' "$result"; return 0 ;; esac
+    printf '%s' "$result"; return 1
 }
 
 timestamp() {
