@@ -61,9 +61,11 @@ SESSION=""   # populated by require_identity() (=$ID_target_session) for session
 FORGE_REQUIRED_PANES="${FORGE_REQUIRED_PANES:-5}"
 
 # ---- Worker context-hygiene controls (worker-context-hygiene feature) ----
-# Rollout kill switch / migration mode. observe = compute+audit, never block or reset,
-# never persist new terminal vocabulary. enforce = accepted steady state.
-FORGE_WORKER_HYGIENE_MODE="${FORGE_WORKER_HYGIENE_MODE:-observe}"
+# enforce = the accepted steady state (DEFAULT since 2026-07-23, after the Step-0 spike +
+# live enforce rollout gate both passed). observe = the kill switch: compute+audit only,
+# never block or reset, never persist new terminal vocabulary — export
+# FORGE_WORKER_HYGIENE_MODE=observe to roll the feature back.
+FORGE_WORKER_HYGIENE_MODE="${FORGE_WORKER_HYGIENE_MODE:-enforce}"
 FORGE_WORKER_AUTO_RESET_CLAUDE="${FORGE_WORKER_AUTO_RESET_CLAUDE:-1}"
 FORGE_WORKER_AUTO_RESET_CODEX="${FORGE_WORKER_AUTO_RESET_CODEX:-1}"
 # Explicit hygiene-degraded opt-in: that family may dispatch without reset proof in

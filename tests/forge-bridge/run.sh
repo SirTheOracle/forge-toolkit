@@ -300,19 +300,19 @@ fi
 echo "== dual-mode / cross-session =="
 
 # T-CLASS-DUAL-DEFAULT: no flags, headless, enforce → host-pane class refuses (UNAVAILABLE)
-dd="$(cd "$rootD" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_IDENTITY_ENFORCE=1 "$BRIDGE" send claude x 2>&1)"; ddrc=$?
+dd="$(cd "$rootD" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_IDENTITY_ENFORCE=1 FORGE_WORKER_HYGIENE_MODE=observe "$BRIDGE" send claude x 2>&1)"; ddrc=$?
 [ "$ddrc" -ne 0 ] && printf '%s' "$dd" | grep -q "identity UNAVAILABLE" \
     && ok "T-CLASS-DUAL-DEFAULT flagless send stays host-pane (refused headless)" \
     || bad "T-CLASS-DUAL-DEFAULT flagless send stays host-pane (rc=$ddrc out=$dd)"
 
 # T-CLASS-DUAL-SEND: flags upgrade to target-scoped — headless caller proceeds under enforce
-ds="$(cd "$rootA" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 "$BRIDGE" send --target-session "$S2" --cross-session claude dual-ok-marker 2>&1)"; dsrc=$?
+ds="$(cd "$rootA" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 FORGE_WORKER_HYGIENE_MODE=observe "$BRIDGE" send --target-session "$S2" --cross-session claude dual-ok-marker 2>&1)"; dsrc=$?
 [ "$dsrc" -eq 0 ] \
     && ok "T-CLASS-DUAL-SEND validated flags upgrade send to target-scoped (proceeds)" \
     || bad "T-CLASS-DUAL-SEND validated flags upgrade send to target-scoped (rc=$dsrc out=$ds)"
 
 # T-ID-CROSS / T-CROSS-VALID: in-pane declared cross-session send to a correctly-rooted target
-run_in_pane "$S1:0.0" crossval "FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 $BRIDGE send --target-session $S2 --cross-session claude cross-ok-marker"
+run_in_pane "$S1:0.0" crossval "FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --target-session $S2 --cross-session claude cross-ok-marker"
 sleep 1
 if [ "$(rc_of crossval)" = "0" ] && tmux capture-pane -p -t "$S2:0.1" | grep -q "cross-ok-marker"; then
     ok "T-CROSS-VALID declared cross-session send lands in the target's pane 1"
@@ -322,7 +322,7 @@ fi
 
 # T-CROSS-WRONGROOT: FORGE_TMUX_LIST claims S2 is rooted elsewhere → root validation refuses
 LISTW="$WORK/tmuxlist-wrong"; printf '%s\t%s\n' "$S2" "$rootB" > "$LISTW"
-run_in_pane "$S1:0.0" crosswrong "FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 FORGE_TMUX_LIST=$LISTW $BRIDGE send --target-session $S2 --cross-session claude nope"
+run_in_pane "$S1:0.0" crosswrong "FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 FORGE_TMUX_LIST=$LISTW FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --target-session $S2 --cross-session claude nope"
 if [ "$(rc_of crosswrong)" != "0" ] && out_of crosswrong | grep -q "rooted at"; then
     ok "T-CROSS-WRONGROOT target rooted elsewhere → refused (class-3 root validation)"
 else
@@ -537,7 +537,7 @@ guard_require_clean(){
 }
 
 guard_block b12-block coding codex-a 2 b12-block || bad "T-GUARD-B12 setup"
-run_in_pane "$GS:0.0" b12-refuse "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b12-next --stage adhoc --worker codex-b )"
+run_in_pane "$GS:0.0" b12-refuse "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug b12-next --stage adhoc --worker codex-b )"
 if [ "$(rc_of b12-refuse)" != 0 ] && out_of b12-refuse | grep -q 'HOOK BLOCKED: dispatch refused' \
    && [ ! -e "$GROOT/.dev/proposals/b12-next/forge-log.yml" ] \
    && ! guard_capture_has 3 'codex-b-adhoc-b12-next.txt' \
@@ -545,7 +545,7 @@ if [ "$(rc_of b12-refuse)" != 0 ] && out_of b12-refuse | grep -q 'HOOK BLOCKED: 
     ok "T-GUARD-B12-CROSS-SLUG"
 else bad "T-GUARD-B12-CROSS-SLUG"; fi
 run_in_pane "$GS:0.0" b12-park "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_INFRA_LOCK_DIR=$GLOCKS $BRIDGE park --slug b12-block --stage coding --reason p0-b12 )"
-run_in_pane "$GS:0.0" b12-after-park "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b12-next --stage adhoc --worker codex-b )"
+run_in_pane "$GS:0.0" b12-after-park "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug b12-next --stage adhoc --worker codex-b )"
 if [ "$(rc_of b12-park)" = 0 ] && [ "$(rc_of b12-after-park)" = 0 ] \
    && grep -q 'parked_at:' "$GROOT/.dev/proposals/b12-block/forge-log.yml" \
    && grep -q 'response: null' "$GROOT/.dev/proposals/b12-next/forge-log.yml" \
@@ -557,7 +557,7 @@ run_in_pane "$GS:0.0" b12-resolve "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE 
 guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B12-A" || exit 1
 
 guard_block b12-ask coding codex-a 2 b12-ask ask || bad "B12 ask setup"
-run_in_pane "$GS:0.0" b12-ask-pass "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b12-ask-next --stage adhoc --worker codex-b )"
+run_in_pane "$GS:0.0" b12-ask-pass "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug b12-ask-next --stage adhoc --worker codex-b )"
 if [ "$(rc_of b12-ask-pass)" = 0 ] && guard_capture_has 3 'codex-b-adhoc-b12-ask-next.txt'; then
     ok "T-GUARD-B12-ASK-CONTROL"
 else bad "T-GUARD-B12-ASK-CONTROL"; fi
@@ -566,7 +566,7 @@ guard_done b12-ask coding codex-a 2 b12-ask-clean || bad "B12 close ask"
 guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B12-ASK" || exit 1
 
 guard_log b12-flight coding codex-a b12-flight || bad "B12 in-flight setup"
-run_in_pane "$GS:0.0" b12-flight-pass "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b12-flight-next --stage adhoc --worker codex-b )"
+run_in_pane "$GS:0.0" b12-flight-pass "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug b12-flight-next --stage adhoc --worker codex-b )"
 if [ "$(rc_of b12-flight-pass)" = 0 ] && guard_capture_has 3 'codex-b-adhoc-b12-flight-next.txt'; then
     ok "T-GUARD-B12-INFLIGHT-CONTROL"
 else bad "T-GUARD-B12-INFLIGHT-CONTROL"; fi
@@ -576,7 +576,7 @@ guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B12-FLIGHT" || exit 1
 
 guard_block b12-parked coding codex-a 2 b12-parked || bad "B12 parked setup"
 run_in_pane "$GS:0.0" b12-parked-do "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_INFRA_LOCK_DIR=$GLOCKS $BRIDGE park --slug b12-parked --stage coding --reason p0-parked )"
-run_in_pane "$GS:0.0" b12-parked-advance "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b12-parked --stage adhoc --worker codex-b )"
+run_in_pane "$GS:0.0" b12-parked-advance "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug b12-parked --stage adhoc --worker codex-b )"
 if [ "$(rc_of b12-parked-do)" = 0 ] && [ "$(rc_of b12-parked-advance)" != 0 ] \
    && out_of b12-parked-advance | grep -q 'open pending' && ! guard_capture_has 3 'codex-b-adhoc-b12-parked.txt'; then
     ok "T-GUARD-B12-PARKED-ADVANCE"
@@ -586,9 +586,9 @@ guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B12-PARKED" || exit 1
 
 guard_block b13-hold coding codex-a 2 b13-hold || bad "B13 setup holder"
 guard_log b13-send adhoc codex-b b13-send || bad "B13 setup logged send"
-run_in_pane "$GS:0.0" b13-normal "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send codex-b B13_NORMAL )"
-run_in_pane "$GS:0.0" b13-own "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-a B13_OWN )"
-run_in_pane "$GS:0.0" b13-other "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-b B13_OTHER )"
+run_in_pane "$GS:0.0" b13-normal "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send codex-b B13_NORMAL )"
+run_in_pane "$GS:0.0" b13-own "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --force codex-a B13_OWN )"
+run_in_pane "$GS:0.0" b13-other "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --force codex-b B13_OTHER )"
 if [ "$(rc_of b13-normal)" != 0 ] && out_of b13-normal | grep -q 'HOOK BLOCKED: send refused' \
    && ! guard_capture_has 3 B13_NORMAL \
    && [ "$(rc_of b13-own)" = 0 ] && guard_capture_has 2 B13_OWN \
@@ -596,8 +596,8 @@ if [ "$(rc_of b13-normal)" != 0 ] && out_of b13-normal | grep -q 'HOOK BLOCKED: 
    && ! guard_capture_has 3 B13_OTHER; then
     ok "T-GUARD-B13-FORCE-MATRIX"
 else bad "T-GUARD-B13-FORCE-MATRIX"; fi
-run_in_pane "$GS:0.0" b13-bypass "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --allow-blocked p0-b13 codex-b B13_BYPASS )"
-run_in_pane "$GS:0.0" b13-again "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send codex-b B13_AGAIN )"
+run_in_pane "$GS:0.0" b13-bypass "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --allow-blocked p0-b13 codex-b B13_BYPASS )"
+run_in_pane "$GS:0.0" b13-again "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send codex-b B13_AGAIN )"
 if [ "$(rc_of b13-bypass)" = 0 ] && guard_capture_has 3 B13_BYPASS \
    && grep -Eq 'GUARD_BLOCK: pipeline=multi stage=\? boundary=send reason=allow-blocked-bypass n=1 .*bypassed=b13-hold.*allow_reason=p0-b13' "$GROOT/.dev/forge-tmp/orchestrator-events.log" \
    && [ "$(rc_of b13-again)" != 0 ] && out_of b13-again | grep -q 'HOOK BLOCKED: send refused' \
@@ -611,7 +611,7 @@ guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B13" || exit 1
 guard_block b15-ok coding codex-a 2 b15-ok || bad "B15 success setup"
 B15_OK_CB="$GROOT/.dev/forge-tmp/callbacks/b15-ok-coding.$GS.$GINC.callback"
 B15_OK_ID="$(sed -n 's/^callback_id: //p' "$B15_OK_CB")"
-run_in_pane "$GS:0.0" b15-ok-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b15-ok --stage adhoc --worker codex-b --supersede )"
+run_in_pane "$GS:0.0" b15-ok-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug b15-ok --stage adhoc --worker codex-b --supersede )"
 if [ "$(rc_of b15-ok-dispatch)" = 0 ] && [ ! -f "$B15_OK_CB" ] \
    && grep -q 'FORGE_SUPERSEDED' "$GROOT/.dev/proposals/b15-ok/forge-log.yml" \
    && grep -Eq "SUPERSEDE_AUDIT: pipeline=b15-ok stage=coding prior_callback_id=$B15_OK_ID prior_status=BLOCKED .*actor=$GS" "$GROOT/.dev/forge-tmp/orchestrator-events.log" \
@@ -628,7 +628,7 @@ guard_block d1sup coding codex-a 2 d1sup || bad "D1-SUP setup"
 cat > "$GROOT/.dev/attention/ask-d1sup.json" <<JSON
 {"schema":"cc-attention/1","event":"ask","variant":"ask","session":"forge-1","root":"$GROOT","emitted_at":"2026-07-19T13:24:52Z","ask_id":"ask-d1sup","mode":"stage","slug":"d1sup","stage":"coding","worker":"codex-a","question_snippet":"drop or keep?"}
 JSON
-run_in_pane "$GS:0.0" d1sup-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug d1sup --stage adhoc --worker codex-b --supersede )"
+run_in_pane "$GS:0.0" d1sup-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug d1sup --stage adhoc --worker codex-b --supersede )"
 if [ "$(rc_of d1sup-dispatch)" = 0 ] \
    && grep -q 'FORGE_SUPERSEDED' "$GROOT/.dev/proposals/d1sup/forge-log.yml" \
    && [ ! -f "$GROOT/.dev/attention/ask-d1sup.json" ] \
@@ -667,7 +667,7 @@ before_audit=$(grep -c 'SUPERSEDE_AUDIT.*b15-fail' "$GROOT/.dev/forge-tmp/orches
 before_audit=${before_audit:-0}
 before_log=$(shasum -a 256 "$GROOT/.dev/proposals/b15-fail/forge-log.yml" | awk '{print $1}')
 before_cb=$(shasum -a 256 "$B15_FAIL_CB" | awk '{print $1}')
-run_in_pane "$GS:0.0" b15-fail-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b15-fail --stage adhoc --worker codex-b --supersede )"
+run_in_pane "$GS:0.0" b15-fail-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug b15-fail --stage adhoc --worker codex-b --supersede )"
 after_audit=$(grep -c 'SUPERSEDE_AUDIT.*b15-fail' "$GROOT/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null || true)
 after_audit=${after_audit:-0}
 after_log=$(shasum -a 256 "$GROOT/.dev/proposals/b15-fail/forge-log.yml" | awk '{print $1}')
@@ -679,13 +679,13 @@ if [ "$(rc_of b15-fail-dispatch)" != 0 ] && [ "$before_log" = "$after_log" ] \
     ok "T-GUARD-B15-SUPERSEDE-CLOSE-FAILURE"
 else bad "T-GUARD-B15-SUPERSEDE-CLOSE-FAILURE"; fi
 sed -i '' 's/^  - timestamp: 2026-07-13T00:00:00Z$/  - timestamp: "2026-07-13T00:00:00Z"/' "$GROOT/.dev/proposals/b15-fail/forge-log.yml"
-run_in_pane "$GS:0.0" b15-fail-repair "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b15-fail --stage adhoc --worker codex-b --supersede )"
+run_in_pane "$GS:0.0" b15-fail-repair "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug b15-fail --stage adhoc --worker codex-b --supersede )"
 [ "$(rc_of b15-fail-repair)" = 0 ] && [ ! -f "$B15_FAIL_CB" ] || bad "B15 repair supersede"
 guard_done b15-fail adhoc codex-b 3 b15-fail-repair-clean || bad "B15 close repair replacement"
 guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B15-FAILURE" || exit 1
 
 guard_block b17-hold coding codex-a 2 b17-hold || bad "B17 setup"
-run_in_pane "$GS:0.0" b17-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug b17-next --stage adhoc --worker codex-b --allow-blocked p0-b17 )"
+run_in_pane "$GS:0.0" b17-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug b17-next --stage adhoc --worker codex-b --allow-blocked p0-b17 )"
 if [ "$(rc_of b17-dispatch)" = 0 ] && guard_capture_has 3 'codex-b-adhoc-b17-next.txt' \
    && grep -Eq 'GUARD_BLOCK: pipeline=multi stage=\? boundary=dispatch reason=allow-blocked-bypass n=1 .*bypassed=b17-hold.*allow_reason=p0-b17' "$GROOT/.dev/forge-tmp/orchestrator-events.log" \
    && ! out_of b17-dispatch | grep -q 'HOOK BLOCKED: send refused'; then
@@ -697,8 +697,8 @@ guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B17" || exit 1
 
 guard_block z-b18-a coding codex-a 2 b18-a || bad "B18 setup A"
 guard_block a-b18-b coding codex-b 3 b18-b || bad "B18 setup B"
-run_in_pane "$GS:0.0" b18-force-a "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-a B18_FORCE_A )"
-run_in_pane "$GS:0.0" b18-force-b "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-b B18_FORCE_B )"
+run_in_pane "$GS:0.0" b18-force-a "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --force codex-a B18_FORCE_A )"
+run_in_pane "$GS:0.0" b18-force-b "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --force codex-b B18_FORCE_B )"
 b18_a_out="$(out_of b18-force-a)"; b18_b_out="$(out_of b18-force-b)"
 if [ "$(rc_of b18-force-a)" != 0 ] && [ "$(rc_of b18-force-b)" != 0 ] \
    && printf '%s' "$b18_a_out" | grep -q 'a-b18-b/coding' && ! printf '%s' "$b18_a_out" | grep -q 'z-b18-a/coding' \
@@ -707,7 +707,7 @@ if [ "$(rc_of b18-force-a)" != 0 ] && [ "$(rc_of b18-force-b)" != 0 ] \
     ok "T-GUARD-B18-FORCE-FILTER"
 else bad "T-GUARD-B18-FORCE-FILTER"; fi
 guard_done a-b18-b coding codex-b 3 b18-b-clean || bad "B18 close B"
-run_in_pane "$GS:0.0" b18-own "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-a B18_AFTER_B )"
+run_in_pane "$GS:0.0" b18-own "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --force codex-a B18_AFTER_B )"
 if [ "$(rc_of b18-own)" = 0 ] && guard_capture_has 2 B18_AFTER_B; then
     ok "T-GUARD-B18-OWN-CONTINUE"
 else bad "T-GUARD-B18-OWN-CONTINUE"; fi
@@ -774,7 +774,7 @@ entries:
     response: null
     files: []
 EOF
-run_in_pane "$S2:0.0" reuseblock "FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR $BRIDGE dispatch --slug rb1 --stage adhoc --worker codex-a"
+run_in_pane "$S2:0.0" reuseblock "FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug rb1 --stage adhoc --worker codex-a"
 if [ "$(rc_of reuseblock)" = "0" ] && ! out_of reuseblock | grep -q "HOOK BLOCKED"; then
     ok "T-REUSE-BLOCK reborn session not blocked by dead incarnation's orphan"
 else
@@ -794,7 +794,7 @@ entries:
     response: null
     files: []
 EOF
-run_in_pane "$S2:0.0" reuselegacy "FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR $BRIDGE dispatch --slug rl1 --stage adhoc --worker codex-a"
+run_in_pane "$S2:0.0" reuselegacy "FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug rl1 --stage adhoc --worker codex-a"
 if [ "$(rc_of reuselegacy)" != "0" ] && out_of reuselegacy | grep -q "open pending"; then
     ok "T-REUSE-LEGACY legacy no-incarnation pending still blocks by name"
 else
@@ -837,7 +837,7 @@ selected_pending_timestamp: "2026-07-11T00:03:00Z"
 message: predecessor
 EOF
 REUSE_CB_BEFORE="$(shasum -a 256 "$REUSE_CB" | awk '{print $1}')"
-run_in_pane "$S2:0.0" reusesup "FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR $BRIDGE dispatch --slug rs1 --stage adhoc --worker codex-a --supersede"
+run_in_pane "$S2:0.0" reusesup "FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug rs1 --stage adhoc --worker codex-a --supersede"
 reuse_inc="$(tmux display-message -p -t "$S2:0.0" '#{session_created}')"
 supok=$(python3 - "$drs/forge-log.yml" "$S1" "$S2" "$reuse_inc" <<'PY'
 import sys,yaml
@@ -1741,7 +1741,7 @@ PY
   }
   hdec(){ ID_target_session="$HS" ID_target_incarnation="$HINC" _hygiene_decide "$HC" "$1" '' ''; }
   # Seed: a clean dispatch to codex-b proves the un-crashed path and creates the journal.
-  run_in_pane "$HS:0.0" hygc-seed "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygc0 --stage adhoc --worker codex-b )"
+  run_in_pane "$HS:0.0" hygc-seed "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygc0 --stage adhoc --worker codex-b )"
   [ "$(rc_of hygc-seed)" = 0 ] && [ "$(jdel codex-b state)" = delivered ] \
     && ok "T-HYG-CRASH seed dispatch delivers + journal records delivered" \
     || bad "T-HYG-CRASH seed: rc=$(rc_of hygc-seed) state=$(jdel codex-b state)"
@@ -1749,7 +1749,7 @@ PY
   run_in_pane "$HS:0.3" hygc-seed-done "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc0 --stage adhoc --status DONE --worker codex-b --message d --quiet )"
   [ "$(rc_of hygc-seed-done)" = 0 ] || bad "T-HYG-CRASH seed close failed"
   # pending seam: crash after the pending log, before any journal delivery record.
-  run_in_pane "$HS:0.0" hygc-pending "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=pending $BRIDGE dispatch --slug hygc1 --stage adhoc --worker codex-a )"
+  run_in_pane "$HS:0.0" hygc-pending "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=pending FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygc1 --stage adhoc --worker codex-a )"
   if [ "$(rc_of hygc-pending)" = 99 ] \
      && grep -q 'response: null' "$HC/.dev/proposals/hygc1/forge-log.yml" \
      && [ -z "$(jdel codex-a state)" ] \
@@ -1763,7 +1763,7 @@ PY
   run_in_pane "$HS:0.2" hygc1-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc1 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
   [ "$(rc_of hygc1-close)" = 0 ] || bad "T-HYG-CRASH hygc1 close failed"
   # activity seam: attempting persisted, crash BEFORE any keystroke.
-  run_in_pane "$HS:0.0" hygc-act "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=activity $BRIDGE dispatch --slug hygc2 --stage adhoc --worker codex-a )"
+  run_in_pane "$HS:0.0" hygc-act "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=activity FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygc2 --stage adhoc --worker codex-a )"
   if [ "$(rc_of hygc-act)" = 99 ] \
      && [ "$(jdel codex-a state)" = attempting ] && [ "$(jdel codex-a kind)" = dispatch ] \
      && [ "$(hdec codex-a)" = "RESET_UNPROVEN attempting" ] \
@@ -1775,14 +1775,14 @@ PY
   # Convergence: close the crashed pending, re-dispatch clean → delivered.
   tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
   run_in_pane "$HS:0.2" hygc2-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc2 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
-  run_in_pane "$HS:0.0" hygc2-retry "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygc2b --stage adhoc --worker codex-a )"
+  run_in_pane "$HS:0.0" hygc2-retry "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygc2b --stage adhoc --worker codex-a )"
   [ "$(rc_of hygc2-retry)" = 0 ] && [ "$(jdel codex-a state)" = delivered ] \
     && ok "T-HYG-CRASH-ACTIVITY retry converges to delivered" \
     || bad "T-HYG-CRASH-ACTIVITY retry rc=$(rc_of hygc2-retry) state=$(jdel codex-a state)"
   tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
   run_in_pane "$HS:0.2" hygc2b-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc2b --stage adhoc --status DONE --worker codex-a --message d --quiet )"
   # send-text seam: text typed, Enter never sent → stays attempting.
-  run_in_pane "$HS:0.0" hygc-text "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=send-text $BRIDGE dispatch --slug hygc3 --stage adhoc --worker codex-b )"
+  run_in_pane "$HS:0.0" hygc-text "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=send-text FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygc3 --stage adhoc --worker codex-b )"
   if [ "$(rc_of hygc-text)" = 99 ] && [ "$(jdel codex-b state)" = attempting ] \
      && hyg_cap_has 3 'adhoc-hygc3.txt'; then
     ok "T-HYG-CRASH-SEND-TEXT text typed, no Enter → stays attempting"
@@ -1792,14 +1792,14 @@ PY
   tmux send-keys -t "$HS:0.3" C-c 2>/dev/null; sleep 0.3
   run_in_pane "$HS:0.3" hygc3-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc3 --stage adhoc --status DONE --worker codex-b --message d --quiet )"
   # send-enter seam: Enter delivered but crash before the delivered write → attempting.
-  run_in_pane "$HS:0.0" hygc-enter "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=send-enter $BRIDGE dispatch --slug hygc4 --stage adhoc --worker codex-b )"
+  run_in_pane "$HS:0.0" hygc-enter "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=send-enter FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygc4 --stage adhoc --worker codex-b )"
   [ "$(rc_of hygc-enter)" = 99 ] && [ "$(jdel codex-b state)" = attempting ] \
     && ok "T-HYG-CRASH-SEND-ENTER post-Enter pre-delivered → stays attempting (callback must confirm)" \
     || bad "T-HYG-CRASH-SEND-ENTER rc=$(rc_of hygc-enter) state='$(jdel codex-b state)'"
   tmux send-keys -t "$HS:0.3" C-c 2>/dev/null; sleep 0.3
   run_in_pane "$HS:0.3" hygc4-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc4 --stage adhoc --status DONE --worker codex-b --message d --quiet )"
   # delivered seam: crash AFTER the delivered write — benign.
-  run_in_pane "$HS:0.0" hygc-del "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=delivered $BRIDGE dispatch --slug hygc5 --stage adhoc --worker codex-a )"
+  run_in_pane "$HS:0.0" hygc-del "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=delivered FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygc5 --stage adhoc --worker codex-a )"
   [ "$(rc_of hygc-del)" = 99 ] && [ "$(jdel codex-a state)" = delivered ] \
     && ok "T-HYG-CRASH-DELIVERED post-delivered crash is benign" \
     || bad "T-HYG-CRASH-DELIVERED rc=$(rc_of hygc-del) state='$(jdel codex-a state)'"
@@ -1807,7 +1807,7 @@ PY
   run_in_pane "$HS:0.2" hygc5-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc5 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
   # Ordinary (logged, non-force) public send: activity seam → attempting kind=send, no keystroke.
   run_in_pane "$HS:0.0" hygc-slog "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug hygc6 --stage adhoc --from claude --to codex-a --prompt p )"
-  run_in_pane "$HS:0.0" hygc-send "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=activity $BRIDGE send codex-a HYGC6_SEND_MARKER )"
+  run_in_pane "$HS:0.0" hygc-send "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=activity FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send codex-a HYGC6_SEND_MARKER )"
   if [ "$(rc_of hygc-send)" = 99 ] && [ "$(jdel codex-a state)" = attempting ] \
      && [ "$(jdel codex-a kind)" = send ] && ! hyg_cap_has 2 HYGC6_SEND_MARKER; then
     ok "T-HYG-CRASH ordinary send activity seam → attempting kind=send, no keystroke"
@@ -1820,7 +1820,7 @@ PY
   run_in_pane "$HS:0.0" hygc-flog "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug hygc7 --stage adhoc --from claude --to codex-a --prompt p )"
   run_in_pane "$HS:0.2" hygc-fblk "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc7 --stage adhoc --status BLOCKED --worker codex-a --message stuck --quiet )"
   gen_before="$(ID_target_session=$HS ID_target_incarnation=$HINC _hygiene_current_gen "$HC" codex-a)"
-  run_in_pane "$HS:0.0" hygc-force "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=send-enter $BRIDGE send --force codex-a HYGC7_FORCE_CONTINUATION )"
+  run_in_pane "$HS:0.0" hygc-force "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=send-enter FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --force codex-a HYGC7_FORCE_CONTINUATION )"
   gen_after="$(ID_target_session=$HS ID_target_incarnation=$HINC _hygiene_current_gen "$HC" codex-a)"
   if [ "$(rc_of hygc-force)" = 99 ] && [ "$(jdel codex-a kind)" = send-force ] \
      && [ "$(jdel codex-a state)" = attempting ] && [ "$gen_after" != "$gen_before" ]; then
@@ -1843,7 +1843,7 @@ PY
   }
   # T-HYG-CB-INVALIDATE: pause the callback after observe-pending (prelock barrier);
   # a concurrent decision must read pending/unknown — never the old safe reading.
-  run_in_pane "$HS:0.0" hygk1-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygk1 --stage adhoc --worker codex-a )"
+  run_in_pane "$HS:0.0" hygk1-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygk1 --stage adhoc --worker codex-a )"
   [ "$(rc_of hygk1-disp)" = 0 ] || bad "T-HYG-CB-INVALIDATE setup dispatch failed"
   hwrite observe-known codex-a "generation=$(hgen codex-a)" "callback_id=seed" "pending_timestamp=seed" \
     "usage_record_hash=seedhash" "headroom=90" "confidence=high" >/dev/null
@@ -1867,7 +1867,7 @@ PY
     && ok "T-HYG-CB exact callback promotes delivery → callback-confirmed" \
     || bad "T-HYG-CB promote missing: state=$(jdel codex-a state)"
   # T-HYG-CB-UNKNOWN-ON-FAILURE: usage path is a directory → DONE still closes, unknown recorded.
-  run_in_pane "$HS:0.0" hygk2-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygk2 --stage adhoc --worker codex-b )"
+  run_in_pane "$HS:0.0" hygk2-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygk2 --stage adhoc --worker codex-b )"
   UFILE="$HC/.dev/forge-usage.$HS.yml"
   rm -f "$UFILE"; mkdir -p "$UFILE"
   tmux send-keys -t "$HS:0.3" C-c 2>/dev/null; sleep 0.3
@@ -1877,7 +1877,7 @@ PY
     || bad "T-HYG-CB-UNKNOWN-ON-FAILURE rc=$(rc_of hygk2-cb) obs='$(jobs_state codex-b)'"
   rmdir "$UFILE" 2>/dev/null
   # T-HYG-CB-LOCK-TIMEOUT: foreign holder on the worker lock → DONE fail-open, unknown, reset-next.
-  run_in_pane "$HS:0.0" hygk3-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygk3 --stage adhoc --worker codex-a )"
+  run_in_pane "$HS:0.0" hygk3-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygk3 --stage adhoc --worker codex-a )"
   hwrite observe-known codex-a "generation=$(hgen codex-a)" "callback_id=k3" "pending_timestamp=k3" \
     "usage_record_hash=k3hash" "headroom=95" "confidence=high" >/dev/null
   KLOCK="$HC/.dev/forge-tmp/hygiene-locks/$HS.$HINC.codex-a.lock"
@@ -1897,7 +1897,7 @@ PY
   fi
   kill "$KHOLD" 2>/dev/null; wait "$KHOLD" 2>/dev/null
   # Mismatched pending_timestamp does NOT promote (real path).
-  run_in_pane "$HS:0.0" hygk4-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygk4 --stage adhoc --worker codex-b )"
+  run_in_pane "$HS:0.0" hygk4-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygk4 --stage adhoc --worker codex-b )"
   python3 - "$JHC" <<'PY'
 import sys,yaml
 jf=sys.argv[1]; d=yaml.safe_load(open(jf)) or {}
@@ -1910,7 +1910,7 @@ PY
     && ok "T-HYG-CB mismatched pending timestamp does NOT promote" \
     || bad "T-HYG-CB mismatched promote: state=$(jdel codex-b state)"
   # T-HYG-CB-BLOCKED-INVALIDATED: BLOCKED invalidates old-safe; send --force advances generation.
-  run_in_pane "$HS:0.0" hygk5-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygk5 --stage adhoc --worker codex-a )"
+  run_in_pane "$HS:0.0" hygk5-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug hygk5 --stage adhoc --worker codex-a )"
   hwrite observe-known codex-a "generation=$(hgen codex-a)" "callback_id=k5" "pending_timestamp=k5" \
     "usage_record_hash=k5hash" "headroom=99" "confidence=high" >/dev/null
   tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
@@ -1920,7 +1920,7 @@ PY
     *) bad "T-HYG-CB-BLOCKED-INVALIDATED still safe: $(hdec codex-a)" ;;
   esac
   kgen_before="$(hgen codex-a)"
-  run_in_pane "$HS:0.0" hygk5-force "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-a HYGK5_CONTINUE )"
+  run_in_pane "$HS:0.0" hygk5-force "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --force codex-a HYGK5_CONTINUE )"
   kgen_after="$(hgen codex-a)"
   [ "$(rc_of hygk5-force)" = 0 ] && [ "$kgen_after" != "$kgen_before" ] && [ "$(jdel codex-a kind)" = send-force ] \
     && ok "T-HYG-CB-BLOCKED-INVALIDATED send --force continuation advances generation" \
@@ -2678,14 +2678,14 @@ fi
 echo "── HYG §M: emit whitelist round-trip ──"
 MR="$(mkR hygm)"
 for et in RESET HYGIENE_DECISION HYGIENE_ABANDON HYGIENE_BYPASSED RESET_UNAVAILABLE OBSERVE_ONLY; do
-  ( cd "$MR" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" emit "$et" --slug m1 worker=codex-a ) >/dev/null 2>&1; rc=$?
+  ( cd "$MR" && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe "$BRIDGE" emit "$et" --slug m1 worker=codex-a ) >/dev/null 2>&1; rc=$?
   if [ "$rc" = 0 ] && grep -q "^$et: pipeline=m1 " "$MR/.dev/forge-tmp/orchestrator-events.log"; then
     ok "T-HYG-EMIT $et round-trips cmd_emit"
   else
     bad "T-HYG-EMIT $et failed rc=$rc"
   fi
 done
-o=$( cd "$MR" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" emit BOGUS --slug m1 2>&1 ); rc=$?
+o=$( cd "$MR" && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe "$BRIDGE" emit BOGUS --slug m1 2>&1 ); rc=$?
 [ "$rc" != 0 ] && echo "$o" | grep -q 'OBSERVE_ONLY; got' \
   && ok "T-HYG-EMIT BOGUS rejected with the updated whitelist error" \
   || bad "T-HYG-EMIT BOGUS: rc=$rc $o"

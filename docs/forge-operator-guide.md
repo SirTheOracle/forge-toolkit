@@ -647,12 +647,13 @@ confirmed-reset decision.
 
 ### Modes
 
-- `FORGE_WORKER_HYGIENE_MODE=observe` (default) — every boundary computes and audits its
-  decision (`HYGIENE_DECISION` events) but never blocks, never resets, and closes
-  pipelines the legacy way (with a loud `HYGIENE_BYPASSED` alongside each legacy
-  completion). This is the rollout kill switch: exporting it rolls the feature back.
-- `enforce` — the accepted steady state. Dirty/unproven panes are reset (with semantic
-  proof) before new work; a clean verify closes via `verify-decision` → `finalize`.
+- `enforce` (**default** since 2026-07-23, after the spike + live rollout gate) — the
+  accepted steady state. Dirty/unproven panes are reset (with semantic proof) before new
+  work; a clean verify closes via `verify-decision` → `finalize`.
+- `FORGE_WORKER_HYGIENE_MODE=observe` — the kill switch: every boundary still computes
+  and audits its decision (`HYGIENE_DECISION` events) but never blocks, never resets, and
+  closes pipelines the legacy way (with a loud `HYGIENE_BYPASSED` alongside each legacy
+  completion). Export it to roll the feature back.
 
 A typo'd mode is a hard error, never a silent fall-through.
 

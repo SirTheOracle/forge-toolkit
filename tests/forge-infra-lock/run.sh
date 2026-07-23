@@ -889,7 +889,7 @@ mkdir -p "$P/.dev/proposals/p14"
   echo "    parked_reason: \"parked\""; echo "    uncommitted: false"; echo "    response: null"; } > "$P/.dev/proposals/p14/forge-log.yml"
 mkdir -p "$P/.dev/proposals/pbad"
 printf 'pipeline: pbad\nentries:\n  - timestamp: "x\n    stage: [unterminated\n  : : {{{\n' > "$P/.dev/proposals/pbad/forge-log.yml"
-out=$( cd "$P" && "$BRIDGE" emit COMPLETE --slug p14 2>&1 ); rc=$?
+out=$( cd "$P" && FORGE_WORKER_HYGIENE_MODE=observe "$BRIDGE" emit COMPLETE --slug p14 2>&1 ); rc=$?
 echo "$out" | grep -qi 'Traceback' && bad "B14 guard tracebacked on a malformed log" || ok "B14 guard fail-safe on malformed log (no traceback)"
 grep -q 'qualifier=incomplete parked=1' "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null \
   && ok "B14 cmd_emit COMPLETE auto-qualified parked=1" || bad "B14 no qualifier: $out $(cat "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null)"
@@ -941,7 +941,7 @@ bahelp=$("$BRIDGE" help 2>&1)
 echo "$bahelp" | grep -q 'park' && echo "$bahelp" | grep -q 'blocked-audit' && ok "B-acc help documents park+blocked-audit" || bad "B-acc help missing"
 # empty --allow-blocked rejected at arg-parse (before any identity/tmux need)
 P="$(mkproj bacc)"; pending_entry "$P" p-b coding codex-a "2026-06-29T00:00:00Z"
-out=$( cd "$P" && env -u TMUX "$BRIDGE" dispatch --slug p-o --stage coding --worker codex-b --allow-blocked 2>&1 ); rc=$?
+out=$( cd "$P" && env -u TMUX FORGE_WORKER_HYGIENE_MODE=observe "$BRIDGE" dispatch --slug p-o --stage coding --worker codex-b --allow-blocked 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && echo "$out" | grep -qi 'requires a non-empty reason' && ok "B-acc empty --allow-blocked rejected" || bad "B-acc empty reason accepted"
 
 # P1-E writer freeze + archive preservation.
