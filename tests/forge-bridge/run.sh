@@ -19,7 +19,7 @@ bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 export FORGE_WATCH_TRIGGER=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fbid.XXXXXX")"; WORK="$(cd "$WORK" && pwd -P)"
 S1="fbid1-$$"; S2="fbid2-$$"; S3="fbid3-$$"; S4="fbid4-$$"; GS="fbguard-$$"
-trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; tmux kill-session -t "${HS:-none}" 2>/dev/null; tmux kill-session -t "${DS:-none}" 2>/dev/null; tmux kill-session -t "${VS:-none}" 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; tmux kill-session -t "${HS:-none}" 2>/dev/null; tmux kill-session -t "${DS:-none}" 2>/dev/null; tmux kill-session -t "${VS:-none}" 2>/dev/null; tmux kill-session -t "${FS:-none}" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # ---- Pure-helper extraction (no main dispatch) ----
 FNS="$WORK/fns.sh"
@@ -1256,7 +1256,7 @@ fi
 # §0 harness: pure-helper extraction (FNS idiom), fixture seams, env defaults.
 echo "── HYG §0: pure-helper extraction ──"
 HFNS="$WORK/hfns.sh"
-sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p; /^_hygiene_file()/,/^}$/p; /^_hygiene_write()/,/^}$/p; /^_hygiene_decide()/,/^}$/p; /^_hygiene_current_gen()/,/^}$/p; /^_terminal_state()/,/^}$/p; /^_hygiene_journal_preflight()/,/^}$/p; /^_hygiene_finalization_field()/,/^}$/p; /^_hygiene_activation_blockers()/,/^}$/p; /^cmd_hygiene_gc()/,/^}$/p; /^_worker_lock_fd()/,/^}$/p; /^_worker_lock()/,/^}$/p; /^_worker_unlock()/,/^}$/p; /^_terminal_lock()/,/^}$/p; /^_terminal_unlock()/,/^}$/p; /^_hygiene_release_all()/,/^}$/p; /^_reset_worker_locked()/,/^}$/p; /^_worker_open_pending_ts()/,/^}$/p; /^_worker_health()/,/^}$/p; /^pane_index()/,/^}$/p' "$BRIDGE" > "$HFNS"
+sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p; /^_hygiene_file()/,/^}$/p; /^_hygiene_write()/,/^}$/p; /^_hygiene_decide()/,/^}$/p; /^_hygiene_current_gen()/,/^}$/p; /^_terminal_state()/,/^}$/p; /^_hygiene_journal_preflight()/,/^}$/p; /^_hygiene_finalization_field()/,/^}$/p; /^_hygiene_activation_blockers()/,/^}$/p; /^cmd_hygiene_gc()/,/^}$/p; /^_worker_lock_fd()/,/^}$/p; /^_worker_lock()/,/^}$/p; /^_worker_unlock()/,/^}$/p; /^_terminal_lock()/,/^}$/p; /^_terminal_unlock()/,/^}$/p; /^_hygiene_release_all()/,/^}$/p; /^_reset_worker_locked()/,/^}$/p; /^_worker_open_pending_ts()/,/^}$/p; /^_worker_health()/,/^}$/p; /^pane_index()/,/^}$/p; /^_completion_id()/,/^}$/p; /^_event_has_completion()/,/^}$/p' "$BRIDGE" > "$HFNS"
 grep -q '_reset_proof_probe' "$HFNS" && ok "HYG helper extraction non-empty" || bad "HYG helper extraction empty"
 HFIX="$ROOT/tests/forge-bridge/fixtures"
 # Shared env for every hygiene subshell: hermetic defaults + capability fixture.
@@ -2454,6 +2454,225 @@ if command -v tmux >/dev/null 2>&1; then
   tmux kill-session -t "$VS" 2>/dev/null
 else
   echo "  (skip HYG §V: tmux unavailable)"
+fi
+
+echo "── HYG §F/§O: finalize + durable outbox + abandon (real tmux, enforce) ──"
+if command -v tmux >/dev/null 2>&1; then
+  FSs="fbhygf-$$"; FS="$FSs"
+  FC="$(mkR hygf)"
+  tmux new-session -d -s "$FS" -x 220 -y 50 -c "$FC"
+  i=0; while [ "$i" -lt 4 ]; do tmux split-window -d -t "$FS:0" -c "$FC"; tmux select-layout -t "$FS:0" tiled >/dev/null 2>&1; i=$((i+1)); done
+  FINC="$(tmux display-message -p -t "$FS:0.0" '#{session_created}')"
+  sleep 1
+  cat > "$WORK/cap-all.yml" <<'YML'
+version: 1
+families:
+  claude:
+    proven: true
+    new_conversation_anchor: '(?m)^.*Welcome to Claude Code.*$|^\s*/help for help'
+    session_id_capture: ''
+  codex:
+    proven: true
+    new_conversation_anchor: '(?m)^\s*OpenAI Codex.*$|^\s*To get started'
+    session_id_capture: ''
+YML
+  printf '│ >\n▌ Send a message\n' > "$WORK/hyg-idle-all.txt"
+  cat > "$WORK/hyg-proof-all.txt" <<'EOF2'
+│ ✻ Welcome to Claude Code!
+  OpenAI Codex (v0.9)
+  To get started, describe a task
+│ >
+▌ Send a message
+EOF2
+  FEV="$FC/.dev/forge-tmp/orchestrator-events.log"
+  FJ="$FC/.dev/forge-hygiene.$FS.$FINC.yml"
+  FCTX="$FC/.dev/forge-context.$FS.yml"
+  FENF="FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=enforce FORGE_RESET_CAPABILITY_FILE=$WORK/cap-all.yml FORGE_IDLE_PROMPTS_FILE=$WORK/hyg-idle-prompts.yml FORGE_WORKER_RESET_PROOF_TIMEOUT_S=1 FORGE_SEND_COMMIT_WAIT_S=0.05 FORGE_HEALTH_FIXTURE=$WORK/hyg-idle-all.txt FORGE_RESET_BASELINE_FIXTURE=$HFIX/deep-conversation-before.txt FORGE_RESET_PROOF_FIXTURE=$WORK/hyg-proof-all.txt"
+  fclean(){ rm -rf "$FC/.dev"; mkdir -p "$FC/.dev/proposals" "$FC/.dev/forge-tmp/callbacks"; }
+  fstate(){ ID_target_session="$FS" ID_target_incarnation="$FINC" _terminal_state "$FC"; }
+  fwr(){ ID_target_session="$FS" ID_target_incarnation="$FINC" _hygiene_write "$FC" "$@"; }
+  fdec(){ ID_target_session="$FS" ID_target_incarnation="$FINC" _hygiene_decide "$FC" "$1" '' ''; }
+  fresets(){ grep -c '^RESET: ' "$FEV" 2>/dev/null | tr -d ' '; }
+  fcompletes(){ grep -c "^COMPLETE: pipeline=$1 " "$FEV" 2>/dev/null | tr -d ' '; }
+  fsetup(){  # <slug> — drive verify/DONE + CLEAR decision to terminal-cleanup
+    run_in_pane "$FS:0.1" "hf$1log" "( cd $FC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug $1 --stage verify --from claude --to codex-a --prompt p )"
+    tmux send-keys -t "$FS:0.2" C-c 2>/dev/null; sleep 0.3
+    run_in_pane "$FS:0.2" "hf$1cb" "( cd $FC && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=enforce $BRIDGE callback --slug $1 --stage verify --status DONE --worker codex-a --message ok --quiet )"
+    local cb="$FC/.dev/forge-tmp/callbacks/$1-verify.$FS.$FINC.callback" cbid pt
+    cbid="$(grep '^callback_id:' "$cb" 2>/dev/null | awk '{print $2}')"
+    pt="$(grep '^selected_pending_timestamp:' "$cb" 2>/dev/null | sed 's/^selected_pending_timestamp:[[:space:]]*//; s/^\"//; s/\"$//')"
+    mkdir -p "$FC/.dev/qa/$1"; printf 'verdict: CLEAR\nsummary: ok\n' > "$FC/.dev/qa/$1/verification-report.yaml"
+    run_in_pane "$FS:0.1" "hf$1vd" "( cd $FC && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=enforce $BRIDGE verify-decision --slug $1 --callback-id $cbid --pending-timestamp \"$pt\" )"
+    out_of "hf$1vd" | grep -q FINALIZE_READY
+  }
+  # A. crash/outbox sequence on slug f4. Seed a delivered generation per worker so reset
+  # coverage can bind latest_generation (a never-dispatched pane is unprovable by design).
+  fsetup f4 || bad "T-HYG-F f4 setup did not reach FINALIZE_READY"
+  fg=1
+  for fw in claude-opus codex-a codex-b claude-sonnet; do
+    fwr delivery "$fw" "id=seed$fg" "generation=$fg" "kind=dispatch" >/dev/null
+    fwr delivered "$fw" >/dev/null
+    fg=$((fg+1))
+  done
+  run_in_pane "$FS:0.1" hff4dry "( cd $FC && $FENF $BRIDGE finalize --slug f4 --dry-run )"
+  [ "$(rc_of hff4dry)" = 0 ] && out_of hff4dry | grep -q '^FINALIZE_DRYRUN ' \
+    && [ "$(fresets)" = 0 ] && [ "$(fstate)" = terminal-cleanup ] \
+    && ok "T-HYG-F dry-run reports plan, clears nothing" \
+    || bad "T-HYG-F dry-run: rc=$(rc_of hff4dry) resets=$(fresets) state=$(fstate)"
+  run_in_pane "$FS:0.1" hff4c1 "( cd $FC && $FENF FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=fin-resets $BRIDGE finalize --slug f4 )"
+  [ "$(rc_of hff4c1)" = 99 ] && [ "$(fresets)" = 4 ] \
+    && ok "T-HYG-F crash at fin-resets: four confirmed resets, no publication" \
+    || bad "T-HYG-F fin-resets crash: rc=$(rc_of hff4c1) resets=$(fresets)"
+  chmod u-w "$FC/.dev"
+  run_in_pane "$FS:0.1" hff4ow "( cd $FC && $FENF $BRIDGE finalize --slug f4 )"
+  chmod u+w "$FC/.dev"
+  [ "$(rc_of hff4ow)" != 0 ] && out_of hff4ow | grep -q 'FINALIZE_OUTBOX_WRITE_FAILED' \
+    && [ "$(fcompletes f4)" = 0 ] && [ "$(fresets)" = 4 ] \
+    && ok "T-HYG-OUTBOX-WRITE-FAIL aborts before COMPLETE; reset-proven reuse (no 5th /clear)" \
+    || bad "T-HYG-OUTBOX-WRITE-FAIL rc=$(rc_of hff4ow) completes=$(fcompletes f4) resets=$(fresets) $(out_of hff4ow | tail -1)"
+  run_in_pane "$FS:0.1" hff4c2 "( cd $FC && $FENF FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=fin-event $BRIDGE finalize --slug f4 )"
+  [ "$(rc_of hff4c2)" = 99 ] && [ "$(fcompletes f4)" = 1 ] && [ "$(fstate)" = outbox-pending ] \
+    && ok "T-HYG-EVENT-TORN crash after append: one COMPLETE, outbox event-pending" \
+    || bad "T-HYG-EVENT-TORN rc=$(rc_of hff4c2) completes=$(fcompletes f4) state=$(fstate)"
+  FTLOCK="$FC/.dev/forge-tmp/hygiene-locks/$FS.$FINC.terminal.lock"
+  python3 - "$FTLOCK" <<'PY' &
+import fcntl,sys,time
+f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(6)
+PY
+  FHOLD=$!
+  sleep 0.5
+  run_in_pane "$FS:0.1" hff4busy "( cd $FC && $FENF FORGE_TERMINAL_LOCK_WAIT_S=1 $BRIDGE finalize --slug f4 )"
+  [ "$(rc_of hff4busy)" != 0 ] && out_of hff4busy | grep -q 'FINALIZE_BUSY terminal-lock' \
+    && ok "T-HYG-FINALIZE-CONCURRENT second finalizer blocks on the terminal mutex" \
+    || bad "T-HYG-FINALIZE-CONCURRENT rc=$(rc_of hff4busy)"
+  kill "$FHOLD" 2>/dev/null; wait "$FHOLD" 2>/dev/null
+  run_in_pane "$FS:0.1" hff4pub "( cd $FC && $FENF $BRIDGE finalize --slug f4 )"
+  fcid="$(out_of hff4pub | sed -n 's/.*completion_id=\([0-9a-f]*\).*/\1/p' | head -1)"
+  if [ "$(rc_of hff4pub)" = 0 ] && out_of hff4pub | grep -q '^FINALIZE_PUBLISHED state=complete ' \
+     && [ "$(fcompletes f4)" = 1 ] && [ "$(fstate)" = complete ] \
+     && grep -q 'next_stage: complete$' "$FCTX" && grep -q "completion_id: $fcid" "$FCTX"; then
+    ok "T-HYG-F retry converges: ONE COMPLETE, ONE context completion_id, state complete"
+  else
+    bad "T-HYG-F publish: rc=$(rc_of hff4pub) completes=$(fcompletes f4) state=$(fstate)"
+  fi
+  python3 - "$FJ" <<'PY' && ok "T-HYG-OUTBOX-SCHEMA finalization snapshot carries per-worker reset ids" || bad "T-HYG-OUTBOX-SCHEMA missing fields"
+import sys,yaml
+d=yaml.safe_load(open(sys.argv[1])) or {}
+f=((d.get("terminal") or {}).get("finalization") or {})
+assert f.get("id") and f.get("phase")=="published", f
+assert str(f.get("context_written"))=="true" and str(f.get("event_written"))=="true", f
+w=f.get("workers") or {}
+assert len(w)==4, w
+for rec in w.values():
+    assert rec.get("reset_id") and rec.get("covers_generation")==rec.get("latest_generation"), rec
+PY
+  run_in_pane "$FS:0.1" hff4noop "( cd $FC && $FENF $BRIDGE finalize --slug f4 )"
+  out_of hff4noop | grep -q "FINALIZE_NOOP already-published completion_id=$fcid" \
+    && ok "T-HYG-F re-finalize is an idempotent NOOP with the same id" \
+    || bad "T-HYG-F noop: $(out_of hff4noop | tail -1)"
+  run_in_pane "$FS:0.1" hff4emit "( cd $FC && $FENF $BRIDGE emit COMPLETE --slug f4 )"
+  [ "$(rc_of hff4emit)" = 0 ] && out_of hff4emit | grep -q 'already published' && [ "$(fcompletes f4)" = 1 ] \
+    && ok "T-HYG-F emit COMPLETE after publish: no-op re-echo, never a second COMPLETE" \
+    || bad "T-HYG-F emit noop: rc=$(rc_of hff4emit) completes=$(fcompletes f4)"
+  run_in_pane "$FS:0.1" hff4ab "( cd $FC && $FENF $BRIDGE hygiene-abandon --slug f4 --reason nope )"
+  [ "$(rc_of hff4ab)" != 0 ] && out_of hff4ab | grep -q 'REFUSED' \
+    && ok "T-HYG-F abandon refused on a published slug" \
+    || bad "T-HYG-F abandon-published: rc=$(rc_of hff4ab)"
+  # B. preflight-all-then-clear + malformed journal.
+  fclean
+  fsetup f3 || bad "T-HYG-F f3 setup failed"
+  run_in_pane "$FS:0.1" hff3busy "( cd $FC && $FENF FORGE_HEALTH_FIXTURE=$WORK/hyg-busy.txt $BRIDGE finalize --slug f3 )"
+  [ "$(rc_of hff3busy)" != 0 ] && out_of hff3busy | grep -q 'FINALIZE_UNCONFIRMED' \
+    && [ "$(fresets)" = 0 ] && [ "$(fcompletes f3)" = 0 ] \
+    && ok "T-HYG-F preflight-all-then-clear: not-idle pane leaves ALL panes uncleared" \
+    || bad "T-HYG-F preflight: rc=$(rc_of hff3busy) resets=$(fresets)"
+  cp "$FJ" "$FJ.bak"; printf '{{{corrupt\n' > "$FJ"
+  run_in_pane "$FS:0.1" hff3mal "( cd $FC && $FENF $BRIDGE finalize --slug f3 )"
+  [ "$(rc_of hff3mal)" != 0 ] && out_of hff3mal | grep -q 'REFUSED: journal identity/schema preflight failed' \
+    && [ "$(fresets)" = 0 ] \
+    && ok "T-HYG-FINALIZE-MALFORMED unreadable journal → refuse, clear nothing" \
+    || bad "T-HYG-FINALIZE-MALFORMED rc=$(rc_of hff3mal)"
+  mv "$FJ.bak" "$FJ"
+  # T-HYG-CTX-CID-CONFLICT: context carrying a DIFFERENT completion_id refuses the write.
+  printf 'active_pipeline: f3\nnext_stage: terminal-cleanup\ncompletion_id: deadbeefdeadbeef\n' > "$FCTX"
+  run_in_pane "$FS:0.1" hff3cid "( cd $FC && $FENF $BRIDGE finalize --slug f3 )"
+  [ "$(rc_of hff3cid)" != 0 ] && out_of hff3cid | grep -q 'FINALIZE_CONTEXT_WRITE_FAILED' \
+    && [ "$(fcompletes f3)" = 0 ] \
+    && ok "T-HYG-CTX-CID-CONFLICT conflicting stored id → no COMPLETE" \
+    || bad "T-HYG-CTX-CID-CONFLICT rc=$(rc_of hff3cid) completes=$(fcompletes f3)"
+  # C. degraded family → qualified completion.
+  fclean
+  fsetup f13 || bad "T-HYG-F f13 setup failed"
+  run_in_pane "$FS:0.1" hff13 "( cd $FC && $FENF FORGE_WORKER_AUTO_RESET_CODEX=0 FORGE_WORKER_HYGIENE_DEGRADED_CODEX=1 $BRIDGE finalize --slug f13 )"
+  if [ "$(rc_of hff13)" = 0 ] && out_of hff13 | grep -q '^FINALIZE_PUBLISHED state=complete-qualified ' \
+     && grep -q '^COMPLETE: pipeline=f13 .*qualifier=hygiene-disabled workers_dirty=codex-a,codex-b' "$FEV" \
+     && grep -q 'next_stage: complete-qualified' "$FCTX"; then
+    ok "T-HYG-F degraded codex → ONE qualified COMPLETE, state complete-qualified"
+  else
+    bad "T-HYG-F degraded: rc=$(rc_of hff13) $(out_of hff13 | tail -1)"
+  fi
+  # D. hygiene-abandon lifecycle.
+  fclean
+  fsetup f8 || bad "T-HYG-F f8 setup failed"
+  fwr delivery claude-opus "id=s" "generation=7" "kind=dispatch" >/dev/null; fwr delivered claude-opus >/dev/null
+  fwr reset claude-opus "id=r7" "generation=7" "reason=threshold" "proof_kind=post-baseline-anchor" "proof_hash=beef" >/dev/null
+  [ "$(fdec claude-opus | awk '{print $1}')" = KEEP_RESET_PROVEN ] || bad "T-HYG-F abandon seed not proven"
+  run_in_pane "$FS:0.1" hff8obs "( cd $FC && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE hygiene-abandon --slug f8 --reason x )"
+  [ "$(rc_of hff8obs)" != 0 ] && out_of hff8obs | grep -q 'enforce-mode command' \
+    && ok "T-HYG-F abandon hard-refuses in observe" || bad "T-HYG-F abandon observe: rc=$(rc_of hff8obs)"
+  run_in_pane "$FS:0.1" hff8wrong "( cd $FC && $FENF $BRIDGE hygiene-abandon --slug not-mine --reason x )"
+  [ "$(rc_of hff8wrong)" != 0 ] && out_of hff8wrong | grep -q 'does not own the current terminal state' \
+    && ok "T-HYG-F abandon refuses a slug that does not own terminal.slug" \
+    || bad "T-HYG-F abandon ownership: rc=$(rc_of hff8wrong)"
+  run_in_pane "$FS:0.1" hff8 "( cd $FC && $FENF $BRIDGE hygiene-abandon --slug f8 --reason operator-stuck )"
+  if [ "$(rc_of hff8)" = 0 ] && out_of hff8 | grep -q '^HYGIENE_ABANDONED slug=f8 ' \
+     && [ "$(fstate)" = cleanup-abandoned ] && grep -q 'next_stage: cleanup-abandoned' "$FCTX" \
+     && grep -q '^HYGIENE_ABANDON: pipeline=f8 .*reason=operator-stuck' "$FEV" \
+     && [ "$(fcompletes f8)" = 0 ]; then
+    ok "T-HYG-F abandon → cleanup-abandoned, audited, never COMPLETE"
+  else
+    bad "T-HYG-F abandon: rc=$(rc_of hff8) state=$(fstate)"
+  fi
+  case "$(fdec claude-opus)" in
+    RESET_UNPROVEN*) ok "T-HYG-F abandon invalidates even a previously proven worker (P1-2)" ;;
+    *) bad "T-HYG-F abandon left claude-opus proven: $(fdec claude-opus)" ;;
+  esac
+  run_in_pane "$FS:0.1" hff8again "( cd $FC && $FENF $BRIDGE hygiene-abandon --slug f8 --reason x )"
+  [ "$(rc_of hff8again)" != 0 ] && ok "T-HYG-F abandon refuses from cleanup-abandoned" \
+    || bad "T-HYG-F abandon re-run accepted"
+  # E. emit COMPLETE delegation refusals + verified-incomplete reproduction.
+  fclean
+  run_in_pane "$FS:0.1" hfemitfresh "( cd $FC && $FENF $BRIDGE emit COMPLETE --slug zz )"
+  [ "$(rc_of hfemitfresh)" != 0 ] && out_of hfemitfresh | grep -q 'no exact verify decision' \
+    && ok "T-HYG-F emit COMPLETE refused with no verify decision (enforce)" \
+    || bad "T-HYG-F emit fresh: rc=$(rc_of hfemitfresh)"
+  run_in_pane "$FS:0.1" hfvp2log "( cd $FC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug vp2 --stage coding --from claude --to codex-b --prompt p )"
+  tmux send-keys -t "$FS:0.3" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$FS:0.3" hfvp2blk "( cd $FC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug vp2 --stage coding --status BLOCKED --worker codex-b --message hold --quiet )"
+  run_in_pane "$FS:0.1" hfvp2park "( cd $FC && FORGE_WATCH_TRIGGER=0 $BRIDGE park --slug vp2 --stage coding --reason hold )" || true
+  grep -q 'parked_at:' "$FC/.dev/proposals/vp2/forge-log.yml" || bad "T-HYG-F vp2 park setup failed"
+  fsetup f9v && bad "T-HYG-F f9v unexpectedly FINALIZE_READY (parked residue present)" || true
+  [ "$(fstate)" = verified-incomplete ] \
+    && ok "T-HYG-F CLEAR + residue lands verified-incomplete (setup)" \
+    || bad "T-HYG-F f9v state=$(fstate)"
+  run_in_pane "$FS:0.1" hff9vemit "( cd $FC && $FENF $BRIDGE emit COMPLETE --slug f9v )"
+  [ "$(rc_of hff9vemit)" = 0 ] && grep -c "^COMPLETE: pipeline=f9v .*qualifier=incomplete" "$FEV" | grep -q '^2$' \
+    && ok "T-HYG-F verified-incomplete emit reproduces the qualified-incomplete signal" \
+    || bad "T-HYG-F vi emit: rc=$(rc_of hff9vemit) count=$(grep -c 'pipeline=f9v' "$FEV")"
+  # F. _completion_id determinism.
+  cidA="$(_completion_id s1 i1 slg cb pt rh)"; cidB="$(_completion_id s1 i1 slg cb pt rh)"; cidC="$(_completion_id s1 i1 slg cb pt2 rh)"
+  cidPy="$(python3 -c 'import json,hashlib;o={"session":"s1","incarnation":"i1","slug":"slg","verify_callback_id":"cb","pending_timestamp":"pt","report_sha256":"rh"};print(hashlib.sha256(json.dumps(o,ensure_ascii=False,sort_keys=False,separators=(",",":")).encode()).hexdigest())')"
+  [ "$cidA" = "$cidB" ] && [ "$cidA" != "$cidC" ] && [ "$cidA" = "$cidPy" ] \
+    && ok "T-HYG-F completion id deterministic + canonical-JSON pinned" \
+    || bad "T-HYG-F completion id: $cidA vs $cidB vs $cidC vs $cidPy"
+  # G. T-HYG-EVENT-SPOOF: unrelated/foreign records never satisfy the exact match.
+  echo "STAGE: pipeline=f4 completion_id=$fcid decoy=1" >> "$FEV"
+  echo "COMPLETE: pipeline=other-slug completion_id=$fcid" >> "$FEV"
+  _event_has_completion "$FEV" f5-never "$fcid" && bad "T-HYG-EVENT-SPOOF matched a foreign pipeline" \
+    || ok "T-HYG-EVENT-SPOOF exact-record parse rejects spoofed/unrelated lines"
+  tmux kill-session -t "$FS" 2>/dev/null
+else
+  echo "  (skip HYG §F/§O: tmux unavailable)"
 fi
 
 echo

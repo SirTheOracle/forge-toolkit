@@ -894,6 +894,17 @@ echo "$out" | grep -qi 'Traceback' && bad "B14 guard tracebacked on a malformed 
 grep -q 'qualifier=incomplete parked=1' "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null \
   && ok "B14 cmd_emit COMPLETE auto-qualified parked=1" || bad "B14 no qualifier: $out $(cat "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null)"
 
+# T-HYG-EMIT-DELEGATE-ENFORCE (worker-context-hygiene §9b companion): the SAME command under
+# enforce is delegated — with no exact verify decision it refuses and appends nothing new.
+ev_before=$(grep -c '^COMPLETE: ' "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null | tr -d ' ')
+out=$( cd "$P" && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=enforce "$BRIDGE" emit COMPLETE --slug p14 2>&1 ); rc=$?
+ev_after=$(grep -c '^COMPLETE: ' "$P/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null | tr -d ' ')
+if [ "$rc" -ne 0 ] && echo "$out" | grep -q 'no exact verify decision' && [ "$ev_before" = "$ev_after" ]; then
+  ok "T-HYG-EMIT-DELEGATE-ENFORCE enforce refuses the bare COMPLETE (B14 observe behavior preserved)"
+else
+  bad "T-HYG-EMIT-DELEGATE-ENFORCE rc=$rc out=$out"
+fi
+
 # B12/B13/B15/B17/B18 execute end to end in tests/forge-bridge/run.sh:
 #   T-GUARD-B12-CROSS-SLUG, T-GUARD-B12-AFTER-PARK,
 #   T-GUARD-B12-ASK-CONTROL, T-GUARD-B12-INFLIGHT-CONTROL,
