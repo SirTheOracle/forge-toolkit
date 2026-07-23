@@ -19,7 +19,7 @@ bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 export FORGE_WATCH_TRIGGER=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fbid.XXXXXX")"; WORK="$(cd "$WORK" && pwd -P)"
 S1="fbid1-$$"; S2="fbid2-$$"; S3="fbid3-$$"; S4="fbid4-$$"; GS="fbguard-$$"
-trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; tmux kill-session -t "${HS:-none}" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # ---- Pure-helper extraction (no main dispatch) ----
 FNS="$WORK/fns.sh"
@@ -1695,6 +1695,145 @@ _worker_lock claude-opus && _worker_lock codex-a && _terminal_lock \
   && ok "T-HYG-RELEASE-ALL releases terminal + worker locks idempotently" \
   || bad "T-HYG-RELEASE-ALL left a lock held"
 _hygiene_release_all
+
+echo "── HYG §C: crash-conservative delivery seams (real tmux, fresh root) ──"
+if command -v tmux >/dev/null 2>&1; then
+  HS="fbhygc-$$"
+  HC="$(mkR hygc-root)"
+  tmux new-session -d -s "$HS" -x 220 -y 50 -c "$HC"
+  i=0; while [ "$i" -lt 4 ]; do tmux split-window -d -t "$HS:0" -c "$HC"; tmux select-layout -t "$HS:0" tiled >/dev/null 2>&1; i=$((i+1)); done
+  HINC="$(tmux display-message -p -t "$HS:0.0" '#{session_created}')"
+  hyg_pane_ready(){
+    local pane="$1" ready="$HC/.dev/forge-tmp/hyg-pane-$1.ready" attempt=0 poll
+    rm -f "$ready"
+    while [ "$attempt" -lt 15 ]; do
+      tmux send-keys -t "$HS:0.$pane" -l ": > \"$ready\"" 2>/dev/null || true
+      tmux send-keys -t "$HS:0.$pane" Enter 2>/dev/null || true
+      poll=0
+      while [ "$poll" -lt 10 ]; do
+        [ -f "$ready" ] && return 0
+        sleep 0.1; poll=$((poll+1))
+      done
+      attempt=$((attempt+1))
+    done
+    return 1
+  }
+  hp=0; hyg_ready_ok=1
+  while [ "$hp" -lt 5 ]; do
+    hyg_pane_ready "$hp" || { bad "T-HYG-PANE-READY-$hp"; hyg_ready_ok=0; }
+    hp=$((hp+1))
+  done
+  rm -f "$HC"/.dev/forge-tmp/hyg-pane-*.ready
+  hyg_cap_has(){
+    local pane="$1" needle="$2" captured
+    captured="$(tmux capture-pane -p -S - -t "$HS:0.$pane" 2>/dev/null | tr -d '\n')" || return 1
+    case "$captured" in *"$needle"*) return 0 ;; *) return 1 ;; esac
+  }
+  JHC="$HC/.dev/forge-hygiene.$HS.$HINC.yml"
+  jdel(){  # jdel <worker> <field> — delivery field from the §C journal
+    python3 - "$JHC" "$1" "$2" <<'PY'
+import sys,yaml,os
+try: d=(yaml.safe_load(open(sys.argv[1])) or {}) if os.path.exists(sys.argv[1]) else {}
+except Exception: d={}
+w=(d.get("workers") or {}).get(sys.argv[2]) or {}
+print((w.get("delivery") or {}).get(sys.argv[3]) or "")
+PY
+  }
+  hdec(){ ID_target_session="$HS" ID_target_incarnation="$HINC" _hygiene_decide "$HC" "$1" '' ''; }
+  # Seed: a clean dispatch to codex-b proves the un-crashed path and creates the journal.
+  run_in_pane "$HS:0.0" hygc-seed "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygc0 --stage adhoc --worker codex-b )"
+  [ "$(rc_of hygc-seed)" = 0 ] && [ "$(jdel codex-b state)" = delivered ] \
+    && ok "T-HYG-CRASH seed dispatch delivers + journal records delivered" \
+    || bad "T-HYG-CRASH seed: rc=$(rc_of hygc-seed) state=$(jdel codex-b state)"
+  tmux send-keys -t "$HS:0.3" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.3" hygc-seed-done "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc0 --stage adhoc --status DONE --worker codex-b --message d --quiet )"
+  [ "$(rc_of hygc-seed-done)" = 0 ] || bad "T-HYG-CRASH seed close failed"
+  # pending seam: crash after the pending log, before any journal delivery record.
+  run_in_pane "$HS:0.0" hygc-pending "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=pending $BRIDGE dispatch --slug hygc1 --stage adhoc --worker codex-a )"
+  if [ "$(rc_of hygc-pending)" = 99 ] \
+     && grep -q 'response: null' "$HC/.dev/proposals/hygc1/forge-log.yml" \
+     && [ -z "$(jdel codex-a state)" ] \
+     && [ "$(hdec codex-a)" = "RESET_UNPROVEN no-record" ] \
+     && ! hyg_cap_has 2 'adhoc-hygc1.txt'; then
+    ok "T-HYG-CRASH-PENDING open pending + no record + no keystroke → RESET_UNPROVEN no-record"
+  else
+    bad "T-HYG-CRASH-PENDING rc=$(rc_of hygc-pending) state='$(jdel codex-a state)' dec='$(hdec codex-a)'"
+  fi
+  tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.2" hygc1-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc1 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
+  [ "$(rc_of hygc1-close)" = 0 ] || bad "T-HYG-CRASH hygc1 close failed"
+  # activity seam: attempting persisted, crash BEFORE any keystroke.
+  run_in_pane "$HS:0.0" hygc-act "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=activity $BRIDGE dispatch --slug hygc2 --stage adhoc --worker codex-a )"
+  if [ "$(rc_of hygc-act)" = 99 ] \
+     && [ "$(jdel codex-a state)" = attempting ] && [ "$(jdel codex-a kind)" = dispatch ] \
+     && [ "$(hdec codex-a)" = "RESET_UNPROVEN attempting" ] \
+     && ! hyg_cap_has 2 'adhoc-hygc2.txt'; then
+    ok "T-HYG-CRASH-ACTIVITY attempting persisted, NO keystroke → RESET_UNPROVEN attempting"
+  else
+    bad "T-HYG-CRASH-ACTIVITY rc=$(rc_of hygc-act) state='$(jdel codex-a state)' dec='$(hdec codex-a)'"
+  fi
+  # Convergence: close the crashed pending, re-dispatch clean → delivered.
+  tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.2" hygc2-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc2 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
+  run_in_pane "$HS:0.0" hygc2-retry "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygc2b --stage adhoc --worker codex-a )"
+  [ "$(rc_of hygc2-retry)" = 0 ] && [ "$(jdel codex-a state)" = delivered ] \
+    && ok "T-HYG-CRASH-ACTIVITY retry converges to delivered" \
+    || bad "T-HYG-CRASH-ACTIVITY retry rc=$(rc_of hygc2-retry) state=$(jdel codex-a state)"
+  tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.2" hygc2b-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc2b --stage adhoc --status DONE --worker codex-a --message d --quiet )"
+  # send-text seam: text typed, Enter never sent → stays attempting.
+  run_in_pane "$HS:0.0" hygc-text "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=send-text $BRIDGE dispatch --slug hygc3 --stage adhoc --worker codex-b )"
+  if [ "$(rc_of hygc-text)" = 99 ] && [ "$(jdel codex-b state)" = attempting ] \
+     && hyg_cap_has 3 'adhoc-hygc3.txt'; then
+    ok "T-HYG-CRASH-SEND-TEXT text typed, no Enter → stays attempting"
+  else
+    bad "T-HYG-CRASH-SEND-TEXT rc=$(rc_of hygc-text) state='$(jdel codex-b state)'"
+  fi
+  tmux send-keys -t "$HS:0.3" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.3" hygc3-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc3 --stage adhoc --status DONE --worker codex-b --message d --quiet )"
+  # send-enter seam: Enter delivered but crash before the delivered write → attempting.
+  run_in_pane "$HS:0.0" hygc-enter "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=send-enter $BRIDGE dispatch --slug hygc4 --stage adhoc --worker codex-b )"
+  [ "$(rc_of hygc-enter)" = 99 ] && [ "$(jdel codex-b state)" = attempting ] \
+    && ok "T-HYG-CRASH-SEND-ENTER post-Enter pre-delivered → stays attempting (callback must confirm)" \
+    || bad "T-HYG-CRASH-SEND-ENTER rc=$(rc_of hygc-enter) state='$(jdel codex-b state)'"
+  tmux send-keys -t "$HS:0.3" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.3" hygc4-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc4 --stage adhoc --status DONE --worker codex-b --message d --quiet )"
+  # delivered seam: crash AFTER the delivered write — benign.
+  run_in_pane "$HS:0.0" hygc-del "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=delivered $BRIDGE dispatch --slug hygc5 --stage adhoc --worker codex-a )"
+  [ "$(rc_of hygc-del)" = 99 ] && [ "$(jdel codex-a state)" = delivered ] \
+    && ok "T-HYG-CRASH-DELIVERED post-delivered crash is benign" \
+    || bad "T-HYG-CRASH-DELIVERED rc=$(rc_of hygc-del) state='$(jdel codex-a state)'"
+  tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.2" hygc5-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc5 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
+  # Ordinary (logged, non-force) public send: activity seam → attempting kind=send, no keystroke.
+  run_in_pane "$HS:0.0" hygc-slog "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug hygc6 --stage adhoc --from claude --to codex-a --prompt p )"
+  run_in_pane "$HS:0.0" hygc-send "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=activity $BRIDGE send codex-a HYGC6_SEND_MARKER )"
+  if [ "$(rc_of hygc-send)" = 99 ] && [ "$(jdel codex-a state)" = attempting ] \
+     && [ "$(jdel codex-a kind)" = send ] && ! hyg_cap_has 2 HYGC6_SEND_MARKER; then
+    ok "T-HYG-CRASH ordinary send activity seam → attempting kind=send, no keystroke"
+  else
+    bad "T-HYG-CRASH ordinary send: rc=$(rc_of hygc-send) state='$(jdel codex-a state)' kind='$(jdel codex-a kind)'"
+  fi
+  tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.2" hygc6-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc6 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
+  # send --force continuation: crash at send-enter → attempting kind=send-force, generation advanced.
+  run_in_pane "$HS:0.0" hygc-flog "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug hygc7 --stage adhoc --from claude --to codex-a --prompt p )"
+  run_in_pane "$HS:0.2" hygc-fblk "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc7 --stage adhoc --status BLOCKED --worker codex-a --message stuck --quiet )"
+  gen_before="$(ID_target_session=$HS ID_target_incarnation=$HINC _hygiene_current_gen "$HC" codex-a)"
+  run_in_pane "$HS:0.0" hygc-force "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_HYGIENE_TEST=1 FORGE_HYGIENE_CRASH_AT=send-enter $BRIDGE send --force codex-a HYGC7_FORCE_CONTINUATION )"
+  gen_after="$(ID_target_session=$HS ID_target_incarnation=$HINC _hygiene_current_gen "$HC" codex-a)"
+  if [ "$(rc_of hygc-force)" = 99 ] && [ "$(jdel codex-a kind)" = send-force ] \
+     && [ "$(jdel codex-a state)" = attempting ] && [ "$gen_after" != "$gen_before" ]; then
+    ok "T-HYG-CRASH send --force advances generation, stays attempting at send-enter seam"
+  else
+    bad "T-HYG-CRASH send --force: rc=$(rc_of hygc-force) kind='$(jdel codex-a kind)' gen $gen_before→$gen_after"
+  fi
+  tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.2" hygc7-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc7 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
+else
+  tmux kill-session -t "$HS" 2>/dev/null
+  echo "  (skip HYG §C: tmux unavailable)"
+fi
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"

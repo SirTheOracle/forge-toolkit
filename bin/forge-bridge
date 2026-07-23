@@ -3339,12 +3339,36 @@ PYEOF
         [ "$_sup_n" -gt 0 ] && _emit_event SUPERSEDE "$slug" "stage=$stage closed_pending=$_sup_n worker=$worker_canonical partial_fail=0"
     fi
 
+    # P0-4: supersede's replacement prompt is written only now, after its reset+close.
+    [ "$supersede" = true ] && printf '%s' "$rendered" > "$prompt_file"
     local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
-    cmd_log --slug "$slug" --stage "$stage" --from claude --to "$worker_canonical" --prompt "$ref_msg" >/dev/null
+    # P1-4: pre-send bookkeeping is FAIL-CLOSED — the pending log, the generation, and the
+    # attempting delivery must all persist BEFORE any keystroke; any failure aborts and
+    # unlocks with NO text sent (no keystroke can occur without durable attempting evidence).
+    cmd_log --slug "$slug" --stage "$stage" --from claude --to "$worker_canonical" --prompt "$ref_msg" >/dev/null || {
+        _emit_event ERROR "$slug" "stage=$stage reason=pending-log-failed worker=$worker_canonical"
+        _worker_unlock "$worker_canonical"; return 1; }
+    _hygiene_crash_at pending   # P2-11: crash here leaves an open pending with no activity
+    local _pend_ts
+    _pend_ts="$(_callback_pending_select_exact "$guard_log" "$stage" "$worker_canonical" "$ID_target_session" "$ID_target_incarnation" 2>/dev/null)"
+    local _dg; _dg="$(_hygiene_write "$project_root" next-gen "")" || {
+        _emit_event ERROR "$slug" "stage=$stage reason=generation-write-failed worker=$worker_canonical"
+        _worker_unlock "$worker_canonical"; return 1; }
+    _hygiene_write "$project_root" delivery "$worker_canonical" \
+        "id=dispatch-$(date -u +%Y%m%dT%H%M%SZ)-$$" "generation=${_dg:-0}" \
+        "kind=$([ "$supersede" = true ] && echo supersede || echo dispatch)" \
+        "slug=$slug" "stage=$stage" "pending_timestamp=${_pend_ts:-}" || {
+        _emit_event ERROR "$slug" "stage=$stage reason=delivery-write-failed worker=$worker_canonical"
+        _worker_unlock "$worker_canonical"; return 1; }
+    _hygiene_crash_at activity  # attempting persisted; crash here -> RESET_UNPROVEN attempting
     cmd_send --_internal "$worker_canonical" "$ref_msg" || {
         _emit_event ERROR "$slug" "stage=$stage reason=send-failed worker=$worker_canonical"
+        _worker_unlock "$worker_canonical"
         return 1
     }
+    _hygiene_crash_at send-enter   # after Enter, before delivered -> stays attempting (proven only by an exact later callback)
+    _hygiene_write "$project_root" delivered "$worker_canonical" 2>/dev/null || true   # advisory: loss keeps attempting (safe)
+    _hygiene_crash_at delivered     # P2-1: after the delivered write — benign (a later callback confirms)
 
     _emit_event DISPATCH "$slug" "stage=$stage worker=$worker_canonical"
     _render_status_file
