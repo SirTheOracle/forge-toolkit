@@ -1938,6 +1938,133 @@ _hygiene_release_all() {
     _terminal_unlock
 }
 
+_reset_worker_locked() {   # <session> <idx> <worker> <reason> <slug> [ignore_pending_ts]
+    local sess="$1" idx="$2" wk="$3" reason="$4" slug="${5:-adhoc}" ignore_pt="${6:-}"
+    local fam; fam="$(_worker_family "$wk")"
+    [ -n "$fam" ] || { echo "RESET_REFUSED reason=non-worker" >&2; return 2; }
+    case "$idx" in 0|2|3|4) ;; *) echo "RESET_REFUSED reason=pane-not-worker idx=$idx" >&2; return 2 ;; esac
+    # P2-5: the supplied index MUST be the canonical pane index for this worker, else a
+    # caller bug would clear one pane while recording reset evidence for another.
+    local _wantidx; _wantidx="$(pane_index "$wk")"
+    [ "$_wantidx" = "$idx" ] || { echo "RESET_REFUSED reason=worker-index-mismatch worker=$wk idx=$idx want=$_wantidx" >&2; return 2; }
+    local pr; pr="$(_resolve_project_root "" 2>/dev/null)"
+    [ -n "$pr" ] || { echo "RESET_REFUSED reason=no-root" >&2; return 1; }
+    if [ "$reason" != operator ]; then
+        _reset_automation_enabled "$fam" >/dev/null || { echo "RESET_UNAVAILABLE family=$fam" >&2; return 3; }
+    fi
+    local live_i; live_i="$(session_incarnation_of "$sess")"
+    if [ -n "${ID_target_incarnation:-}" ] && [ "$live_i" != "$ID_target_incarnation" ]; then
+        echo "RESET_REFUSED reason=incarnation-changed" >&2; return 1; fi
+    # P0-3: journal identity/schema preflight BEFORE any keystroke — a foreign/partial-identity
+    # (same-name rebirth) or malformed non-empty journal refuses here, so no /clear is sent.
+    _hygiene_journal_preflight "$pr" || { echo "RESET_REFUSED reason=journal-identity-foreign worker=$wk" >&2; return 1; }
+    # P1-4: pending scan is FAIL-CLOSED — a scan error is treated as "pending present".
+    local _open _oprc; _open="$(_worker_open_pending_ts "$pr" "$wk" "$ignore_pt")"; _oprc=$?
+    [ "$_oprc" -eq 0 ] || { echo "RESET_REFUSED reason=pending-scan-failed worker=$wk" >&2; return 1; }
+    [ -z "$_open" ] || { echo "RESET_REFUSED reason=open-pending ts=$_open" >&2; return 1; }
+    local _hp; _hp="$(_worker_health "$sess" "$idx" "$wk")"
+    case "$_hp" in idle) ;; *) echo "RESET_REFUSED reason=not-idle state=$_hp" >&2; return 1 ;; esac
+    # 1. baseline (visible-screen fingerprint + anchor-present + session id). P1-4: a failed
+    # capture refuses rather than resetting against an empty/garbage baseline.
+    local _base _bfp _bpres _bsid _bhist
+    _base="$(_reset_baseline "$sess" "$idx" "$fam")" || { echo "RESET_REFUSED reason=baseline-capture-failed worker=$wk" >&2; return 1; }
+    [ -n "$_base" ] || { echo "RESET_REFUSED reason=baseline-empty worker=$wk" >&2; return 1; }
+    IFS=$'\t' read -r _bfp _bpres _bsid _bhist <<< "$_base"
+    # 2-5. cancel copy mode, /clear, commit wait, Enter. P2-6: a failed send-keys must NOT
+    # reach the proof poll (a swallowed /clear could otherwise match an incidental redraw).
+    _cancel_copy_mode "$sess:$WINDOW.$idx"
+    tmux send-keys -t "$sess:$WINDOW.$idx" -l "/clear" || { echo "RESET_REFUSED reason=send-clear-failed worker=$wk" >&2; return 1; }
+    sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
+    tmux send-keys -t "$sess:$WINDOW.$idx" Enter || { echo "RESET_REFUSED reason=send-enter-failed worker=$wk" >&2; return 1; }
+    # 6. bounded semantic proof.
+    local _proof; _proof="$(_reset_proof_probe "$sess" "$idx" "$fam" "${_bfp:-}" "${_bpres:-0}" "${_bsid:-}")" || {
+        echo "RESET_UNPROVEN worker=$wk $_proof" >&2; return 1; }
+    # 7. re-require process + idle after proof.
+    local _hp2; _hp2="$(_worker_health "$sess" "$idx" "$wk")"
+    case "$_hp2" in idle) ;; *) echo "RESET_UNPROVEN reason=post-not-idle state=$_hp2" >&2; return 1 ;; esac
+    # 8. persist reset coverage for the CURRENT generation immediately. P0-1 CONTRACT:
+    # reset.covers_generation = latest_generation AT RESET TIME. This is deliberately the
+    # PRE-delivery generation for a dispatch reset — the subsequent delivery advances
+    # latest_generation and thereby invalidates this reset (the pane did work; it is no
+    # longer clean). A reset with NO subsequent delivery (finalize, and its idempotent
+    # retry) keeps covers==latest and is the KEEP_RESET_PROVEN reuse path (see §F reuse
+    # test). Do NOT "cover the delivery's generation": that would make a reset read as
+    # valid AFTER the pane ran that delivery's stage. HARD: a journal-write failure aborts
+    # WITHOUT emitting RESET, so the pane is re-clearable (no false proof).
+    local _g; _g="$(_hygiene_current_gen "$pr" "$wk")"
+    local _pk _ph; _pk="$(printf '%s' "$_proof" | sed -n 's/.*kind=\([^ ]*\).*/\1/p')"
+    _ph="$(printf '%s' "$_proof" | sed -n 's/.*hash=\([0-9a-f]*\).*/\1/p')"
+    _hygiene_write "$pr" reset "$wk" "id=reset-$(date -u +%Y%m%dT%H%M%SZ)-$$" \
+        "generation=${_g:-0}" "reason=$reason" "proof_kind=${_pk:-post-baseline-anchor}" "proof_hash=${_ph:-none}" \
+        || { echo "RESET_UNPROVEN reason=coverage-write-failed worker=$wk" >&2; return 1; }
+    # 9. clear stale stall snapshots ONLY after semantic confirmation; emit RESET (P2-8:
+    # attributed to the dispatching slug, not adhoc).
+    rm -f "$FORGE_CACHE_DIR/${sess}-pane${idx}.snapshot" "$FORGE_CACHE_DIR/${sess}-pane${idx}.last-stall-check" 2>/dev/null || true
+    _emit_event RESET "$slug" "worker=$wk idx=$idx reason=$reason proof=${_pk:-post-baseline-anchor} generation=${_g:-0} base_history=${_bhist:-0}"
+    echo "RESET_OK worker=$wk generation=${_g:-0}"
+}
+
+# Open pending timestamps targeting a worker (excluding an ignored one). Empty => none.
+# P1-6: filters to the CURRENT session+incarnation (with the never-skip-legacy rule used
+# elsewhere) so a dead predecessor or same-name reborn session cannot block a reset.
+_worker_open_pending_ts() {   # <project_root> <worker> [ignore_ts]
+    FORGE_WP_WK="$2" FORGE_WP_IG="${3:-}" FORGE_WP_SESS="$(_resolve_session)" FORGE_WP_INC="${ID_target_incarnation:-}" \
+    python3 - "$1/.dev/proposals" <<'PY'
+import os,sys,glob,yaml
+base=sys.argv[1]; wk=os.environ["FORGE_WP_WK"]; ig=os.environ.get("FORGE_WP_IG","")
+sess=os.environ.get("FORGE_WP_SESS") or ""; inc=os.environ.get("FORGE_WP_INC") or ""
+al={'inline':'claude-opus','general':'claude-opus','claude-general':'claude-opus','opus':'claude-opus',
+    'codex':'codex-a','codex-b':'codex-b','orchestrator':'claude','claude-orchestrator':'claude','sonnet':'claude-sonnet'}
+c=lambda v: al.get(v,v)
+for lp in glob.glob(os.path.join(base,"*","forge-log.yml")):
+    # P1-4: a log we CANNOT parse might hide a pending — fail closed (rc2) so the reset caller
+    # refuses rather than clearing a pane that may still be in flight.
+    try: es=(yaml.safe_load(open(lp)) or {}).get("entries") or []
+    except Exception: sys.stderr.write("PENDING_SCAN_UNREADABLE:%s\n"%lp); sys.exit(2)
+    for e in es:
+        if not (isinstance(e,dict) and e.get("response") is None and c(str(e.get("to") or ""))==wk): continue
+        es_s=str(e.get("session") or ""); es_i=str(e.get("incarnation") or "")
+        # never-skip-legacy: an entry with no session/incarnation still matches; only a
+        # CONFIRMED different session/incarnation is skipped.
+        if es_s and sess and es_s!=sess: continue
+        if es_i and inc and es_i!=str(inc): continue
+        ts=str(e.get("timestamp") or "")
+        if ts and ts!=ig: print(ts)
+PY
+}
+
+# Worker health via idle-prompts.yml (keyed per canonical worker). Echoes
+# idle|busy|prompting|unknown. Test seam FORGE_HEALTH_FIXTURE. P1-4: captures the VISIBLE
+# SCREEN ONLY (no -S), so a historical idle prompt in scrollback cannot read as idle while the
+# visible pane is busy; `unknown` (the fail-closed value) is never accepted as idle by callers.
+_worker_health() {   # <session> <idx> <worker>
+    local sess="$1" idx="$2" wk="$3"
+    local cap; cap=$(mktemp -t forge-wh-XXXXXX 2>/dev/null) || { printf unknown; return 0; }
+    if [ -n "${FORGE_HEALTH_FIXTURE:-}" ] && [ -f "${FORGE_HEALTH_FIXTURE}" ]; then
+        cp "$FORGE_HEALTH_FIXTURE" "$cap"
+    else
+        tmux capture-pane -p -t "$sess:$WINDOW.$idx" > "$cap" 2>/dev/null || true   # visible screen only
+    fi
+    local out; out=$(python3 - "$cap" "$wk" "$FORGE_IDLE_PROMPTS_FILE" <<'PYEOF'
+import sys,re,yaml
+raw=open(sys.argv[1]).read(); kind=sys.argv[2]
+try: prompts=yaml.safe_load(open(sys.argv[3])) or {}
+except Exception: print("unknown"); sys.exit(0)
+norm=re.sub(r'\x1b\[[0-9;]*[A-Za-z]','',raw)
+tail='\n'.join([l for l in norm.splitlines() if l.strip()][-25:])
+cfg=prompts.get(kind) or {}
+def m(p):
+    try: return bool(p) and re.search(p,tail,re.M)
+    except re.error: return False
+if m(cfg.get('active_work_marker')): print("busy")
+elif m(cfg.get('approval_prompt')): print("prompting")
+elif m(cfg.get('idle_prompt_anchor')): print("idle")
+else: print("unknown")
+PYEOF
+)
+    rm -f "$cap" 2>/dev/null; printf '%s' "${out:-unknown}"
+}
+
 # Insert parked_at/parked_reason/uncommitted as SIBLINGS of a specific open entry
 # (located by timestamp anchor), keeping response: null, in BOTH logs — mirroring
 # _patch_response_by_ts's dual-write (pipeline hard-fail, summary soft-fail). §3.1.
@@ -3241,16 +3368,9 @@ PYEOF
     mkdir -p "$(dirname "$prompt_file")"
     printf '%s' "$rendered" > "$prompt_file"
 
-    # Hard Rule 20 — orchestrator (this bridge call) drives /clear, never the worker.
-    if [ "$do_clear" = true ]; then
-        # Split text/Enter (same TUI-commit reason as cmd_send) so /clear
-        # reliably submits instead of sitting unsubmitted in the worker input.
-        _cancel_copy_mode "$SESSION:$WINDOW.$worker_pane"
-        tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" -l "/clear"
-        sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
-        tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" Enter
-        sleep "${FORGE_CLEAR_WAIT_S:-2}"
-    fi
+    # Reset decision + confirmed reset are performed inside the Step-7 enforcement block
+    # below (under the worker lock), coalescing explicit --clear with the automatic
+    # decision into ONE _reset_worker_locked call. Idle-only clearing is no longer a code path.
 
     # --supersede destructive close (deferred — fix-plan Review #5): close every
     # open same-slug pending as FORGE_SUPERSEDED via the no-context helper (NOT

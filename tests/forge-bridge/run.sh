@@ -1256,7 +1256,7 @@ fi
 # §0 harness: pure-helper extraction (FNS idiom), fixture seams, env defaults.
 echo "── HYG §0: pure-helper extraction ──"
 HFNS="$WORK/hfns.sh"
-sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p; /^_hygiene_file()/,/^}$/p; /^_hygiene_write()/,/^}$/p; /^_hygiene_decide()/,/^}$/p; /^_hygiene_current_gen()/,/^}$/p; /^_terminal_state()/,/^}$/p; /^_hygiene_journal_preflight()/,/^}$/p; /^_hygiene_finalization_field()/,/^}$/p; /^_hygiene_activation_blockers()/,/^}$/p; /^cmd_hygiene_gc()/,/^}$/p; /^_worker_lock_fd()/,/^}$/p; /^_worker_lock()/,/^}$/p; /^_worker_unlock()/,/^}$/p; /^_terminal_lock()/,/^}$/p; /^_terminal_unlock()/,/^}$/p; /^_hygiene_release_all()/,/^}$/p' "$BRIDGE" > "$HFNS"
+sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p; /^_hygiene_file()/,/^}$/p; /^_hygiene_write()/,/^}$/p; /^_hygiene_decide()/,/^}$/p; /^_hygiene_current_gen()/,/^}$/p; /^_terminal_state()/,/^}$/p; /^_hygiene_journal_preflight()/,/^}$/p; /^_hygiene_finalization_field()/,/^}$/p; /^_hygiene_activation_blockers()/,/^}$/p; /^cmd_hygiene_gc()/,/^}$/p; /^_worker_lock_fd()/,/^}$/p; /^_worker_lock()/,/^}$/p; /^_worker_unlock()/,/^}$/p; /^_terminal_lock()/,/^}$/p; /^_terminal_unlock()/,/^}$/p; /^_hygiene_release_all()/,/^}$/p; /^_reset_worker_locked()/,/^}$/p; /^_worker_open_pending_ts()/,/^}$/p; /^_worker_health()/,/^}$/p; /^pane_index()/,/^}$/p' "$BRIDGE" > "$HFNS"
 grep -q '_reset_proof_probe' "$HFNS" && ok "HYG helper extraction non-empty" || bad "HYG helper extraction empty"
 HFIX="$ROOT/tests/forge-bridge/fixtures"
 # Shared env for every hygiene subshell: hermetic defaults + capability fixture.
@@ -1931,6 +1931,164 @@ PY
 else
   echo "  (skip HYG §C/§K: tmux unavailable)"
 fi
+
+echo "── HYG §R6: confirmed reset primitive (stubbed tmux spy) ──"
+RROOT="$WORK/hygR"; mkdir -p "$RROOT/.dev/proposals" "$RROOT/.dev/forge-tmp/hygiene-locks"
+RCACHE="$WORK/hygR-cache"; mkdir -p "$RCACHE"
+RSPY="$WORK/hygR-tmux.spy"; : > "$RSPY"
+_resolve_project_root(){ printf '%s' "$RROOT"; }
+_resolve_session(){ printf 'hygS'; }
+session_incarnation_of(){ printf '%s' "${SIO_VAL:-42}"; }
+_cancel_copy_mode(){ :; }
+_emit_event(){ printf '%s: pipeline=%s %s\n' "$1" "$2" "$3" >> "$RROOT/events.log"; }
+tmux(){
+  echo "tmux $*" >> "$RSPY"
+  case "${TMUX_SPY_FAIL:-}" in
+    text)  case "$*" in *send-keys*" -l "*) return 1 ;; esac ;;
+    enter) case "$*" in *send-keys*Enter*)  return 1 ;; esac ;;
+  esac
+  return 0
+}
+clear_count(){ grep -c -- '-l /clear' "$RSPY" 2>/dev/null | tr -d ' '; }
+export WINDOW=0 FORGE_CACHE_DIR="$RCACHE" FORGE_SEND_COMMIT_WAIT_S=0.01
+cat > "$WORK/hyg-idle-prompts.yml" <<'YML'
+claude-opus:
+  idle_prompt_anchor: '│ >'
+  active_work_marker: 'ESC to interrupt'
+  approval_prompt: 'Do you want'
+claude-sonnet:
+  idle_prompt_anchor: '│ >'
+  active_work_marker: 'ESC to interrupt'
+  approval_prompt: 'Do you want'
+codex-a:
+  idle_prompt_anchor: '▌ Send a message'
+  active_work_marker: 'Working…'
+  approval_prompt: 'Approve'
+codex-b:
+  idle_prompt_anchor: '▌ Send a message'
+  active_work_marker: 'Working…'
+  approval_prompt: 'Approve'
+YML
+export FORGE_IDLE_PROMPTS_FILE="$WORK/hyg-idle-prompts.yml"
+printf '● thinking hard\nESC to interrupt\n' > "$WORK/hyg-busy.txt"
+printf 'Do you want to proceed?\n' > "$WORK/hyg-prompting.txt"
+printf 'no anchors here at all\n' > "$WORK/hyg-unknown.txt"
+# Happy path: idle + proven pair → RESET_OK, coverage recorded, stall cache cleared, one /clear.
+# Seed a delivered generation first so reset coverage binds to latest_generation (P0-1 contract).
+_hygiene_write "$RROOT" delivery claude-opus "id=seed" "generation=1" "kind=dispatch" >/dev/null
+_hygiene_write "$RROOT" delivered claude-opus >/dev/null
+touch "$RCACHE/hygS-pane0.snapshot" "$RCACHE/hygS-pane0.last-stall-check"
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_BASELINE_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_PROOF_FIXTURE="$HFIX/claude-opus-clear-after.txt" \
+    _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+if [ "$rc" = 0 ] && echo "$o" | grep -q '^RESET_OK worker=claude-opus' \
+   && [ "$(clear_count)" = 1 ] \
+   && [ ! -f "$RCACHE/hygS-pane0.snapshot" ] \
+   && grep -q 'RESET: pipeline=rslug worker=claude-opus' "$RROOT/events.log" \
+   && grep -q 'proof_hash:' "$RROOT/.dev/forge-hygiene.hygS.42.yml"; then
+  ok "T-HYG-RESET happy path → RESET_OK + coverage + stallcache cleared + RESET event"
+else
+  bad "T-HYG-RESET happy path rc=$rc: $o (clears=$(clear_count))"
+fi
+[ "$(hdec2(){ _hygiene_decide "$RROOT" claude-opus '' ''; }; hdec2)" = "KEEP_RESET_PROVEN reset-covers-latest" ] \
+  && ok "T-HYG-RESET coverage reads back KEEP_RESET_PROVEN" || bad "T-HYG-RESET coverage decision wrong"
+# Index mismatch (P2-5).
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/codex-a-clear-before.txt" _reset_worker_locked hygS 0 codex-a threshold rslug 2>&1); rc=$?
+[ "$rc" = 2 ] && echo "$o" | grep -q 'worker-index-mismatch' \
+  && ok "T-HYG-RESET-INDEX-MISMATCH wrong pane refused rc2" || bad "T-HYG-RESET-INDEX-MISMATCH rc=$rc $o"
+# Preconditions: busy / prompting / unknown each refuse BEFORE /clear.
+cc0="$(clear_count)"
+for hf in hyg-busy.txt hyg-prompting.txt hyg-unknown.txt; do
+  o=$(FORGE_HEALTH_FIXTURE="$WORK/$hf" _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+  [ "$rc" = 1 ] && echo "$o" | grep -q 'not-idle' || bad "T-HYG-RESET-REFUSE-PRECOND $hf rc=$rc $o"
+done
+[ "$(clear_count)" = "$cc0" ] && ok "T-HYG-RESET-REFUSE-PRECOND busy/prompting/unknown refuse with NO /clear" \
+  || bad "T-HYG-RESET-REFUSE-PRECOND a /clear leaked"
+# Open pending refuses; ignoring the exact owned pending proceeds.
+mkdir -p "$RROOT/.dev/proposals/rp"
+printf 'pipeline: rp\nentries:\n  - timestamp: "2026-07-23T01:00:00Z"\n    stage: coding\n    to: claude-opus\n    response: null\n' > "$RROOT/.dev/proposals/rp/forge-log.yml"
+cc0="$(clear_count)"
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$o" | grep -q 'open-pending' && [ "$(clear_count)" = "$cc0" ] \
+  && ok "T-HYG-RESET open pending refused before /clear" || bad "T-HYG-RESET open pending: rc=$rc $o"
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_BASELINE_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_PROOF_FIXTURE="$HFIX/claude-opus-clear-after.txt" \
+    _reset_worker_locked hygS 0 claude-opus supersede rslug "2026-07-23T01:00:00Z" 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "T-HYG-RESET ignore_pt skips ONLY the owned pending (supersede path)" \
+  || bad "T-HYG-RESET ignore_pt rc=$rc $o"
+# Unreadable log → fail-closed pending scan.
+printf 'entries:\n  - {{{bad\n' > "$RROOT/.dev/proposals/rp/forge-log.yml"
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$o" | grep -q 'pending-scan-failed' \
+  && ok "T-HYG-RESET unreadable log → pending-scan-failed (fail-closed)" || bad "T-HYG-RESET scan-fail rc=$rc $o"
+rm -rf "$RROOT/.dev/proposals/rp"
+# Incarnation changed refuses.
+o=$(SIO_VAL=99 FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$o" | grep -q 'incarnation-changed' \
+  && ok "T-HYG-RESET incarnation change refused" || bad "T-HYG-RESET incarnation rc=$rc $o"
+# Foreign / rebirth / malformed journal refuse BEFORE any keystroke (P0-3).
+cc0="$(clear_count)"
+for jf_body in "session: other\nincarnation: 42" "session: hygS\nincarnation: 43" "{{{malformed"; do
+  printf "version: 1\n$jf_body\n" > "$RROOT/.dev/forge-hygiene.hygS.42.yml"
+  o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+  [ "$rc" = 1 ] && echo "$o" | grep -q 'journal-identity-foreign' || bad "T-HYG-RESET-FOREIGN-JOURNAL ($jf_body) rc=$rc $o"
+done
+[ "$(clear_count)" = "$cc0" ] && ok "T-HYG-RESET-FOREIGN-JOURNAL foreign/rebirth/malformed refuse with NO /clear" \
+  || bad "T-HYG-RESET-FOREIGN-JOURNAL a /clear leaked"
+rm -f "$RROOT/.dev/forge-hygiene.hygS.42.yml"
+# Send failures never reach the proof poll (P2-6).
+o=$(TMUX_SPY_FAIL=text FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_BASELINE_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$o" | grep -q 'send-clear-failed' \
+  && ok "T-HYG-RESET-SEND-FAIL swallowed /clear text refused" || bad "T-HYG-RESET-SEND-FAIL text rc=$rc $o"
+o=$(TMUX_SPY_FAIL=enter FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_BASELINE_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$o" | grep -q 'send-enter-failed' \
+  && ok "T-HYG-RESET-SEND-FAIL swallowed Enter refused" || bad "T-HYG-RESET-SEND-FAIL enter rc=$rc $o"
+# UNPROVEN (ignored clear): stall snapshots retained; PROVEN path already removed them.
+touch "$RCACHE/hygS-pane0.snapshot"
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_BASELINE_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_PROOF_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$o" | grep -q 'UNPROVEN' && [ -f "$RCACHE/hygS-pane0.snapshot" ] \
+  && ok "T-HYG-RESET-STALLCACHE UNPROVEN keeps snapshots (no false cleanup)" \
+  || bad "T-HYG-RESET-STALLCACHE rc=$rc $o"
+rm -f "$RCACHE/hygS-pane0.snapshot"
+# Coverage-write failure → RESET_UNPROVEN, retry converges (crash-retry semantics).
+RJ3="$WORK/hygR-cw"; mkdir -p "$RJ3/.dev/forge-tmp/hygiene-locks"
+_resolve_project_root(){ printf '%s' "$RJ3"; }
+chmod u-w "$RJ3/.dev"
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_BASELINE_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_PROOF_FIXTURE="$HFIX/claude-opus-clear-after.txt" \
+    _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+chmod u+w "$RJ3/.dev"
+[ "$rc" = 1 ] && echo "$o" | grep -q 'coverage-write-failed' \
+  && ok "T-HYG-RESET-CRASH-RETRY unpersisted coverage → UNPROVEN (no false proof)" \
+  || bad "T-HYG-RESET-CRASH-RETRY rc=$rc $o"
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_BASELINE_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_PROOF_FIXTURE="$HFIX/claude-opus-clear-after.txt" \
+    _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "T-HYG-RESET-CRASH-RETRY safe repeat succeeds" || bad "T-HYG-RESET-CRASH-RETRY retry rc=$rc $o"
+_resolve_project_root(){ printf '%s' "$RROOT"; }
+# Family capability gate: codex unproven → rc3 RESET_UNAVAILABLE unless reason=operator.
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/codex-a-clear-before.txt" _reset_worker_locked hygS 2 codex-a threshold rslug 2>&1); rc=$?
+[ "$rc" = 3 ] && echo "$o" | grep -q 'RESET_UNAVAILABLE family=codex' \
+  && ok "T-HYG-RESET codex unproven → RESET_UNAVAILABLE rc3" || bad "T-HYG-RESET codex gate rc=$rc $o"
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/codex-a-clear-before.txt" \
+    FORGE_RESET_BASELINE_FIXTURE="$HFIX/codex-a-clear-before.txt" \
+    FORGE_RESET_PROOF_FIXTURE="$HFIX/codex-a-clear-after.txt" \
+    _reset_worker_locked hygS 2 codex-a operator rslug 2>&1); rc=$?
+[ "$rc" = 0 ] && ok "T-HYG-RESET operator reason bypasses the capability gate" \
+  || bad "T-HYG-RESET operator bypass rc=$rc $o"
+unset -f tmux
+unset TMUX_SPY_FAIL SIO_VAL 2>/dev/null
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
