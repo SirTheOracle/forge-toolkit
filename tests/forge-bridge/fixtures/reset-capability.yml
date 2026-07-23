@@ -7,7 +7,7 @@ version: 1
 families:
   claude:
     proven: true
-    new_conversation_anchor: '(?m)Claude Code v[0-9]+\.[0-9]|Welcome to Claude Code|^\s*/help for help'
+    new_conversation_anchor: '(?m)Claude Code v[0-9]+\.[0-9]|Welcome to Claude Code|/release-notes for more|ctx: 0k \(0%\)'
     session_id_capture: ''          # claude exposes no stable in-pane session id
   codex:
     proven: false                   # kept false for the enforce-unavailable test family
