@@ -1852,7 +1852,7 @@ PY
     fi
     return 0
 }
-_lifecycle_unlock() { exec 9>&- 2>/dev/null || true; }
+_lifecycle_unlock() { { exec 9>&- ; } 2>/dev/null || true; }
 
 # ---- Worker boundary locks (worker-context-hygiene Step 3) ----
 # Fixed fds per canonical worker (bash-3.2 has no dynamic-fd alloc; finalize holds all
@@ -1890,7 +1890,9 @@ PY
     return 0
 }
 _worker_unlock() {   # <worker_canonical>
-    local fd; fd="$(_worker_lock_fd "$1")"; [ -n "$fd" ] && eval "exec $fd>&- 2>/dev/null" || true
+    # NB: the error suppression must wrap the eval, NOT ride inside the exec — a persistent
+    # `exec N>&- 2>/dev/null` would silence the whole process's stderr from then on.
+    local fd; fd="$(_worker_lock_fd "$1")"; [ -n "$fd" ] && eval "exec $fd>&-" 2>/dev/null || true
 }
 
 # ---- Terminal/lifecycle mutex (P0-1, R3) — fd 7 ----
@@ -1921,7 +1923,7 @@ PY
     if [ "$rc" -ne 0 ]; then exec 7>&-; echo "TERMINAL_LOCK: busy — another terminal operation holds it" >&2; return 1; fi
     return 0
 }
-_terminal_unlock() { exec 7>&- 2>/dev/null || true; }
+_terminal_unlock() { { exec 7>&- ; } 2>/dev/null || true; }
 
 # ---- Single cleanup/finally path (P0-4, R3) ----
 # Releases EVERY hygiene lock (terminal 7, worker 10-13, lifecycle 9). Releasing an unheld fd
@@ -3364,9 +3366,91 @@ PYEOF
         _work_start_guard "$project_root" "dispatch" "$allow_blocked" "" "" || return 1
     fi
 
+    # ---- Worker-context-hygiene enforcement (Step 7) ----
+    # P2-2: a typo'd mode is a hard error, never a silent observe fall-through, so a run
+    # intended as enforce cannot quietly dispatch dirty.
+    local _dmode; _dmode="$(_hygiene_mode)" || { _emit_event ERROR "$slug" "stage=$stage reason=hygiene-mode-invalid"; echo "ERROR: FORGE_WORKER_HYGIENE_MODE must be observe|enforce." >&2; return 1; }
+    # P0-4: single cleanup path — every enforcement/supersede return below releases the worker
+    # (and lifecycle) lock via the RETURN trap, so no fd 10-13 can leak on an error path.
+    trap _hygiene_release_all RETURN
+    _worker_lock "$worker_canonical" || { _emit_event ERROR "$slug" "stage=$stage reason=worker-lock-busy worker=$worker_canonical"; return 1; }
+    if [ "$_dmode" = enforce ]; then
+        # P0-2: awaiting-verify-decision is a send-blocking terminal state (new work would
+        # invalidate the exact verify callback binding finalization relies on).
+        local _tstate; _tstate="$(_terminal_state "$project_root")"
+        case "$_tstate" in
+            awaiting-verify-decision|verified-incomplete|terminal-cleanup|outbox-pending)
+                _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=terminal-state-block state=$_tstate worker=$worker_canonical"
+                echo "HOOK BLOCKED: slug in terminal state '$_tstate' blocks all worker sends. Resolve/finalize or hygiene-abandon first." >&2
+                return 1 ;;
+        esac
+        # P0-2: repeat the open-pending + health guards UNDER the worker lock (current session/
+        # incarnation), before deciding — a pending/ACTIVE delivery that appeared after the
+        # pre-lock guard must not be accepted on a KEEP path. --supersede owns an open pending
+        # and abandons it, so it is exempt here (its own reset handles the owned pending).
+        if [ "$supersede" != true ]; then
+            local _wp _wprc; _wp="$(_worker_open_pending_ts "$project_root" "$worker_canonical" "")"; _wprc=$?
+            [ "$_wprc" -eq 0 ] || { _emit_event ERROR "$slug" "stage=$stage reason=pending-scan-failed worker=$worker_canonical"; echo "HOOK BLOCKED: pending scan failed for $worker_canonical." >&2; return 1; }
+            [ -z "$_wp" ] || { _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=worker-has-open-pending worker=$worker_canonical"; echo "HOOK BLOCKED: $worker_canonical has an open pending under the lock — refusing to start new work." >&2; return 1; }
+            local _wh; _wh="$(_worker_health "$SESSION" "$worker_pane" "$worker_canonical")"
+            case "$_wh" in idle) ;; *) _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=worker-not-idle state=$_wh worker=$worker_canonical"; echo "HOOK BLOCKED: $worker_canonical not idle (state=$_wh) — refusing to start new work." >&2; return 1 ;; esac
+        fi
+    fi
+    local _min; _min="$(_worker_min_headroom "$worker_canonical")" || {
+        _worker_unlock "$worker_canonical"
+        _emit_event ERROR "$slug" "stage=$stage reason=config-error worker=$worker_canonical"
+        echo "ERROR: invalid FORGE_WORKER_MIN_HEADROOM(_family) — dispatch refused, nothing mutated." >&2
+        return 1; }
+    local _fam; _fam="$(_worker_family "$worker_canonical")"
+    local _decision _reason
+    read -r _decision _reason < <(_hygiene_decide "$project_root" "$worker_canonical" "" "")
+    # P2-7: confidence for the audit — KEEP_OBSERVED/RESET_THRESHOLD are reached only via a
+    # high-confidence observation; every other decision has no confident reading.
+    local _conf=none; case "$_decision" in KEEP_OBSERVED|RESET_THRESHOLD) _conf=high ;; esac
+    [ "$do_clear" = true ] && case "$_decision" in KEEP_*) _decision=RESET_UNPROVEN; _reason=explicit-clear ;; esac
+    local _degraded=0
+    case "$_fam" in
+        claude) [ "$FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE" = 1 ] && _degraded=1 ;;
+        codex)  [ "$FORGE_WORKER_HYGIENE_DEGRADED_CODEX" = 1 ]  && _degraded=1 ;;
+    esac
+    local _action="$_decision"
+    if [ "$_dmode" != enforce ]; then   # P1-2: _dmode already validated via _hygiene_mode above
+        _action=OBSERVE_ONLY
+    elif [ "$supersede" = true ]; then
+        # Supersede resets unconditionally in the close block below (abandoning in-flight
+        # context always resets, independent of headroom); audited there.
+        _action=SUPERSEDE_RESET_DEFERRED
+    else
+        case "$_decision" in
+            RESET_THRESHOLD|RESET_UNPROVEN)
+                if _reset_automation_enabled "$_fam" >/dev/null; then
+                    _reset_worker_locked "$SESSION" "$worker_pane" "$worker_canonical" \
+                        "$([ "$do_clear" = true ] && echo explicit || echo threshold)" "$slug" || {
+                        _worker_unlock "$worker_canonical"
+                        _emit_event ERROR "$slug" "stage=$stage reason=reset-failed worker=$worker_canonical"
+                        echo "ERROR: required reset did not confirm — dispatch refused, nothing mutated." >&2
+                        return 1; }
+                    _action=RESET_CONFIRMED
+                elif [ "$_degraded" = 1 ]; then
+                    _action=RESET_UNAVAILABLE   # P2-7: normalized to the declared vocabulary
+                    _hygiene_write "$project_root" terminal "" "hygiene_disabled_${_fam}=1" 2>/dev/null || true
+                    _emit_event RESET_UNAVAILABLE "$slug" "stage=$stage worker=$worker_canonical family=$_fam reason=degraded-proceed"
+                else
+                    _worker_unlock "$worker_canonical"
+                    _emit_event RESET_UNAVAILABLE "$slug" "stage=$stage worker=$worker_canonical family=$_fam reason=auto-reset-disabled"
+                    echo "RESET_UNAVAILABLE: family '$_fam' reset disabled/unproven and hygiene-degraded not enabled — dispatch refused." >&2
+                    return 1
+                fi ;;
+            KEEP_OBSERVED|KEEP_RESET_PROVEN) : ;;
+        esac
+    fi
+    _emit_event HYGIENE_DECISION "$slug" "stage=$stage worker=$worker_canonical action=$_action reason=$_reason threshold=$_min confidence=${_conf:-none} mode=$FORGE_WORKER_HYGIENE_MODE generation=$(_hygiene_current_gen "$project_root" "$worker_canonical")"
+
     local prompt_file="$project_root/.dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
     mkdir -p "$(dirname "$prompt_file")"
-    printf '%s' "$rendered" > "$prompt_file"
+    # P0-4: for --supersede the prompt is written AFTER the reset+close succeed (see Step 4),
+    # so a failed supersede reset leaves the prior prompt file byte-for-byte unchanged.
+    [ "$supersede" != true ] && printf '%s' "$rendered" > "$prompt_file"
 
     # Reset decision + confirmed reset are performed inside the Step-7 enforcement block
     # below (under the worker lock), coalescing explicit --clear with the automatic
@@ -3454,6 +3538,29 @@ PYEOF
                     return 1
                 fi
             fi
+            # Worker-context-hygiene Step 7 (supersede): reset BEFORE closing the pending or
+            # writing the replacement prompt (P0-4). Ignore ONLY the exact owned pending.
+            if [ "$_dmode" = enforce ] && _hygiene_worker_ok "$worker_canonical"; then   # P1-2: validated mode
+                if _reset_automation_enabled "$_fam" >/dev/null; then
+                    if _reset_worker_locked "$SESSION" "$worker_pane" "$worker_canonical" supersede "$slug" "$_sup_ts"; then
+                        _emit_event HYGIENE_DECISION "$slug" "stage=$_sup_stage worker=$worker_canonical action=RESET_CONFIRMED reason=supersede-abandon threshold=$_min confidence=none mode=enforce generation=$(_hygiene_current_gen "$project_root" "$worker_canonical")"
+                    else
+                        _lifecycle_unlock; _worker_unlock "$worker_canonical"
+                        echo "ERROR: --supersede reset did not confirm for $slug/$_sup_stage — pending/prompt left byte-for-byte unchanged." >&2
+                        return 1
+                    fi
+                elif { [ "$_fam" = claude ] && [ "$FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE" = 1 ]; } || { [ "$_fam" = codex ] && [ "$FORGE_WORKER_HYGIENE_DEGRADED_CODEX" = 1 ]; }; then
+                    # P1-5: degraded opt-in — proceed without reset, recorded qualified-disabled.
+                    _hygiene_write "$project_root" terminal "" "hygiene_disabled_${_fam}=1" 2>/dev/null || true
+                    _emit_event RESET_UNAVAILABLE "$slug" "stage=$_sup_stage worker=$worker_canonical family=$_fam reason=degraded-supersede"
+                else
+                    # P1-5: automation unavailable and no degraded opt-in — refuse; nothing mutated.
+                    _lifecycle_unlock; _worker_unlock "$worker_canonical"
+                    _emit_event RESET_UNAVAILABLE "$slug" "stage=$_sup_stage worker=$worker_canonical family=$_fam reason=auto-reset-disabled-supersede"
+                    echo "ERROR: --supersede refused — $worker_canonical ($_fam) reset unavailable and hygiene-degraded off; pending/prompt unchanged." >&2
+                    return 1
+                fi
+            fi
             if ! _patch_response_by_ts "$slug" "$_sup_ts" "FORGE_SUPERSEDED: re-dispatched $stage (orphan-log-entries guard); auto-closed $_sup_now"; then
                 _lifecycle_unlock
                 echo "ERROR: --supersede close failed for $slug/$_sup_stage; callback retained" >&2
@@ -3511,6 +3618,7 @@ PYEOF
     _hygiene_write "$project_root" delivered "$worker_canonical" 2>/dev/null || true   # advisory: loss keeps attempting (safe)
     _hygiene_crash_at delivered     # P2-1: after the delivered write — benign (a later callback confirms)
 
+    _worker_unlock "$worker_canonical"
     _emit_event DISPATCH "$slug" "stage=$stage worker=$worker_canonical"
     _render_status_file
     echo "DISPATCHED stage=$stage worker=$worker_canonical slug=$slug prompt=$prompt_file"
