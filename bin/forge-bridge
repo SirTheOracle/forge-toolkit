@@ -634,6 +634,347 @@ PY
     printf '%s' "$result"; return 1
 }
 
+# Per-session/incarnation hygiene journal path. Separate from forge-context/forge-usage.
+_hygiene_file() {
+    local s="${ID_target_session:-__nosession__}" i="${ID_target_incarnation:-0}"
+    [ -n "$s" ] || s="__nosession__"; [ -n "$i" ] || i="0"
+    printf '%s/forge-hygiene.%s.%s.yml' "$DEV_DIR" "$s" "$i"
+}
+
+# Atomic journal upsert under the fd-8 journal file LEAF lock. LOCK-ORDER CONTRACT
+# (P0-2): fd 8 is a leaf — it is acquired and RELEASED inside this function and is NEVER
+# held while acquiring any other lock (worker 10-13, lifecycle 9). Therefore its textual
+# position relative to lifecycle acquisition is order-irrelevant: no path holds fd 8 while
+# waiting for another lock, so it cannot participate in a deadlock cycle. Callers may write
+# the journal before OR after acquiring the lifecycle lock (the callback path deliberately
+# invalidates observation BEFORE lifecycle per plan Step 5). rc: 0 ok; 1 lock/open;
+# 4 identity-mismatch; 5 malformed/non-mapping (journal NOT replaced); 6 write/fsync failed.
+# ops: next-gen|delivery|delivered|promote|observe-pending|observe-known|observe-unknown|
+# reset|terminal|finalize.
+_hygiene_write() {   # <project_root> <op> <worker> key=val...
+    local pr="$1" op="$2" worker="$3"; shift 3
+    local jf="$pr/$(_hygiene_file)" ld="$pr/.dev/forge-tmp/hygiene-locks"
+    mkdir -p "$ld" "$(dirname "$jf")" 2>/dev/null
+    local lock="$ld/${ID_target_session:-__nosession__}.${ID_target_incarnation:-0}.journal.lock"
+    exec 8>"$lock" || { echo "ERROR: hygiene journal lock open failed" >&2; return 1; }
+    FORGE_HJ_WAIT_S="${FORGE_HYGIENE_LOCK_WAIT_S:-5}" python3 - <<'PY' || { exec 8>&-; echo "HYGIENE_LOCK: busy" >&2; return 1; }
+import fcntl,os,time,sys
+dl=time.time()+float(os.environ.get("FORGE_HJ_WAIT_S","5"))
+while True:
+    try: fcntl.flock(8,fcntl.LOCK_EX|fcntl.LOCK_NB); sys.exit(0)
+    except OSError:
+        if time.time()>=dl: sys.exit(75)
+        time.sleep(0.05)
+PY
+    FORGE_HJ_SESS="${ID_target_session:-__nosession__}" FORGE_HJ_INC="${ID_target_incarnation:-0}" \
+    FORGE_HJ_OP="$op" FORGE_HJ_WK="$worker" FORGE_HJ_KV="$*" \
+    python3 - "$jf" <<'PY'
+import os,sys,yaml,time
+jf=sys.argv[1]
+sess=os.environ["FORGE_HJ_SESS"]; inc=os.environ["FORGE_HJ_INC"]
+op=os.environ["FORGE_HJ_OP"]; wk=os.environ["FORGE_HJ_WK"]
+kv={}
+for tok in os.environ.get("FORGE_HJ_KV","").split():
+    if "=" in tok: k,v=tok.split("=",1); kv[k]=v
+# P0-6: a malformed / non-mapping existing journal is NEVER silently replaced. Fail
+# closed (rc5) so the caller does not proceed on evidence it could not read. A missing
+# journal is normal at first write (rc0 path below).
+d={}
+if os.path.exists(jf):
+    try: d=yaml.safe_load(open(jf))
+    except Exception:
+        sys.stderr.write("HYGIENE_JOURNAL_MALFORMED\n"); sys.exit(5)
+    if d is None: d={}
+    elif not isinstance(d,dict):
+        sys.stderr.write("HYGIENE_JOURNAL_NONMAPPING\n"); sys.exit(5)
+if d.get("session") and (str(d.get("session"))!=sess or str(d.get("incarnation"))!=inc):
+    sys.stderr.write("HYGIENE_IDENTITY_MISMATCH\n"); sys.exit(4)
+# P1-8: reject a corrupt high-water / workers shape rather than trusting int(d["next_generation"]).
+_ng=d.get("next_generation")
+if _ng is not None and not (isinstance(_ng,int) and not isinstance(_ng,bool) and _ng>=1):
+    sys.stderr.write("HYGIENE_NEXTGEN_INVALID\n"); sys.exit(5)
+_wk=d.get("workers")
+if _wk is not None and not isinstance(_wk,dict):
+    sys.stderr.write("HYGIENE_WORKERS_SHAPE\n"); sys.exit(5)
+d.setdefault("version",1); d["session"]=sess; d["incarnation"]=inc
+d.setdefault("next_generation",1); d.setdefault("workers",{})
+w=d["workers"].setdefault(wk,{}) if wk else None
+now=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
+if op=="next-gen":
+    g=int(d["next_generation"]); d["next_generation"]=g+1; print(g)
+elif op=="delivery" and w is not None:
+    g=int(kv.get("generation") or 0)
+    w["delivery"]={"id":kv.get("id"),"generation":g,"kind":kv.get("kind"),"slug":kv.get("slug"),
+                   "stage":kv.get("stage"),"pending_timestamp":kv.get("pending_timestamp"),
+                   "state":"attempting","started_at":now,"delivered_at":None}
+    w["latest_generation"]=g
+elif op=="delivered" and w is not None:
+    if w.get("delivery"): w["delivery"]["state"]="delivered"; w["delivery"]["delivered_at"]=now
+elif op=="promote" and w is not None:
+    dv=w.get("delivery") or {}
+    if dv.get("pending_timestamp") and dv.get("pending_timestamp")==kv.get("pending_timestamp"):
+        dv["state"]="callback-confirmed"
+elif op=="observe-pending" and w is not None:
+    w["observation"]={"state":"pending","covers_generation":int(kv.get("generation") or 0),
+                      "callback_id":kv.get("callback_id"),"pending_timestamp":kv.get("pending_timestamp"),"measured_at":now}
+elif op=="observe-known" and w is not None:
+    w["observation"]={"state":"known","covers_generation":int(kv.get("generation") or 0),
+                      "callback_id":kv.get("callback_id"),"pending_timestamp":kv.get("pending_timestamp"),
+                      "usage_record_hash":kv.get("usage_record_hash"),
+                      "headroom":(int(kv["headroom"]) if kv.get("headroom","").isdigit() else None),
+                      "confidence":kv.get("confidence"),"measured_at":now}
+elif op=="observe-unknown" and w is not None:
+    o=w.setdefault("observation",{}); o["state"]="unknown"; o["measured_at"]=now
+    if kv.get("generation","").isdigit(): o["covers_generation"]=int(kv["generation"])
+elif op=="reset" and w is not None:
+    w["reset"]={"id":kv.get("id"),"covers_generation":int(kv.get("generation") or 0),
+                "reason":kv.get("reason"),"proof_kind":kv.get("proof_kind"),
+                "proof_hash":kv.get("proof_hash"),"confirmed_at":now}
+elif op=="invalidate-worker" and w is not None:
+    # P1-2: advance the worker to a fresh generation so its prior reset/observation no
+    # longer cover latest_generation -> _hygiene_decide returns RESET_UNPROVEN. Used by
+    # hygiene-abandon so an abandoned slug's workers cannot be reused as proven-clean.
+    g=int(d["next_generation"]); d["next_generation"]=g+1
+    w["latest_generation"]=g
+    w["delivery"]={"id":kv.get("id"),"generation":g,"kind":kv.get("kind") or "invalidate",
+                   "state":"invalidated","started_at":now,"delivered_at":None}
+    print(g)
+elif op=="terminal":
+    t=d.setdefault("terminal",{}); t.update({k:v for k,v in kv.items()})
+elif op=="finalize":
+    f=d.setdefault("terminal",{}).setdefault("finalization",{}); f.update({k:v for k,v in kv.items()})
+elif op=="finalize-snapshot":
+    # P0-8: full durable outbox. Stores phase + qualification/dirty + context_written/
+    # event_written flags (from kv) AND snapshots each worker's confirmed reset id +
+    # generation, so recovery can deterministically resume from per-pane reset state.
+    f=d.setdefault("terminal",{}).setdefault("finalization",{})
+    for k,v in kv.items(): f[k]=v
+    fw=f.setdefault("workers",{})
+    for wk2,rec in (d.get("workers") or {}).items():
+        rs=(rec or {}).get("reset") or {}
+        if rs.get("proof_hash") and rs.get("covers_generation")==rec.get("latest_generation"):
+            fw[wk2]={"latest_generation":rec.get("latest_generation"),
+                     "reset_id":rs.get("id"),"covers_generation":rs.get("covers_generation")}
+# P1-9: durable atomic write — fsync the temp file, rename, then fsync the parent dir so a
+# power loss cannot lose a completed outbox phase. Any failure here returns rc6 WITHOUT
+# leaving a partial journal (os.replace is atomic; a crashed tmp is ignored on resume).
+tmp=jf+".tmp.%d"%os.getpid()
+try:
+    with open(tmp,"w") as f_:
+        yaml.safe_dump(d,f_,default_flow_style=False,sort_keys=True)
+        f_.flush(); os.fsync(f_.fileno())
+    os.replace(tmp,jf)
+    dfd=os.open(os.path.dirname(jf) or ".", os.O_RDONLY)
+    try: os.fsync(dfd)
+    finally: os.close(dfd)
+except Exception:
+    try: os.remove(tmp)
+    except Exception: pass
+    sys.stderr.write("HYGIENE_JOURNAL_WRITE_FAILED\n"); sys.exit(6)
+PY
+    local rc=$?
+    exec 8>&-
+    return $rc
+}
+
+# Pure decision (KEEP_RESET_PROVEN|KEEP_OBSERVED|RESET_THRESHOLD|RESET_UNPROVEN + reason).
+# No wall-clock TTL. exp_cb/exp_pt are RESERVED for a future exact-callback tightening;
+# every current caller passes them empty, so generation coverage is the binding today —
+# do NOT "restore" a stricter clause without updating callers or KEEP_OBSERVED breaks.
+_hygiene_decide() {   # <project_root> <worker> <expect_callback_id> <expect_pending_ts>
+    local pr="$1" wk="$2" exp_cb="$3" exp_pt="$4"
+    local min; min="$(_worker_min_headroom "$wk")" || { echo "RESET_UNPROVEN config-error"; return 1; }
+    local jf="$pr/$(_hygiene_file)"
+    FORGE_HD_MIN="$min" FORGE_HD_CB="$exp_cb" FORGE_HD_PT="$exp_pt" \
+    FORGE_HD_SESS="${ID_target_session:-__nosession__}" FORGE_HD_INC="${ID_target_incarnation:-0}" \
+    python3 - "$jf" "$wk" <<'PY'
+import os,sys,yaml
+jf=sys.argv[1]; wk=sys.argv[2]; mn=int(os.environ["FORGE_HD_MIN"])
+exp_cb=os.environ.get("FORGE_HD_CB") or ""; exp_pt=os.environ.get("FORGE_HD_PT") or ""
+sess=os.environ["FORGE_HD_SESS"]; inc=os.environ["FORGE_HD_INC"]
+if not os.path.exists(jf): print("RESET_UNPROVEN no-journal"); sys.exit(0)
+try: d=yaml.safe_load(open(jf)) or {}
+except Exception: print("RESET_UNPROVEN malformed-journal"); sys.exit(0)
+if not isinstance(d,dict): print("RESET_UNPROVEN malformed-journal"); sys.exit(0)
+if d.get("session") and (str(d.get("session"))!=sess or str(d.get("incarnation"))!=inc):
+    print("RESET_UNPROVEN identity-mismatch"); sys.exit(0)
+w=((d.get("workers") or {}).get(wk) or {})
+lg=w.get("latest_generation")
+if lg is None: print("RESET_UNPROVEN no-record"); sys.exit(0)
+if (w.get("delivery") or {}).get("state")=="attempting": print("RESET_UNPROVEN attempting"); sys.exit(0)
+rs=w.get("reset") or {}
+if rs.get("covers_generation")==lg and rs.get("proof_hash"):
+    print("KEEP_RESET_PROVEN reset-covers-latest"); sys.exit(0)
+ob=w.get("observation") or {}
+if (ob.get("state")=="known" and ob.get("covers_generation")==lg and ob.get("confidence")=="high"
+    and (not exp_cb or ob.get("callback_id")==exp_cb) and (not exp_pt or ob.get("pending_timestamp")==exp_pt)
+    and isinstance(ob.get("headroom"),int)):
+    if ob["headroom"]>mn: print("KEEP_OBSERVED headroom=%d>%d"%(ob["headroom"],mn))
+    else: print("RESET_THRESHOLD headroom=%d<=%d"%(ob["headroom"],mn))
+    sys.exit(0)
+print("RESET_UNPROVEN no-matching-coverage")
+PY
+}
+
+_hygiene_current_gen() {   # <project_root> <worker>
+    python3 - "$1/$(_hygiene_file)" "$2" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+w=((d.get("workers") or {}).get(sys.argv[2]) or {}); print(w.get("latest_generation") or "")
+PY
+}
+
+# Current terminal state (empty => running). Collapses an unpublished finalization outbox
+# to outbox-pending for the send/dispatch block.
+_terminal_state() {   # <project_root>
+    python3 - "$1/$(_hygiene_file)" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+t=(d.get("terminal") or {}); st=str(t.get("state") or "")
+f=(t.get("finalization") or {})
+if st=="terminal-cleanup" and f.get("phase") in ("resets-confirmed","event-pending"):
+    print("outbox-pending")
+else: print(st)
+PY
+}
+
+# P0-3 / P1-8: side-effect-free journal identity + schema preflight. rc0 = OK (or missing/None);
+# rc1 = a NON-EMPTY journal with foreign/partial identity or a malformed schema. NEVER writes,
+# so it can gate a physical /clear (reset, finalize pass 2). A same-name rebirth (matching
+# session, different incarnation) is foreign and refuses.
+_hygiene_journal_preflight() {   # <project_root>
+    FORGE_JP_SESS="${ID_target_session:-__nosession__}" FORGE_JP_INC="${ID_target_incarnation:-0}" \
+    python3 - "$1/$(_hygiene_file)" <<'PY'
+import sys,os,yaml
+jf=sys.argv[1]; sess=os.environ["FORGE_JP_SESS"]; inc=os.environ["FORGE_JP_INC"]
+if not os.path.exists(jf): sys.exit(0)                       # missing => unproven, handled downstream
+try: d=yaml.safe_load(open(jf))
+except Exception: sys.stderr.write("JOURNAL_MALFORMED\n"); sys.exit(1)
+if d is None: sys.exit(0)
+if not isinstance(d,dict): sys.stderr.write("JOURNAL_NONMAPPING\n"); sys.exit(1)
+js=d.get("session"); ji=d.get("incarnation")
+if js is None or ji is None or str(js)!=sess or str(ji)!=inc:
+    sys.stderr.write("JOURNAL_IDENTITY_FOREIGN\n"); sys.exit(1) # foreign / partial / rebirth
+w=d.get("workers")
+if w is not None and not isinstance(w,dict): sys.stderr.write("JOURNAL_WORKERS_SHAPE\n"); sys.exit(1)
+ng=d.get("next_generation",1)
+if not (isinstance(ng,int) and not isinstance(ng,bool) and ng>=1):
+    sys.stderr.write("JOURNAL_NEXTGEN_INVALID\n"); sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# Read a finalization outbox field (id|phase). Empty if absent.
+_hygiene_finalization_field() {   # <project_root> <field>
+    python3 - "$1/$(_hygiene_file)" "$2" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+print(((d.get("terminal") or {}).get("finalization") or {}).get(sys.argv[2]) or "")
+PY
+}
+
+# Activation-preflight blockers (plan Step 11 item 4): open pendings, verify/DONE callbacks
+# awaiting interpretation. Prints one blocker token per line (empty = none). Session-scoped.
+_hygiene_activation_blockers() {   # <project_root>
+    local pr="$1" sess; sess="$(_resolve_session)"
+    FORGE_AB_SESS="$sess" FORGE_AB_INC="${ID_target_incarnation:-${ID_host_incarnation:-}}" python3 - "$pr/.dev" <<'PY'
+import os,sys,glob,re
+try: import yaml
+except Exception: yaml=None
+dev=sys.argv[1]; sess=os.environ.get("FORGE_AB_SESS") or ""; inc=os.environ.get("FORGE_AB_INC") or ""
+for lp in glob.glob(os.path.join(dev,"proposals","*","forge-log.yml")):
+    try: es=(yaml.safe_load(open(lp)) or {}).get("entries") or [] if yaml else []
+    except Exception: es=[]
+    for e in es:
+        if isinstance(e,dict) and e.get("response") is None:
+            s=str(e.get("session") or ""); i=str(e.get("incarnation") or "")
+            if (not s or not sess or s==sess) and (not i or not inc or i==str(inc)):
+                print("open-pending:%s" % os.path.basename(os.path.dirname(lp))); break
+# P2-4: scan ALL callback files (qualified AND legacy/unqualified names) and select by the
+# stage=verify + status=DONE headers, not the filename glob, so a valid awaiting verify
+# callback cannot evade the preflight.
+for cb in glob.glob(os.path.join(dev,"forge-tmp","callbacks","*.callback")):
+    hdr={}
+    try:
+        for ln in open(cb).read().splitlines():
+            if ln.startswith("message:"): break
+            m=re.match(r'^([a-z_]+):\s*(.*)$',ln)
+            if m: hdr[m.group(1)]=m.group(2).strip()
+    except Exception: continue
+    if (hdr.get("stage") or "")!="verify": continue
+    if (hdr.get("status") or "").upper()!="DONE": continue
+    cs=str(hdr.get("session") or ""); ci=str(hdr.get("incarnation") or "")
+    if (not cs or not sess or cs==sess) and (not ci or not inc or ci==str(inc)):
+        print("verify-callback-awaiting:%s" % (hdr.get("slug") or "?"))
+PY
+}
+
+cmd_hygiene_status() {
+    require_identity "hygiene-status" host-session || return 1
+    local pr; pr="$(_resolve_project_root "")"
+    [ -n "$pr" ] || { echo "hygiene-status: no project root"; return 0; }
+    local jf="$pr/$(_hygiene_file)"
+    echo "hygiene mode=$FORGE_WORKER_HYGIENE_MODE"
+    echo "  claude auto_reset=$(_reset_automation_enabled claude 2>/dev/null) degraded=$FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE"
+    echo "  codex  auto_reset=$(_reset_automation_enabled codex 2>/dev/null)  degraded=$FORGE_WORKER_HYGIENE_DEGRADED_CODEX"
+    echo "  min_headroom shared=$FORGE_WORKER_MIN_HEADROOM claude=${FORGE_WORKER_MIN_HEADROOM_CLAUDE-inherit} codex=${FORGE_WORKER_MIN_HEADROOM_CODEX-inherit}"
+    local cu; cu="$(_completion_unresolved "$pr" 2>/dev/null)"
+    echo "  unresolved: ${cu:-parked=0 blocked=0}"
+    echo "  terminal_state: $(_terminal_state "$pr")"
+    # Activation preflight (plan Step 11 item 4): refuse enforce on an open pending, a
+    # verify/DONE callback awaiting interpretation, OR nonzero parked/blocked residue.
+    local _blk; _blk="$(_hygiene_activation_blockers "$pr")"
+    case "$cu" in "parked=0 blocked=0"|"") : ;; *) _blk="${_blk:+$_blk$'\n'}residue:$cu" ;; esac
+    if [ -n "$_blk" ]; then
+        echo "  ACTIVATION: REFUSE enforce —"
+        printf '%s\n' "$_blk" | while IFS= read -r b; do [ -n "$b" ] && echo "    - $b"; done
+    else
+        echo "  ACTIVATION: eligible (no open pending / verify callback / parked/blocked) — confirm spike + live gate before enforce"
+    fi
+    [ -f "$jf" ] && { echo "  journal: $jf"; sed -n '1,40p' "$jf"; } || echo "  journal: (none — unproven, normal at upgrade)"
+}
+
+cmd_hygiene_gc() {
+    require_identity "hygiene-gc" host-session || return 1
+    local days=30 dry=0
+    while [ $# -gt 0 ]; do case "$1" in --days) days="$2"; shift 2 ;; --dry-run) dry=1; shift ;; *) shift ;; esac; done
+    # P2-3: reject a non-integer / negative retention window BEFORE any deletion.
+    case "$days" in ''|*[!0-9]*) echo "ERROR: hygiene-gc --days must be a non-negative integer; got '$days'" >&2; return 1 ;; esac
+    local pr; pr="$(_resolve_project_root "")"; [ -n "$pr" ] || { echo "hygiene-gc: no project root"; return 0; }
+    local live; live="$(_same_root_sessions "$pr" 2>/dev/null | tr '\n' ',')"
+    FORGE_GC_LIVE="$live" FORGE_GC_DAYS="$days" FORGE_GC_DRY="$dry" \
+    python3 - "$pr/.dev" <<'PY'
+import os,sys,glob,time,yaml
+dev=sys.argv[1]; live=set(x for x in os.environ.get("FORGE_GC_LIVE","").split(",") if x)
+days=int(os.environ.get("FORGE_GC_DAYS") or "30"); dry=os.environ.get("FORGE_GC_DRY")=="1"
+cutoff=time.time()-days*86400
+term_ok={"complete","complete-qualified","cleanup-abandoned"}
+for jf in glob.glob(os.path.join(dev,"forge-hygiene.*.yml")):
+    # P2-13: one retained-malformed rule shared with the writer — a parse error OR a
+    # non-mapping (list/scalar) YAML is RETAINED, never deleted and never `.get()`-ed.
+    try: d=yaml.safe_load(open(jf))
+    except Exception: print("RETAIN(malformed) %s"%jf); continue
+    if d is not None and not isinstance(d,dict): print("RETAIN(non-mapping) %s"%jf); continue
+    d=d or {}
+    sess=str(d.get("session") or ""); st=str((d.get("terminal") or {}).get("state") or "")
+    dead = sess not in live; old = os.path.getmtime(jf) < cutoff
+    if dead and st in term_ok and old:
+        print(("WOULD-REMOVE " if dry else "REMOVED ")+jf)
+        if not dry:
+            os.remove(jf); inc=str(d.get("incarnation") or "0")
+            for lk in glob.glob(os.path.join(dev,"forge-tmp","hygiene-locks","%s.%s.*.lock"%(sess,inc))):
+                os.remove(lk)
+    else:
+        print("RETAIN(live=%s state=%s old=%s) %s"%(not dead,st,old,jf))
+PY
+}
+
 timestamp() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
@@ -5422,6 +5763,8 @@ case "${1:-help}" in
     alias-self-test)     shift; cmd_alias_self_test "$@" ;;
     identity)            cmd_identity ;;
     health)              cmd_health ;;
+    hygiene-status)      shift; cmd_hygiene_status "$@" ;;
+    hygiene-gc)          shift; cmd_hygiene_gc "$@" ;;
     help|*)
         echo "forge-bridge — cross-pane messaging with hooks and audit log"
         echo ""

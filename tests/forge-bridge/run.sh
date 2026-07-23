@@ -1256,7 +1256,7 @@ fi
 # §0 harness: pure-helper extraction (FNS idiom), fixture seams, env defaults.
 echo "── HYG §0: pure-helper extraction ──"
 HFNS="$WORK/hfns.sh"
-sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p' "$BRIDGE" > "$HFNS"
+sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p; /^_hygiene_file()/,/^}$/p; /^_hygiene_write()/,/^}$/p; /^_hygiene_decide()/,/^}$/p; /^_hygiene_current_gen()/,/^}$/p; /^_terminal_state()/,/^}$/p; /^_hygiene_journal_preflight()/,/^}$/p; /^_hygiene_finalization_field()/,/^}$/p; /^_hygiene_activation_blockers()/,/^}$/p; /^cmd_hygiene_gc()/,/^}$/p' "$BRIDGE" > "$HFNS"
 grep -q '_reset_proof_probe' "$HFNS" && ok "HYG helper extraction non-empty" || bad "HYG helper extraction empty"
 HFIX="$ROOT/tests/forge-bridge/fixtures"
 # Shared env for every hygiene subshell: hermetic defaults + capability fixture.
@@ -1353,6 +1353,281 @@ YML
   printf 'fresh…\nsession: def456\n> \n'   > "$WORK/sid-after.txt"
   FORGE_RESET_CAPABILITY_FILE="$WORK/cap-sid.yml" \
     probe_pair "T-HYG-RESET-SIDCHANGE" claude "$WORK/sid-before.txt" "$WORK/sid-after.txt" '^PROVEN kind=session-id-change'
+
+echo "── HYG §D: decision precedence (hermetic journal fixtures) ──"
+export DEV_DIR=".dev"
+export ID_target_session="hygS" ID_target_incarnation="42"
+HJF=".dev/forge-hygiene.hygS.42.yml"
+hj() {  # hj <root> — write journal from stdin
+  mkdir -p "$1/.dev"; cat > "$1/$HJF"
+}
+hj_obs() {  # hj_obs <root> <worker> <latest> <covers> <headroom> <confidence>
+  hj "$1" <<EOF
+version: 1
+session: hygS
+incarnation: 42
+next_generation: 9
+workers:
+  $2:
+    latest_generation: $3
+    observation:
+      state: known
+      covers_generation: $4
+      callback_id: cb1
+      pending_timestamp: "2026-07-23T00:00:00Z"
+      usage_record_hash: aaaa
+      headroom: $5
+      confidence: $6
+      measured_at: "2020-01-01T00:00:00Z"
+EOF
+}
+D="$WORK/hygD"; mkdir -p "$D/.dev"
+hj_obs "$D" claude-opus 4 4 76 high
+[ "$(_hygiene_decide "$D" claude-opus '' '' | awk '{print $1}')" = KEEP_OBSERVED ] \
+  && ok "T-HYG-DEC 76 > 75 → KEEP_OBSERVED" || bad "T-HYG-DEC 76 wrong: $(_hygiene_decide "$D" claude-opus '' '')"
+hj_obs "$D" claude-opus 4 4 75 high
+[ "$(_hygiene_decide "$D" claude-opus '' '' | awk '{print $1}')" = RESET_THRESHOLD ] \
+  && ok "T-HYG-DEC 75 <= 75 → RESET_THRESHOLD (inclusive)" || bad "T-HYG-DEC 75 wrong"
+hj_obs "$D" claude-opus 4 4 74 high
+[ "$(_hygiene_decide "$D" claude-opus '' '' | awk '{print $1}')" = RESET_THRESHOLD ] \
+  && ok "T-HYG-DEC 74 → RESET_THRESHOLD" || bad "T-HYG-DEC 74 wrong"
+hj_obs "$D" claude-opus 4 4 1 high
+[ "$(FORGE_WORKER_MIN_HEADROOM=0 _hygiene_decide "$D" claude-opus '' '' | awk '{print $1}')" = KEEP_OBSERVED ] \
+  && ok "T-HYG-DEC min=0 keeps headroom 1" || bad "T-HYG-DEC min=0 wrong"
+hj_obs "$D" claude-opus 4 4 100 high
+[ "$(FORGE_WORKER_MIN_HEADROOM=100 _hygiene_decide "$D" claude-opus '' '' | awk '{print $1}')" = RESET_THRESHOLD ] \
+  && ok "T-HYG-DEC min=100 resets headroom 100" || bad "T-HYG-DEC min=100 wrong"
+o=$(FORGE_WORKER_MIN_HEADROOM=abc _hygiene_decide "$D" claude-opus '' '' 2>/dev/null); rc=$?
+[ "$rc" = 1 ] && echo "$o" | grep -q 'config-error' \
+  && ok "T-HYG-DEC invalid threshold → rc1 config-error (mutates nothing)" || bad "T-HYG-DEC config-error wrong: rc=$rc $o"
+# Identical decision logic for all four workers.
+for hw in claude-opus codex-a codex-b claude-sonnet; do
+  hj_obs "$D" "$hw" 4 4 76 high
+  [ "$(_hygiene_decide "$D" "$hw" '' '' | awk '{print $1}')" = KEEP_OBSERVED ] \
+    && ok "T-HYG-DEC identical policy for $hw" || bad "T-HYG-DEC $hw diverged"
+done
+rm -f "$D/$HJF"
+[ "$(_hygiene_decide "$D" claude-opus '' '')" = "RESET_UNPROVEN no-journal" ] \
+  && ok "T-HYG-DEC missing journal → RESET_UNPROVEN no-journal" || bad "T-HYG-DEC missing journal wrong"
+printf '{unclosed: [\n' > "$D/$HJF"
+[ "$(_hygiene_decide "$D" claude-opus '' '')" = "RESET_UNPROVEN malformed-journal" ] \
+  && ok "T-HYG-DEC malformed journal → RESET_UNPROVEN" || bad "T-HYG-DEC malformed wrong"
+hj_obs "$D" claude-opus 4 4 90 low
+[ "$(_hygiene_decide "$D" claude-opus '' '')" = "RESET_UNPROVEN no-matching-coverage" ] \
+  && ok "T-HYG-DEC confidence=low → RESET_UNPROVEN" || bad "T-HYG-DEC low confidence wrong"
+hj_obs "$D" claude-opus 4 3 90 high
+[ "$(_hygiene_decide "$D" claude-opus '' '')" = "RESET_UNPROVEN no-matching-coverage" ] \
+  && ok "T-HYG-DEC stale generation coverage → RESET_UNPROVEN" || bad "T-HYG-DEC stale-gen wrong"
+hj_obs "$D" claude-opus 4 4 90 high   # measured_at pinned to 2020 in hj_obs
+[ "$(_hygiene_decide "$D" claude-opus '' '' | awk '{print $1}')" = KEEP_OBSERVED ] \
+  && ok "T-HYG-DEC no age-only invalidation (2020 reading still valid)" || bad "T-HYG-DEC age TTL crept in"
+hj "$D" <<'EOF'
+version: 1
+session: hygS
+incarnation: 43
+next_generation: 9
+workers:
+  claude-opus:
+    latest_generation: 4
+EOF
+[ "$(_hygiene_decide "$D" claude-opus '' '')" = "RESET_UNPROVEN identity-mismatch" ] \
+  && ok "T-HYG-DEC same-name rebirth (incarnation changed) → identity-mismatch" || bad "T-HYG-DEC rebirth wrong"
+hj "$D" <<'EOF'
+version: 1
+session: otherS
+incarnation: 42
+next_generation: 9
+workers:
+  claude-opus:
+    latest_generation: 4
+EOF
+[ "$(_hygiene_decide "$D" claude-opus '' '')" = "RESET_UNPROVEN identity-mismatch" ] \
+  && ok "T-HYG-DEC foreign session → identity-mismatch" || bad "T-HYG-DEC foreign session wrong"
+hj "$D" <<'EOF'
+version: 1
+session: hygS
+incarnation: 42
+next_generation: 9
+workers:
+  claude-opus:
+    latest_generation: 4
+    reset:
+      id: reset-x
+      covers_generation: 4
+      proof_hash: beef
+    observation:
+      state: known
+      covers_generation: 3
+      headroom: 10
+      confidence: high
+EOF
+[ "$(_hygiene_decide "$D" claude-opus '' '')" = "KEEP_RESET_PROVEN reset-covers-latest" ] \
+  && ok "T-HYG-DEC reset beats older low observation (reset-wins)" || bad "T-HYG-DEC reset-wins wrong"
+hj "$D" <<'EOF'
+version: 1
+session: hygS
+incarnation: 42
+next_generation: 9
+workers:
+  claude-opus:
+    latest_generation: 5
+    delivery:
+      state: attempting
+    reset:
+      covers_generation: 4
+      proof_hash: beef
+EOF
+[ "$(_hygiene_decide "$D" claude-opus '' '')" = "RESET_UNPROVEN attempting" ] \
+  && ok "T-HYG-DEC attempting delivery → RESET_UNPROVEN" || bad "T-HYG-DEC attempting wrong"
+hj "$D" <<'EOF'
+version: 1
+session: hygS
+incarnation: 42
+next_generation: 9
+workers:
+  claude-opus:
+    latest_generation: 5
+    reset:
+      covers_generation: 4
+      proof_hash: beef
+    observation:
+      state: known
+      covers_generation: 4
+      headroom: 90
+      confidence: high
+EOF
+[ "$(_hygiene_decide "$D" claude-opus '' '')" = "RESET_UNPROVEN no-matching-coverage" ] \
+  && ok "T-HYG-DEC later activity invalidates reset AND observation" || bad "T-HYG-DEC later-activity wrong"
+hj "$D" <<'EOF'
+version: 1
+session: hygS
+incarnation: 42
+next_generation: 9
+workers: {}
+EOF
+[ "$(_hygiene_decide "$D" claude-opus '' '')" = "RESET_UNPROVEN no-record" ] \
+  && ok "T-HYG-DEC unknown worker → RESET_UNPROVEN no-record" || bad "T-HYG-DEC no-record wrong"
+
+echo "── HYG §J: journal writer (atomic, identity, no-clobber) ──"
+J="$WORK/hygJ"; mkdir -p "$J/.dev"
+g=$(_hygiene_write "$J" next-gen ""); rc=$?
+[ "$rc" = 0 ] && [ "$g" = 1 ] && ok "T-HYG-JOURNAL next-gen allocates 1" || bad "T-HYG-JOURNAL first alloc: rc=$rc g=$g"
+g=$(_hygiene_write "$J" next-gen "")
+[ "$g" = 2 ] && ok "T-HYG-JOURNAL next-gen advances high-water" || bad "T-HYG-JOURNAL second alloc: $g"
+( _hygiene_write "$J" next-gen "" > "$WORK/g1.out" 2>/dev/null ) &
+( _hygiene_write "$J" next-gen "" > "$WORK/g2.out" 2>/dev/null ) &
+wait
+g1=$(cat "$WORK/g1.out"); g2=$(cat "$WORK/g2.out")
+[ -n "$g1" ] && [ -n "$g2" ] && [ "$g1" != "$g2" ] \
+  && ok "T-HYG-JOURNAL concurrent next-gen → distinct generations ($g1/$g2)" \
+  || bad "T-HYG-JOURNAL concurrent alloc collided: '$g1' '$g2'"
+_hygiene_write "$J" delivery claude-opus "id=d1" "generation=3" "kind=dispatch" "slug=s" "stage=coding" "pending_timestamp=T1" \
+  && grep -q 'state: attempting' "$J/$HJF" && ok "T-HYG-JOURNAL delivery persists attempting" || bad "T-HYG-JOURNAL delivery write failed"
+_hygiene_write "$J" delivered claude-opus \
+  && grep -q 'state: delivered' "$J/$HJF" && ok "T-HYG-JOURNAL delivered flips state" || bad "T-HYG-JOURNAL delivered failed"
+_hygiene_write "$J" promote claude-opus "pending_timestamp=T1" \
+  && grep -q 'state: callback-confirmed' "$J/$HJF" && ok "T-HYG-JOURNAL exact promote → callback-confirmed" || bad "T-HYG-JOURNAL promote failed"
+_hygiene_write "$J" delivery claude-opus "id=d2" "generation=4" "kind=dispatch" "pending_timestamp=T2" >/dev/null
+_hygiene_write "$J" promote claude-opus "pending_timestamp=WRONG"
+grep -q 'state: attempting' "$J/$HJF" \
+  && ok "T-HYG-JOURNAL mismatched promote does NOT confirm" || bad "T-HYG-JOURNAL mismatched promote confirmed"
+JF2="$WORK/hygJ2"; mkdir -p "$JF2/.dev"
+hj "$JF2" <<'EOF'
+version: 1
+session: foreignS
+incarnation: 7
+next_generation: 3
+workers: {}
+EOF
+sha_before=$(shasum -a 256 "$JF2/$HJF" | awk '{print $1}')
+_hygiene_write "$JF2" next-gen "" >/dev/null 2>&1; rc=$?
+sha_after=$(shasum -a 256 "$JF2/$HJF" | awk '{print $1}')
+[ "$rc" = 4 ] && [ "$sha_before" = "$sha_after" ] \
+  && ok "T-HYG-JOURNAL foreign identity → rc4, no write" || bad "T-HYG-JOURNAL foreign identity: rc=$rc"
+printf 'version: 1\nsession: hygS\n  bad-indent: {{{\n' > "$JF2/$HJF"
+sha_before=$(shasum -a 256 "$JF2/$HJF" | awk '{print $1}')
+_hygiene_write "$JF2" next-gen "" >/dev/null 2>&1; rc=$?
+sha_after=$(shasum -a 256 "$JF2/$HJF" | awk '{print $1}')
+[ "$rc" = 5 ] && [ "$sha_before" = "$sha_after" ] \
+  && ok "T-HYG-JOURNAL-MALFORMED-NOCLOBBER parse-error → rc5 byte-identical" || bad "T-HYG-JOURNAL malformed clobbered: rc=$rc"
+printf -- '- a\n- b\n' > "$JF2/$HJF"
+sha_before=$(shasum -a 256 "$JF2/$HJF" | awk '{print $1}')
+_hygiene_write "$JF2" next-gen "" >/dev/null 2>&1; rc=$?
+sha_after=$(shasum -a 256 "$JF2/$HJF" | awk '{print $1}')
+[ "$rc" = 5 ] && [ "$sha_before" = "$sha_after" ] \
+  && ok "T-HYG-JOURNAL-MALFORMED-NOCLOBBER non-mapping → rc5 byte-identical" || bad "T-HYG-JOURNAL non-mapping clobbered: rc=$rc"
+JF3="$WORK/hygJ3"; mkdir -p "$JF3/.dev/forge-tmp/hygiene-locks"
+chmod u-w "$JF3/.dev"
+_hygiene_write "$JF3" next-gen "" >/dev/null 2>&1; rc=$?
+chmod u+w "$JF3/.dev"
+[ "$rc" = 6 ] && [ -z "$(ls "$JF3/.dev"/forge-hygiene.*.tmp.* 2>/dev/null)" ] \
+  && ok "T-HYG-JOURNAL-WRITE-FAIL unwritable dir → rc6, no partial tmp" || bad "T-HYG-JOURNAL write-fail: rc=$rc"
+# Journal preflight (P0-3): side-effect-free, foreign/rebirth/malformed refuse.
+_hygiene_journal_preflight "$J" && ok "T-HYG-PREFLIGHT own journal OK" || bad "T-HYG-PREFLIGHT own journal refused"
+_hygiene_journal_preflight "$JF2" 2>/dev/null; rc=$?
+[ "$rc" = 1 ] && ok "T-HYG-PREFLIGHT non-mapping journal refused" || bad "T-HYG-PREFLIGHT non-mapping accepted"
+rm -f "$JF2/$HJF"
+_hygiene_journal_preflight "$JF2" && ok "T-HYG-PREFLIGHT missing journal OK (unproven downstream)" || bad "T-HYG-PREFLIGHT missing refused"
+hj "$JF2" <<'EOF'
+version: 1
+session: hygS
+incarnation: 43
+next_generation: 3
+EOF
+_hygiene_journal_preflight "$JF2" 2>/dev/null; rc=$?
+[ "$rc" = 1 ] && ok "T-HYG-PREFLIGHT same-name rebirth refused" || bad "T-HYG-PREFLIGHT rebirth accepted"
+
+echo "── HYG §G: hygiene-gc (conservative, dead-incarnation only) ──"
+GCROOT="$WORK/hygGC"; mkdir -p "$GCROOT/.dev/forge-tmp/hygiene-locks"
+require_identity(){ return 0; }
+_resolve_project_root(){ printf '%s' "$GCROOT"; }
+_same_root_sessions(){ printf 'live-sess\n'; }
+cat > "$GCROOT/.dev/forge-hygiene.ghost.7.yml" <<'EOF'
+version: 1
+session: ghost
+incarnation: 7
+terminal:
+  state: complete
+EOF
+touch -t 202001010000 "$GCROOT/.dev/forge-hygiene.ghost.7.yml"
+touch "$GCROOT/.dev/forge-tmp/hygiene-locks/ghost.7.journal.lock"
+cat > "$GCROOT/.dev/forge-hygiene.live-sess.1.yml" <<'EOF'
+version: 1
+session: live-sess
+incarnation: 1
+terminal:
+  state: complete
+EOF
+touch -t 202001010000 "$GCROOT/.dev/forge-hygiene.live-sess.1.yml"
+cat > "$GCROOT/.dev/forge-hygiene.ghost2.1.yml" <<'EOF'
+version: 1
+session: ghost2
+incarnation: 1
+terminal:
+  state: terminal-cleanup
+EOF
+touch -t 202001010000 "$GCROOT/.dev/forge-hygiene.ghost2.1.yml"
+printf '{bad yaml\n' > "$GCROOT/.dev/forge-hygiene.ghost3.1.yml"
+touch -t 202001010000 "$GCROOT/.dev/forge-hygiene.ghost3.1.yml"
+printf -- '- listy\n' > "$GCROOT/.dev/forge-hygiene.ghost4.1.yml"
+touch -t 202001010000 "$GCROOT/.dev/forge-hygiene.ghost4.1.yml"
+o=$(cmd_hygiene_gc --days xx 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$o" | grep -q 'non-negative integer' \
+  && ok "T-HYG-GC invalid --days rejected before deletion" || bad "T-HYG-GC bad days: rc=$rc"
+o=$(cmd_hygiene_gc --days 30 --dry-run 2>&1)
+echo "$o" | grep -q 'WOULD-REMOVE .*ghost\.7' && [ -f "$GCROOT/.dev/forge-hygiene.ghost.7.yml" ] \
+  && ok "T-HYG-GC dry-run marks dead terminal journal, removes nothing" || bad "T-HYG-GC dry-run wrong: $o"
+o=$(cmd_hygiene_gc --days 30 2>&1)
+[ ! -f "$GCROOT/.dev/forge-hygiene.ghost.7.yml" ] && [ ! -f "$GCROOT/.dev/forge-tmp/hygiene-locks/ghost.7.journal.lock" ] \
+  && ok "T-HYG-GC live run removes dead terminal journal + its locks" || bad "T-HYG-GC live removal failed: $o"
+[ -f "$GCROOT/.dev/forge-hygiene.live-sess.1.yml" ] && echo "$o" | grep -q 'RETAIN(live=True.*live-sess' \
+  && ok "T-HYG-GC live session RETAINED" || bad "T-HYG-GC live session removed"
+[ -f "$GCROOT/.dev/forge-hygiene.ghost2.1.yml" ] \
+  && ok "T-HYG-GC non-terminal (terminal-cleanup) RETAINED" || bad "T-HYG-GC terminal-cleanup removed"
+[ -f "$GCROOT/.dev/forge-hygiene.ghost3.1.yml" ] && echo "$o" | grep -q 'RETAIN(malformed)' \
+  && ok "T-HYG-GC malformed RETAINED" || bad "T-HYG-GC malformed removed"
+[ -f "$GCROOT/.dev/forge-hygiene.ghost4.1.yml" ] && echo "$o" | grep -q 'RETAIN(non-mapping)' \
+  && ok "T-HYG-GC non-mapping RETAINED" || bad "T-HYG-GC non-mapping removed"
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
