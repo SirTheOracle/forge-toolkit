@@ -1830,9 +1830,106 @@ PY
   fi
   tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
   run_in_pane "$HS:0.2" hygc7-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygc7 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
-else
+
+  echo "── HYG §K: callback race close / fail-open observation ──"
+  hwrite(){ ID_target_session="$HS" ID_target_incarnation="$HINC" _hygiene_write "$HC" "$@"; }
+  hgen(){ ID_target_session="$HS" ID_target_incarnation="$HINC" _hygiene_current_gen "$HC" "$1"; }
+  jobs_state(){  # jobs_state <worker> — observation.state from the journal
+    python3 - "$JHC" "$1" <<'PY'
+import sys,yaml
+d=yaml.safe_load(open(sys.argv[1])) or {}
+print((((d.get("workers") or {}).get(sys.argv[2]) or {}).get("observation") or {}).get("state") or "")
+PY
+  }
+  # T-HYG-CB-INVALIDATE: pause the callback after observe-pending (prelock barrier);
+  # a concurrent decision must read pending/unknown — never the old safe reading.
+  run_in_pane "$HS:0.0" hygk1-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygk1 --stage adhoc --worker codex-a )"
+  [ "$(rc_of hygk1-disp)" = 0 ] || bad "T-HYG-CB-INVALIDATE setup dispatch failed"
+  hwrite observe-known codex-a "generation=$(hgen codex-a)" "callback_id=seed" "pending_timestamp=seed" \
+    "usage_record_hash=seedhash" "headroom=90" "confidence=high" >/dev/null
+  [ "$(hdec codex-a | awk '{print $1}')" = KEEP_OBSERVED ] || bad "T-HYG-CB-INVALIDATE seed not old-safe: $(hdec codex-a)"
+  KREADY="$HC/.dev/forge-tmp/hygk1.ready"; KREL="$HC/.dev/forge-tmp/hygk1.release"
+  rm -f "$KREADY" "$KREL"; : > "$WORK/out.hygk1cb"
+  tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
+  tmux send-keys -t "$HS:0.2" "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_CALLBACK_PRELOCK_READY=$KREADY FORGE_CALLBACK_PRELOCK_RELEASE=$KREL $BRIDGE callback --slug hygk1 --stage adhoc --status DONE --worker codex-a --message d --quiet ) > $WORK/out.hygk1cb 2>&1; echo DONE_\$? >> $WORK/out.hygk1cb" Enter
+  kp=0; while [ "$kp" -lt 100 ] && [ ! -f "$KREADY" ]; do sleep 0.1; kp=$((kp+1)); done
+  if [ -f "$KREADY" ]; then
+    mid="$(hdec codex-a)"
+    case "$mid" in RESET_UNPROVEN*) ok "T-HYG-CB-INVALIDATE mid-callback decision is unproven ($mid)" ;;
+      *) bad "T-HYG-CB-INVALIDATE mid-callback read old-safe: $mid" ;; esac
+  else
+    bad "T-HYG-CB-INVALIDATE barrier never reached"
+  fi
+  : > "$KREL"
+  kp=0; while [ "$kp" -lt 120 ] && ! grep -q '^DONE_' "$WORK/out.hygk1cb" 2>/dev/null; do sleep 0.25; kp=$((kp+1)); done
+  [ "$(rc_of hygk1cb)" = 0 ] || bad "T-HYG-CB-INVALIDATE callback DONE failed: $(out_of hygk1cb | tail -2)"
+  [ "$(jdel codex-a state)" = callback-confirmed ] \
+    && ok "T-HYG-CB exact callback promotes delivery → callback-confirmed" \
+    || bad "T-HYG-CB promote missing: state=$(jdel codex-a state)"
+  # T-HYG-CB-UNKNOWN-ON-FAILURE: usage path is a directory → DONE still closes, unknown recorded.
+  run_in_pane "$HS:0.0" hygk2-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygk2 --stage adhoc --worker codex-b )"
+  UFILE="$HC/.dev/forge-usage.$HS.yml"
+  rm -f "$UFILE"; mkdir -p "$UFILE"
+  tmux send-keys -t "$HS:0.3" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.3" hygk2-cb "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygk2 --stage adhoc --status DONE --worker codex-b --message d --quiet )"
+  [ "$(rc_of hygk2-cb)" = 0 ] && [ "$(jobs_state codex-b)" = unknown ] \
+    && ok "T-HYG-CB-UNKNOWN-ON-FAILURE DONE closes, observation unknown" \
+    || bad "T-HYG-CB-UNKNOWN-ON-FAILURE rc=$(rc_of hygk2-cb) obs='$(jobs_state codex-b)'"
+  rmdir "$UFILE" 2>/dev/null
+  # T-HYG-CB-LOCK-TIMEOUT: foreign holder on the worker lock → DONE fail-open, unknown, reset-next.
+  run_in_pane "$HS:0.0" hygk3-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygk3 --stage adhoc --worker codex-a )"
+  hwrite observe-known codex-a "generation=$(hgen codex-a)" "callback_id=k3" "pending_timestamp=k3" \
+    "usage_record_hash=k3hash" "headroom=95" "confidence=high" >/dev/null
+  KLOCK="$HC/.dev/forge-tmp/hygiene-locks/$HS.$HINC.codex-a.lock"
+  python3 - "$KLOCK" <<'PY' &
+import fcntl,sys,time
+f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(8)
+PY
+  KHOLD=$!
+  sleep 0.5
+  tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.2" hygk3-cb "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_LOCK_WAIT_S=1 $BRIDGE callback --slug hygk3 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
+  if [ "$(rc_of hygk3-cb)" = 0 ] && [ "$(jobs_state codex-a)" = unknown ]; then
+    case "$(hdec codex-a)" in RESET_UNPROVEN*) ok "T-HYG-CB-LOCK-TIMEOUT DONE fail-open, unknown, next boundary resets" ;;
+      *) bad "T-HYG-CB-LOCK-TIMEOUT decision not unproven: $(hdec codex-a)" ;; esac
+  else
+    bad "T-HYG-CB-LOCK-TIMEOUT rc=$(rc_of hygk3-cb) obs='$(jobs_state codex-a)'"
+  fi
+  kill "$KHOLD" 2>/dev/null; wait "$KHOLD" 2>/dev/null
+  # Mismatched pending_timestamp does NOT promote (real path).
+  run_in_pane "$HS:0.0" hygk4-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygk4 --stage adhoc --worker codex-b )"
+  python3 - "$JHC" <<'PY'
+import sys,yaml
+jf=sys.argv[1]; d=yaml.safe_load(open(jf)) or {}
+d["workers"]["codex-b"]["delivery"]["pending_timestamp"]="1999-01-01T00:00:00Z"
+yaml.safe_dump(d,open(jf,"w"),default_flow_style=False,sort_keys=True)
+PY
+  tmux send-keys -t "$HS:0.3" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.3" hygk4-cb "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygk4 --stage adhoc --status DONE --worker codex-b --message d --quiet )"
+  [ "$(rc_of hygk4-cb)" = 0 ] && [ "$(jdel codex-b state)" != callback-confirmed ] \
+    && ok "T-HYG-CB mismatched pending timestamp does NOT promote" \
+    || bad "T-HYG-CB mismatched promote: state=$(jdel codex-b state)"
+  # T-HYG-CB-BLOCKED-INVALIDATED: BLOCKED invalidates old-safe; send --force advances generation.
+  run_in_pane "$HS:0.0" hygk5-disp "( cd $HC && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug hygk5 --stage adhoc --worker codex-a )"
+  hwrite observe-known codex-a "generation=$(hgen codex-a)" "callback_id=k5" "pending_timestamp=k5" \
+    "usage_record_hash=k5hash" "headroom=99" "confidence=high" >/dev/null
+  tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.2" hygk5-blk "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygk5 --stage adhoc --status BLOCKED --worker codex-a --message stuck --quiet )"
+  case "$(hdec codex-a)" in
+    RESET_UNPROVEN*) ok "T-HYG-CB-BLOCKED-INVALIDATED BLOCKED invalidates prior safe observation" ;;
+    *) bad "T-HYG-CB-BLOCKED-INVALIDATED still safe: $(hdec codex-a)" ;;
+  esac
+  kgen_before="$(hgen codex-a)"
+  run_in_pane "$HS:0.0" hygk5-force "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE send --force codex-a HYGK5_CONTINUE )"
+  kgen_after="$(hgen codex-a)"
+  [ "$(rc_of hygk5-force)" = 0 ] && [ "$kgen_after" != "$kgen_before" ] && [ "$(jdel codex-a kind)" = send-force ] \
+    && ok "T-HYG-CB-BLOCKED-INVALIDATED send --force continuation advances generation" \
+    || bad "T-HYG-CB-BLOCKED-INVALIDATED force: rc=$(rc_of hygk5-force) gen $kgen_before→$kgen_after"
+  tmux send-keys -t "$HS:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$HS:0.2" hygk5-close "( cd $HC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug hygk5 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
   tmux kill-session -t "$HS" 2>/dev/null
-  echo "  (skip HYG §C: tmux unavailable)"
+else
+  echo "  (skip HYG §C/§K: tmux unavailable)"
 fi
 
 echo

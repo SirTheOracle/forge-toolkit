@@ -826,6 +826,27 @@ w=((d.get("workers") or {}).get(sys.argv[2]) or {}); print(w.get("latest_generat
 PY
 }
 
+_usage_record_hash() {   # <usage_file> <worker>
+    [ -f "$1" ] || { printf ''; return 0; }
+    python3 - "$1" "$2" <<'PY'
+import sys,yaml,hashlib,json
+try: d=yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: print(""); sys.exit(0)
+r=((d.get("workers") or {}).get(sys.argv[2]))
+print("" if r is None else hashlib.sha256(json.dumps(r,sort_keys=True,separators=(",",":")).encode()).hexdigest())
+PY
+}
+_usage_record_headroom() {   # <usage_file> <worker> -> "<headroom> <confidence>"
+    [ -f "$1" ] || { printf ' none'; return 0; }
+    python3 - "$1" "$2" <<'PY'
+import sys,yaml
+try: d=yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: print(" none"); sys.exit(0)
+r=((d.get("workers") or {}).get(sys.argv[2]) or {})
+hr=r.get("headroom"); print("%s %s" % (hr if isinstance(hr,int) else "", r.get("confidence") or "none"))
+PY
+}
+
 # Current terminal state (empty => running). Collapses an unpublished finalization outbox
 # to outbox-pending for the send/dispatch block.
 _terminal_state() {   # <project_root>
@@ -3510,6 +3531,31 @@ EOF
     # Atomic publish writes to a temp file in the SAME dir (same filesystem) then
     # renames into place.
     local cb_tmp="$cb_dir/.$(basename "$cb_file").tmp.$$"
+    # Worker-context-hygiene Step 5: invalidate prior observation coverage BEFORE publication so
+    # a concurrent dispatch can never read an old safe reading while this callback publishes.
+    # P0-4: a RETURN trap releases the worker (and lifecycle) lock on EVERY callback error path.
+    # Best-effort worker lock (fail-OPEN): a timeout must not fail DONE/ERROR/BLOCKED.
+    trap _hygiene_release_all RETURN
+    local _cb_worker_locked=0 _cb_invalidated=0
+    if _hygiene_worker_ok "$worker_canonical" && _worker_lock "$worker_canonical" 2>/dev/null; then
+        _cb_worker_locked=1
+        _hygiene_write "$project_root" observe-pending "$worker_canonical" \
+            "generation=$(_hygiene_current_gen "$project_root" "$worker_canonical")" \
+            "callback_id=$cb_id" "pending_timestamp=$selected_pending_timestamp" && _cb_invalidated=1
+    elif _hygiene_worker_ok "$worker_canonical"; then
+        # P1-6: lock-timeout path — durably invalidate the old high-confidence observation. This
+        # write is CHECKED; on success the old `known` becomes `unknown` and can never satisfy
+        # KEEP_OBSERVED. On failure escalate (below) rather than silently leaving stale-safe.
+        _hygiene_write "$project_root" observe-unknown "$worker_canonical" && _cb_invalidated=1
+    fi
+    # P1-6: if invalidation did not persist (journal locked/unwritable), the old observation may
+    # still read as KEEP_OBSERVED. We cannot fail DONE (fail-open), so escalate loudly AND make a
+    # bounded second attempt; a persistent failure is a durable-journal fault surfaced for the
+    # operator (documented residual — an unwritable journal defeats every persistence path).
+    if _hygiene_worker_ok "$worker_canonical" && [ "$_cb_invalidated" != 1 ]; then
+        _hygiene_write "$project_root" observe-unknown "$worker_canonical" && _cb_invalidated=1
+        [ "$_cb_invalidated" = 1 ] || _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=observation-invalidation-unpersisted (journal unwritable) — prior evidence may be stale"
+    fi
     # §3.3: serialize publication against park/resolve/supersede/consume on the same
     # (slug,stage). Acquire before close-then-publish; release after the mv.
     _callback_prelock_barrier
@@ -3601,11 +3647,27 @@ EOF
     cb_msg_len=$(printf '%s' "$message" | wc -c | tr -d ' ')
     _emit_event CALLBACK "$slug" "stage=$stage worker=$worker_canonical status=$status message_len=$cb_msg_len callback_file=$cb_file"
 
-    # Read-only, family-aware per-task usage observation. Placed AFTER all
-    # critical callback work above (callback file, log-response, CALLBACK emit)
-    # and wrapped `|| true` so it can never delay or break the callback. NEVER
-    # issues /clear, /new, or /compact — see _observe_usage.
+    # Read-only, family-aware per-task usage observation. Under the worker lock (Step 5)
+    # when held: record KNOWN coverage only if the target worker's usage record canonical
+    # hash CHANGED and confidence is high; else unknown. A DONE/ERROR/BLOCKED callback also
+    # promotes an attempting delivery. Never issues /clear, /new, /compact.
+    local _uf="$project_root/$(_usage_file)"
+    local _h_before; _h_before="$(_usage_record_hash "$_uf" "$worker_canonical")"
     _observe_usage "$worker_canonical" "$slug" "$stage" "$worker_idx" "$project_root" || true
+    if [ "$_cb_worker_locked" = 1 ]; then
+        local _h_after; _h_after="$(_usage_record_hash "$_uf" "$worker_canonical")"
+        local _hr _conf; read -r _hr _conf < <(_usage_record_headroom "$_uf" "$worker_canonical")
+        local _cg; _cg="$(_hygiene_current_gen "$project_root" "$worker_canonical")"
+        if [ -n "$_h_after" ] && [ "$_h_after" != "$_h_before" ] && [ "${_conf:-none}" = high ]; then
+            _hygiene_write "$project_root" observe-known "$worker_canonical" \
+                "generation=${_cg:-0}" "callback_id=$cb_id" "pending_timestamp=$selected_pending_timestamp" \
+                "usage_record_hash=$_h_after" "headroom=${_hr:-}" "confidence=high" 2>/dev/null || true
+        else
+            _hygiene_write "$project_root" observe-unknown "$worker_canonical" "generation=${_cg:-0}" 2>/dev/null || true
+        fi
+        _hygiene_write "$project_root" promote "$worker_canonical" "pending_timestamp=$selected_pending_timestamp" 2>/dev/null || true
+        _worker_unlock "$worker_canonical"
+    fi
 
     _render_status_file
     echo "CALLBACK $status stage=$stage slug=$slug worker=$worker_canonical → $cb_file"
