@@ -1585,18 +1585,67 @@ cmd_send() {
         esac
     fi
 
-    tmux select-pane -t "$SESSION:$WINDOW.$PANE"
+    # Worker-boundary serialization + crash-conservative delivery (Steps 3-4/7).
+    case "$TARGET" in
+        codex-a|codex-b|claude-opus|claude-sonnet)
+            if [ "$SKIP_BLOCK_GUARD" = 1 ]; then
+                # dispatch's internal delivery — caller owns the lock + generation.
+                _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"
+                return $?
+            fi
+            local _pr2; _pr2="$(_resolve_project_root "" 2>/dev/null)"
+            # P1-2: route mode through _hygiene_mode (a typo is a hard error, not silent legacy).
+            local _smode; _smode="$(_hygiene_mode)" || { echo "HOOK BLOCKED: FORGE_WORKER_HYGIENE_MODE must be observe|enforce." >&2; return 1; }
+            if [ "$_smode" = enforce ] && [ -n "$_pr2" ]; then
+                # P0-2: awaiting-verify-decision also blocks all worker sends (incl. --force).
+                case "$(_terminal_state "$_pr2")" in
+                    awaiting-verify-decision|verified-incomplete|terminal-cleanup|outbox-pending)
+                        echo "HOOK BLOCKED: terminal state blocks all worker sends (incl. --force). Resolve/finalize or hygiene-abandon first." >&2
+                        return 1 ;;
+                esac
+            fi
+            _worker_lock "$TARGET" || return 1
+            # P1-4: FAIL-CLOSED bookkeeping — advance the generation + persist attempting
+            # BEFORE typing; any write failure aborts with NO keystroke. send --force is the
+            # no-reset continuation but STILL advances the generation so prior observation/
+            # reset cannot authorize the next stage.
+            local _g; _g="$(_hygiene_write "$_pr2" next-gen "")" || { _worker_unlock "$TARGET"; echo "HOOK BLOCKED: send refused — generation write failed for $TARGET." >&2; return 1; }
+            _hygiene_write "$_pr2" delivery "$TARGET" \
+                "id=send-$(date -u +%Y%m%dT%H%M%SZ)-$$" "generation=${_g:-0}" \
+                "kind=$([ "$FORCE" = true ] && echo send-force || echo send)" || { _worker_unlock "$TARGET"; echo "HOOK BLOCKED: send refused — delivery write failed for $TARGET." >&2; return 1; }
+            # P2-10: direct worker sends are audited too (a no-reset continuation boundary).
+            _emit_event HYGIENE_DECISION "${FORGE_SEND_SLUG:-adhoc}" "worker=$TARGET action=SEND_CONTINUATION reason=$([ "$FORCE" = true ] && echo force-continuation || echo direct-send) confidence=none mode=$(_hygiene_mode 2>/dev/null) generation=${_g:-0}"
+            _hygiene_crash_at activity
+            _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"; local _rc=$?
+            _hygiene_crash_at send-enter
+            [ "$_rc" -eq 0 ] && _hygiene_write "$_pr2" delivered "$TARGET" 2>/dev/null || true   # advisory
+            _hygiene_crash_at delivered   # P2-1: after the delivered write (public send path)
+            _worker_unlock "$TARGET"
+            return $_rc
+            ;;
+    esac
+    # Non-worker target (pane-1 / orchestrator relay) — unchanged path.
+    _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"
+}
+
+# Lock-owned key-send primitive. Assumes the caller owns the target worker lock (or the
+# target is non-worker). NEVER acquires a worker lock itself (avoids the cmd_dispatch
+# self-deadlock). P2-12: every mutating tmux command is checked; on ANY failure the
+# delivery stays `attempting` (rc!=0) so the caller does NOT mark it delivered.
+_worker_send_locked() {   # <full-target> <msg>
+    local _tgt="$1" MSG="$2"
+    tmux select-pane -t "$_tgt" || { echo "SEND_FAILED select-pane $_tgt" >&2; return 1; }
     sleep 0.3
-    _cancel_copy_mode "$SESSION:$WINDOW.$PANE"
+    _cancel_copy_mode "$_tgt"
     # Split the send into two events: type the text literally first (-l), pause
     # so the worker TUI commits the line into its input buffer, THEN press Enter
     # as a standalone keystroke. Combining text+Enter into one send-keys call
     # leaves the text sitting UNSUBMITTED on current Codex/Claude TUI builds —
     # the dispatch reports success but the worker pane never receives the prompt.
-    # Same fix already proven on the callback path (see _send notify below).
-    tmux send-keys -t "$SESSION:$WINDOW.$PANE" -l "$MSG"
+    tmux send-keys -t "$_tgt" -l "$MSG" || { echo "SEND_FAILED text $_tgt" >&2; return 1; }
+    _hygiene_crash_at send-text
     sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
-    tmux send-keys -t "$SESSION:$WINDOW.$PANE" Enter
+    tmux send-keys -t "$_tgt" Enter || { echo "SEND_FAILED enter $_tgt" >&2; return 1; }
 }
 
 cmd_read() {
@@ -1783,6 +1832,90 @@ PY
     return 0
 }
 _lifecycle_unlock() { exec 9>&- 2>/dev/null || true; }
+
+# ---- Worker boundary locks (worker-context-hygiene Step 3) ----
+# Fixed fds per canonical worker (bash-3.2 has no dynamic-fd alloc; finalize holds all
+# four at once). Order: worker(10-13) > lifecycle(9) > journal(8). NEVER reuse fd 9.
+# Non-reentrant: a caller must not re-acquire a lock it already holds (that would
+# `exec $fd>` reopen the fd and DROP the flock); the _worker_send_locked discipline
+# enforces this. fd inheritance is load-bearing in observe too — every worker send
+# takes the lock for the audit trail.
+_worker_lock_fd() {   # <worker_canonical> -> fd or empty
+    case "$1" in
+        claude-opus)   printf 10 ;; codex-a)       printf 11 ;;
+        codex-b)       printf 12 ;; claude-sonnet) printf 13 ;;
+        *)             printf '' ;;
+    esac
+}
+_worker_lock() {   # <worker_canonical> ; rc 0 held, 1 busy/error, 2 non-worker
+    local wk="$1" fd; fd="$(_worker_lock_fd "$wk")"
+    [ -n "$fd" ] || { echo "ERROR: worker-lock: pane 1 / non-worker '$wk' is unlockable" >&2; return 2; }
+    local pr; pr="$(_resolve_project_root "" 2>/dev/null)"
+    [ -n "$pr" ] || { echo "ERROR: worker-lock: no project root" >&2; return 1; }
+    local ld="$pr/.dev/forge-tmp/hygiene-locks"; mkdir -p "$ld" 2>/dev/null
+    local lf="$ld/${ID_target_session:-__nosession__}.${ID_target_incarnation:-0}.${wk}.lock"
+    eval "exec $fd>\"\$lf\"" || { echo "ERROR: worker-lock: cannot open $lf" >&2; return 1; }
+    FORGE_WL_FD="$fd" FORGE_WL_WAIT_S="${FORGE_WORKER_LOCK_WAIT_S:-5}" python3 - <<'PY'
+import fcntl,os,time,sys
+fd=int(os.environ["FORGE_WL_FD"]); dl=time.time()+float(os.environ.get("FORGE_WL_WAIT_S","5"))
+while True:
+    try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); sys.exit(0)
+    except OSError:
+        if time.time()>=dl: sys.exit(75)
+        time.sleep(0.05)
+PY
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then eval "exec $fd>&-"; echo "WORKER_LOCK: busy — $wk within ${FORGE_WORKER_LOCK_WAIT_S:-5}s" >&2; return 1; fi
+    return 0
+}
+_worker_unlock() {   # <worker_canonical>
+    local fd; fd="$(_worker_lock_fd "$1")"; [ -n "$fd" ] && eval "exec $fd>&- 2>/dev/null" || true
+}
+
+# ---- Terminal/lifecycle mutex (P0-1, R3) — fd 7 ----
+# ONE per-session terminal mutex that EVERY terminal-state mutator acquires FIRST, before any
+# worker or lifecycle lock: cmd_finalize, cmd_hygiene_abandon, cmd_verify_decision, and the
+# park --resolve terminal handoff. This serializes finalize vs park/verify/abandon so residue
+# and terminal state cannot change between a finalizer's revalidation and its publication, and
+# abandon cannot overwrite `complete` after a concurrent finalizer published.
+# GLOBAL LOCK ORDER: terminal(7) > worker(10-13) > lifecycle(9) > journal(8, leaf). No terminal
+# op holds both a worker and a lifecycle lock, so this stays a strict partial order; the callback
+# path (worker→lifecycle, no terminal lock) cannot form a cycle with it.
+_terminal_lock() {   # rc 0 = held on fd 7
+    local pr; pr="$(_resolve_project_root "" 2>/dev/null)"
+    [ -n "$pr" ] || { echo "ERROR: terminal-lock: no project root" >&2; return 1; }
+    local ld="$pr/.dev/forge-tmp/hygiene-locks"; mkdir -p "$ld" 2>/dev/null
+    local lf="$ld/${ID_target_session:-__nosession__}.${ID_target_incarnation:-0}.terminal.lock"
+    exec 7>"$lf" || { echo "ERROR: terminal-lock: cannot open $lf" >&2; return 1; }
+    FORGE_TL_WAIT_S="${FORGE_TERMINAL_LOCK_WAIT_S:-10}" python3 - <<'PY'
+import fcntl,os,time,sys
+dl=time.time()+float(os.environ.get("FORGE_TL_WAIT_S","10"))
+while True:
+    try: fcntl.flock(7,fcntl.LOCK_EX|fcntl.LOCK_NB); sys.exit(0)
+    except OSError:
+        if time.time()>=dl: sys.exit(75)
+        time.sleep(0.05)
+PY
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then exec 7>&-; echo "TERMINAL_LOCK: busy — another terminal operation holds it" >&2; return 1; fi
+    return 0
+}
+_terminal_unlock() { exec 7>&- 2>/dev/null || true; }
+
+# ---- Single cleanup/finally path (P0-4, R3) ----
+# Releases EVERY hygiene lock (terminal 7, worker 10-13, lifecycle 9). Releasing an unheld fd
+# is a harmless no-op, so this is idempotent and safe to call from a RETURN trap. Installed via
+# `trap _hygiene_release_all RETURN` at the top of the worker-lock critical section in
+# cmd_callback, cmd_dispatch, cmd_finalize, cmd_hygiene_abandon, and cmd_verify_decision, so
+# fds are released on EVERY return — normal, guard-refusal, lock-timeout, and crash-seam exits —
+# with no per-branch unlock bookkeeping. (bash-3.2: a RETURN trap fires when the trapping
+# function returns and is NOT inherited by nested helper calls without `set -T`, verified.)
+_hygiene_release_all() {
+    local w
+    for w in claude-opus codex-a codex-b claude-sonnet; do _worker_unlock "$w"; done
+    _lifecycle_unlock
+    _terminal_unlock
+}
 
 # Insert parked_at/parked_reason/uncommitted as SIBLINGS of a specific open entry
 # (located by timestamp anchor), keeping response: null, in BOTH logs — mirroring

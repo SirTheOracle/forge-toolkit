@@ -1256,7 +1256,7 @@ fi
 # §0 harness: pure-helper extraction (FNS idiom), fixture seams, env defaults.
 echo "── HYG §0: pure-helper extraction ──"
 HFNS="$WORK/hfns.sh"
-sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p; /^_hygiene_file()/,/^}$/p; /^_hygiene_write()/,/^}$/p; /^_hygiene_decide()/,/^}$/p; /^_hygiene_current_gen()/,/^}$/p; /^_terminal_state()/,/^}$/p; /^_hygiene_journal_preflight()/,/^}$/p; /^_hygiene_finalization_field()/,/^}$/p; /^_hygiene_activation_blockers()/,/^}$/p; /^cmd_hygiene_gc()/,/^}$/p' "$BRIDGE" > "$HFNS"
+sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p; /^_hygiene_file()/,/^}$/p; /^_hygiene_write()/,/^}$/p; /^_hygiene_decide()/,/^}$/p; /^_hygiene_current_gen()/,/^}$/p; /^_terminal_state()/,/^}$/p; /^_hygiene_journal_preflight()/,/^}$/p; /^_hygiene_finalization_field()/,/^}$/p; /^_hygiene_activation_blockers()/,/^}$/p; /^cmd_hygiene_gc()/,/^}$/p; /^_worker_lock_fd()/,/^}$/p; /^_worker_lock()/,/^}$/p; /^_worker_unlock()/,/^}$/p; /^_terminal_lock()/,/^}$/p; /^_terminal_unlock()/,/^}$/p; /^_hygiene_release_all()/,/^}$/p' "$BRIDGE" > "$HFNS"
 grep -q '_reset_proof_probe' "$HFNS" && ok "HYG helper extraction non-empty" || bad "HYG helper extraction empty"
 HFIX="$ROOT/tests/forge-bridge/fixtures"
 # Shared env for every hygiene subshell: hermetic defaults + capability fixture.
@@ -1628,6 +1628,73 @@ o=$(cmd_hygiene_gc --days 30 2>&1)
   && ok "T-HYG-GC malformed RETAINED" || bad "T-HYG-GC malformed removed"
 [ -f "$GCROOT/.dev/forge-hygiene.ghost4.1.yml" ] && echo "$o" | grep -q 'RETAIN(non-mapping)' \
   && ok "T-HYG-GC non-mapping RETAINED" || bad "T-HYG-GC non-mapping removed"
+
+echo "── HYG §L: worker boundary locks (fds 10-13) + terminal mutex (fd 7) ──"
+HYGROOT="$WORK/hygL"; mkdir -p "$HYGROOT/.dev/forge-tmp/hygiene-locks"
+_resolve_project_root(){ printf '%s' "$HYGROOT"; }
+# Pane 1 / non-worker is unlockable.
+[ -z "$(_worker_lock_fd claude)" ] && _worker_lock claude 2>/dev/null; rc=$?
+[ "$rc" = 2 ] && ok "T-HYG-RESET-PANE1 non-worker lock → rc2" || bad "T-HYG-RESET-PANE1 rc=$rc"
+# Acquire + release + immediate re-acquire (fd release within one process).
+_worker_lock claude-opus && _worker_unlock claude-opus && _worker_lock claude-opus \
+  && ok "T-HYG-LOCK-FD-RELEASE unlock frees the fd for immediate re-acquire" \
+  || bad "T-HYG-LOCK-FD-RELEASE re-acquire failed"
+_worker_unlock claude-opus
+# Same-worker contention serializes: a foreign holder makes _worker_lock time out busy.
+LOCKF="$HYGROOT/.dev/forge-tmp/hygiene-locks/hygS.42.claude-opus.lock"
+python3 - "$LOCKF" <<'PY' &
+import fcntl,sys,time
+f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(4)
+PY
+HOLDPID=$!
+sleep 0.7
+FORGE_WORKER_LOCK_WAIT_S=1 _worker_lock claude-opus 2>/dev/null; rc=$?
+[ "$rc" = 1 ] && ok "T-HYG-LOCK-SERIALIZE same worker busy → rc1 within wait" || { bad "T-HYG-LOCK-SERIALIZE rc=$rc (expected busy)"; _worker_unlock claude-opus; }
+# Different workers are independent while claude-opus is held externally.
+FORGE_WORKER_LOCK_WAIT_S=1 _worker_lock codex-a \
+  && ok "T-HYG-LOCK-INDEPENDENT different worker acquires concurrently" \
+  || bad "T-HYG-LOCK-INDEPENDENT codex-a blocked by claude-opus holder"
+_worker_unlock codex-a
+kill "$HOLDPID" 2>/dev/null; wait "$HOLDPID" 2>/dev/null
+# Held lock survives a python heredoc child (fd inheritance is load-bearing).
+_worker_lock codex-b
+python3 - <<'PY'
+print("heredoc child ran")
+PY
+FORGE_WL_PROBE="$HYGROOT/.dev/forge-tmp/hygiene-locks/hygS.42.codex-b.lock" python3 - <<'PY'
+import fcntl,os,sys
+f=open(os.environ["FORGE_WL_PROBE"],'w')
+try:
+    fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB); sys.exit(1)   # acquired => lock was dropped
+except OSError:
+    sys.exit(0)                                               # busy => still held
+PY
+rc=$?
+[ "$rc" = 0 ] && ok "T-HYG-LOCK held lock survives heredoc child (fd inheritance)" || bad "T-HYG-LOCK dropped across heredoc"
+_worker_unlock codex-b
+# _worker_send_locked never re-acquires a worker lock (no-self-deadlock, source pin).
+sed -n '/^_worker_send_locked()/,/^}$/p' "$BRIDGE" | grep -q '_worker_lock' \
+  && bad "T-HYG-LOCK-NO-SELF-DEADLOCK _worker_send_locked acquires a lock" \
+  || ok "T-HYG-LOCK-NO-SELF-DEADLOCK _worker_send_locked is lock-free (caller owns it)"
+# Terminal mutex: acquire/release + busy under a foreign holder.
+_terminal_lock && _terminal_unlock && ok "T-HYG-TERMINAL-MUTEX acquire/release" || bad "T-HYG-TERMINAL-MUTEX basic acquire failed"
+TLOCKF="$HYGROOT/.dev/forge-tmp/hygiene-locks/hygS.42.terminal.lock"
+python3 - "$TLOCKF" <<'PY' &
+import fcntl,sys,time
+f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(3)
+PY
+THOLD=$!
+sleep 0.5
+FORGE_TERMINAL_LOCK_WAIT_S=1 _terminal_lock 2>/dev/null; rc=$?
+[ "$rc" = 1 ] && ok "T-HYG-TERMINAL-MUTEX busy under a concurrent holder" || { bad "T-HYG-TERMINAL-MUTEX rc=$rc"; _terminal_unlock; }
+kill "$THOLD" 2>/dev/null; wait "$THOLD" 2>/dev/null
+# _hygiene_release_all is idempotent and frees everything (safe on unheld fds).
+_worker_lock claude-opus; _worker_lock codex-a; _terminal_lock
+_hygiene_release_all; _hygiene_release_all
+_worker_lock claude-opus && _worker_lock codex-a && _terminal_lock \
+  && ok "T-HYG-RELEASE-ALL releases terminal + worker locks idempotently" \
+  || bad "T-HYG-RELEASE-ALL left a lock held"
+_hygiene_release_all
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
