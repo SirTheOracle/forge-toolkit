@@ -432,16 +432,20 @@ def load_context(root, path):
         return None
     return data
 
-def pending_entries(root, path):
-    """Open (response: null) entries in a forge-log.yml.
-    Returns list of dicts {stage,to,timestamp}. Uses the bridge's regex
-    fallback when yaml.safe_load chokes on legacy malformed entries."""
+def _read_log_entries(root, path):
+    """(entries, parse_clean). ALL normalized entries (open+closed) in a
+    forge-log.yml; parse_clean is False when a legacy regex-fallback block could
+    not be classified (no response line). A caller building a 'stage fully
+    resolved' predicate MUST treat parse_clean=False as non-authoritative (keep
+    alerting). Uses the bridge's regex fallback when yaml.safe_load chokes on
+    legacy malformed entries."""
     try:
         with open(path) as f:
             raw = f.read()
     except OSError:
-        return []
+        return [], False
     entries = None
+    parse_clean = True
     if HAVE_YAML:
         try:
             data = yaml.safe_load(raw) or {}
@@ -455,7 +459,7 @@ def pending_entries(root, path):
         starts = [(m.start(), m.group(1)) for m in block_re.finditer(raw)]
         if not starts and raw.strip():
             note_unparseable(root, path)
-            return []
+            return [], False
         for i, (off, ts) in enumerate(starts):
             end = starts[i + 1][0] if i + 1 < len(starts) else len(raw)
             blk = raw[off:end]
@@ -464,6 +468,9 @@ def pending_entries(root, path):
                 return mm.group(1).strip() if mm else None
             rmatch = re.search(r'^\s+response:\s*(null|"(?:[^"\\]|\\.)*")', blk, re.MULTILINE)
             if not rmatch:
+                # A block we cannot classify open-vs-closed makes the whole log
+                # non-authoritative for resolved-stage reconciliation (fail-safe).
+                parse_clean = False
                 continue
             resp = None if rmatch.group(1) == 'null' else rmatch.group(1)
             # Blocked-item lifecycle: the regex fallback (legacy malformed logs) must
@@ -481,18 +488,26 @@ def pending_entries(root, path):
     for e in entries:
         # A hand-edited/legacy log can yield non-dict list items; skip them
         # rather than letting e.get() abort the whole root's scan.
-        if isinstance(e, dict) and e.get('response') is None:
+        if isinstance(e, dict):
             pr = e.get('parked_reason')
             if isinstance(pr, str):
                 pr = pr.strip().strip('"')
             out.append({'stage': e.get('stage'), 'to': e.get('to'),
                         'timestamp': e.get('timestamp'),
+                        'response': e.get('response'),
                         'session': e.get('session'),
                         'incarnation': e.get('incarnation'),
                         'parked_at': e.get('parked_at'),
                         'parked_reason': pr,
                         'uncommitted': bool(e.get('uncommitted'))})
-    return out
+    return out, parse_clean
+
+def pending_entries(root, path):
+    """Open (response: null) entries in a forge-log.yml. Thin filter over
+    _read_log_entries so the open-set and the all-set share one parser.
+    Returns list of dicts {stage,to,timestamp,...}."""
+    entries, _ = _read_log_entries(root, path)
+    return [e for e in entries if e.get('response') is None]
 
 def parse_callback(path):
     """Parse a .callback file. Returns dict or None.
@@ -577,6 +592,9 @@ def parse_callback(path):
 # ── findings ─────────────────────────────────────────────────────────────
 # policy: 'standard' (backoff), 'daily' (>=24h), 'never' (status-only)
 findings = []  # dict: condition, root, key, policy, session, slug, stage, msg
+RESOLVED_STAGES_BY_ROOT = {}  # root -> set of (slug, stage) fully resolved in forge-log
+                              # (>=1 entry, all closed, cleanly parsed). Published by
+                              # scan_root; read by scan_attention (C4 NEEDS-ASK suppress).
 TASKS = []     # cc-board/1 tasks[] projection (Step 3): read-time fold, no ledger
 EPISODES = []  # episode records, ALL roots (R3a) — board assembles/sorts/caps once at render
 task_stuck_ids = set()  # (root, session, dispatch_id) collected at the TASK-STUCK emission
@@ -604,21 +622,65 @@ def scan_root(root):
     # --- pipeline logs: open + stale pendings, indexed by slug ---
     open_by_slug = {}     # slug -> [pending,...]
     stale_pendings = []   # (slug, pending)
+    resolved_stages = set()   # (slug, stage): >=1 entry, all closed, clean parse
+    closed_max_ts = {}        # (slug, stage) -> newest CLOSED dispatch ts (str)
     for logp in glob.glob(os.path.join(dev, 'proposals', '*', 'forge-log.yml')):
         slug = os.path.basename(os.path.dirname(logp))
-        pend = pending_entries(root, logp)
+        all_entries, parse_clean = _read_log_entries(root, logp)
+        pend = [e for e in all_entries if e.get('response') is None]
         if pend:
             open_by_slug[slug] = pend
         for p in pend:
             a = age_s(p.get('timestamp'))
             if a is not None and a > STALE_AGE:
                 stale_pendings.append((slug, p))
+        # Reconciliation: only an authoritative (cleanly-parsed) log with >=1 entry
+        # can mark a stage resolved. Absence/corruption => keep alerting (fail-safe).
+        if parse_clean and all_entries:
+            by_stage = {}
+            for e in all_entries:
+                if not isinstance(e, dict):
+                    continue
+                st = e.get('stage')
+                d = by_stage.setdefault(st, {'n': 0, 'open': 0, 'cmax': ''})
+                d['n'] += 1
+                if e.get('response') is None:
+                    d['open'] += 1
+                else:
+                    ets = str(e.get('timestamp') or '')
+                    if ets > d['cmax']:
+                        d['cmax'] = ets
+            for st, d in by_stage.items():
+                if d['n'] >= 1 and d['open'] == 0:
+                    resolved_stages.add((slug, st))
+                if d['cmax']:
+                    closed_max_ts[(slug, st)] = d['cmax']
+    # Published AFTER the loop so a mid-loop throw leaves the key absent -> no
+    # suppression (fail-safe: keep alerting).
+    RESOLVED_STAGES_BY_ROOT[root] = resolved_stages
 
     def has_open_pending(slug, stage=None):
         pend = open_by_slug.get(slug, [])
         if stage is None:
             return bool(pend)
         return any(p.get('stage') == stage for p in pend)
+
+    def has_live_pending(slug, stage=None):
+        # Like has_open_pending, but excludes a superseded orphan (an open pending
+        # with a strictly-newer CLOSED dispatch ts for its stage). Anti-suppression:
+        # used ONLY at the NEEDS-DECISION gate so an orphan cannot hide a live decision.
+        pend = open_by_slug.get(slug, [])
+        live = []
+        for p in pend:
+            pst = p.get('stage')
+            cmax = closed_max_ts.get((slug, pst))
+            pts = str(p.get('timestamp') or '')
+            if cmax and pts and cmax > pts:
+                continue  # superseded orphan — not a live pending
+            live.append(p)
+        if stage is None:
+            return bool(live)
+        return any(p.get('stage') == stage for p in live)
 
     # --- callback files: header-validated, per-owner BLOCKED correlation ---
     callback_groups = {}
@@ -841,9 +903,16 @@ def scan_root(root):
             pass
         if fresh:
             continue
+        # A pending with a strictly-newer CLOSED dispatch for the same (slug, stage)
+        # is a superseded orphan (e.g. a mis-dispatched twin), not a live stall —
+        # demote it to the status-only STALE-PENDING residue branch. Dispatch-ts vs
+        # dispatch-ts (like-kind) dodges the ask-emit-vs-dispatch timestamp trap.
+        p_ts = str(p.get('timestamp') or '')
+        superseded = bool(closed_max_ts.get((slug, stage)) and p_ts
+                          and closed_max_ts[(slug, stage)] > p_ts)
         sec = age_s(p.get('timestamp'))
         a = human_age(sec)
-        if sec is not None and sec <= ZOMBIE_AGE_S:
+        if sec is not None and sec <= ZOMBIE_AGE_S and not superseded:
             msg = (f"{label} · {slug} — worker stalled at {stage} "
                    f"(pending {a}, to {p.get('to')})")
             add_finding('WORKER-STALLED', root, f"{slug}\t{stage}", msg,
@@ -897,7 +966,7 @@ def scan_root(root):
         if is_live:
             live_seen = True
         _eval_context(root, label, cp, embedded, is_live,
-                      has_open_pending, open_by_slug, live_blocked)
+                      has_open_pending, open_by_slug, live_blocked, has_live_pending)
 
     # --- LEGACY bare context (status-only, only if no live suffixed ctx) ---
     legacy = os.path.join(dev, 'forge-context.yml')
@@ -960,7 +1029,7 @@ def _handle_event_line(root, label, line):
         add_finding('PIPELINE-COMPLETE', root, slug, msg, policy='once', slug=slug)
 
 def _eval_context(root, label, cp, embedded, is_live,
-                  has_open_pending, open_by_slug, live_blocked):
+                  has_open_pending, open_by_slug, live_blocked, has_live_pending):
     ctx = load_context(root, cp)
     if ctx is None:
         return  # unparseable already recorded
@@ -1015,7 +1084,9 @@ def _eval_context(root, label, cp, embedded, is_live,
         # NEEDS-DECISION: decision predicate + no open pending + dwelled.
         decision = (nxt == 'pending-orchestrator-decision' or
                     (last in QA_FAMILY and status == 'done' and nxt != 'complete'))
-        if decision and not has_open_pending(slug):
+        # D3: use has_live_pending here so a superseded orphan cannot hide a live
+        # decision. The zombie-evidence path below keeps raw has_open_pending.
+        if decision and not has_live_pending(slug):
             a = age_s(updated)
             if a is not None and a >= DWELL_S:
                 msg = (f"{label} · {slug} — decision needed after {last} "
@@ -1271,6 +1342,12 @@ def scan_attention(root, label):
             continue
         sess = rec.get('session')
         slug = rec.get('slug'); stage = rec.get('stage'); worker = rec.get('worker')
+        # stale-alert-lifecycle: suppress a stage-mode ask whose (slug, stage) is
+        # fully resolved in the forge-log (>=1 entry, all closed). Session-scope asks
+        # (no slug/stage) and unresolved/unparseable stages are never suppressed.
+        if (rec.get('mode') == 'stage' and slug and stage
+                and (slug, stage) in RESOLVED_STAGES_BY_ROOT.get(root, set())):
+            continue
         q = (rec.get('question_snippet') or '').strip()
         who = sess or label
         tag = f" ({slug}/{stage})" if slug and stage else ""
