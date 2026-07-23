@@ -1,0 +1,12 @@
+● I reviewed the diff and applied the requested changes to the parser.
+
+  The regression suite is green: 42 passed, 0 failed.
+
+● Updated src/parser.py with the bounded-window capture logic.
+
+  Anything else on this task before I report back?
+
+╭──────────────────────────────────────────────────────────────╮
+│ >                                                            │
+╰──────────────────────────────────────────────────────────────╯
+  ctx: 112k (56%) · sonnet

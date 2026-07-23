@@ -1,0 +1,12 @@
+# Provider reset-proof capability + anchor table (Step 0/1). `proven: false` forces
+# the family to RESET_UNAVAILABLE in enforce unless HYGIENE_DEGRADED is on.
+version: 1
+families:
+  claude:
+    proven: true
+    new_conversation_anchor: '(?m)^.*Welcome to Claude Code.*$|^\s*/help for help'
+    session_id_capture: ''          # claude exposes no stable in-pane session id
+  codex:
+    proven: false                   # DEFAULT OFF until the Step 0 spike proves it
+    new_conversation_anchor: '(?m)^\s*OpenAI Codex.*$|^\s*To get started'
+    session_id_capture: ''

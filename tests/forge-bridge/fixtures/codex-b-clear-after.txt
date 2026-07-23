@@ -1,0 +1,10 @@
+╭──────────────────────────────────────────╮
+│  OpenAI Codex (v0.9)                     │
+╰──────────────────────────────────────────╯
+
+  To get started, describe a task or try one of these commands:
+    /init  /status  /diff
+
+▌ Send a message
+
+  Context 100% left

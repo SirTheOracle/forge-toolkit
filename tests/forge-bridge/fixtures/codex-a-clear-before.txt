@@ -1,0 +1,10 @@
+codex
+  I finished wiring the callback handler; the unit suite passes locally.
+
+  Files changed:
+    - src/handler.ts
+    - tests/handler.test.ts
+
+▌ Send a message
+
+  Context 41% left
