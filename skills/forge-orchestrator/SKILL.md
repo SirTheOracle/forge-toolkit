@@ -646,7 +646,7 @@ proposal → review → incorporate → implementation → impl-review → codin
 
 **implementation** — codex-a preferred, **claude-opus (pane 0) fallback**
 - Template: `~/.config/forge/prompts/implementation.txt` (skill: `adversarial-implementation`)
-- HIGH-tier stage (Hard Rule 22): the only valid workers are `codex-a` and `claude-opus`; the bridge rejects `codex-b`/`claude-sonnet` here. Fall back to **claude-opus** (never a throughput pane) only if codex-a's recorded usage shows high fill (`forge-bridge usage` → codex-a `headroom` known and ≤ 20) — Hard Rule 9, never silent fallback. A valid Codex `Context N% left` footer now supplies that numeric signal; an absent or malformed footer remains `unknown` and never triggers substitution.
+- HIGH-tier stage (Hard Rule 22): the only valid workers are `codex-a` and `claude-opus`; the bridge rejects `codex-b`/`claude-sonnet` here. Fallback to the other HIGH pane is an availability decision (Hard Rule 9), not a usage-threshold decision; the bridge owns context hygiene.
 - Output: `.dev/proposals/{slug}/implementation.md`
 - Dispatch (preferred — codex-a):
   ```bash
@@ -889,18 +889,21 @@ Routing starts from **reasoning tier** (Hard Rule 22), then availability:
    - `review` → codex-a only
    - `implementation` / `verify` → HIGH panes only (codex-a or claude-opus)
    - `verify` → NOT whoever did QA (check the log)
-4. **Usage awareness**: Usage is recorded per task. Read `~/bin/forge-bridge usage`
-   for a per-worker snapshot (normalized `headroom` 0-100 = % capacity remaining,
-   plus `confidence`). Claude parses `ctx: Nk (P%)`; Codex parses `Context N% left`
-   when rendered. A valid anchor for either provider publishes numeric headroom with
-   `confidence=high`. Route normally to the stage's default worker. Only when a worker's
-   `headroom` is **known and ≤ 20** (≥80% used) AND the stage allows an alternative,
-   prefer the alternative — and surface that substitution (Hard Rule 9, never silent).
-   `headroom: unknown` / `confidence: none` can occur for either provider when its
-   footer is absent or malformed and means *no usage-based substitution* — route the
-   default worker as usual, do NOT warn on a normal route, and never treat `unknown`
-   as "fine" or "exhausted." Usage is **observed, never reset** — a high reading is
-   never license to `/clear` or `/compact` (Hard Rule 20 stays the only clear path)
+4. **Usage awareness**: Usage is recorded per task and the **bridge owns context
+   hygiene** — you never `/clear` a worker yourself. The bridge resets a worker at the
+   next safe boundary (before dispatch, and at terminal cleanup) when its high-confidence
+   `headroom` is **at or below** the shared minimum (`FORGE_WORKER_MIN_HEADROOM`, default
+   75), or when its evidence is missing/unknown/stale (unknown means **unproven**, which
+   triggers a reset — never "fine" or "exhausted"). Read `~/bin/forge-bridge usage` for a
+   read-only snapshot (normalized `headroom` 0-100; Claude parses `ctx: Nk (P%)`, Codex
+   parses `Context N% left`). Usage **never** authorizes a mid-stage reset and **never**
+   changes the reasoning tier (Hard Rule 22); BLOCKED fix-and-continue retains context but
+   advances the delivery generation. All four worker panes share the policy; pane 1 is
+   excluded. Every boundary emits a `HYGIENE_DECISION` audit record. `observe` mode is the
+   rollout kill switch (legacy behavior + a loud `HYGIENE_BYPASSED`); `enforce` is the
+   accepted feature mode. A clean verify is closed with `verify-decision` then `finalize`;
+   a bare `COMPLETE` means the finalization outbox published after all four workers were
+   proven reset. `hygiene-abandon` is the audited cleanup-non-completion escape.
 5. **If no one is available**: Tell the user. Don't wait silently.
 
 ---
@@ -1096,28 +1099,25 @@ Background agent failures follow this protocol:
     timeout-per-stage table, and the self-service repair path for the
     runtime regex tables.
 
-20. **`forge-bridge dispatch --clear` between same-pane Claude dispatches.**
-    Claude worker panes (`claude-opus` pane 0, `claude-sonnet` pane 4)
-    accumulate in-conversation context across dispatches. Pass `--clear`
-    to `dispatch` when re-dispatching to a Claude pane that already ran a
-    prior stage in this pipeline. With the HIGH-tier fallbacks (Hard Rule
-    22) the pane-0 (claude-opus) reuse cases are now the common ones:
-      - `impl-review` after `incorporate`
-      - `implementation` fallback after `incorporate`
-      - `verify` fallback after `impl-review` (or any earlier pane-0 stage)
-    Pane-4 (claude-sonnet) reuse:
-      - `qa-fix` after `coding`
-    The bridge issues `/clear` and waits `FORGE_CLEAR_WAIT_S` (default 2 s)
-    before sending the new prompt.
+20. **Context hygiene is bridge-owned (worker-context-hygiene).** The bridge
+    resets a worker at a safe boundary when its proven headroom is `<= 75` (the
+    tunable `FORGE_WORKER_MIN_HEADROOM`, family overrides `_CLAUDE`/`_CODEX`) or
+    when hygiene evidence is unproven, and it clears **all four** workers at
+    terminal completion. All four providers are reset (Codex included); the bridge
+    proves each reset semantically (a new-conversation redraw or a changed session
+    id — never idle alone). A clean verify requires `forge-bridge verify-decision`,
+    then `forge-bridge finalize`; a **bare COMPLETE** means the finalization outbox
+    published after four proven resets. `hygiene-abandon` is the audited *cleanup*
+    non-completion escape from an indefinitely blocked terminal state; an explicitly
+    enabled hygiene-degraded family instead yields a qualified
+    `COMPLETE qualifier=hygiene-disabled`. `observe` mode is the rollout/kill switch
+    (legacy completion + a loud `HYGIENE_BYPASSED`); `enforce` is the accepted mode.
+    Every dispatch boundary emits a `HYGIENE_DECISION` audit record. Do NOT type
+    `/clear` manually; `dispatch --clear` coalesces into the automatic reset.
 
-    Codex worker panes do not need `--clear`.
-
-    Exception: when sending a FORGE_BLOCKED follow-up on the SAME task,
-    use raw `forge-bridge send --force` — do NOT `dispatch` again, that
-    would `/clear` and lose the worker's task context.
-
-    Never type `/clear` manually via raw `send`. Always go through the
-    `dispatch --clear` flag so the wait timing is consistent.
+    Exception (unchanged): when sending a FORGE_BLOCKED follow-up on the SAME task,
+    use raw `forge-bridge send --force` — do NOT `dispatch` again. It retains the
+    worker's task context and advances the delivery generation; it never resets.
 
 21. **Worker permission-mode and ident contract.**
     Launch flags:
