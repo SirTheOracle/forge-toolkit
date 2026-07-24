@@ -7,9 +7,13 @@ version: 1
 families:
   claude:
     proven: true
-    new_conversation_anchor: '(?m)Claude Code v[0-9]+\.[0-9]|Welcome to Claude Code|/release-notes for more|ctx: 0k \(0%\)'
+    # EVENT marker only (see bin/forge-bridge _reset_proof_probe). 'ctx: 0k (0%)' deliberately
+    # does NOT live here — it is a STATE predicate and belongs in pristine_state_anchor.
+    new_conversation_anchor: '(?m)Claude Code v[0-9]+\.[0-9]|Welcome to Claude Code|/release-notes for more'
+    pristine_state_anchor: '(?m)ctx: 0k \(0%\)'
     session_id_capture: ''          # claude exposes no stable in-pane session id
   codex:
     proven: false                   # kept false for the enforce-unavailable test family
     new_conversation_anchor: '(?m)>_ OpenAI Codex|^\s*OpenAI Codex.*$|^\s*To get started'
+    pristine_state_anchor: ''       # no reliable zero-context indicator in the codex TUI
     session_id_capture: 'codex resume ([0-9a-f-]{8,})'

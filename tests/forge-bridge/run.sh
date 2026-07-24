@@ -1331,10 +1331,37 @@ sed -n '/^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p' "$BRIDGE" |
     "$HFIX/codex-b-clear-before.txt" "$HFIX/codex-b-clear-after.txt" '^PROVEN kind=session-id-change'
   probe_pair "T-HYG-RESET-DEEP-BASELINE >120-line baseline" claude \
     "$HFIX/deep-conversation-before.txt" "$HFIX/claude-opus-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
+  # A pane that IGNORED the clear still reports its real context ('ctx: 98k (49%)'), so it can
+  # never match pristine_state_anchor — the state proof must not rescue it.
   probe_pair "T-HYG-RESET-IDLE-FAIL ignored clear (idle==idle)" claude \
     "$HFIX/ignored-clear-idle.txt" "$HFIX/ignored-clear-idle.txt" '^UNPROVEN:no-redraw'
-  probe_pair "T-HYG-RESET-HISTORICAL-FAIL banner already visible" claude \
-    "$HFIX/claude-opus-clear-after.txt" "$HFIX/claude-opus-clear-after.txt" 'anchor-was-present-pre-clear'
+  # Stale EVENT anchor with a live conversation still on screen must not prove a reset: banner
+  # visible before AND after, but context is non-zero so the state proof cannot fire either.
+  printf 'Claude Code v2.1.218\n/release-notes for more\n* still mid-conversation\n> \n  [Opus 4.8] ctx: 45k (5%%)\n' > "$WORK/stale-banner-live-ctx.txt"
+  probe_pair "T-HYG-RESET-HISTORICAL-FAIL banner already visible, context non-zero" claude \
+    "$WORK/stale-banner-live-ctx.txt" "$WORK/stale-banner-live-ctx.txt" 'anchor-was-present-pre-clear'
+  # REGRESSION (catch-22, 2026-07-23): an ALREADY-CLEAN pane — pristine at baseline and after
+  # the clear — must be PROVABLE. While 'ctx: 0k (0%)' lived in new_conversation_anchor this
+  # returned anchor-was-present-pre-clear, refusing every dispatch to a fresh or idle pane.
+  probe_pair "T-HYG-RESET-PRISTINE already-clean pane is provable" claude \
+    "$HFIX/claude-opus-clear-after.txt" "$HFIX/claude-opus-clear-after.txt" '^PROVEN kind=pristine-state'
+  # Ordering pin: when BOTH an observed redraw and zero context hold, the event proof wins so
+  # the stronger kind= label is reported (pristine must not shadow post-baseline-anchor).
+  probe_pair "T-HYG-RESET-PRISTINE-ORDER redraw outranks state proof" claude \
+    "$HFIX/claude-opus-clear-before.txt" "$HFIX/claude-opus-clear-after.txt" '^PROVEN kind=post-baseline-anchor'
+  # A family with no pristine anchor configured falls through to the event rules unchanged.
+  cat > "$WORK/cap-no-pristine.yml" <<'YML'
+version: 1
+families:
+  claude:
+    proven: true
+    new_conversation_anchor: '(?m)Claude Code v[0-9]+\.[0-9]'
+    pristine_state_anchor: ''
+    session_id_capture: ''
+YML
+  ( FORGE_RESET_CAPABILITY_FILE="$WORK/cap-no-pristine.yml"
+    probe_pair "T-HYG-RESET-PRISTINE-EMPTY falls through to event rules" claude \
+      "$HFIX/claude-opus-clear-after.txt" "$HFIX/claude-opus-clear-after.txt" 'anchor-was-present-pre-clear' )
   # Scrollback-only anchor: the visible proof screen has NO banner (banner lives only in
   # scrollback, which the probe never captures) — redraw alone must not prove.
   printf '● cleared? screen redrew but no banner visible\n> \n' > "$WORK/scrollback-visible.txt"

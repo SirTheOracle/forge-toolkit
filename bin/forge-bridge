@@ -587,8 +587,24 @@ PY
 
 # Reset-proof probe. Runs AFTER /clear+Enter; polls a fresh VISIBLE-SCREEN capture (same
 # region as the baseline, P1-8 — no scrollback). PROVEN iff a changed provider session id,
-# OR (anchor present now AND absent at baseline AND the screen fingerprint changed). Idle
-# alone is never success; a scrollback-only anchor cannot appear. Seam: FORGE_RESET_PROOF_FIXTURE.
+# OR the pane reports a pristine (zero-context) state, OR (anchor present now AND absent at
+# baseline AND the screen fingerprint changed). Idle alone is never success; a scrollback-only
+# anchor cannot appear. Seam: FORGE_RESET_PROOF_FIXTURE.
+#
+# pristine_state_anchor vs new_conversation_anchor — these are DIFFERENT KINDS of signal and
+# must not be merged (doing so caused the catch-22 fixed here):
+#   * new_conversation_anchor is an EVENT marker (welcome box, /release-notes) — evidence that a
+#     redraw happened. It is only meaningful relative to the baseline, hence the
+#     absent-before/present-after rule.
+#   * pristine_state_anchor is a STATE predicate — the pane's own report that it holds no
+#     conversation (Claude Code's 'ctx: 0k (0%)' footer). It is baseline-independent: whatever
+#     preceded it, a pane at zero context satisfies the goal of reset, so a no-op clear on an
+#     already-empty pane is a successful reset, not an unprovable one.
+# Putting a state predicate in the event anchor makes an ALREADY-CLEAN pane un-resettable:
+# base_present and cur_present are both true, so the anchor-was-present-pre-clear rule refuses
+# every dispatch to a freshly-started or idle pane. A pane that merely IGNORED the clear still
+# shows its real context (e.g. 'ctx: 98k (49%)'), so it never matches pristine and is still
+# correctly rejected by no-redraw.
 _reset_proof_probe() {   # <session> <idx> <family> <base_fp> <base_anchor_present> <base_sid>
     local sess="$1" idx="$2" fam="$3" base_fp="$4" base_present="$5" base_sid="$6"
     local deadline; deadline="$(_reset_proof_timeout)"
@@ -622,6 +638,13 @@ cur_fp=hashlib.sha256(window.encode()).hexdigest()[:16]
 cur_present=bool(anchor) and bool(re.search(anchor,window,re.M))
 if cur_present and not base_present and cur_fp!=base_fp:
     print("PROVEN kind=post-baseline-anchor hash="+cur_fp); sys.exit(0)
+# State proof, baseline-independent: the pane reports zero context, so it holds no prior
+# conversation whatever preceded. Ordered AFTER post-baseline-anchor (an observed redraw is the
+# stronger evidence and keeps its kind= label) but BEFORE anchor-was-present-pre-clear, which is
+# the rule that would otherwise make an already-clean pane permanently unprovable.
+pristine=f.get("pristine_state_anchor") or ""
+if pristine and re.search(pristine,window,re.M):
+    print("PROVEN kind=pristine-state hash="+cur_fp); sys.exit(0)
 if cur_present and base_present: print("UNPROVEN:anchor-was-present-pre-clear"); sys.exit(0)
 if cur_fp==base_fp: print("UNPROVEN:no-redraw"); sys.exit(0)
 print("UNPROVEN:no-new-anchor")
