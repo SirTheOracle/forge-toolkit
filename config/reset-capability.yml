@@ -1,0 +1,31 @@
+# Provider reset-proof capability + anchor table — RUNTIME SEED (worker-context-hygiene).
+# Installed to $HOME/.config/forge/reset-capability.yml only if absent (never clobbered).
+# Anchors pinned from the live reset-proof spike of 2026-07-23 (Claude Code v2.1.218,
+# codex-cli v0.144.6). FAIL-CLOSED: both families ship `proven: false`; flip a family to
+# true only after re-running the live gate on YOUR install (CLI versions drift — the
+# 2026-07-23 spike caught exactly such drift). See docs/forge-operator-guide.md.
+version: 1
+#
+# Two DIFFERENT kinds of signal — do not merge them:
+#   new_conversation_anchor  EVENT marker (welcome box, /release-notes). Only meaningful
+#                            relative to the baseline: must be ABSENT before the clear and
+#                            PRESENT after.
+#   pristine_state_anchor    STATE predicate — the pane's own report that it holds no
+#                            conversation. Baseline-independent; proves the reset goal on its
+#                            own. Must match ONLY at genuinely zero context, so that a pane
+#                            which ignored the clear (still showing e.g. 'ctx: 98k (49%)')
+#                            never matches.
+# 'ctx: 0k (0%)' previously lived in new_conversation_anchor, which made an already-clean pane
+# un-resettable: present before AND after → anchor-was-present-pre-clear → every dispatch to a
+# freshly-started or idle pane refused.
+families:
+  claude:
+    proven: false
+    new_conversation_anchor: '(?m)Claude Code v[0-9]+\.[0-9]|Welcome to Claude Code|/release-notes for more'
+    pristine_state_anchor: '(?m)ctx: 0k \(0%\)'
+    session_id_capture: ''
+  codex:
+    proven: false
+    new_conversation_anchor: '(?m)>_ OpenAI Codex|^\s*OpenAI Codex.*$|^\s*To get started'
+    pristine_state_anchor: ''
+    session_id_capture: 'codex resume ([0-9a-f-]{8,})'

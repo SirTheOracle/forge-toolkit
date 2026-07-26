@@ -1,0 +1,19 @@
+# Provider reset-proof capability + anchor table (Step 0/1). Anchors pinned from the LIVE
+# reset-proof spike of 2026-07-23 (Claude Code v2.1.218, codex-cli v0.144.6) — the fixture
+# pairs in this directory are sanitized real captures from that gate. `proven: false`
+# forces the family to RESET_UNAVAILABLE in enforce unless HYGIENE_DEGRADED is on
+# (codex stays false HERE so the unavailable/degraded test scenarios stay exercisable).
+version: 1
+families:
+  claude:
+    proven: true
+    # EVENT marker only (see bin/forge-bridge _reset_proof_probe). 'ctx: 0k (0%)' deliberately
+    # does NOT live here — it is a STATE predicate and belongs in pristine_state_anchor.
+    new_conversation_anchor: '(?m)Claude Code v[0-9]+\.[0-9]|Welcome to Claude Code|/release-notes for more'
+    pristine_state_anchor: '(?m)ctx: 0k \(0%\)'
+    session_id_capture: ''          # claude exposes no stable in-pane session id
+  codex:
+    proven: false                   # kept false for the enforce-unavailable test family
+    new_conversation_anchor: '(?m)>_ OpenAI Codex|^\s*OpenAI Codex.*$|^\s*To get started'
+    pristine_state_anchor: ''       # no reliable zero-context indicator in the codex TUI
+    session_id_capture: 'codex resume ([0-9a-f-]{8,})'

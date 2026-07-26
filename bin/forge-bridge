@@ -60,6 +60,30 @@ SESSION=""   # populated by require_identity() (=$ID_target_session) for session
 # Required pane count (Phase 2: 5 panes)
 FORGE_REQUIRED_PANES="${FORGE_REQUIRED_PANES:-5}"
 
+# ---- Worker context-hygiene controls (worker-context-hygiene feature) ----
+# enforce = the accepted steady state (DEFAULT since 2026-07-23, after the Step-0 spike +
+# live enforce rollout gate both passed). observe = the kill switch: compute+audit only,
+# never block or reset, never persist new terminal vocabulary — export
+# FORGE_WORKER_HYGIENE_MODE=observe to roll the feature back.
+FORGE_WORKER_HYGIENE_MODE="${FORGE_WORKER_HYGIENE_MODE:-enforce}"
+FORGE_WORKER_AUTO_RESET_CLAUDE="${FORGE_WORKER_AUTO_RESET_CLAUDE:-1}"
+FORGE_WORKER_AUTO_RESET_CODEX="${FORGE_WORKER_AUTO_RESET_CODEX:-1}"
+# Explicit hygiene-degraded opt-in: that family may dispatch without reset proof in
+# enforce, is excluded from the all-four gate, and yields only a qualified completion.
+FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE="${FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE:-0}"
+FORGE_WORKER_HYGIENE_DEGRADED_CODEX="${FORGE_WORKER_HYGIENE_DEGRADED_CODEX:-0}"
+# Per-post-clear proof poll ceiling (seconds), bounded 1..30.
+FORGE_WORKER_RESET_PROOF_TIMEOUT_S="${FORGE_WORKER_RESET_PROOF_TIMEOUT_S:-5}"
+# Worker-lock wait (seconds). Fail-closed for dispatch/send; callback path is fail-open.
+FORGE_WORKER_LOCK_WAIT_S="${FORGE_WORKER_LOCK_WAIT_S:-5}"
+# Journal (fd-8 leaf) lock wait (seconds). Distinct tunable read by _hygiene_write (P2-1).
+FORGE_HYGIENE_LOCK_WAIT_S="${FORGE_HYGIENE_LOCK_WAIT_S:-5}"
+# Shared min-headroom threshold; family overrides inherit when unset. Inclusive:
+# headroom > min may reuse; headroom <= min must reset.
+FORGE_WORKER_MIN_HEADROOM="${FORGE_WORKER_MIN_HEADROOM:-75}"
+# Capability/anchor fixture path (data-driven; never hard-coded).
+FORGE_RESET_CAPABILITY_FILE="${FORGE_RESET_CAPABILITY_FILE:-$HOME/.config/forge/reset-capability.yml}"
+
 # --- Session Detection (called explicitly by tmux-required commands) ---
 
 require_pane_count() {
@@ -437,6 +461,566 @@ pane_name() {
     esac
 }
 
+# ---- Worker context-hygiene helpers (worker-context-hygiene) ----
+
+_worker_family() {
+    case "$1" in
+        claude-opus|claude-sonnet) printf 'claude' ;;
+        codex-a|codex-b)           printf 'codex'  ;;
+        *)                         printf '' ;;
+    esac
+}
+_hygiene_worker_ok() {   # rc0 iff a policy-covered worker pane (never pane 1)
+    case "$1" in claude-opus|codex-a|codex-b|claude-sonnet) return 0 ;; *) return 1 ;; esac
+}
+_hygiene_valid_pct() {   # <val> rc0 iff integer 0..100
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 0 ] && [ "$1" -le 100 ]
+}
+# P2-2: mode must be exactly observe|enforce. Echoes the mode; a typo (e.g. `enforc`) is a
+# HARD config error (rc1) so it can never silently fall through to observe in a mutating
+# path. Every enforce/observe branch resolves the mode through this helper.
+_hygiene_mode() {
+    case "${FORGE_WORKER_HYGIENE_MODE:-observe}" in
+        observe|enforce) printf '%s' "${FORGE_WORKER_HYGIENE_MODE:-observe}" ;;
+        *) echo "CONFIG_ERROR: FORGE_WORKER_HYGIENE_MODE='$FORGE_WORKER_HYGIENE_MODE' must be observe|enforce" >&2; return 1 ;;
+    esac
+}
+# rc0 iff the resolved mode is enforce; rc2 on invalid mode (caller aborts).
+_hygiene_enforcing() {
+    local m; m="$(_hygiene_mode)" || return 2
+    [ "$m" = enforce ]
+}
+# Test-only crash injector (P0-5). NO-OP unless BOTH FORGE_HYGIENE_TEST=1 AND
+# FORGE_HYGIENE_CRASH_AT names <phase>. Neither is ever set in production, so it cannot
+# fire accidentally. On a match it `exit 99`s, simulating a hard crash at that exact point.
+# Phase names (delivery): pending | activity | send-text | send-enter | delivered.
+# Phase names (finalize outbox): fin-pane | fin-resets | fin-resets-confirmed |
+#   fin-context | fin-event-pending | fin-event | fin-published.
+_hygiene_crash_at() {   # <phase>
+    [ "${FORGE_HYGIENE_TEST:-0}" = 1 ] || return 0
+    [ "${FORGE_HYGIENE_CRASH_AT:-}" = "$1" ] || return 0
+    echo "FORGE_HYGIENE_CRASH_INJECTED phase=$1" >&2
+    exit 99
+}
+
+# Effective min-headroom for a worker. Echoes the integer; a present-but-invalid shared
+# OR family value is a hard config error (rc1, CONFIG_ERROR) — never a silent fallback.
+_worker_min_headroom() {   # <worker_canonical>
+    local fam; fam="$(_worker_family "$1")"
+    local shared="$FORGE_WORKER_MIN_HEADROOM" fam_raw=""
+    case "$fam" in
+        claude) fam_raw="${FORGE_WORKER_MIN_HEADROOM_CLAUDE-}" ;;
+        codex)  fam_raw="${FORGE_WORKER_MIN_HEADROOM_CODEX-}"  ;;
+    esac
+    if ! _hygiene_valid_pct "$shared"; then
+        echo "CONFIG_ERROR: FORGE_WORKER_MIN_HEADROOM='$shared' not integer 0..100" >&2; return 1
+    fi
+    if [ -n "$fam_raw" ]; then
+        if ! _hygiene_valid_pct "$fam_raw"; then
+            echo "CONFIG_ERROR: FORGE_WORKER_MIN_HEADROOM_$(printf '%s' "$fam" | tr a-z A-Z)='$fam_raw' not integer 0..100" >&2; return 1
+        fi
+        printf '%s' "$fam_raw"; return 0
+    fi
+    printf '%s' "$shared"
+}
+
+_reset_proof_timeout() {
+    local t="${FORGE_WORKER_RESET_PROOF_TIMEOUT_S:-5}"
+    case "$t" in ''|*[!0-9]*) t=5 ;; esac
+    [ "$t" -lt 1 ] && t=1; [ "$t" -gt 30 ] && t=30
+    printf '%s' "$t"
+}
+
+# Auto-reset admissible for a family? Combines the operator env flag with the checked-in
+# capability fixture's `proven` bit. Fail-closed. Echoes enabled/disabled:<reason>.
+_reset_automation_enabled() {   # <family>
+    local fam="$1" flag cap
+    case "$fam" in
+        claude) flag="$FORGE_WORKER_AUTO_RESET_CLAUDE" ;;
+        codex)  flag="$FORGE_WORKER_AUTO_RESET_CODEX"  ;;
+        *)      echo "disabled:unknown-family"; return 1 ;;
+    esac
+    if [ "$flag" != "1" ]; then echo "disabled:operator-off"; return 1; fi
+    cap="$(FORGE_RCF="$FORGE_RESET_CAPABILITY_FILE" python3 - "$fam" 2>/dev/null <<'PY'
+import os,sys,yaml
+fam=sys.argv[1]
+try: d=yaml.safe_load(open(os.environ["FORGE_RCF"])) or {}
+except Exception: print("unproven:no-fixture"); sys.exit(0)
+f=((d.get("families") or {}).get(fam) or {})
+print("proven" if f.get("proven") is True else "unproven:fixture")
+PY
+)"
+    case "$cap" in proven) echo "enabled"; return 0 ;; *) echo "disabled:${cap:-unproven}"; return 1 ;; esac
+}
+
+# Baseline capture BEFORE /clear. P1-8: captures the VISIBLE SCREEN ONLY (no -S, so no
+# scrollback) — a historical banner that scrolled off is not captured and cannot satisfy
+# the "new anchor" test. Echoes "<screen_fp>\t<anchor_present:0|1>\t<session_id>\t<history_size>".
+_reset_baseline() {   # <session> <idx> <family>
+    local sess="$1" idx="$2" fam="$3" cap hsize
+    cap=$(mktemp -t forge-baseline-XXXXXX 2>/dev/null) || return 1
+    if [ -n "${FORGE_RESET_BASELINE_FIXTURE:-}" ] && [ -f "${FORGE_RESET_BASELINE_FIXTURE}" ]; then
+        cp "$FORGE_RESET_BASELINE_FIXTURE" "$cap"; hsize="${FORGE_RESET_BASELINE_HISTORY:-0}"
+    else
+        tmux capture-pane -p -t "$sess:$WINDOW.$idx" > "$cap" 2>/dev/null || true   # visible screen only
+        hsize="$(tmux display-message -p -t "$sess:$WINDOW.$idx" '#{history_size}' 2>/dev/null || echo 0)"
+    fi
+    FORGE_RCF="$FORGE_RESET_CAPABILITY_FILE" python3 - "$cap" "$fam" "${hsize:-0}" <<'PY'
+import sys,re,hashlib,os,yaml
+raw=open(sys.argv[1]).read(); fam=sys.argv[2]; hsize=sys.argv[3]
+norm=re.sub(r'\x1b\[[0-9;]*[A-Za-z]','',raw); norm=re.sub(r'\x1b\][0-9;]*\x07','',norm)
+lines=[l for l in norm.splitlines() if l.strip()]; window="\n".join(lines[-40:])
+try: d=yaml.safe_load(open(os.environ["FORGE_RCF"])) or {}
+except Exception: d={}
+f=((d.get("families") or {}).get(fam) or {})
+anchor=f.get("new_conversation_anchor") or ""
+present=1 if (anchor and re.search(anchor,window,re.M)) else 0
+sid=""; sidpat=f.get("session_id_capture") or ""
+if sidpat:
+    m=re.search(sidpat,norm,re.M)
+    if m: sid=(m.group(1) if m.groups() else m.group(0)).strip()
+print("%s\t%d\t%s\t%s" % (hashlib.sha256(window.encode()).hexdigest()[:16],present,sid,hsize))
+PY
+    rm -f "$cap" 2>/dev/null
+}
+
+# Reset-proof probe. Runs AFTER /clear+Enter; polls a fresh VISIBLE-SCREEN capture (same
+# region as the baseline, P1-8 — no scrollback). PROVEN iff a changed provider session id,
+# OR the pane reports a pristine (zero-context) state, OR (anchor present now AND absent at
+# baseline AND the screen fingerprint changed). Idle alone is never success; a scrollback-only
+# anchor cannot appear. Seam: FORGE_RESET_PROOF_FIXTURE.
+#
+# pristine_state_anchor vs new_conversation_anchor — these are DIFFERENT KINDS of signal and
+# must not be merged (doing so caused the catch-22 fixed here):
+#   * new_conversation_anchor is an EVENT marker (welcome box, /release-notes) — evidence that a
+#     redraw happened. It is only meaningful relative to the baseline, hence the
+#     absent-before/present-after rule.
+#   * pristine_state_anchor is a STATE predicate — the pane's own report that it holds no
+#     conversation (Claude Code's 'ctx: 0k (0%)' footer). It is baseline-independent: whatever
+#     preceded it, a pane at zero context satisfies the goal of reset, so a no-op clear on an
+#     already-empty pane is a successful reset, not an unprovable one.
+# Putting a state predicate in the event anchor makes an ALREADY-CLEAN pane un-resettable:
+# base_present and cur_present are both true, so the anchor-was-present-pre-clear rule refuses
+# every dispatch to a freshly-started or idle pane. A pane that merely IGNORED the clear still
+# shows its real context (e.g. 'ctx: 98k (49%)'), so it never matches pristine and is still
+# correctly rejected by no-redraw.
+_reset_proof_probe() {   # <session> <idx> <family> <base_fp> <base_anchor_present> <base_sid>
+    local sess="$1" idx="$2" fam="$3" base_fp="$4" base_present="$5" base_sid="$6"
+    local deadline; deadline="$(_reset_proof_timeout)"
+    local cap_file; cap_file=$(mktemp -t forge-reset-XXXXXX 2>/dev/null) || return 1
+    local start; start=$(date +%s) result="UNPROVEN:timeout"
+    while :; do
+        if [ -n "${FORGE_RESET_PROOF_FIXTURE:-}" ] && [ -f "${FORGE_RESET_PROOF_FIXTURE}" ]; then
+            cp "$FORGE_RESET_PROOF_FIXTURE" "$cap_file"
+        else
+            tmux capture-pane -p -t "$sess:$WINDOW.$idx" > "$cap_file" 2>/dev/null || true   # visible screen only
+        fi
+        result="$(FORGE_RCF="$FORGE_RESET_CAPABILITY_FILE" FORGE_BFP="$base_fp" FORGE_BPRES="$base_present" FORGE_BSID="$base_sid" \
+            python3 - "$fam" "$cap_file" 2>/dev/null <<'PY'
+import os,sys,re,hashlib,yaml
+fam=sys.argv[1]; cap=open(sys.argv[2]).read()
+norm=re.sub(r'\x1b\[[0-9;]*[A-Za-z]','',cap); norm=re.sub(r'\x1b\][0-9;]*\x07','',norm)
+lines=[l for l in norm.splitlines() if l.strip()]; window="\n".join(lines[-40:])
+try: d=yaml.safe_load(open(os.environ["FORGE_RCF"])) or {}
+except Exception: print("UNPROVEN:no-fixture"); sys.exit(0)
+f=((d.get("families") or {}).get(fam) or {})
+base_sid=os.environ.get("FORGE_BSID") or ""
+sidpat=f.get("session_id_capture") or ""
+if sidpat:
+    m=re.search(sidpat,norm,re.M)
+    cur=(m.group(1) if (m and m.groups()) else (m.group(0) if m else "")).strip()
+    if cur and cur!=base_sid:
+        print("PROVEN kind=session-id-change hash="+hashlib.sha256(cur.encode()).hexdigest()[:16]); sys.exit(0)
+anchor=f.get("new_conversation_anchor") or ""
+base_present=os.environ.get("FORGE_BPRES")=="1"; base_fp=os.environ.get("FORGE_BFP") or ""
+cur_fp=hashlib.sha256(window.encode()).hexdigest()[:16]
+cur_present=bool(anchor) and bool(re.search(anchor,window,re.M))
+if cur_present and not base_present and cur_fp!=base_fp:
+    print("PROVEN kind=post-baseline-anchor hash="+cur_fp); sys.exit(0)
+# State proof, baseline-independent: the pane reports zero context, so it holds no prior
+# conversation whatever preceded. Ordered AFTER post-baseline-anchor (an observed redraw is the
+# stronger evidence and keeps its kind= label) but BEFORE anchor-was-present-pre-clear, which is
+# the rule that would otherwise make an already-clean pane permanently unprovable.
+pristine=f.get("pristine_state_anchor") or ""
+if pristine and re.search(pristine,window,re.M):
+    print("PROVEN kind=pristine-state hash="+cur_fp); sys.exit(0)
+if cur_present and base_present: print("UNPROVEN:anchor-was-present-pre-clear"); sys.exit(0)
+if cur_fp==base_fp: print("UNPROVEN:no-redraw"); sys.exit(0)
+print("UNPROVEN:no-new-anchor")
+PY
+)"
+        case "$result" in PROVEN*) break ;; esac
+        [ $(( $(date +%s) - start )) -ge "$deadline" ] && break
+        sleep 0.3
+    done
+    rm -f "$cap_file" 2>/dev/null
+    case "$result" in PROVEN*) printf '%s' "$result"; return 0 ;; esac
+    printf '%s' "$result"; return 1
+}
+
+# Per-session/incarnation hygiene journal path. Separate from forge-context/forge-usage.
+_hygiene_file() {
+    local s="${ID_target_session:-__nosession__}" i="${ID_target_incarnation:-0}"
+    [ -n "$s" ] || s="__nosession__"; [ -n "$i" ] || i="0"
+    printf '%s/forge-hygiene.%s.%s.yml' "$DEV_DIR" "$s" "$i"
+}
+
+# Atomic journal upsert under the fd-8 journal file LEAF lock. LOCK-ORDER CONTRACT
+# (P0-2): fd 8 is a leaf — it is acquired and RELEASED inside this function and is NEVER
+# held while acquiring any other lock (worker 10-13, lifecycle 9). Therefore its textual
+# position relative to lifecycle acquisition is order-irrelevant: no path holds fd 8 while
+# waiting for another lock, so it cannot participate in a deadlock cycle. Callers may write
+# the journal before OR after acquiring the lifecycle lock (the callback path deliberately
+# invalidates observation BEFORE lifecycle per plan Step 5). rc: 0 ok; 1 lock/open;
+# 4 identity-mismatch; 5 malformed/non-mapping (journal NOT replaced); 6 write/fsync failed.
+# ops: next-gen|delivery|delivered|promote|observe-pending|observe-known|observe-unknown|
+# reset|terminal|finalize.
+_hygiene_write() {   # <project_root> <op> <worker> key=val...
+    local pr="$1" op="$2" worker="$3"; shift 3
+    local jf="$pr/$(_hygiene_file)" ld="$pr/.dev/forge-tmp/hygiene-locks"
+    mkdir -p "$ld" "$(dirname "$jf")" 2>/dev/null
+    local lock="$ld/${ID_target_session:-__nosession__}.${ID_target_incarnation:-0}.journal.lock"
+    exec 8>"$lock" || { echo "ERROR: hygiene journal lock open failed" >&2; return 1; }
+    FORGE_HJ_WAIT_S="${FORGE_HYGIENE_LOCK_WAIT_S:-5}" python3 - <<'PY' || { exec 8>&-; echo "HYGIENE_LOCK: busy" >&2; return 1; }
+import fcntl,os,time,sys
+dl=time.time()+float(os.environ.get("FORGE_HJ_WAIT_S","5"))
+while True:
+    try: fcntl.flock(8,fcntl.LOCK_EX|fcntl.LOCK_NB); sys.exit(0)
+    except OSError:
+        if time.time()>=dl: sys.exit(75)
+        time.sleep(0.05)
+PY
+    FORGE_HJ_SESS="${ID_target_session:-__nosession__}" FORGE_HJ_INC="${ID_target_incarnation:-0}" \
+    FORGE_HJ_OP="$op" FORGE_HJ_WK="$worker" FORGE_HJ_KV="$*" \
+    python3 - "$jf" <<'PY'
+import os,sys,yaml,time
+jf=sys.argv[1]
+sess=os.environ["FORGE_HJ_SESS"]; inc=os.environ["FORGE_HJ_INC"]
+op=os.environ["FORGE_HJ_OP"]; wk=os.environ["FORGE_HJ_WK"]
+kv={}
+for tok in os.environ.get("FORGE_HJ_KV","").split():
+    if "=" in tok: k,v=tok.split("=",1); kv[k]=v
+# P0-6: a malformed / non-mapping existing journal is NEVER silently replaced. Fail
+# closed (rc5) so the caller does not proceed on evidence it could not read. A missing
+# journal is normal at first write (rc0 path below).
+d={}
+if os.path.exists(jf):
+    try: d=yaml.safe_load(open(jf))
+    except Exception:
+        sys.stderr.write("HYGIENE_JOURNAL_MALFORMED\n"); sys.exit(5)
+    if d is None: d={}
+    elif not isinstance(d,dict):
+        sys.stderr.write("HYGIENE_JOURNAL_NONMAPPING\n"); sys.exit(5)
+if d.get("session") and (str(d.get("session"))!=sess or str(d.get("incarnation"))!=inc):
+    sys.stderr.write("HYGIENE_IDENTITY_MISMATCH\n"); sys.exit(4)
+# P1-8: reject a corrupt high-water / workers shape rather than trusting int(d["next_generation"]).
+_ng=d.get("next_generation")
+if _ng is not None and not (isinstance(_ng,int) and not isinstance(_ng,bool) and _ng>=1):
+    sys.stderr.write("HYGIENE_NEXTGEN_INVALID\n"); sys.exit(5)
+_wk=d.get("workers")
+if _wk is not None and not isinstance(_wk,dict):
+    sys.stderr.write("HYGIENE_WORKERS_SHAPE\n"); sys.exit(5)
+d.setdefault("version",1); d["session"]=sess; d["incarnation"]=inc
+d.setdefault("next_generation",1); d.setdefault("workers",{})
+w=d["workers"].setdefault(wk,{}) if wk else None
+now=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
+if op=="next-gen":
+    g=int(d["next_generation"]); d["next_generation"]=g+1; print(g)
+elif op=="delivery" and w is not None:
+    g=int(kv.get("generation") or 0)
+    w["delivery"]={"id":kv.get("id"),"generation":g,"kind":kv.get("kind"),"slug":kv.get("slug"),
+                   "stage":kv.get("stage"),"pending_timestamp":kv.get("pending_timestamp"),
+                   "state":"attempting","started_at":now,"delivered_at":None}
+    w["latest_generation"]=g
+elif op=="delivered" and w is not None:
+    if w.get("delivery"): w["delivery"]["state"]="delivered"; w["delivery"]["delivered_at"]=now
+elif op=="promote" and w is not None:
+    dv=w.get("delivery") or {}
+    if dv.get("pending_timestamp") and dv.get("pending_timestamp")==kv.get("pending_timestamp"):
+        dv["state"]="callback-confirmed"
+elif op=="observe-pending" and w is not None:
+    w["observation"]={"state":"pending","covers_generation":int(kv.get("generation") or 0),
+                      "callback_id":kv.get("callback_id"),"pending_timestamp":kv.get("pending_timestamp"),"measured_at":now}
+elif op=="observe-known" and w is not None:
+    w["observation"]={"state":"known","covers_generation":int(kv.get("generation") or 0),
+                      "callback_id":kv.get("callback_id"),"pending_timestamp":kv.get("pending_timestamp"),
+                      "usage_record_hash":kv.get("usage_record_hash"),
+                      "headroom":(int(kv["headroom"]) if kv.get("headroom","").isdigit() else None),
+                      "confidence":kv.get("confidence"),"measured_at":now}
+elif op=="observe-unknown" and w is not None:
+    o=w.setdefault("observation",{}); o["state"]="unknown"; o["measured_at"]=now
+    if kv.get("generation","").isdigit(): o["covers_generation"]=int(kv["generation"])
+elif op=="reset" and w is not None:
+    w["reset"]={"id":kv.get("id"),"covers_generation":int(kv.get("generation") or 0),
+                "reason":kv.get("reason"),"proof_kind":kv.get("proof_kind"),
+                "proof_hash":kv.get("proof_hash"),"confirmed_at":now}
+elif op=="invalidate-worker" and w is not None:
+    # P1-2: advance the worker to a fresh generation so its prior reset/observation no
+    # longer cover latest_generation -> _hygiene_decide returns RESET_UNPROVEN. Used by
+    # hygiene-abandon so an abandoned slug's workers cannot be reused as proven-clean.
+    g=int(d["next_generation"]); d["next_generation"]=g+1
+    w["latest_generation"]=g
+    w["delivery"]={"id":kv.get("id"),"generation":g,"kind":kv.get("kind") or "invalidate",
+                   "state":"invalidated","started_at":now,"delivered_at":None}
+    print(g)
+elif op=="terminal":
+    t=d.setdefault("terminal",{}); t.update({k:v for k,v in kv.items()})
+elif op=="finalize":
+    f=d.setdefault("terminal",{}).setdefault("finalization",{}); f.update({k:v for k,v in kv.items()})
+elif op=="finalize-snapshot":
+    # P0-8: full durable outbox. Stores phase + qualification/dirty + context_written/
+    # event_written flags (from kv) AND snapshots each worker's confirmed reset id +
+    # generation, so recovery can deterministically resume from per-pane reset state.
+    f=d.setdefault("terminal",{}).setdefault("finalization",{})
+    for k,v in kv.items(): f[k]=v
+    fw=f.setdefault("workers",{})
+    for wk2,rec in (d.get("workers") or {}).items():
+        rs=(rec or {}).get("reset") or {}
+        if rs.get("proof_hash") and rs.get("covers_generation")==rec.get("latest_generation"):
+            fw[wk2]={"latest_generation":rec.get("latest_generation"),
+                     "reset_id":rs.get("id"),"covers_generation":rs.get("covers_generation")}
+# P1-9: durable atomic write — fsync the temp file, rename, then fsync the parent dir so a
+# power loss cannot lose a completed outbox phase. Any failure here returns rc6 WITHOUT
+# leaving a partial journal (os.replace is atomic; a crashed tmp is ignored on resume).
+tmp=jf+".tmp.%d"%os.getpid()
+try:
+    with open(tmp,"w") as f_:
+        yaml.safe_dump(d,f_,default_flow_style=False,sort_keys=True)
+        f_.flush(); os.fsync(f_.fileno())
+    os.replace(tmp,jf)
+    dfd=os.open(os.path.dirname(jf) or ".", os.O_RDONLY)
+    try: os.fsync(dfd)
+    finally: os.close(dfd)
+except Exception:
+    try: os.remove(tmp)
+    except Exception: pass
+    sys.stderr.write("HYGIENE_JOURNAL_WRITE_FAILED\n"); sys.exit(6)
+PY
+    local rc=$?
+    exec 8>&-
+    return $rc
+}
+
+# Pure decision (KEEP_RESET_PROVEN|KEEP_OBSERVED|RESET_THRESHOLD|RESET_UNPROVEN + reason).
+# No wall-clock TTL. exp_cb/exp_pt are RESERVED for a future exact-callback tightening;
+# every current caller passes them empty, so generation coverage is the binding today —
+# do NOT "restore" a stricter clause without updating callers or KEEP_OBSERVED breaks.
+_hygiene_decide() {   # <project_root> <worker> <expect_callback_id> <expect_pending_ts>
+    local pr="$1" wk="$2" exp_cb="$3" exp_pt="$4"
+    local min; min="$(_worker_min_headroom "$wk")" || { echo "RESET_UNPROVEN config-error"; return 1; }
+    local jf="$pr/$(_hygiene_file)"
+    FORGE_HD_MIN="$min" FORGE_HD_CB="$exp_cb" FORGE_HD_PT="$exp_pt" \
+    FORGE_HD_SESS="${ID_target_session:-__nosession__}" FORGE_HD_INC="${ID_target_incarnation:-0}" \
+    python3 - "$jf" "$wk" <<'PY'
+import os,sys,yaml
+jf=sys.argv[1]; wk=sys.argv[2]; mn=int(os.environ["FORGE_HD_MIN"])
+exp_cb=os.environ.get("FORGE_HD_CB") or ""; exp_pt=os.environ.get("FORGE_HD_PT") or ""
+sess=os.environ["FORGE_HD_SESS"]; inc=os.environ["FORGE_HD_INC"]
+if not os.path.exists(jf): print("RESET_UNPROVEN no-journal"); sys.exit(0)
+try: d=yaml.safe_load(open(jf)) or {}
+except Exception: print("RESET_UNPROVEN malformed-journal"); sys.exit(0)
+if not isinstance(d,dict): print("RESET_UNPROVEN malformed-journal"); sys.exit(0)
+if d.get("session") and (str(d.get("session"))!=sess or str(d.get("incarnation"))!=inc):
+    print("RESET_UNPROVEN identity-mismatch"); sys.exit(0)
+w=((d.get("workers") or {}).get(wk) or {})
+lg=w.get("latest_generation")
+if lg is None: print("RESET_UNPROVEN no-record"); sys.exit(0)
+if (w.get("delivery") or {}).get("state")=="attempting": print("RESET_UNPROVEN attempting"); sys.exit(0)
+rs=w.get("reset") or {}
+if rs.get("covers_generation")==lg and rs.get("proof_hash"):
+    print("KEEP_RESET_PROVEN reset-covers-latest"); sys.exit(0)
+ob=w.get("observation") or {}
+if (ob.get("state")=="known" and ob.get("covers_generation")==lg and ob.get("confidence")=="high"
+    and (not exp_cb or ob.get("callback_id")==exp_cb) and (not exp_pt or ob.get("pending_timestamp")==exp_pt)
+    and isinstance(ob.get("headroom"),int)):
+    if ob["headroom"]>mn: print("KEEP_OBSERVED headroom=%d>%d"%(ob["headroom"],mn))
+    else: print("RESET_THRESHOLD headroom=%d<=%d"%(ob["headroom"],mn))
+    sys.exit(0)
+print("RESET_UNPROVEN no-matching-coverage")
+PY
+}
+
+_hygiene_current_gen() {   # <project_root> <worker>
+    python3 - "$1/$(_hygiene_file)" "$2" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+w=((d.get("workers") or {}).get(sys.argv[2]) or {}); print(w.get("latest_generation") or "")
+PY
+}
+
+_usage_record_hash() {   # <usage_file> <worker>
+    [ -f "$1" ] || { printf ''; return 0; }
+    python3 - "$1" "$2" <<'PY'
+import sys,yaml,hashlib,json
+try: d=yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: print(""); sys.exit(0)
+r=((d.get("workers") or {}).get(sys.argv[2]))
+print("" if r is None else hashlib.sha256(json.dumps(r,sort_keys=True,separators=(",",":")).encode()).hexdigest())
+PY
+}
+_usage_record_headroom() {   # <usage_file> <worker> -> "<headroom> <confidence>"
+    [ -f "$1" ] || { printf ' none'; return 0; }
+    python3 - "$1" "$2" <<'PY'
+import sys,yaml
+try: d=yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: print(" none"); sys.exit(0)
+r=((d.get("workers") or {}).get(sys.argv[2]) or {})
+hr=r.get("headroom"); print("%s %s" % (hr if isinstance(hr,int) else "", r.get("confidence") or "none"))
+PY
+}
+
+# Current terminal state (empty => running). Collapses an unpublished finalization outbox
+# to outbox-pending for the send/dispatch block.
+_terminal_state() {   # <project_root>
+    python3 - "$1/$(_hygiene_file)" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+t=(d.get("terminal") or {}); st=str(t.get("state") or "")
+f=(t.get("finalization") or {})
+if st=="terminal-cleanup" and f.get("phase") in ("resets-confirmed","event-pending"):
+    print("outbox-pending")
+else: print(st)
+PY
+}
+
+# P0-3 / P1-8: side-effect-free journal identity + schema preflight. rc0 = OK (or missing/None);
+# rc1 = a NON-EMPTY journal with foreign/partial identity or a malformed schema. NEVER writes,
+# so it can gate a physical /clear (reset, finalize pass 2). A same-name rebirth (matching
+# session, different incarnation) is foreign and refuses.
+_hygiene_journal_preflight() {   # <project_root>
+    FORGE_JP_SESS="${ID_target_session:-__nosession__}" FORGE_JP_INC="${ID_target_incarnation:-0}" \
+    python3 - "$1/$(_hygiene_file)" <<'PY'
+import sys,os,yaml
+jf=sys.argv[1]; sess=os.environ["FORGE_JP_SESS"]; inc=os.environ["FORGE_JP_INC"]
+if not os.path.exists(jf): sys.exit(0)                       # missing => unproven, handled downstream
+try: d=yaml.safe_load(open(jf))
+except Exception: sys.stderr.write("JOURNAL_MALFORMED\n"); sys.exit(1)
+if d is None: sys.exit(0)
+if not isinstance(d,dict): sys.stderr.write("JOURNAL_NONMAPPING\n"); sys.exit(1)
+js=d.get("session"); ji=d.get("incarnation")
+if js is None or ji is None or str(js)!=sess or str(ji)!=inc:
+    sys.stderr.write("JOURNAL_IDENTITY_FOREIGN\n"); sys.exit(1) # foreign / partial / rebirth
+w=d.get("workers")
+if w is not None and not isinstance(w,dict): sys.stderr.write("JOURNAL_WORKERS_SHAPE\n"); sys.exit(1)
+ng=d.get("next_generation",1)
+if not (isinstance(ng,int) and not isinstance(ng,bool) and ng>=1):
+    sys.stderr.write("JOURNAL_NEXTGEN_INVALID\n"); sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# Read a finalization outbox field (id|phase). Empty if absent.
+_hygiene_finalization_field() {   # <project_root> <field>
+    python3 - "$1/$(_hygiene_file)" "$2" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+print(((d.get("terminal") or {}).get("finalization") or {}).get(sys.argv[2]) or "")
+PY
+}
+
+# Activation-preflight blockers (plan Step 11 item 4): open pendings, verify/DONE callbacks
+# awaiting interpretation. Prints one blocker token per line (empty = none). Session-scoped.
+_hygiene_activation_blockers() {   # <project_root>
+    local pr="$1" sess; sess="$(_resolve_session)"
+    FORGE_AB_SESS="$sess" FORGE_AB_INC="${ID_target_incarnation:-${ID_host_incarnation:-}}" python3 - "$pr/.dev" <<'PY'
+import os,sys,glob,re
+try: import yaml
+except Exception: yaml=None
+dev=sys.argv[1]; sess=os.environ.get("FORGE_AB_SESS") or ""; inc=os.environ.get("FORGE_AB_INC") or ""
+for lp in glob.glob(os.path.join(dev,"proposals","*","forge-log.yml")):
+    try: es=(yaml.safe_load(open(lp)) or {}).get("entries") or [] if yaml else []
+    except Exception: es=[]
+    for e in es:
+        if isinstance(e,dict) and e.get("response") is None:
+            s=str(e.get("session") or ""); i=str(e.get("incarnation") or "")
+            if (not s or not sess or s==sess) and (not i or not inc or i==str(inc)):
+                print("open-pending:%s" % os.path.basename(os.path.dirname(lp))); break
+# P2-4: scan ALL callback files (qualified AND legacy/unqualified names) and select by the
+# stage=verify + status=DONE headers, not the filename glob, so a valid awaiting verify
+# callback cannot evade the preflight.
+for cb in glob.glob(os.path.join(dev,"forge-tmp","callbacks","*.callback")):
+    hdr={}
+    try:
+        for ln in open(cb).read().splitlines():
+            if ln.startswith("message:"): break
+            m=re.match(r'^([a-z_]+):\s*(.*)$',ln)
+            if m: hdr[m.group(1)]=m.group(2).strip()
+    except Exception: continue
+    if (hdr.get("stage") or "")!="verify": continue
+    if (hdr.get("status") or "").upper()!="DONE": continue
+    cs=str(hdr.get("session") or ""); ci=str(hdr.get("incarnation") or "")
+    if (not cs or not sess or cs==sess) and (not ci or not inc or ci==str(inc)):
+        print("verify-callback-awaiting:%s" % (hdr.get("slug") or "?"))
+PY
+}
+
+cmd_hygiene_status() {
+    require_identity "hygiene-status" host-session || return 1
+    local pr; pr="$(_resolve_project_root "")"
+    [ -n "$pr" ] || { echo "hygiene-status: no project root"; return 0; }
+    local jf="$pr/$(_hygiene_file)"
+    echo "hygiene mode=$FORGE_WORKER_HYGIENE_MODE"
+    echo "  claude auto_reset=$(_reset_automation_enabled claude 2>/dev/null) degraded=$FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE"
+    echo "  codex  auto_reset=$(_reset_automation_enabled codex 2>/dev/null)  degraded=$FORGE_WORKER_HYGIENE_DEGRADED_CODEX"
+    echo "  min_headroom shared=$FORGE_WORKER_MIN_HEADROOM claude=${FORGE_WORKER_MIN_HEADROOM_CLAUDE-inherit} codex=${FORGE_WORKER_MIN_HEADROOM_CODEX-inherit}"
+    local cu; cu="$(_completion_unresolved "$pr" 2>/dev/null)"
+    echo "  unresolved: ${cu:-parked=0 blocked=0}"
+    echo "  terminal_state: $(_terminal_state "$pr")"
+    # Activation preflight (plan Step 11 item 4): refuse enforce on an open pending, a
+    # verify/DONE callback awaiting interpretation, OR nonzero parked/blocked residue.
+    local _blk; _blk="$(_hygiene_activation_blockers "$pr")"
+    case "$cu" in "parked=0 blocked=0"|"") : ;; *) _blk="${_blk:+$_blk$'\n'}residue:$cu" ;; esac
+    if [ -n "$_blk" ]; then
+        echo "  ACTIVATION: REFUSE enforce —"
+        printf '%s\n' "$_blk" | while IFS= read -r b; do [ -n "$b" ] && echo "    - $b"; done
+    else
+        echo "  ACTIVATION: eligible (no open pending / verify callback / parked/blocked) — confirm spike + live gate before enforce"
+    fi
+    [ -f "$jf" ] && { echo "  journal: $jf"; sed -n '1,40p' "$jf"; } || echo "  journal: (none — unproven, normal at upgrade)"
+}
+
+cmd_hygiene_gc() {
+    require_identity "hygiene-gc" host-session || return 1
+    local days=30 dry=0
+    while [ $# -gt 0 ]; do case "$1" in --days) days="$2"; shift 2 ;; --dry-run) dry=1; shift ;; *) shift ;; esac; done
+    # P2-3: reject a non-integer / negative retention window BEFORE any deletion.
+    case "$days" in ''|*[!0-9]*) echo "ERROR: hygiene-gc --days must be a non-negative integer; got '$days'" >&2; return 1 ;; esac
+    local pr; pr="$(_resolve_project_root "")"; [ -n "$pr" ] || { echo "hygiene-gc: no project root"; return 0; }
+    local live; live="$(_same_root_sessions "$pr" 2>/dev/null | tr '\n' ',')"
+    FORGE_GC_LIVE="$live" FORGE_GC_DAYS="$days" FORGE_GC_DRY="$dry" \
+    python3 - "$pr/.dev" <<'PY'
+import os,sys,glob,time,yaml
+dev=sys.argv[1]; live=set(x for x in os.environ.get("FORGE_GC_LIVE","").split(",") if x)
+days=int(os.environ.get("FORGE_GC_DAYS") or "30"); dry=os.environ.get("FORGE_GC_DRY")=="1"
+cutoff=time.time()-days*86400
+term_ok={"complete","complete-qualified","cleanup-abandoned"}
+for jf in glob.glob(os.path.join(dev,"forge-hygiene.*.yml")):
+    # P2-13: one retained-malformed rule shared with the writer — a parse error OR a
+    # non-mapping (list/scalar) YAML is RETAINED, never deleted and never `.get()`-ed.
+    try: d=yaml.safe_load(open(jf))
+    except Exception: print("RETAIN(malformed) %s"%jf); continue
+    if d is not None and not isinstance(d,dict): print("RETAIN(non-mapping) %s"%jf); continue
+    d=d or {}
+    sess=str(d.get("session") or ""); st=str((d.get("terminal") or {}).get("state") or "")
+    dead = sess not in live; old = os.path.getmtime(jf) < cutoff
+    if dead and st in term_ok and old:
+        print(("WOULD-REMOVE " if dry else "REMOVED ")+jf)
+        if not dry:
+            os.remove(jf); inc=str(d.get("incarnation") or "0")
+            for lk in glob.glob(os.path.join(dev,"forge-tmp","hygiene-locks","%s.%s.*.lock"%(sess,inc))):
+                os.remove(lk)
+    else:
+        print("RETAIN(live=%s state=%s old=%s) %s"%(not dead,st,old,jf))
+PY
+}
+
 timestamp() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
@@ -807,7 +1391,7 @@ except:
             impl-review)         next_stage="coding" ;;
             coding)              next_stage="qa" ;;
             qa|qa-fix|qa-retry)  next_stage="" ;;       # orchestrator decides
-            verify)              next_stage="complete" ;;
+            verify)              if [ "$FORGE_WORKER_HYGIENE_MODE" = enforce ]; then next_stage="awaiting-verify-decision"; else next_stage="complete"; fi ;;
             commit-review)       next_stage="" ;;       # side-channel, not a pipeline stage
             *)                   next_stage="unknown" ;;
         esac
@@ -851,8 +1435,10 @@ EOF
         _emit_event STAGE "$slug" "result_stage=$stage status=$status next=${next_stage:-pending-orchestrator-decision} worker=$worker"
     fi
 
-    # Heartbeat: pipeline complete — strict terminal condition. Qualified when the
-    # session-scoped unresolved set (parked + non-ask blocked) is non-empty (§3.4).
+    # Heartbeat: pipeline complete. In ENFORCE, verify/DONE never emits bare COMPLETE
+    # (next_stage is awaiting-verify-decision above, so the guard is already false); it
+    # defers to verify-decision → finalize. In OBSERVE, legacy completion is preserved
+    # and a loud HYGIENE_BYPASSED is emitted (kill-switch fidelity, R2-2).
     if [ "$stage" = "verify" ] && [ "$status" = "done" ] && [ "$next_stage" = "complete" ]; then
         local _cpr; _cpr=$(_resolve_project_root "" 2>/dev/null)
         local _cq=""
@@ -864,6 +1450,7 @@ EOF
             esac
         fi
         _emit_event COMPLETE "$slug" "last_stage=$stage worker=$worker$_cq"
+        [ "$FORGE_WORKER_HYGIENE_MODE" != enforce ] && _emit_event HYGIENE_BYPASSED "$slug" "reason=observe-mode last_stage=$stage worker=$worker"
     fi
 }
 
@@ -1047,18 +1634,67 @@ cmd_send() {
         esac
     fi
 
-    tmux select-pane -t "$SESSION:$WINDOW.$PANE"
+    # Worker-boundary serialization + crash-conservative delivery (Steps 3-4/7).
+    case "$TARGET" in
+        codex-a|codex-b|claude-opus|claude-sonnet)
+            if [ "$SKIP_BLOCK_GUARD" = 1 ]; then
+                # dispatch's internal delivery — caller owns the lock + generation.
+                _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"
+                return $?
+            fi
+            local _pr2; _pr2="$(_resolve_project_root "" 2>/dev/null)"
+            # P1-2: route mode through _hygiene_mode (a typo is a hard error, not silent legacy).
+            local _smode; _smode="$(_hygiene_mode)" || { echo "HOOK BLOCKED: FORGE_WORKER_HYGIENE_MODE must be observe|enforce." >&2; return 1; }
+            if [ "$_smode" = enforce ] && [ -n "$_pr2" ]; then
+                # P0-2: awaiting-verify-decision also blocks all worker sends (incl. --force).
+                case "$(_terminal_state "$_pr2")" in
+                    awaiting-verify-decision|verified-incomplete|terminal-cleanup|outbox-pending)
+                        echo "HOOK BLOCKED: terminal state blocks all worker sends (incl. --force). Resolve/finalize or hygiene-abandon first." >&2
+                        return 1 ;;
+                esac
+            fi
+            _worker_lock "$TARGET" || return 1
+            # P1-4: FAIL-CLOSED bookkeeping — advance the generation + persist attempting
+            # BEFORE typing; any write failure aborts with NO keystroke. send --force is the
+            # no-reset continuation but STILL advances the generation so prior observation/
+            # reset cannot authorize the next stage.
+            local _g; _g="$(_hygiene_write "$_pr2" next-gen "")" || { _worker_unlock "$TARGET"; echo "HOOK BLOCKED: send refused — generation write failed for $TARGET." >&2; return 1; }
+            _hygiene_write "$_pr2" delivery "$TARGET" \
+                "id=send-$(date -u +%Y%m%dT%H%M%SZ)-$$" "generation=${_g:-0}" \
+                "kind=$([ "$FORCE" = true ] && echo send-force || echo send)" || { _worker_unlock "$TARGET"; echo "HOOK BLOCKED: send refused — delivery write failed for $TARGET." >&2; return 1; }
+            # P2-10: direct worker sends are audited too (a no-reset continuation boundary).
+            _emit_event HYGIENE_DECISION "${FORGE_SEND_SLUG:-adhoc}" "worker=$TARGET action=SEND_CONTINUATION reason=$([ "$FORCE" = true ] && echo force-continuation || echo direct-send) confidence=none mode=$(_hygiene_mode 2>/dev/null) generation=${_g:-0}"
+            _hygiene_crash_at activity
+            _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"; local _rc=$?
+            _hygiene_crash_at send-enter
+            [ "$_rc" -eq 0 ] && _hygiene_write "$_pr2" delivered "$TARGET" 2>/dev/null || true   # advisory
+            _hygiene_crash_at delivered   # P2-1: after the delivered write (public send path)
+            _worker_unlock "$TARGET"
+            return $_rc
+            ;;
+    esac
+    # Non-worker target (pane-1 / orchestrator relay) — unchanged path.
+    _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"
+}
+
+# Lock-owned key-send primitive. Assumes the caller owns the target worker lock (or the
+# target is non-worker). NEVER acquires a worker lock itself (avoids the cmd_dispatch
+# self-deadlock). P2-12: every mutating tmux command is checked; on ANY failure the
+# delivery stays `attempting` (rc!=0) so the caller does NOT mark it delivered.
+_worker_send_locked() {   # <full-target> <msg>
+    local _tgt="$1" MSG="$2"
+    tmux select-pane -t "$_tgt" || { echo "SEND_FAILED select-pane $_tgt" >&2; return 1; }
     sleep 0.3
-    _cancel_copy_mode "$SESSION:$WINDOW.$PANE"
+    _cancel_copy_mode "$_tgt"
     # Split the send into two events: type the text literally first (-l), pause
     # so the worker TUI commits the line into its input buffer, THEN press Enter
     # as a standalone keystroke. Combining text+Enter into one send-keys call
     # leaves the text sitting UNSUBMITTED on current Codex/Claude TUI builds —
     # the dispatch reports success but the worker pane never receives the prompt.
-    # Same fix already proven on the callback path (see _send notify below).
-    tmux send-keys -t "$SESSION:$WINDOW.$PANE" -l "$MSG"
+    tmux send-keys -t "$_tgt" -l "$MSG" || { echo "SEND_FAILED text $_tgt" >&2; return 1; }
+    _hygiene_crash_at send-text
     sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
-    tmux send-keys -t "$SESSION:$WINDOW.$PANE" Enter
+    tmux send-keys -t "$_tgt" Enter || { echo "SEND_FAILED enter $_tgt" >&2; return 1; }
 }
 
 cmd_read() {
@@ -1244,7 +1880,220 @@ PY
     fi
     return 0
 }
-_lifecycle_unlock() { exec 9>&- 2>/dev/null || true; }
+_lifecycle_unlock() { { exec 9>&- ; } 2>/dev/null || true; }
+
+# ---- Worker boundary locks (worker-context-hygiene Step 3) ----
+# Fixed fds per canonical worker (bash-3.2 has no dynamic-fd alloc; finalize holds all
+# four at once). Order: worker(10-13) > lifecycle(9) > journal(8). NEVER reuse fd 9.
+# Non-reentrant: a caller must not re-acquire a lock it already holds (that would
+# `exec $fd>` reopen the fd and DROP the flock); the _worker_send_locked discipline
+# enforces this. fd inheritance is load-bearing in observe too — every worker send
+# takes the lock for the audit trail.
+_worker_lock_fd() {   # <worker_canonical> -> fd or empty
+    case "$1" in
+        claude-opus)   printf 10 ;; codex-a)       printf 11 ;;
+        codex-b)       printf 12 ;; claude-sonnet) printf 13 ;;
+        *)             printf '' ;;
+    esac
+}
+_worker_lock() {   # <worker_canonical> ; rc 0 held, 1 busy/error, 2 non-worker
+    local wk="$1" fd; fd="$(_worker_lock_fd "$wk")"
+    [ -n "$fd" ] || { echo "ERROR: worker-lock: pane 1 / non-worker '$wk' is unlockable" >&2; return 2; }
+    local pr; pr="$(_resolve_project_root "" 2>/dev/null)"
+    [ -n "$pr" ] || { echo "ERROR: worker-lock: no project root" >&2; return 1; }
+    local ld="$pr/.dev/forge-tmp/hygiene-locks"; mkdir -p "$ld" 2>/dev/null
+    local lf="$ld/${ID_target_session:-__nosession__}.${ID_target_incarnation:-0}.${wk}.lock"
+    eval "exec $fd>\"\$lf\"" || { echo "ERROR: worker-lock: cannot open $lf" >&2; return 1; }
+    FORGE_WL_FD="$fd" FORGE_WL_WAIT_S="${FORGE_WORKER_LOCK_WAIT_S:-5}" python3 - <<'PY'
+import fcntl,os,time,sys
+fd=int(os.environ["FORGE_WL_FD"]); dl=time.time()+float(os.environ.get("FORGE_WL_WAIT_S","5"))
+while True:
+    try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); sys.exit(0)
+    except OSError:
+        if time.time()>=dl: sys.exit(75)
+        time.sleep(0.05)
+PY
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then eval "exec $fd>&-"; echo "WORKER_LOCK: busy — $wk within ${FORGE_WORKER_LOCK_WAIT_S:-5}s" >&2; return 1; fi
+    return 0
+}
+_worker_unlock() {   # <worker_canonical>
+    # NB: the error suppression must wrap the eval, NOT ride inside the exec — a persistent
+    # `exec N>&- 2>/dev/null` would silence the whole process's stderr from then on.
+    local fd; fd="$(_worker_lock_fd "$1")"; [ -n "$fd" ] && eval "exec $fd>&-" 2>/dev/null || true
+}
+
+# ---- Terminal/lifecycle mutex (P0-1, R3) — fd 7 ----
+# ONE per-session terminal mutex that EVERY terminal-state mutator acquires FIRST, before any
+# worker or lifecycle lock: cmd_finalize, cmd_hygiene_abandon, cmd_verify_decision, and the
+# park --resolve terminal handoff. This serializes finalize vs park/verify/abandon so residue
+# and terminal state cannot change between a finalizer's revalidation and its publication, and
+# abandon cannot overwrite `complete` after a concurrent finalizer published.
+# GLOBAL LOCK ORDER: terminal(7) > worker(10-13) > lifecycle(9) > journal(8, leaf). No terminal
+# op holds both a worker and a lifecycle lock, so this stays a strict partial order; the callback
+# path (worker→lifecycle, no terminal lock) cannot form a cycle with it.
+_terminal_lock() {   # rc 0 = held on fd 7
+    local pr; pr="$(_resolve_project_root "" 2>/dev/null)"
+    [ -n "$pr" ] || { echo "ERROR: terminal-lock: no project root" >&2; return 1; }
+    local ld="$pr/.dev/forge-tmp/hygiene-locks"; mkdir -p "$ld" 2>/dev/null
+    local lf="$ld/${ID_target_session:-__nosession__}.${ID_target_incarnation:-0}.terminal.lock"
+    exec 7>"$lf" || { echo "ERROR: terminal-lock: cannot open $lf" >&2; return 1; }
+    FORGE_TL_WAIT_S="${FORGE_TERMINAL_LOCK_WAIT_S:-10}" python3 - <<'PY'
+import fcntl,os,time,sys
+dl=time.time()+float(os.environ.get("FORGE_TL_WAIT_S","10"))
+while True:
+    try: fcntl.flock(7,fcntl.LOCK_EX|fcntl.LOCK_NB); sys.exit(0)
+    except OSError:
+        if time.time()>=dl: sys.exit(75)
+        time.sleep(0.05)
+PY
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then exec 7>&-; echo "TERMINAL_LOCK: busy — another terminal operation holds it" >&2; return 1; fi
+    return 0
+}
+_terminal_unlock() { { exec 7>&- ; } 2>/dev/null || true; }
+
+# ---- Single cleanup/finally path (P0-4, R3) ----
+# Releases EVERY hygiene lock (terminal 7, worker 10-13, lifecycle 9). Releasing an unheld fd
+# is a harmless no-op, so this is idempotent and safe to call from a RETURN trap. Installed via
+# `trap _hygiene_release_all RETURN` at the top of the worker-lock critical section in
+# cmd_callback, cmd_dispatch, cmd_finalize, cmd_hygiene_abandon, and cmd_verify_decision, so
+# fds are released on EVERY return — normal, guard-refusal, lock-timeout, and crash-seam exits —
+# with no per-branch unlock bookkeeping. (bash-3.2: a RETURN trap fires when the trapping
+# function returns and is NOT inherited by nested helper calls without `set -T`, verified.)
+_hygiene_release_all() {
+    local w
+    for w in claude-opus codex-a codex-b claude-sonnet; do _worker_unlock "$w"; done
+    _lifecycle_unlock
+    _terminal_unlock
+}
+
+_reset_worker_locked() {   # <session> <idx> <worker> <reason> <slug> [ignore_pending_ts]
+    local sess="$1" idx="$2" wk="$3" reason="$4" slug="${5:-adhoc}" ignore_pt="${6:-}"
+    local fam; fam="$(_worker_family "$wk")"
+    [ -n "$fam" ] || { echo "RESET_REFUSED reason=non-worker" >&2; return 2; }
+    case "$idx" in 0|2|3|4) ;; *) echo "RESET_REFUSED reason=pane-not-worker idx=$idx" >&2; return 2 ;; esac
+    # P2-5: the supplied index MUST be the canonical pane index for this worker, else a
+    # caller bug would clear one pane while recording reset evidence for another.
+    local _wantidx; _wantidx="$(pane_index "$wk")"
+    [ "$_wantidx" = "$idx" ] || { echo "RESET_REFUSED reason=worker-index-mismatch worker=$wk idx=$idx want=$_wantidx" >&2; return 2; }
+    local pr; pr="$(_resolve_project_root "" 2>/dev/null)"
+    [ -n "$pr" ] || { echo "RESET_REFUSED reason=no-root" >&2; return 1; }
+    if [ "$reason" != operator ]; then
+        _reset_automation_enabled "$fam" >/dev/null || { echo "RESET_UNAVAILABLE family=$fam" >&2; return 3; }
+    fi
+    local live_i; live_i="$(session_incarnation_of "$sess")"
+    if [ -n "${ID_target_incarnation:-}" ] && [ "$live_i" != "$ID_target_incarnation" ]; then
+        echo "RESET_REFUSED reason=incarnation-changed" >&2; return 1; fi
+    # P0-3: journal identity/schema preflight BEFORE any keystroke — a foreign/partial-identity
+    # (same-name rebirth) or malformed non-empty journal refuses here, so no /clear is sent.
+    _hygiene_journal_preflight "$pr" || { echo "RESET_REFUSED reason=journal-identity-foreign worker=$wk" >&2; return 1; }
+    # P1-4: pending scan is FAIL-CLOSED — a scan error is treated as "pending present".
+    local _open _oprc; _open="$(_worker_open_pending_ts "$pr" "$wk" "$ignore_pt")"; _oprc=$?
+    [ "$_oprc" -eq 0 ] || { echo "RESET_REFUSED reason=pending-scan-failed worker=$wk" >&2; return 1; }
+    [ -z "$_open" ] || { echo "RESET_REFUSED reason=open-pending ts=$_open" >&2; return 1; }
+    local _hp; _hp="$(_worker_health "$sess" "$idx" "$wk")"
+    case "$_hp" in idle) ;; *) echo "RESET_REFUSED reason=not-idle state=$_hp" >&2; return 1 ;; esac
+    # 1. baseline (visible-screen fingerprint + anchor-present + session id). P1-4: a failed
+    # capture refuses rather than resetting against an empty/garbage baseline.
+    local _base _bfp _bpres _bsid _bhist
+    _base="$(_reset_baseline "$sess" "$idx" "$fam")" || { echo "RESET_REFUSED reason=baseline-capture-failed worker=$wk" >&2; return 1; }
+    [ -n "$_base" ] || { echo "RESET_REFUSED reason=baseline-empty worker=$wk" >&2; return 1; }
+    IFS=$'\t' read -r _bfp _bpres _bsid _bhist <<< "$_base"
+    # 2-5. cancel copy mode, /clear, commit wait, Enter. P2-6: a failed send-keys must NOT
+    # reach the proof poll (a swallowed /clear could otherwise match an incidental redraw).
+    _cancel_copy_mode "$sess:$WINDOW.$idx"
+    tmux send-keys -t "$sess:$WINDOW.$idx" -l "/clear" || { echo "RESET_REFUSED reason=send-clear-failed worker=$wk" >&2; return 1; }
+    sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
+    tmux send-keys -t "$sess:$WINDOW.$idx" Enter || { echo "RESET_REFUSED reason=send-enter-failed worker=$wk" >&2; return 1; }
+    # 6. bounded semantic proof.
+    local _proof; _proof="$(_reset_proof_probe "$sess" "$idx" "$fam" "${_bfp:-}" "${_bpres:-0}" "${_bsid:-}")" || {
+        echo "RESET_UNPROVEN worker=$wk $_proof" >&2; return 1; }
+    # 7. re-require process + idle after proof.
+    local _hp2; _hp2="$(_worker_health "$sess" "$idx" "$wk")"
+    case "$_hp2" in idle) ;; *) echo "RESET_UNPROVEN reason=post-not-idle state=$_hp2" >&2; return 1 ;; esac
+    # 8. persist reset coverage for the CURRENT generation immediately. P0-1 CONTRACT:
+    # reset.covers_generation = latest_generation AT RESET TIME. This is deliberately the
+    # PRE-delivery generation for a dispatch reset — the subsequent delivery advances
+    # latest_generation and thereby invalidates this reset (the pane did work; it is no
+    # longer clean). A reset with NO subsequent delivery (finalize, and its idempotent
+    # retry) keeps covers==latest and is the KEEP_RESET_PROVEN reuse path (see §F reuse
+    # test). Do NOT "cover the delivery's generation": that would make a reset read as
+    # valid AFTER the pane ran that delivery's stage. HARD: a journal-write failure aborts
+    # WITHOUT emitting RESET, so the pane is re-clearable (no false proof).
+    local _g; _g="$(_hygiene_current_gen "$pr" "$wk")"
+    local _pk _ph; _pk="$(printf '%s' "$_proof" | sed -n 's/.*kind=\([^ ]*\).*/\1/p')"
+    _ph="$(printf '%s' "$_proof" | sed -n 's/.*hash=\([0-9a-f]*\).*/\1/p')"
+    _hygiene_write "$pr" reset "$wk" "id=reset-$(date -u +%Y%m%dT%H%M%SZ)-$$" \
+        "generation=${_g:-0}" "reason=$reason" "proof_kind=${_pk:-post-baseline-anchor}" "proof_hash=${_ph:-none}" \
+        || { echo "RESET_UNPROVEN reason=coverage-write-failed worker=$wk" >&2; return 1; }
+    # 9. clear stale stall snapshots ONLY after semantic confirmation; emit RESET (P2-8:
+    # attributed to the dispatching slug, not adhoc).
+    rm -f "$FORGE_CACHE_DIR/${sess}-pane${idx}.snapshot" "$FORGE_CACHE_DIR/${sess}-pane${idx}.last-stall-check" 2>/dev/null || true
+    _emit_event RESET "$slug" "worker=$wk idx=$idx reason=$reason proof=${_pk:-post-baseline-anchor} generation=${_g:-0} base_history=${_bhist:-0}"
+    echo "RESET_OK worker=$wk generation=${_g:-0}"
+}
+
+# Open pending timestamps targeting a worker (excluding an ignored one). Empty => none.
+# P1-6: filters to the CURRENT session+incarnation (with the never-skip-legacy rule used
+# elsewhere) so a dead predecessor or same-name reborn session cannot block a reset.
+_worker_open_pending_ts() {   # <project_root> <worker> [ignore_ts]
+    FORGE_WP_WK="$2" FORGE_WP_IG="${3:-}" FORGE_WP_SESS="$(_resolve_session)" FORGE_WP_INC="${ID_target_incarnation:-}" \
+    python3 - "$1/.dev/proposals" <<'PY'
+import os,sys,glob,yaml
+base=sys.argv[1]; wk=os.environ["FORGE_WP_WK"]; ig=os.environ.get("FORGE_WP_IG","")
+sess=os.environ.get("FORGE_WP_SESS") or ""; inc=os.environ.get("FORGE_WP_INC") or ""
+al={'inline':'claude-opus','general':'claude-opus','claude-general':'claude-opus','opus':'claude-opus',
+    'codex':'codex-a','codex-b':'codex-b','orchestrator':'claude','claude-orchestrator':'claude','sonnet':'claude-sonnet'}
+c=lambda v: al.get(v,v)
+for lp in glob.glob(os.path.join(base,"*","forge-log.yml")):
+    # P1-4: a log we CANNOT parse might hide a pending — fail closed (rc2) so the reset caller
+    # refuses rather than clearing a pane that may still be in flight.
+    try: es=(yaml.safe_load(open(lp)) or {}).get("entries") or []
+    except Exception: sys.stderr.write("PENDING_SCAN_UNREADABLE:%s\n"%lp); sys.exit(2)
+    for e in es:
+        if not (isinstance(e,dict) and e.get("response") is None and c(str(e.get("to") or ""))==wk): continue
+        es_s=str(e.get("session") or ""); es_i=str(e.get("incarnation") or "")
+        # never-skip-legacy: an entry with no session/incarnation still matches; only a
+        # CONFIRMED different session/incarnation is skipped.
+        if es_s and sess and es_s!=sess: continue
+        if es_i and inc and es_i!=str(inc): continue
+        ts=str(e.get("timestamp") or "")
+        if ts and ts!=ig: print(ts)
+PY
+}
+
+# Worker health via idle-prompts.yml (keyed per canonical worker). Echoes
+# idle|busy|prompting|unknown. Test seam FORGE_HEALTH_FIXTURE. P1-4: captures the VISIBLE
+# SCREEN ONLY (no -S), so a historical idle prompt in scrollback cannot read as idle while the
+# visible pane is busy; `unknown` (the fail-closed value) is never accepted as idle by callers.
+_worker_health() {   # <session> <idx> <worker>
+    local sess="$1" idx="$2" wk="$3"
+    local cap; cap=$(mktemp -t forge-wh-XXXXXX 2>/dev/null) || { printf unknown; return 0; }
+    if [ -n "${FORGE_HEALTH_FIXTURE:-}" ] && [ -f "${FORGE_HEALTH_FIXTURE}" ]; then
+        cp "$FORGE_HEALTH_FIXTURE" "$cap"
+    else
+        tmux capture-pane -p -t "$sess:$WINDOW.$idx" > "$cap" 2>/dev/null || true   # visible screen only
+    fi
+    local out; out=$(python3 - "$cap" "$wk" "$FORGE_IDLE_PROMPTS_FILE" <<'PYEOF'
+import sys,re,yaml
+raw=open(sys.argv[1]).read(); kind=sys.argv[2]
+try: prompts=yaml.safe_load(open(sys.argv[3])) or {}
+except Exception: print("unknown"); sys.exit(0)
+norm=re.sub(r'\x1b\[[0-9;]*[A-Za-z]','',raw)
+tail='\n'.join([l for l in norm.splitlines() if l.strip()][-25:])
+cfg=prompts.get(kind) or {}
+def m(p):
+    try: return bool(p) and re.search(p,tail,re.M)
+    except re.error: return False
+if m(cfg.get('active_work_marker')): print("busy")
+elif m(cfg.get('approval_prompt')): print("prompting")
+elif m(cfg.get('idle_prompt_anchor')): print("idle")
+else: print("unknown")
+PYEOF
+)
+    rm -f "$cap" 2>/dev/null; printf '%s' "${out:-unknown}"
+}
 
 # Insert parked_at/parked_reason/uncommitted as SIBLINGS of a specific open entry
 # (located by timestamp anchor), keeping response: null, in BOTH logs — mirroring
@@ -1494,6 +2343,60 @@ if len(pending)!=1:
     print('CALLBACK_IDENTITY_AMBIGUOUS: pending cardinality='+str(len(pending)),file=sys.stderr); sys.exit(2)
 selected=str(pending[0].get('timestamp') or '')
 if not selected: print('CALLBACK_IDENTITY_CHANGED: pending timestamp missing',file=sys.stderr); sys.exit(3)
+fields=[cbf,status,str(cb.get('callback_id') or ''),selected,cb_s,cb_i,str(cb.get('origin') or ''),hashlib.sha256(raw).hexdigest()]
+if not fields[2]: print('CALLBACK_HEADER_INVALID: callback_id missing',file=sys.stderr); sys.exit(3)
+print('|'.join(fields))
+PY
+}
+
+# Worker-context-hygiene (Step 8c): terminal-callback selector. Same identity contract as
+# _callback_mutation_select, but binds against the CLOSED pending a terminal DONE callback
+# already patched (a DONE callback closes its pending before publishing, so the open-pending
+# cardinality the mutation selector demands is 0 by design). Echoes the same tuple shape:
+# file|status|callback_id|selected_ts|session|incarnation|origin|sha256. Deterministic, so a
+# revalidation is a byte-compare of two invocations.
+_callback_terminal_select() {   # <cb_dir> <slug> <stage> <session> <incarnation> <statuses> <log>
+    local cb_dir="$1" slug="$2" stage="$3" session="$4" incarnation="$5" statuses="$6" plog="$7"
+    local cb_file scan_rc=0
+    cb_file="$(_scan_callback_candidates "$cb_dir" "$slug" "$stage" "$session" "$incarnation")" || scan_rc=$?
+    case "$scan_rc" in
+        0) ;;
+        1) return 1 ;;
+        2) echo "CALLBACK_IDENTITY_AMBIGUOUS" >&2; return 2 ;;
+        3) echo "CALLBACK_HEADER_INVALID" >&2; return 3 ;;
+        4) echo "CALLBACK_SCANNER_DEPENDENCY" >&2; return 4 ;;
+        *) echo "CALLBACK_IDENTITY_CHANGED" >&2; return 3 ;;
+    esac
+    python3 - "$cb_file" "$slug" "$stage" "$session" "$incarnation" "$statuses" "$plog" <<'PY'
+import hashlib,sys,yaml
+cbf,slug,stage,actor_s,actor_i,statuses,plog=sys.argv[1:8]
+try:
+    raw=open(cbf,'rb').read(); cb=yaml.safe_load(raw) or {}
+    entries=(yaml.safe_load(open(plog)) or {}).get('entries') or []
+except Exception as exc: print('CALLBACK_HEADER_INVALID:'+str(exc),file=sys.stderr); sys.exit(3)
+cb_s=str(cb.get('session') or ''); cb_i=str(cb.get('incarnation') or '')
+if str(cb.get('slug') or '')!=slug or str(cb.get('stage') or '')!=stage:
+    print('CALLBACK_IDENTITY_CHANGED',file=sys.stderr); sys.exit(3)
+if actor_i:
+    if cb_s!=actor_s or cb_i!=actor_i:
+        print('CALLBACK_IDENTITY_AMBIGUOUS',file=sys.stderr); sys.exit(2)
+else:
+    if cb_i or (cb_s and cb_s!=actor_s):
+        print('CALLBACK_IDENTITY_AMBIGUOUS',file=sys.stderr); sys.exit(2)
+status=str(cb.get('status') or ''); allowed=set(x for x in statuses.split(',') if x)
+if status not in allowed: print('CALLBACK_STATUS_INELIGIBLE:'+status,file=sys.stderr); sys.exit(5)
+aliases={'inline':'claude-opus','general':'claude-opus','claude-general':'claude-opus','opus':'claude-opus','codex':'codex-a','orchestrator':'claude','claude-orchestrator':'claude','sonnet':'claude-sonnet'}
+canonical=lambda value: aliases.get(value,value)
+cb_worker=canonical(str(cb.get('worker') or ''))
+selected=str(cb.get('selected_pending_timestamp') or '')
+if not selected:
+    print('CALLBACK_IDENTITY_CHANGED: missing selected_pending_timestamp',file=sys.stderr); sys.exit(3)
+bound=[e for e in entries if isinstance(e,dict) and e.get('stage')==stage
+       and canonical(str(e.get('to') or ''))==cb_worker
+       and str(e.get('session') or '')==cb_s and str(e.get('incarnation') or '')==cb_i
+       and str(e.get('timestamp') or '')==selected]
+if len(bound)!=1:
+    print('CALLBACK_IDENTITY_AMBIGUOUS: bound cardinality='+str(len(bound)),file=sys.stderr); sys.exit(2)
 fields=[cbf,status,str(cb.get('callback_id') or ''),selected,cb_s,cb_i,str(cb.get('origin') or ''),hashlib.sha256(raw).hexdigest()]
 if not fields[2]: print('CALLBACK_HEADER_INVALID: callback_id missing',file=sys.stderr); sys.exit(3)
 print('|'.join(fields))
@@ -1778,6 +2681,55 @@ PYEOF
     if [ -n "$n_skipped" ] && [ "$n_skipped" -gt 0 ] 2>/dev/null; then
         echo "WARN: log-response closed the most recent of $((n_skipped + 1)) pending entries for slug=$slug stage=$target_stage_resolved to=$target_to; $n_skipped older duplicate(s) left OPEN (ts: $skipped_ts). Run 'dispatch --supersede' or the orphan migration to close them." >&2
         _emit_event WARN_DUP_PENDING "$slug" "stage=$target_stage_resolved to=$target_to closed_ts=$target_ts skipped=$n_skipped skipped_ts=$skipped_ts"
+    fi
+
+    # stale-alert-lifecycle D2: surface cross-identity orphan pendings for this
+    # (slug, stage) that matches() EXCLUDED (different to/session) so a mis-dispatched
+    # twin becomes a durable audit signal, not a silent future WORKER-STALLED.
+    # Audit-only: NEVER auto-closes (incarnation-strict, P1-WC). Non-fatal; rc unchanged.
+    local _orphan_ts
+    _orphan_ts=$(FORGE_OP_LOG="$pipeline_log" FORGE_OP_STAGE="$target_stage_resolved" \
+                 FORGE_OP_TO="$target_canonical" FORGE_OP_SESS="$ID_target_session" \
+                 FORGE_OP_CLOSED_TS="$target_ts" python3 - <<'PY' 2>/dev/null || true
+import os, sys
+try:
+    import yaml
+except Exception:
+    sys.exit(0)
+try:
+    with open(os.environ["FORGE_OP_LOG"]) as f:
+        data=yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(0)
+stage=os.environ["FORGE_OP_STAGE"]; closed_ts=os.environ["FORGE_OP_CLOSED_TS"]
+to=os.environ.get("FORGE_OP_TO",""); sess=os.environ.get("FORGE_OP_SESS","")
+out=[]
+for e in data.get("entries", []) or []:
+    if not (isinstance(e, dict) and e.get("stage")==stage and e.get("response") is None):
+        continue
+    ets=str(e.get("timestamp") or "")
+    if ets==closed_ts:
+        continue
+    e_to=str(e.get("to") or ""); e_sess=str(e.get("session") or "")
+    # Only report entries matches() would have EXCLUDED (different identity) —
+    # same-identity older dups are WARN_DUP_PENDING's job.
+    if (to and e_to and e_to!=to) or (sess and e_sess and e_sess!=sess):
+        out.append(ets)
+print(",".join(t for t in out if t))
+PY
+)
+    if [ -n "$_orphan_ts" ]; then
+        echo "WARN: log-response closed $slug/$target_stage_resolved but cross-identity orphan pending(s) remain OPEN (ts: $_orphan_ts). Not auto-closed (incarnation-strict). Run 'dispatch --supersede' to clear them." >&2
+        _emit_event WARN_ORPHAN_PENDING "$slug" "stage=$target_stage_resolved closed_ts=$target_ts orphan_ts=$_orphan_ts"
+    fi
+
+    # stale-alert-lifecycle D1: on a terminal close, archive any resolved operator
+    # ask for this (slug, stage) so it stops rendering as a false NEEDS-ASK and stops
+    # `park` refusing on it. Non-fatal; gated inside on no-open-pending.
+    if [ "$status" = "done" ] || [ "$status" = "error" ]; then
+        local _ar_root; _ar_root=$(_resolve_project_root "" 2>/dev/null || true)
+        [ -n "$_ar_root" ] || _ar_root="$PWD"
+        _archive_resolved_asks "$_ar_root" "$slug" "$target_stage_resolved"
     fi
 
     # Hook 2: auto-update forge-context.yml using the resolved entry.
@@ -2496,20 +3448,95 @@ PYEOF
         _work_start_guard "$project_root" "dispatch" "$allow_blocked" "" "" || return 1
     fi
 
+    # ---- Worker-context-hygiene enforcement (Step 7) ----
+    # P2-2: a typo'd mode is a hard error, never a silent observe fall-through, so a run
+    # intended as enforce cannot quietly dispatch dirty.
+    local _dmode; _dmode="$(_hygiene_mode)" || { _emit_event ERROR "$slug" "stage=$stage reason=hygiene-mode-invalid"; echo "ERROR: FORGE_WORKER_HYGIENE_MODE must be observe|enforce." >&2; return 1; }
+    # P0-4: single cleanup path — every enforcement/supersede return below releases the worker
+    # (and lifecycle) lock via the RETURN trap, so no fd 10-13 can leak on an error path.
+    trap _hygiene_release_all RETURN
+    _worker_lock "$worker_canonical" || { _emit_event ERROR "$slug" "stage=$stage reason=worker-lock-busy worker=$worker_canonical"; return 1; }
+    if [ "$_dmode" = enforce ]; then
+        # P0-2: awaiting-verify-decision is a send-blocking terminal state (new work would
+        # invalidate the exact verify callback binding finalization relies on).
+        local _tstate; _tstate="$(_terminal_state "$project_root")"
+        case "$_tstate" in
+            awaiting-verify-decision|verified-incomplete|terminal-cleanup|outbox-pending)
+                _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=terminal-state-block state=$_tstate worker=$worker_canonical"
+                echo "HOOK BLOCKED: slug in terminal state '$_tstate' blocks all worker sends. Resolve/finalize or hygiene-abandon first." >&2
+                return 1 ;;
+        esac
+        # P0-2: repeat the open-pending + health guards UNDER the worker lock (current session/
+        # incarnation), before deciding — a pending/ACTIVE delivery that appeared after the
+        # pre-lock guard must not be accepted on a KEEP path. --supersede owns an open pending
+        # and abandons it, so it is exempt here (its own reset handles the owned pending).
+        if [ "$supersede" != true ]; then
+            local _wp _wprc; _wp="$(_worker_open_pending_ts "$project_root" "$worker_canonical" "")"; _wprc=$?
+            [ "$_wprc" -eq 0 ] || { _emit_event ERROR "$slug" "stage=$stage reason=pending-scan-failed worker=$worker_canonical"; echo "HOOK BLOCKED: pending scan failed for $worker_canonical." >&2; return 1; }
+            [ -z "$_wp" ] || { _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=worker-has-open-pending worker=$worker_canonical"; echo "HOOK BLOCKED: $worker_canonical has an open pending under the lock — refusing to start new work." >&2; return 1; }
+            local _wh; _wh="$(_worker_health "$SESSION" "$worker_pane" "$worker_canonical")"
+            case "$_wh" in idle) ;; *) _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=worker-not-idle state=$_wh worker=$worker_canonical"; echo "HOOK BLOCKED: $worker_canonical not idle (state=$_wh) — refusing to start new work." >&2; return 1 ;; esac
+        fi
+    fi
+    local _min; _min="$(_worker_min_headroom "$worker_canonical")" || {
+        _worker_unlock "$worker_canonical"
+        _emit_event ERROR "$slug" "stage=$stage reason=config-error worker=$worker_canonical"
+        echo "ERROR: invalid FORGE_WORKER_MIN_HEADROOM(_family) — dispatch refused, nothing mutated." >&2
+        return 1; }
+    local _fam; _fam="$(_worker_family "$worker_canonical")"
+    local _decision _reason
+    read -r _decision _reason < <(_hygiene_decide "$project_root" "$worker_canonical" "" "")
+    # P2-7: confidence for the audit — KEEP_OBSERVED/RESET_THRESHOLD are reached only via a
+    # high-confidence observation; every other decision has no confident reading.
+    local _conf=none; case "$_decision" in KEEP_OBSERVED|RESET_THRESHOLD) _conf=high ;; esac
+    [ "$do_clear" = true ] && case "$_decision" in KEEP_*) _decision=RESET_UNPROVEN; _reason=explicit-clear ;; esac
+    local _degraded=0
+    case "$_fam" in
+        claude) [ "$FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE" = 1 ] && _degraded=1 ;;
+        codex)  [ "$FORGE_WORKER_HYGIENE_DEGRADED_CODEX" = 1 ]  && _degraded=1 ;;
+    esac
+    local _action="$_decision"
+    if [ "$_dmode" != enforce ]; then   # P1-2: _dmode already validated via _hygiene_mode above
+        _action=OBSERVE_ONLY
+    elif [ "$supersede" = true ]; then
+        # Supersede resets unconditionally in the close block below (abandoning in-flight
+        # context always resets, independent of headroom); audited there.
+        _action=SUPERSEDE_RESET_DEFERRED
+    else
+        case "$_decision" in
+            RESET_THRESHOLD|RESET_UNPROVEN)
+                if _reset_automation_enabled "$_fam" >/dev/null; then
+                    _reset_worker_locked "$SESSION" "$worker_pane" "$worker_canonical" \
+                        "$([ "$do_clear" = true ] && echo explicit || echo threshold)" "$slug" || {
+                        _worker_unlock "$worker_canonical"
+                        _emit_event ERROR "$slug" "stage=$stage reason=reset-failed worker=$worker_canonical"
+                        echo "ERROR: required reset did not confirm — dispatch refused, nothing mutated." >&2
+                        return 1; }
+                    _action=RESET_CONFIRMED
+                elif [ "$_degraded" = 1 ]; then
+                    _action=RESET_UNAVAILABLE   # P2-7: normalized to the declared vocabulary
+                    _hygiene_write "$project_root" terminal "" "hygiene_disabled_${_fam}=1" 2>/dev/null || true
+                    _emit_event RESET_UNAVAILABLE "$slug" "stage=$stage worker=$worker_canonical family=$_fam reason=degraded-proceed"
+                else
+                    _worker_unlock "$worker_canonical"
+                    _emit_event RESET_UNAVAILABLE "$slug" "stage=$stage worker=$worker_canonical family=$_fam reason=auto-reset-disabled"
+                    echo "RESET_UNAVAILABLE: family '$_fam' reset disabled/unproven and hygiene-degraded not enabled — dispatch refused." >&2
+                    return 1
+                fi ;;
+            KEEP_OBSERVED|KEEP_RESET_PROVEN) : ;;
+        esac
+    fi
+    _emit_event HYGIENE_DECISION "$slug" "stage=$stage worker=$worker_canonical action=$_action reason=$_reason threshold=$_min confidence=${_conf:-none} mode=$FORGE_WORKER_HYGIENE_MODE generation=$(_hygiene_current_gen "$project_root" "$worker_canonical")"
+
     local prompt_file="$project_root/.dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
     mkdir -p "$(dirname "$prompt_file")"
-    printf '%s' "$rendered" > "$prompt_file"
+    # P0-4: for --supersede the prompt is written AFTER the reset+close succeed (see Step 4),
+    # so a failed supersede reset leaves the prior prompt file byte-for-byte unchanged.
+    [ "$supersede" != true ] && printf '%s' "$rendered" > "$prompt_file"
 
-    # Hard Rule 20 — orchestrator (this bridge call) drives /clear, never the worker.
-    if [ "$do_clear" = true ]; then
-        # Split text/Enter (same TUI-commit reason as cmd_send) so /clear
-        # reliably submits instead of sitting unsubmitted in the worker input.
-        _cancel_copy_mode "$SESSION:$WINDOW.$worker_pane"
-        tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" -l "/clear"
-        sleep "${FORGE_SEND_COMMIT_WAIT_S:-0.3}"
-        tmux send-keys -t "$SESSION:$WINDOW.$worker_pane" Enter
-        sleep "${FORGE_CLEAR_WAIT_S:-2}"
-    fi
+    # Reset decision + confirmed reset are performed inside the Step-7 enforcement block
+    # below (under the worker lock), coalescing explicit --clear with the automatic
+    # decision into ONE _reset_worker_locked call. Idle-only clearing is no longer a code path.
 
     # --supersede destructive close (deferred — fix-plan Review #5): close every
     # open same-slug pending as FORGE_SUPERSEDED via the no-context helper (NOT
@@ -2593,6 +3620,29 @@ PYEOF
                     return 1
                 fi
             fi
+            # Worker-context-hygiene Step 7 (supersede): reset BEFORE closing the pending or
+            # writing the replacement prompt (P0-4). Ignore ONLY the exact owned pending.
+            if [ "$_dmode" = enforce ] && _hygiene_worker_ok "$worker_canonical"; then   # P1-2: validated mode
+                if _reset_automation_enabled "$_fam" >/dev/null; then
+                    if _reset_worker_locked "$SESSION" "$worker_pane" "$worker_canonical" supersede "$slug" "$_sup_ts"; then
+                        _emit_event HYGIENE_DECISION "$slug" "stage=$_sup_stage worker=$worker_canonical action=RESET_CONFIRMED reason=supersede-abandon threshold=$_min confidence=none mode=enforce generation=$(_hygiene_current_gen "$project_root" "$worker_canonical")"
+                    else
+                        _lifecycle_unlock; _worker_unlock "$worker_canonical"
+                        echo "ERROR: --supersede reset did not confirm for $slug/$_sup_stage — pending/prompt left byte-for-byte unchanged." >&2
+                        return 1
+                    fi
+                elif { [ "$_fam" = claude ] && [ "$FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE" = 1 ]; } || { [ "$_fam" = codex ] && [ "$FORGE_WORKER_HYGIENE_DEGRADED_CODEX" = 1 ]; }; then
+                    # P1-5: degraded opt-in — proceed without reset, recorded qualified-disabled.
+                    _hygiene_write "$project_root" terminal "" "hygiene_disabled_${_fam}=1" 2>/dev/null || true
+                    _emit_event RESET_UNAVAILABLE "$slug" "stage=$_sup_stage worker=$worker_canonical family=$_fam reason=degraded-supersede"
+                else
+                    # P1-5: automation unavailable and no degraded opt-in — refuse; nothing mutated.
+                    _lifecycle_unlock; _worker_unlock "$worker_canonical"
+                    _emit_event RESET_UNAVAILABLE "$slug" "stage=$_sup_stage worker=$worker_canonical family=$_fam reason=auto-reset-disabled-supersede"
+                    echo "ERROR: --supersede refused — $worker_canonical ($_fam) reset unavailable and hygiene-degraded off; pending/prompt unchanged." >&2
+                    return 1
+                fi
+            fi
             if ! _patch_response_by_ts "$slug" "$_sup_ts" "FORGE_SUPERSEDED: re-dispatched $stage (orphan-log-entries guard); auto-closed $_sup_now"; then
                 _lifecycle_unlock
                 echo "ERROR: --supersede close failed for $slug/$_sup_stage; callback retained" >&2
@@ -2610,19 +3660,47 @@ PYEOF
                     return 1
                 fi
             fi
+            # stale-alert-lifecycle D1: archive a resolved ask for the superseded stage
+            # (the FORGE_SUPERSEDED close path; mirrors --answers archival). Non-fatal.
+            _archive_resolved_asks "$project_root" "$slug" "$_sup_stage"
             _lifecycle_unlock
             _sup_n=$((_sup_n + 1))
         done <<< "$_sup_pendings"
         [ "$_sup_n" -gt 0 ] && _emit_event SUPERSEDE "$slug" "stage=$stage closed_pending=$_sup_n worker=$worker_canonical partial_fail=0"
     fi
 
+    # P0-4: supersede's replacement prompt is written only now, after its reset+close.
+    [ "$supersede" = true ] && printf '%s' "$rendered" > "$prompt_file"
     local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
-    cmd_log --slug "$slug" --stage "$stage" --from claude --to "$worker_canonical" --prompt "$ref_msg" >/dev/null
+    # P1-4: pre-send bookkeeping is FAIL-CLOSED — the pending log, the generation, and the
+    # attempting delivery must all persist BEFORE any keystroke; any failure aborts and
+    # unlocks with NO text sent (no keystroke can occur without durable attempting evidence).
+    cmd_log --slug "$slug" --stage "$stage" --from claude --to "$worker_canonical" --prompt "$ref_msg" >/dev/null || {
+        _emit_event ERROR "$slug" "stage=$stage reason=pending-log-failed worker=$worker_canonical"
+        _worker_unlock "$worker_canonical"; return 1; }
+    _hygiene_crash_at pending   # P2-11: crash here leaves an open pending with no activity
+    local _pend_ts
+    _pend_ts="$(_callback_pending_select_exact "$guard_log" "$stage" "$worker_canonical" "$ID_target_session" "$ID_target_incarnation" 2>/dev/null)"
+    local _dg; _dg="$(_hygiene_write "$project_root" next-gen "")" || {
+        _emit_event ERROR "$slug" "stage=$stage reason=generation-write-failed worker=$worker_canonical"
+        _worker_unlock "$worker_canonical"; return 1; }
+    _hygiene_write "$project_root" delivery "$worker_canonical" \
+        "id=dispatch-$(date -u +%Y%m%dT%H%M%SZ)-$$" "generation=${_dg:-0}" \
+        "kind=$([ "$supersede" = true ] && echo supersede || echo dispatch)" \
+        "slug=$slug" "stage=$stage" "pending_timestamp=${_pend_ts:-}" || {
+        _emit_event ERROR "$slug" "stage=$stage reason=delivery-write-failed worker=$worker_canonical"
+        _worker_unlock "$worker_canonical"; return 1; }
+    _hygiene_crash_at activity  # attempting persisted; crash here -> RESET_UNPROVEN attempting
     cmd_send --_internal "$worker_canonical" "$ref_msg" || {
         _emit_event ERROR "$slug" "stage=$stage reason=send-failed worker=$worker_canonical"
+        _worker_unlock "$worker_canonical"
         return 1
     }
+    _hygiene_crash_at send-enter   # after Enter, before delivered -> stays attempting (proven only by an exact later callback)
+    _hygiene_write "$project_root" delivered "$worker_canonical" 2>/dev/null || true   # advisory: loss keeps attempting (safe)
+    _hygiene_crash_at delivered     # P2-1: after the delivered write — benign (a later callback confirms)
 
+    _worker_unlock "$worker_canonical"
     _emit_event DISPATCH "$slug" "stage=$stage worker=$worker_canonical"
     _render_status_file
     echo "DISPATCHED stage=$stage worker=$worker_canonical slug=$slug prompt=$prompt_file"
@@ -2763,6 +3841,31 @@ EOF
     # Atomic publish writes to a temp file in the SAME dir (same filesystem) then
     # renames into place.
     local cb_tmp="$cb_dir/.$(basename "$cb_file").tmp.$$"
+    # Worker-context-hygiene Step 5: invalidate prior observation coverage BEFORE publication so
+    # a concurrent dispatch can never read an old safe reading while this callback publishes.
+    # P0-4: a RETURN trap releases the worker (and lifecycle) lock on EVERY callback error path.
+    # Best-effort worker lock (fail-OPEN): a timeout must not fail DONE/ERROR/BLOCKED.
+    trap _hygiene_release_all RETURN
+    local _cb_worker_locked=0 _cb_invalidated=0
+    if _hygiene_worker_ok "$worker_canonical" && _worker_lock "$worker_canonical" 2>/dev/null; then
+        _cb_worker_locked=1
+        _hygiene_write "$project_root" observe-pending "$worker_canonical" \
+            "generation=$(_hygiene_current_gen "$project_root" "$worker_canonical")" \
+            "callback_id=$cb_id" "pending_timestamp=$selected_pending_timestamp" && _cb_invalidated=1
+    elif _hygiene_worker_ok "$worker_canonical"; then
+        # P1-6: lock-timeout path — durably invalidate the old high-confidence observation. This
+        # write is CHECKED; on success the old `known` becomes `unknown` and can never satisfy
+        # KEEP_OBSERVED. On failure escalate (below) rather than silently leaving stale-safe.
+        _hygiene_write "$project_root" observe-unknown "$worker_canonical" && _cb_invalidated=1
+    fi
+    # P1-6: if invalidation did not persist (journal locked/unwritable), the old observation may
+    # still read as KEEP_OBSERVED. We cannot fail DONE (fail-open), so escalate loudly AND make a
+    # bounded second attempt; a persistent failure is a durable-journal fault surfaced for the
+    # operator (documented residual — an unwritable journal defeats every persistence path).
+    if _hygiene_worker_ok "$worker_canonical" && [ "$_cb_invalidated" != 1 ]; then
+        _hygiene_write "$project_root" observe-unknown "$worker_canonical" && _cb_invalidated=1
+        [ "$_cb_invalidated" = 1 ] || _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=observation-invalidation-unpersisted (journal unwritable) — prior evidence may be stale"
+    fi
     # §3.3: serialize publication against park/resolve/supersede/consume on the same
     # (slug,stage). Acquire before close-then-publish; release after the mv.
     _callback_prelock_barrier
@@ -2854,11 +3957,27 @@ EOF
     cb_msg_len=$(printf '%s' "$message" | wc -c | tr -d ' ')
     _emit_event CALLBACK "$slug" "stage=$stage worker=$worker_canonical status=$status message_len=$cb_msg_len callback_file=$cb_file"
 
-    # Read-only, family-aware per-task usage observation. Placed AFTER all
-    # critical callback work above (callback file, log-response, CALLBACK emit)
-    # and wrapped `|| true` so it can never delay or break the callback. NEVER
-    # issues /clear, /new, or /compact — see _observe_usage.
+    # Read-only, family-aware per-task usage observation. Under the worker lock (Step 5)
+    # when held: record KNOWN coverage only if the target worker's usage record canonical
+    # hash CHANGED and confidence is high; else unknown. A DONE/ERROR/BLOCKED callback also
+    # promotes an attempting delivery. Never issues /clear, /new, /compact.
+    local _uf="$project_root/$(_usage_file)"
+    local _h_before; _h_before="$(_usage_record_hash "$_uf" "$worker_canonical")"
     _observe_usage "$worker_canonical" "$slug" "$stage" "$worker_idx" "$project_root" || true
+    if [ "$_cb_worker_locked" = 1 ]; then
+        local _h_after; _h_after="$(_usage_record_hash "$_uf" "$worker_canonical")"
+        local _hr _conf; read -r _hr _conf < <(_usage_record_headroom "$_uf" "$worker_canonical")
+        local _cg; _cg="$(_hygiene_current_gen "$project_root" "$worker_canonical")"
+        if [ -n "$_h_after" ] && [ "$_h_after" != "$_h_before" ] && [ "${_conf:-none}" = high ]; then
+            _hygiene_write "$project_root" observe-known "$worker_canonical" \
+                "generation=${_cg:-0}" "callback_id=$cb_id" "pending_timestamp=$selected_pending_timestamp" \
+                "usage_record_hash=$_h_after" "headroom=${_hr:-}" "confidence=high" 2>/dev/null || true
+        else
+            _hygiene_write "$project_root" observe-unknown "$worker_canonical" "generation=${_cg:-0}" 2>/dev/null || true
+        fi
+        _hygiene_write "$project_root" promote "$worker_canonical" "pending_timestamp=$selected_pending_timestamp" 2>/dev/null || true
+        _worker_unlock "$worker_canonical"
+    fi
 
     _render_status_file
     echo "CALLBACK $status stage=$stage slug=$slug worker=$worker_canonical → $cb_file"
@@ -2948,6 +4067,58 @@ _resolve_callback_file() {   # <cb_dir> <slug> <stage> <session>
     if [ -n "$sess" ] && [ -f "$owned" ]; then printf '%s' "$owned"; return 0; fi
     if [ -f "$legacy" ]; then printf '%s' "$legacy"; return 0; fi
     return 1
+}
+
+# stale-alert-lifecycle D1: archive resolved operator asks on terminal stage close.
+# Mirrors `forge dispatch --answers` archival so an ask answered in-pane or via
+# supersede stops rendering as a false NEEDS-ASK (and stops `park` refusing on it via
+# _callback_ask_origin). Gate: refuse while ANY open pending for (slug, stage) remains
+# under any identity. Unparseable log => do not archive. Idempotent, NON-FATAL: never
+# changes the caller's exit code.
+_archive_resolved_asks() {   # <project_root> <slug> <stage>
+    local pr="$1" slug="$2" stage="$3"
+    [ -n "$pr" ] && [ -n "$slug" ] && [ -n "$stage" ] || return 0
+    FORGE_AR_ROOT="$pr" FORGE_AR_SLUG="$slug" FORGE_AR_STAGE="$stage" python3 - <<'PY' 2>/dev/null || true
+import os, glob, json, sys
+try:
+    import yaml
+except Exception:
+    yaml = None
+root=os.environ["FORGE_AR_ROOT"]; slug=os.environ["FORGE_AR_SLUG"]; stage=os.environ["FORGE_AR_STAGE"]
+logp=os.path.join(root, ".dev", "proposals", slug, "forge-log.yml")
+try:
+    with open(logp) as f:
+        raw=f.read()
+except OSError:
+    sys.exit(0)
+entries=None
+if yaml is not None:
+    try:
+        entries=(yaml.safe_load(raw) or {}).get("entries", []) or []
+    except Exception:
+        entries=None
+if entries is None:
+    sys.exit(0)   # unparseable => keep the ask hot (fail-safe)
+for e in entries:
+    if isinstance(e, dict) and e.get("stage")==stage and e.get("response") is None:
+        sys.exit(0)   # an open pending for this stage remains => gate holds
+adir=os.path.join(root, ".dev", "attention")
+arch=os.path.join(adir, "archive")
+for fp in glob.glob(os.path.join(adir, "ask-*.json")):
+    try:
+        r=json.load(open(fp))
+    except Exception:
+        continue
+    if (r.get("event")=="ask" and r.get("slug")==slug and r.get("stage")==stage
+            and r.get("mode")=="stage"):
+        try:
+            os.makedirs(arch, exist_ok=True)
+            os.replace(fp, os.path.join(arch, os.path.basename(fp)))
+            sys.stderr.write("forge-bridge: archived resolved ask %s (%s/%s)\n"
+                             % (os.path.basename(fp), slug, stage))
+        except OSError:
+            pass
+PY
 }
 
 # Legacy ask carve-out: a pre-origin BLOCKED callback is ask-origin iff its explicit
@@ -3095,8 +4266,11 @@ with open('$cb_file') as f:
 print(d.get('message', '') or '')
 " 2>/dev/null)
 
-    printf 'STATUS: %s\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nCALLBACK: %s\n' \
-        "$status" "$stage" "$slug" "$worker_canonical" "$message"
+    local _cbid _selpt
+    _cbid=$(grep '^callback_id:' "$cb_file" | awk '{print $2}')
+    _selpt=$(grep '^selected_pending_timestamp:' "$cb_file" | sed 's/^selected_pending_timestamp:[[:space:]]*//; s/^"//; s/"$//')
+    printf 'STATUS: %s\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nCALLBACK: %s\nCALLBACK_ID: %s\nPENDING_TIMESTAMP: %s\n' \
+        "$status" "$stage" "$slug" "$worker_canonical" "$message" "$_cbid" "$_selpt"
 
     if [ -n "$digest_template" ] && [ "$status" = "DONE" ]; then
         local digest_tmpl="$FORGE_DIGESTS_DIR/$digest_template.txt"
@@ -3365,7 +4539,402 @@ cmd_park_resolve() {   # <slug> <stage> <note>   (acquires the lifecycle lock)
     _lifecycle_unlock
     _emit_event PARK "$slug" "stage=$stage action=resolved note=$(_sanitize_event_value "$note")"
     _render_status_file
+    # After releasing the lifecycle lock, consult the stored clean verify decision. NEVER
+    # acquire worker locks or call finalize inline (H1). P0-1: the terminal-cleanup transition
+    # is written under the terminal mutex (acquired AFTER the lifecycle lock is released, so no
+    # ordering inversion), and residue is re-read under it so a concurrent finalize/verify cannot
+    # interleave. Return after the handoff line so the legacy line does not also print.
+    if [ "$(_hygiene_mode 2>/dev/null)" = enforce ]; then
+        if _terminal_lock; then
+            local _pst; _pst="$(_terminal_state "$project_root")"
+            local _pcu; _pcu="$(_completion_unresolved "$project_root")"
+            if [ "$_pst" = verified-incomplete ] && [ "$_pcu" = "parked=0 blocked=0" ]; then
+                if _hygiene_write "$project_root" terminal "" "state=terminal-cleanup"; then
+                    _terminal_unlock; echo "PARK_RESOLVED FINALIZE_READY slug=$slug stage=$stage"; return 0
+                fi
+                _terminal_unlock; echo "PARK_RESOLVED FINALIZE_DEFERRED slug=$slug stage=$stage (terminal-cleanup write failed; retry finalize)" >&2; return 0
+            elif [ "$_pst" = verified-incomplete ]; then
+                _terminal_unlock; echo "PARK_RESOLVED FINALIZE_DEFERRED slug=$slug stage=$stage $_pcu"; return 0
+            fi
+            _terminal_unlock
+        fi
+    fi
     echo "PARK RESOLVED slug=$slug stage=$stage"
+}
+
+cmd_verify_decision() {
+    require_identity "verify-decision" host-session || return 1
+    # P0-9: enforce-only terminal command. In observe it must NOT persist the new terminal
+    # vocabulary; an invalid mode is a hard error, never a silent observe fall-through.
+    _hygiene_enforcing || { echo "ERROR: verify-decision is an enforce-mode command (mode=$FORGE_WORKER_HYGIENE_MODE); in observe, verify/DONE closes via legacy completion." >&2; return 1; }
+    local slug="" callback_id="" pending_ts=""
+    while [ $# -gt 0 ]; do case "$1" in
+        --slug) slug="$2"; shift 2 ;;
+        --callback-id) callback_id="$2"; shift 2 ;;
+        --pending-timestamp) pending_ts="$2"; shift 2 ;;
+        *) shift ;;
+    esac; done
+    [ -n "$slug" ] && [ -n "$callback_id" ] && [ -n "$pending_ts" ] || {
+        echo "Usage: forge-bridge verify-decision --slug <s> --callback-id <id> --pending-timestamp <ts>" >&2; return 1; }
+    local pr; pr="$(_resolve_project_root "")"; [ -n "$pr" ] || { echo "ERROR: no project root" >&2; return 1; }
+    # P0-1/P0-4: terminal mutex + single cleanup path. Serializes against finalize/abandon/park.
+    trap _hygiene_release_all RETURN
+    _terminal_lock || { echo "REFUSED: verify-decision busy — another terminal operation is running." >&2; return 1; }
+    # P1-7: refuse if the slug has already reached a finished/abandoned terminal state (a
+    # verify-decision cannot re-decide a published or abandoned slug).
+    case "$(_terminal_state "$pr")" in
+        complete|complete-qualified|cleanup-abandoned)
+            echo "REFUSED: slug is already terminal ($(_terminal_state "$pr")) — verify-decision is not valid." >&2; return 1 ;;
+    esac
+    local report="$pr/.dev/qa/$slug/verification-report.yaml"
+    local cb_dir="$pr/.dev/forge-tmp/callbacks" plog="$pr/.dev/proposals/$slug/forge-log.yml"
+    local sel rc=0
+    sel="$(_callback_terminal_select "$cb_dir" "$slug" verify "$ID_target_session" "$ID_target_incarnation" DONE "$plog")" || rc=$?
+    [ "$rc" -eq 0 ] || { echo "REFUSED: no owned verify/DONE callback (rc=$rc)" >&2; return 1; }
+    local _cbf _st _cbid _selpt _cbs _cbi _org _hash
+    IFS='|' read -r _cbf _st _cbid _selpt _cbs _cbi _org _hash <<< "$sel"
+    [ "$_cbid" = "$callback_id" ] && [ "$_selpt" = "$pending_ts" ] || { echo "REFUSED: callback id / pending timestamp mismatch" >&2; return 1; }
+    # P1-7: the worker identity for the journal is the callback's `worker:` header, NOT the
+    # selection's status field (`_st` is DONE|ERROR|... — a schema bug in R2).
+    local _cbwk; _cbwk="$(grep '^worker:' "$_cbf" | awk '{print $2}')"
+    _lifecycle_lock "$slug" verify || return 1
+    # Deterministic selector → revalidation is an exact re-select + tuple compare.
+    [ "$(_callback_terminal_select "$cb_dir" "$slug" verify "$ID_target_session" "$ID_target_incarnation" DONE "$plog" 2>/dev/null)" = "$sel" ] || {
+        _lifecycle_unlock; echo "REFUSED: callback identity changed" >&2; return 1; }
+    [ -f "$report" ] || { _lifecycle_unlock; echo "REFUSED: verification-report.yaml missing" >&2; return 1; }
+    local _verdict _rhash
+    _verdict="$(python3 - "$report" <<'PY'
+import sys,yaml
+try: d=yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: print("MALFORMED"); sys.exit(0)
+v=str(d.get("verdict") or d.get("result") or "MALFORMED").upper()
+print(v if v in ("CLEAR","ISSUES_REMAIN") else "MALFORMED")
+PY
+)"
+    _rhash="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
+    case "$_verdict" in CLEAR) ;; *) _lifecycle_unlock; echo "REFUSED: verdict='$_verdict' (not CLEAR) — no cleanup." >&2; return 1 ;; esac
+    local _rhash2; _rhash2="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
+    [ "$_rhash" = "$_rhash2" ] || { _lifecycle_unlock; echo "REFUSED: report changed during decision" >&2; return 1; }
+    # P0-3/P1-7: the decision + terminal transition are HARD — a silent journal failure must
+    # not leave the caller believing the decision was recorded. Written under the verify
+    # lifecycle lock (serializes against callback publication / park-resolve on this stage).
+    _hygiene_write "$pr" terminal "" "slug=$slug verify_callback_id=$callback_id verify_pending_ts=$pending_ts report_sha256=$_rhash verdict=CLEAR worker=$_cbwk decided_at=$(timestamp)" \
+        || { _lifecycle_unlock; echo "ERROR: verify-decision: could not persist the CLEAR decision (journal write failed) — no transition." >&2; return 1; }
+    local _cu; _cu="$(_completion_unresolved "$pr")"
+    case "$_cu" in
+        "parked=0 blocked=0")
+            _hygiene_write "$pr" terminal "" "state=terminal-cleanup" \
+                || { _lifecycle_unlock; echo "ERROR: verify-decision: terminal-cleanup write failed — retry." >&2; return 1; }
+            _lifecycle_unlock
+            _emit_event STAGE "$slug" "result_stage=verify status=decided next=terminal-cleanup"
+            echo "FINALIZE_READY slug=$slug state=terminal-cleanup" ;;
+        *)
+            _hygiene_write "$pr" terminal "" "state=verified-incomplete" \
+                || { _lifecycle_unlock; echo "ERROR: verify-decision: verified-incomplete write failed — retry." >&2; return 1; }
+            _lifecycle_unlock
+            _emit_event COMPLETE "$slug" "last_stage=verify qualifier=incomplete $_cu"
+            echo "VERIFIED_INCOMPLETE slug=$slug $_cu" ;;
+    esac
+}
+
+# Deterministic completion ID: SHA-256 over UTF-8 canonical JSON, fixed key order, compact
+# separators. Single helper — no shell concatenation (M2).
+_completion_id() {   # <session> <incarnation> <slug> <verify_cb_id> <pending_ts> <report_sha256>
+    python3 - "$@" <<'PY'
+import sys,json,hashlib
+k=["session","incarnation","slug","verify_callback_id","pending_timestamp","report_sha256"]
+obj={k[i]:sys.argv[1+i] for i in range(6)}
+print(hashlib.sha256(json.dumps(obj,ensure_ascii=False,sort_keys=False,separators=(",",":")).encode()).hexdigest())
+PY
+}
+
+# P0-5: EXACT published-completion match — a `COMPLETE:` record whose pipeline == slug AND
+# whose completion_id == the stored id. NOT a bare substring grep (which an unrelated event or
+# a spoofed field could satisfy). rc0 = present. The completion_id encodes session+incarnation,
+# so a match implies matching identity.
+_event_has_completion() {   # <evlog> <slug> <completion_id>
+    [ -f "$1" ] || return 1
+    FORGE_EC_SLUG="$2" FORGE_EC_CID="$3" python3 - "$1" <<'PY'
+import os,sys,re
+slug=os.environ["FORGE_EC_SLUG"]; cid=os.environ["FORGE_EC_CID"]
+for ln in open(sys.argv[1]):
+    if not ln.startswith("COMPLETE:"): continue
+    if re.search(r'\bpipeline=%s(\s|$)'%re.escape(slug), ln) and re.search(r'\bcompletion_id=%s(\s|$)'%re.escape(cid), ln):
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# P0-5: durable, fsync'd, idempotent append of the bare COMPLETE record. Idempotent: no-op if
+# the exact record already exists. rc0 only when the record is durably present after the call.
+_append_complete_event() {   # <project_root> <slug> <completion_id> <extra_fields>
+    local pr="$1" slug="$2" cid="$3" extra="$4"
+    local log_dir="$pr/.dev/forge-tmp" log_file="$pr/.dev/forge-tmp/orchestrator-events.log"
+    mkdir -p "$log_dir" 2>/dev/null || return 1
+    _event_has_completion "$log_file" "$slug" "$cid" && return 0
+    FORGE_AE_FILE="$log_file" FORGE_AE_LINE="COMPLETE: pipeline=$slug completion_id=$cid$extra" python3 - <<'PY'
+import os,sys
+f=os.environ["FORGE_AE_FILE"]; line=os.environ["FORGE_AE_LINE"].rstrip("\n")+"\n"
+try:
+    fd=os.open(f, os.O_WRONLY|os.O_CREAT|os.O_APPEND, 0o644)
+    os.write(fd, line.encode()); os.fsync(fd); os.close(fd)
+    d=os.open(os.path.dirname(f) or ".", os.O_RDONLY)
+    try: os.fsync(d)
+    finally: os.close(d)
+except Exception: sys.exit(1)
+sys.exit(0)
+PY
+    local rc=$?
+    # Fire the watcher the same way _emit_event does (fail-open), so the board updates promptly.
+    if [ "$rc" = 0 ] && [ "${FORGE_WATCH_TRIGGER:-1}" = "1" ]; then
+        local _fw="${FORGE_WATCH_BIN:-$HOME/bin/forge-watch}"
+        [ -x "$_fw" ] && ( nohup "$_fw" check >/dev/null 2>&1 & ) 2>/dev/null || true
+    fi
+    return $rc
+}
+
+cmd_finalize() {
+    require_identity "finalize" host-pane || return 1
+    local slug="" dry=0
+    while [ $# -gt 0 ]; do case "$1" in --slug) slug="$2"; shift 2 ;; --dry-run) dry=1; shift ;; *) shift ;; esac; done
+    [ -n "$slug" ] || { echo "Usage: forge-bridge finalize --slug <s> [--dry-run]" >&2; return 1; }
+    _hygiene_enforcing || { echo "ERROR: finalize is an enforce-mode command (mode=$FORGE_WORKER_HYGIENE_MODE)" >&2; return 1; }
+    local pr; pr="$(_resolve_project_root "")"; [ -n "$pr" ] || { echo "ERROR: no project root" >&2; return 1; }
+    # P0-4: single cleanup path — every return below (including the crash seams) releases the
+    # terminal, worker, and lifecycle locks. P0-1: acquire the terminal mutex FIRST so no
+    # park/verify-decision/abandon can mutate residue or terminal state between our checks and
+    # publication.
+    trap _hygiene_release_all RETURN
+    _terminal_lock || { echo "FINALIZE_BUSY terminal-lock (another terminal operation is running)" >&2; return 1; }
+    # P0-3: side-effect-free journal identity+schema preflight BEFORE acquiring worker locks and
+    # BEFORE any /clear. A foreign/partial-identity or malformed non-empty journal refuses here,
+    # so no pane is ever physically cleared against unproven identity.
+    _hygiene_journal_preflight "$pr" || { echo "REFUSED: journal identity/schema preflight failed — no worker cleared." >&2; return 1; }
+    local order="claude-opus codex-a codex-b claude-sonnet" w
+    for w in $order; do
+        _worker_lock "$w" || { echo "FINALIZE_BUSY worker-lock $w" >&2; return 1; }
+    done
+    # Idempotent no-op if already published (concurrency mutex M1 + the terminal mutex: a second
+    # finalizer waits on the terminal lock; after the first publishes, it observes complete).
+    local _st; _st="$(_terminal_state "$pr")"
+    if [ "$_st" = complete ] || [ "$_st" = complete-qualified ]; then
+        local _cid; _cid="$(_hygiene_finalization_field "$pr" id)"
+        for w in $order; do _worker_unlock "$w"; done
+        echo "FINALIZE_NOOP already-published completion_id=$_cid"; return 0
+    fi
+    # Revalidate terminal-cleanup ownership + report hash + zero unresolved.
+    local _tj; _tj="$(python3 - "$pr/$(_hygiene_file)" <<'PY'
+import sys,yaml
+d=yaml.safe_load(open(sys.argv[1])) or {}; t=(d.get("terminal") or {})
+print("%s|%s|%s|%s|%s" % (t.get("state") or "", t.get("slug") or "", t.get("verify_callback_id") or "",
+                          t.get("verify_pending_ts") or "", t.get("report_sha256") or ""))
+PY
+)"
+    local _tstate _tslug _tcb _tpt _trh; IFS='|' read -r _tstate _tslug _tcb _tpt _trh <<< "$_tj"
+    if [ "$_tstate" != terminal-cleanup ] || [ "$_tslug" != "$slug" ]; then
+        for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: not terminal-cleanup for $slug (state=$_tstate)" >&2; return 1; fi
+    # P1-7: a malformed/non-mapping journal is a HARD refusal in finalize (not treated as a
+    # missing/reset-needed journal). Side-effect-free read check; unreadable => never clear.
+    if ! python3 - "$pr/$(_hygiene_file)" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+if not os.path.exists(jf): sys.exit(0)
+try: d=yaml.safe_load(open(jf))
+except Exception: sys.exit(5)
+sys.exit(0 if (d is None or isinstance(d,dict)) else 5)
+PY
+    then for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: hygiene journal malformed — finalize will not clear on unreadable evidence." >&2; return 1; fi
+    local report="$pr/.dev/qa/$slug/verification-report.yaml" _rh2
+    _rh2="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
+    [ "$_rh2" = "$_trh" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: report hash changed since decision" >&2; return 1; }
+    local _cu; _cu="$(_completion_unresolved "$pr")"
+    [ "$_cu" = "parked=0 blocked=0" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: unresolved residue $_cu" >&2; return 1; }
+    local _cid; _cid="$(_completion_id "${ID_target_session}" "${ID_target_incarnation}" "$slug" "$_tcb" "$_tpt" "$_trh")"
+    echo "FINALIZE proof-bound ~$(( $(_reset_proof_timeout) * 4 ))s + 4 commit waits; slug=$slug id=$_cid"
+    # ---- Pass 1: preflight ALL four before the first clear (plan Step 9). ----
+    local dirty="" qualified=0 to_clear="" any_bad=0
+    for w in $order; do
+        local idx fam; idx="$(pane_index "$w")"; fam="$(_worker_family "$w")"
+        local _deg=0; case "$fam" in claude) [ "$FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE" = 1 ] && _deg=1 ;; codex) [ "$FORGE_WORKER_HYGIENE_DEGRADED_CODEX" = 1 ] && _deg=1 ;; esac
+        if [ "$_deg" = 1 ] && ! _reset_automation_enabled "$fam" >/dev/null; then
+            dirty="$dirty$w,"; qualified=1
+            echo "  $w: hygiene-disabled (degraded) — excluded from four-reset gate"; continue
+        fi
+        local _health; _health="$(_worker_health "$SESSION" "$idx" "$w")"
+        if [ "$_health" != idle ]; then echo "  $w: NOT idle (state=$_health) — cannot finalize" >&2; any_bad=1; continue; fi
+        # P1-7: a config error (rc1) from the decision helper is a HARD refusal, not reset-needed.
+        local _dec; _dec="$(_hygiene_decide "$pr" "$w" "" "")"; local _drc=$?
+        if [ "$_drc" = 1 ]; then any_bad=1; echo "  $w: config error ($_dec) — cannot finalize" >&2; continue; fi
+        _dec="$(printf '%s' "$_dec" | awk '{print $1}')"
+        if [ "$_dec" = KEEP_RESET_PROVEN ]; then
+            echo "  $w: reset-proven, revalidated — no redundant /clear"
+        else
+            to_clear="$to_clear $w"; echo "  $w: needs reset (decision=$_dec)"
+        fi
+    done
+    if [ "$any_bad" = 1 ]; then
+        for w in $order; do _worker_unlock "$w"; done
+        echo "FINALIZE_UNCONFIRMED — a pane is not idle / config error; left terminal-cleanup, no COMPLETE." >&2; return 1; fi
+    if [ "$dry" = 1 ]; then for w in $order; do _worker_unlock "$w"; done; echo "FINALIZE_DRYRUN complete_would_id=$_cid to_clear=${to_clear# }"; return 0; fi
+    # ---- Pass 2: clear only the panes lacking valid coverage. ----
+    for w in $to_clear; do
+        local idx; idx="$(pane_index "$w")"
+        _reset_worker_locked "$SESSION" "$idx" "$w" terminal "$slug" || { for w in $order; do _worker_unlock "$w"; done; echo "FINALIZE_UNCONFIRMED worker=$w — leaving terminal-cleanup, no COMPLETE." >&2; return 1; }
+        echo "  $w: reset confirmed"
+        _hygiene_crash_at fin-pane
+    done
+    _hygiene_crash_at fin-resets
+    # ---- P0-3: REVALIDATE terminal state + report hash + residue IMMEDIATELY before the
+    # irreversible publication (defense-in-depth against a concurrent park/verify mutation;
+    # terminal-cleanup already blocks new worker work, so residue is monotonically
+    # non-increasing, but we re-check under the held worker locks anyway). ----
+    local _rev; _rev="$(_terminal_state "$pr")"
+    # outbox-pending is OUR OWN resumed progress (phase resets-confirmed/event-pending under a
+    # raw terminal-cleanup) — a crash retry must converge through here, not refuse itself.
+    case "$_rev" in terminal-cleanup|outbox-pending) ;;
+        *) for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: terminal state changed to '$_rev' during finalize — no COMPLETE." >&2; return 1 ;; esac
+    _rh2="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
+    [ "$_rh2" = "$_trh" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: report hash changed during finalize — no COMPLETE." >&2; return 1; }
+    _cu="$(_completion_unresolved "$pr")"
+    [ "$_cu" = "parked=0 blocked=0" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: residue appeared during finalize ($_cu) — no COMPLETE." >&2; return 1; }
+    # ---- Durable outbox publication (plan Step 9). Pre-COMPLETE writes are HARD. P0-8:
+    # snapshot per-worker reset ids/generations + qualification/dirty into the outbox. ----
+    _hygiene_write "$pr" finalize-snapshot "" "id=$_cid" "phase=resets-confirmed" "qualified=$qualified" "dirty=${dirty%,}" "context_written=false" "event_written=false" \
+        || { for w in $order; do _worker_unlock "$w"; done; echo "FINALIZE_OUTBOX_WRITE_FAILED phase=resets-confirmed — no COMPLETE emitted." >&2; return 1; }
+    _hygiene_crash_at fin-resets-confirmed
+    # P0-7/P1-1: HARD, semantic, read-back-verified, atomic context write. Sets next_stage to the
+    # EXACT final state (complete-qualified stays qualified — never bare complete), rejects a
+    # conflicting pre-existing completion_id, and fsyncs a temp-rename.
+    local _final_state; _final_state=$([ "$qualified" = 1 ] && echo complete-qualified || echo complete)
+    local ctx; ctx="$pr/$(_context_file)"
+    if ! FORGE_FC_NEXT="$_final_state" FORGE_FC_CID="$_cid" python3 - "$ctx" <<'PY'
+import os,sys,re
+ctx=sys.argv[1]; nxt=os.environ["FORGE_FC_NEXT"]; cid=os.environ["FORGE_FC_CID"]
+try: txt=open(ctx).read()
+except Exception: sys.exit(1)
+m=re.search(r'(?m)^completion_id:\s*(\S+)\s*$', txt)
+if m and m.group(1)!=cid: sys.stderr.write("CONTEXT_CID_CONFLICT\n"); sys.exit(2)
+if re.search(r'(?m)^next_stage:', txt): txt=re.sub(r'(?m)^next_stage:.*$','next_stage: '+nxt,txt)
+else: txt=txt.rstrip('\n')+'\nnext_stage: '+nxt+'\n'
+if not m: txt=txt.rstrip('\n')+'\ncompletion_id: '+cid+'\n'
+tmp=ctx+'.tmp.%d'%os.getpid()
+try:
+    with open(tmp,'w') as f: f.write(txt); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,ctx)
+except Exception: sys.exit(1)
+v=open(ctx).read()
+sys.exit(0 if (('next_stage: '+nxt) in v and ('completion_id: '+cid) in v) else 3)
+PY
+    then echo "FINALIZE_CONTEXT_WRITE_FAILED — outbox stays resets-confirmed, no COMPLETE." >&2; return 1; fi
+    _hygiene_crash_at fin-context
+    _hygiene_write "$pr" finalize "" "phase=event-pending" "context_written=true" \
+        || { for w in $order; do _worker_unlock "$w"; done; echo "FINALIZE_OUTBOX_WRITE_FAILED phase=event-pending — no COMPLETE emitted." >&2; return 1; }
+    _hygiene_crash_at fin-event-pending
+    # P0-5/P0-7: durable, fsync'd, idempotent, EXACT event publication. `_append_complete_event`
+    # no-ops if the exact record already exists and returns nonzero unless the record is durably
+    # present after the call. A failure keeps the outbox at event-pending; a retry re-appends
+    # (idempotent by exact match), so it publishes exactly once and is never spoofable by an
+    # unrelated event carrying the id.
+    local evlog="$pr/.dev/forge-tmp/orchestrator-events.log"
+    local _extra=""; [ "$qualified" = 1 ] && _extra=" qualifier=hygiene-disabled workers_dirty=${dirty%,}"
+    _append_complete_event "$pr" "$slug" "$_cid" "$_extra" || {
+        echo "FINALIZE_EVENT_UNCONFIRMED — COMPLETE not durably appended; outbox stays event-pending, retry finalize." >&2; return 1; }
+    _hygiene_crash_at fin-event
+    _event_has_completion "$evlog" "$slug" "$_cid" || {
+        echo "FINALIZE_EVENT_UNCONFIRMED — exact COMPLETE record absent after append; outbox stays event-pending, retry finalize." >&2; return 1; }
+    # Event is demonstrably present -> now (and only now) advance to published + terminal
+    # (_final_state was computed for the context write above).
+    _hygiene_write "$pr" finalize "" "phase=published" "event_written=true" \
+        || echo "WARN: finalize published-flag write failed; the COMPLETE is durable, a resume is an idempotent no-op." >&2
+    _hygiene_write "$pr" terminal "" "state=$_final_state" \
+        || echo "WARN: finalize terminal-state write failed; the COMPLETE is durable, a resume is an idempotent no-op." >&2
+    _hygiene_crash_at fin-published
+    _render_status_file
+    echo "FINALIZE_PUBLISHED state=$_final_state completion_id=$_cid workers_dirty=${dirty%,}"
+}
+
+cmd_hygiene_abandon() {
+    require_identity "hygiene-abandon" host-session || return 1
+    # P0-9: enforce-only (persists cleanup-abandoned vocabulary + emits a terminal event).
+    _hygiene_enforcing || { echo "ERROR: hygiene-abandon is an enforce-mode command (mode=$FORGE_WORKER_HYGIENE_MODE)" >&2; return 1; }
+    local slug="" reason=""
+    while [ $# -gt 0 ]; do case "$1" in --slug) slug="$2"; shift 2 ;; --reason) reason="$2"; shift 2 ;; *) shift ;; esac; done
+    [ -n "$slug" ] && [ -n "$reason" ] || { echo "Usage: forge-bridge hygiene-abandon --slug <s> --reason <non-empty-text>" >&2; return 1; }
+    local pr; pr="$(_resolve_project_root "")"; [ -n "$pr" ] || { echo "ERROR: no project root" >&2; return 1; }
+    local _st; _st="$(_terminal_state "$pr")"
+    case "$_st" in
+        verified-incomplete|terminal-cleanup|outbox-pending) ;;
+        *) echo "REFUSED: hygiene-abandon only from verified-incomplete/terminal-cleanup/outbox-pending; state=$_st" >&2; return 1 ;;
+    esac
+    # P1-2: bind terminal ownership — the journal's stored terminal.slug/session/incarnation
+    # must equal this actor and --slug, so a stale/mistyped slug cannot mutate the wrong
+    # pipeline's terminal context or emit an event for it.
+    local _tslug; _tslug="$(python3 - "$pr/$(_hygiene_file)" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+print(str((d.get("terminal") or {}).get("slug") or ""))
+PY
+)"
+    [ "$_tslug" = "$slug" ] || { echo "REFUSED: --slug '$slug' does not own the current terminal state (terminal.slug='$_tslug')." >&2; return 1; }
+    # P0-1/P0-4: acquire the terminal mutex FIRST, then all worker locks, under a single RETURN
+    # cleanup, so abandon serializes against a concurrent finalizer and every exit releases fds.
+    trap _hygiene_release_all RETURN
+    _terminal_lock || { echo "HYGIENE_ABANDON_BUSY terminal-lock (another terminal operation is running)." >&2; return 1; }
+    local order="claude-opus codex-a codex-b claude-sonnet" w
+    for w in $order; do _worker_lock "$w" || { echo "HYGIENE_ABANDON_BUSY $w — stop retrying finalize first." >&2; return 1; }; done
+    # P0-1: RE-CHECK preconditions AFTER acquiring the mutex + all locks — a concurrent finalizer
+    # could have published `complete`, or the state could have moved, between the pre-lock read
+    # and now. Re-read terminal state, ownership, and the exact published completion event.
+    local _st2; _st2="$(_terminal_state "$pr")"
+    case "$_st2" in verified-incomplete|terminal-cleanup|outbox-pending) ;;
+        *) echo "REFUSED: terminal state changed to '$_st2' before the mutex was held — nothing abandoned." >&2; return 1 ;; esac
+    local _tslug2; _tslug2="$(python3 - "$pr/$(_hygiene_file)" <<'PY'
+import sys,yaml,os
+try: d=(yaml.safe_load(open(sys.argv[1])) or {}) if os.path.exists(sys.argv[1]) else {}
+except Exception: d={}
+print(str((d.get("terminal") or {}).get("slug") or ""))
+PY
+)"
+    [ "$_tslug2" = "$slug" ] || { echo "REFUSED: terminal ownership changed (terminal.slug='$_tslug2') — nothing abandoned." >&2; return 1; }
+    local _cid; _cid="$(_hygiene_finalization_field "$pr" id)"
+    if [ -n "$_cid" ] && _event_has_completion "$pr/.dev/forge-tmp/orchestrator-events.log" "$slug" "$_cid"; then
+        echo "REFUSED: an exact completion event already exists — cannot abandon a published slug." >&2; return 1; fi
+    local _cu; _cu="$(_completion_unresolved "$pr")"
+    # P1-2: invalidate every worker's proof (advance its generation) so no pane is reusable as
+    # proven-clean after "workers left unproven". HARD: a write failure aborts before the
+    # terminal transition so state stays recoverable.
+    local _wsummary=""
+    for w in $order; do
+        local _pdec; _pdec="$(_hygiene_decide "$pr" "$w" "" "" | awk '{print $1}')"
+        _hygiene_write "$pr" invalidate-worker "$w" "id=abandon-$(date -u +%Y%m%dT%H%M%SZ)-$$" "kind=hygiene-abandon" >/dev/null \
+            || { echo "ERROR: hygiene-abandon: could not invalidate $w evidence (journal write failed); no terminal transition performed." >&2; return 1; }
+        _wsummary="${_wsummary}${w}=${_pdec} "
+    done
+    # HARD terminal + context transition (P1-1/P1-2: fail if durable state cannot be written; the
+    # event is emitted ONLY after the context write succeeds).
+    _hygiene_write "$pr" terminal "" "state=cleanup-abandoned" \
+        || { echo "ERROR: hygiene-abandon: terminal write failed; workers invalidated, state NOT transitioned — retry." >&2; return 1; }
+    local ctx; ctx="$pr/$(_context_file)"
+    if ! FORGE_AC_NEXT=cleanup-abandoned python3 - "$ctx" <<'PY'
+import os,sys,re
+ctx=sys.argv[1]; nxt=os.environ["FORGE_AC_NEXT"]
+try: txt=open(ctx).read()
+except Exception: sys.exit(1)
+if re.search(r'(?m)^next_stage:', txt): txt=re.sub(r'(?m)^next_stage:.*$','next_stage: '+nxt,txt)
+else: txt=txt.rstrip('\n')+'\nnext_stage: '+nxt+'\n'
+tmp=ctx+'.tmp.%d'%os.getpid()
+try:
+    with open(tmp,'w') as f: f.write(txt); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,ctx)
+except Exception: sys.exit(1)
+sys.exit(0 if ('next_stage: '+nxt) in open(ctx).read() else 1)
+PY
+    then echo "ERROR: hygiene-abandon: context write failed; terminal journal is cleanup-abandoned, retry to reconcile context." >&2; return 1; fi
+    _emit_event HYGIENE_ABANDON "$slug" "reason=$(_sanitize_event_value "$reason") $_cu state_was=$_st2 workers=$(_sanitize_event_value "$_wsummary")"
+    _render_status_file
+    echo "HYGIENE_ABANDONED slug=$slug $_cu — workers left unproven ($_wsummary); unrelated work may resume."
 }
 
 cmd_blocked_audit() {
@@ -3971,8 +5540,9 @@ cmd_emit() {
     local type="$1"; shift
     case "$type" in
         DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE) ;;
+        RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY) ;;
         *)
-            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE; got '$type'" >&2
+            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY; got '$type'" >&2
             return 1
             ;;
     esac
@@ -4006,6 +5576,36 @@ cmd_emit() {
             fields="$fields ${passthrough[*]}"
         else
             fields="${passthrough[*]}"
+        fi
+    fi
+    # Worker-context-hygiene (Step 9): in ENFORCE, public `emit COMPLETE` never emits a
+    # bare completion directly — it delegates to the stored terminal transition/finalizer.
+    # A verified-incomplete slug may reproduce the idempotent qualified-incomplete signal;
+    # without an exact verify decision it refuses. Observe: legacy. An invalid mode is a
+    # hard error (P2-2). P1-3: once already published, a bare COMPLETE is a NO-OP that
+    # re-echoes the stored completion id — it never appends a second, id-less COMPLETE.
+    if [ "$type" = COMPLETE ] && [[ "$fields" != *completion_id=* ]]; then
+        local _m; _m="$(_hygiene_mode)" || { echo "ERROR: emit COMPLETE refused — $(_hygiene_mode 2>&1 >/dev/null)" >&2; return 1; }
+        if [ "$_m" = enforce ]; then
+            # emit is otherwise ungated; the delegation decision needs the session-scoped
+            # journal, so resolve identity best-effort here (headless emit stays fail-closed:
+            # an unresolvable session reads state=running and refuses the bare COMPLETE).
+            [ -n "${ID_target_session:-}" ] || require_identity "emit" host-degrade >/dev/null 2>&1 || true
+            local _dpr; _dpr=$(_resolve_project_root "" 2>/dev/null)
+            local _dst; _dst="$(_terminal_state "${_dpr:-.}" 2>/dev/null)"
+            case "$_dst" in
+                terminal-cleanup|outbox-pending)
+                    echo "ERROR: emit COMPLETE is delegated in enforce mode — run 'forge-bridge finalize --slug $slug'." >&2; return 1 ;;
+                verified-incomplete)
+                    local _du; _du="$(_completion_unresolved "$_dpr")"
+                    _emit_event COMPLETE "$slug" "qualifier=incomplete $_du"; return 0 ;;
+                complete|complete-qualified)
+                    # Already published — idempotent no-op; do NOT append a bare/id-less COMPLETE.
+                    local _pid; _pid="$(_hygiene_finalization_field "$_dpr" id)"
+                    echo "COMPLETE already published (state=$_dst completion_id=$_pid) — no-op."; return 0 ;;
+                *)
+                    echo "ERROR: emit COMPLETE refused — no exact verify decision for '$slug' (state=${_dst:-running})." >&2; return 1 ;;
+            esac
         fi
     fi
     # Completion gating (§3.4): auto-qualify a manual COMPLETE when the caller did not
@@ -5121,6 +6721,11 @@ case "${1:-help}" in
     alias-self-test)     shift; cmd_alias_self_test "$@" ;;
     identity)            cmd_identity ;;
     health)              cmd_health ;;
+    verify-decision)     shift; cmd_verify_decision "$@" ;;
+    finalize)            shift; cmd_finalize "$@" ;;
+    hygiene-status)      shift; cmd_hygiene_status "$@" ;;
+    hygiene-gc)          shift; cmd_hygiene_gc "$@" ;;
+    hygiene-abandon)     shift; cmd_hygiene_abandon "$@" ;;
     help|*)
         echo "forge-bridge — cross-pane messaging with hooks and audit log"
         echo ""
@@ -5173,7 +6778,13 @@ case "${1:-help}" in
         echo "  digest --slug <s> --stage <s> --template <name> [--worker <w>]"
         echo "                                Render digest prompt to .dev/forge-tmp/ for ad-hoc Agent dispatch"
         echo "  emit <TYPE> --slug <s> [--stage <s>] [key=value …]"
-        echo "                                Orchestrator-driven heartbeat emit (TYPE: DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE)"
+        echo "                                Orchestrator-driven heartbeat emit (TYPE: DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY)"
+        echo "  verify-decision --slug <s> --callback-id <id> --pending-timestamp <ts>"
+        echo "                                Bind verify/DONE to .dev/qa/<slug>/verification-report.yaml, hash it, transition terminal state; prints FINALIZE_READY"
+        echo "  finalize --slug <s> [--dry-run]  Clear all four workers (proven) + publish the single bare COMPLETE via a durable outbox"
+        echo "  hygiene-status                Print mode, per-family reset capability, thresholds, residue, terminal state, activation preflight, journal"
+        echo "  hygiene-gc [--days N] [--dry-run]  Reap dead-incarnation terminal journals + locks (conservative)"
+        echo "  hygiene-abandon --slug <s> --reason <text>  Audited cleanup non-completion escape from a stuck terminal state"
         echo ""
         echo "Panes: claude-opus/opus/inline/general (0), claude/orchestrator/claude-orchestrator (1), codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)"
         echo ""

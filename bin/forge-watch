@@ -432,16 +432,20 @@ def load_context(root, path):
         return None
     return data
 
-def pending_entries(root, path):
-    """Open (response: null) entries in a forge-log.yml.
-    Returns list of dicts {stage,to,timestamp}. Uses the bridge's regex
-    fallback when yaml.safe_load chokes on legacy malformed entries."""
+def _read_log_entries(root, path):
+    """(entries, parse_clean). ALL normalized entries (open+closed) in a
+    forge-log.yml; parse_clean is False when a legacy regex-fallback block could
+    not be classified (no response line). A caller building a 'stage fully
+    resolved' predicate MUST treat parse_clean=False as non-authoritative (keep
+    alerting). Uses the bridge's regex fallback when yaml.safe_load chokes on
+    legacy malformed entries."""
     try:
         with open(path) as f:
             raw = f.read()
     except OSError:
-        return []
+        return [], False
     entries = None
+    parse_clean = True
     if HAVE_YAML:
         try:
             data = yaml.safe_load(raw) or {}
@@ -455,7 +459,7 @@ def pending_entries(root, path):
         starts = [(m.start(), m.group(1)) for m in block_re.finditer(raw)]
         if not starts and raw.strip():
             note_unparseable(root, path)
-            return []
+            return [], False
         for i, (off, ts) in enumerate(starts):
             end = starts[i + 1][0] if i + 1 < len(starts) else len(raw)
             blk = raw[off:end]
@@ -464,6 +468,9 @@ def pending_entries(root, path):
                 return mm.group(1).strip() if mm else None
             rmatch = re.search(r'^\s+response:\s*(null|"(?:[^"\\]|\\.)*")', blk, re.MULTILINE)
             if not rmatch:
+                # A block we cannot classify open-vs-closed makes the whole log
+                # non-authoritative for resolved-stage reconciliation (fail-safe).
+                parse_clean = False
                 continue
             resp = None if rmatch.group(1) == 'null' else rmatch.group(1)
             # Blocked-item lifecycle: the regex fallback (legacy malformed logs) must
@@ -481,18 +488,26 @@ def pending_entries(root, path):
     for e in entries:
         # A hand-edited/legacy log can yield non-dict list items; skip them
         # rather than letting e.get() abort the whole root's scan.
-        if isinstance(e, dict) and e.get('response') is None:
+        if isinstance(e, dict):
             pr = e.get('parked_reason')
             if isinstance(pr, str):
                 pr = pr.strip().strip('"')
             out.append({'stage': e.get('stage'), 'to': e.get('to'),
                         'timestamp': e.get('timestamp'),
+                        'response': e.get('response'),
                         'session': e.get('session'),
                         'incarnation': e.get('incarnation'),
                         'parked_at': e.get('parked_at'),
                         'parked_reason': pr,
                         'uncommitted': bool(e.get('uncommitted'))})
-    return out
+    return out, parse_clean
+
+def pending_entries(root, path):
+    """Open (response: null) entries in a forge-log.yml. Thin filter over
+    _read_log_entries so the open-set and the all-set share one parser.
+    Returns list of dicts {stage,to,timestamp,...}."""
+    entries, _ = _read_log_entries(root, path)
+    return [e for e in entries if e.get('response') is None]
 
 def parse_callback(path):
     """Parse a .callback file. Returns dict or None.
@@ -577,6 +592,9 @@ def parse_callback(path):
 # ── findings ─────────────────────────────────────────────────────────────
 # policy: 'standard' (backoff), 'daily' (>=24h), 'never' (status-only)
 findings = []  # dict: condition, root, key, policy, session, slug, stage, msg
+RESOLVED_STAGES_BY_ROOT = {}  # root -> set of (slug, stage) fully resolved in forge-log
+                              # (>=1 entry, all closed, cleanly parsed). Published by
+                              # scan_root; read by scan_attention (C4 NEEDS-ASK suppress).
 TASKS = []     # cc-board/1 tasks[] projection (Step 3): read-time fold, no ledger
 EPISODES = []  # episode records, ALL roots (R3a) — board assembles/sorts/caps once at render
 task_stuck_ids = set()  # (root, session, dispatch_id) collected at the TASK-STUCK emission
@@ -604,21 +622,65 @@ def scan_root(root):
     # --- pipeline logs: open + stale pendings, indexed by slug ---
     open_by_slug = {}     # slug -> [pending,...]
     stale_pendings = []   # (slug, pending)
+    resolved_stages = set()   # (slug, stage): >=1 entry, all closed, clean parse
+    closed_max_ts = {}        # (slug, stage) -> newest CLOSED dispatch ts (str)
     for logp in glob.glob(os.path.join(dev, 'proposals', '*', 'forge-log.yml')):
         slug = os.path.basename(os.path.dirname(logp))
-        pend = pending_entries(root, logp)
+        all_entries, parse_clean = _read_log_entries(root, logp)
+        pend = [e for e in all_entries if e.get('response') is None]
         if pend:
             open_by_slug[slug] = pend
         for p in pend:
             a = age_s(p.get('timestamp'))
             if a is not None and a > STALE_AGE:
                 stale_pendings.append((slug, p))
+        # Reconciliation: only an authoritative (cleanly-parsed) log with >=1 entry
+        # can mark a stage resolved. Absence/corruption => keep alerting (fail-safe).
+        if parse_clean and all_entries:
+            by_stage = {}
+            for e in all_entries:
+                if not isinstance(e, dict):
+                    continue
+                st = e.get('stage')
+                d = by_stage.setdefault(st, {'n': 0, 'open': 0, 'cmax': ''})
+                d['n'] += 1
+                if e.get('response') is None:
+                    d['open'] += 1
+                else:
+                    ets = str(e.get('timestamp') or '')
+                    if ets > d['cmax']:
+                        d['cmax'] = ets
+            for st, d in by_stage.items():
+                if d['n'] >= 1 and d['open'] == 0:
+                    resolved_stages.add((slug, st))
+                if d['cmax']:
+                    closed_max_ts[(slug, st)] = d['cmax']
+    # Published AFTER the loop so a mid-loop throw leaves the key absent -> no
+    # suppression (fail-safe: keep alerting).
+    RESOLVED_STAGES_BY_ROOT[root] = resolved_stages
 
     def has_open_pending(slug, stage=None):
         pend = open_by_slug.get(slug, [])
         if stage is None:
             return bool(pend)
         return any(p.get('stage') == stage for p in pend)
+
+    def has_live_pending(slug, stage=None):
+        # Like has_open_pending, but excludes a superseded orphan (an open pending
+        # with a strictly-newer CLOSED dispatch ts for its stage). Anti-suppression:
+        # used ONLY at the NEEDS-DECISION gate so an orphan cannot hide a live decision.
+        pend = open_by_slug.get(slug, [])
+        live = []
+        for p in pend:
+            pst = p.get('stage')
+            cmax = closed_max_ts.get((slug, pst))
+            pts = str(p.get('timestamp') or '')
+            if cmax and pts and cmax > pts:
+                continue  # superseded orphan — not a live pending
+            live.append(p)
+        if stage is None:
+            return bool(live)
+        return any(p.get('stage') == stage for p in live)
 
     # --- callback files: header-validated, per-owner BLOCKED correlation ---
     callback_groups = {}
@@ -841,9 +903,16 @@ def scan_root(root):
             pass
         if fresh:
             continue
+        # A pending with a strictly-newer CLOSED dispatch for the same (slug, stage)
+        # is a superseded orphan (e.g. a mis-dispatched twin), not a live stall —
+        # demote it to the status-only STALE-PENDING residue branch. Dispatch-ts vs
+        # dispatch-ts (like-kind) dodges the ask-emit-vs-dispatch timestamp trap.
+        p_ts = str(p.get('timestamp') or '')
+        superseded = bool(closed_max_ts.get((slug, stage)) and p_ts
+                          and closed_max_ts[(slug, stage)] > p_ts)
         sec = age_s(p.get('timestamp'))
         a = human_age(sec)
-        if sec is not None and sec <= ZOMBIE_AGE_S:
+        if sec is not None and sec <= ZOMBIE_AGE_S and not superseded:
             msg = (f"{label} · {slug} — worker stalled at {stage} "
                    f"(pending {a}, to {p.get('to')})")
             add_finding('WORKER-STALLED', root, f"{slug}\t{stage}", msg,
@@ -897,7 +966,7 @@ def scan_root(root):
         if is_live:
             live_seen = True
         _eval_context(root, label, cp, embedded, is_live,
-                      has_open_pending, open_by_slug, live_blocked)
+                      has_open_pending, open_by_slug, live_blocked, has_live_pending)
 
     # --- LEGACY bare context (status-only, only if no live suffixed ctx) ---
     legacy = os.path.join(dev, 'forge-context.yml')
@@ -952,15 +1021,47 @@ def _handle_event_line(root, label, line):
         add_finding('WORKER-STALL-EVENT', root, f"{slug}\t{stage}\t{st}", msg,
                     slug=slug, stage=stage)
     elif typ == 'COMPLETE' and NOTIFY_COMPLETE:
-        if fields.get('qualifier') == 'incomplete':
+        q = fields.get('qualifier')
+        if q == 'incomplete':
             pk = fields.get('parked', '0'); bl = fields.get('blocked', '0')
             msg = f"{label} · {slug} — complete — {pk} parked, {bl} blocked (incomplete)"
+        elif q == 'hygiene-disabled':
+            wd = fields.get('workers_dirty', '?')
+            add_finding('PIPELINE-COMPLETE-QUALIFIED', root, slug,
+                        f"{label} · {slug} — shipped, workers left dirty ({wd}) — hygiene-disabled",
+                        policy='once', slug=slug)
+            return
         else:
             msg = f"{label} · {slug} — pipeline COMPLETE"
         add_finding('PIPELINE-COMPLETE', root, slug, msg, policy='once', slug=slug)
+    elif typ == 'RESET_UNAVAILABLE':
+        add_finding('RESET-UNAVAILABLE', root, slug,
+                    f"{label} · {slug} — reset unavailable ({fields.get('family', '?')}) — actionable",
+                    policy='standard', slug=slug)
+    elif typ == 'HYGIENE_ABANDON':
+        add_finding('CLEANUP-ABANDONED', root, slug,
+                    f"{label} · {slug} — cleanup abandoned ({fields.get('reason', '?')}) — workers unproven, NOT complete",
+                    policy='once', slug=slug)
+
+def _has_hygiene_terminal_vocab(root, slug):
+    """Worker-context-hygiene: has this slug ever produced enforce-mode hygiene
+    evidence at this root? Minimal wiring per plan Step 11: any HYGIENE_DECISION
+    or RESET event for the slug in the orchestrator events log. A pure legacy /
+    observe pipeline has neither and stays on the back-compat green path."""
+    ev = os.path.join(root, '.dev', 'forge-tmp', 'orchestrator-events.log')
+    try:
+        with open(ev) as f:
+            for ln in f:
+                if ln.startswith(('HYGIENE_DECISION:', 'RESET:')) and \
+                        (f'pipeline={slug} ' in ln or ln.rstrip().endswith(f'pipeline={slug}')):
+                    return True
+    except Exception:
+        return False
+    return False
+
 
 def _eval_context(root, label, cp, embedded, is_live,
-                  has_open_pending, open_by_slug, live_blocked):
+                  has_open_pending, open_by_slug, live_blocked, has_live_pending):
     ctx = load_context(root, cp)
     if ctx is None:
         return  # unparseable already recorded
@@ -977,6 +1078,30 @@ def _eval_context(root, label, cp, embedded, is_live,
         # no COMPLETE event seen. Same slug key as the event source, so the two
         # dedup; the context source persists the condition so the event-consumed
         # finding does not re-fire on the next scan.
+        # Worker-context-hygiene: these are NOT completion and NOT zombies.
+        if nxt in ('awaiting-verify-decision', 'verified-incomplete', 'terminal-cleanup'):
+            add_finding('HYGIENE-CLEANUP', root, slug,
+                        f"{label} · {slug} — {nxt} — awaiting verify-decision/finalize",
+                        policy='never', slug=slug)
+            return
+        if nxt == 'cleanup-abandoned':
+            return  # surfaced via HYGIENE_ABANDON; not a zombie, not complete
+        cid = ctx.get('completion_id')
+        if nxt == 'complete-qualified':
+            # P0-5: qualified (hygiene-disabled) completion is shipped-but-unclean, NEVER green.
+            add_finding('PIPELINE-COMPLETE-QUALIFIED', root, slug,
+                        f"{label} · {slug} — shipped, workers left dirty — hygiene-disabled",
+                        policy='once', slug=slug)
+            return
+        # P0-5: an enforce completion is green ONLY with a published completion_id in context.
+        # A context that reads `complete` with NO completion_id AND no hygiene terminal vocab is a
+        # legacy/observe completion (kept green for back-compat); a `complete` that DROPPED its id
+        # is a torn/partial write and must NOT go green.
+        if nxt == 'complete' and not cid and _has_hygiene_terminal_vocab(root, slug):
+            add_finding('HYGIENE-CLEANUP', root, slug,
+                        f"{label} · {slug} — complete without a published completion_id — partial finalize, retry",
+                        policy='daily', slug=slug)
+            return
         if nxt == 'complete' and NOTIFY_COMPLETE:
             # Qualify (non-green) when parked/blocked work is still open for THIS session
             # at this root — mirror the event-path qualifier (P16d) so a later tick (event
@@ -1014,8 +1139,13 @@ def _eval_context(root, label, cp, embedded, is_live,
                         session=embedded, slug=slug, stage=last)
         # NEEDS-DECISION: decision predicate + no open pending + dwelled.
         decision = (nxt == 'pending-orchestrator-decision' or
-                    (last in QA_FAMILY and status == 'done' and nxt != 'complete'))
-        if decision and not has_open_pending(slug):
+                    (last in QA_FAMILY and status == 'done' and
+                     nxt not in ('complete', 'complete-qualified', 'cleanup-abandoned',
+                                 'awaiting-verify-decision', 'verified-incomplete',
+                                 'terminal-cleanup')))
+        # D3: use has_live_pending here so a superseded orphan cannot hide a live
+        # decision. The zombie-evidence path below keeps raw has_open_pending.
+        if decision and not has_live_pending(slug):
             a = age_s(updated)
             if a is not None and a >= DWELL_S:
                 msg = (f"{label} · {slug} — decision needed after {last} "
@@ -1025,8 +1155,8 @@ def _eval_context(root, label, cp, embedded, is_live,
         return
 
     # --- zombie: context whose session is not live at this root ---
-    if nxt == 'complete':
-        return  # finished; not a zombie
+    if nxt in ('complete', 'complete-qualified', 'cleanup-abandoned'):
+        return  # finished / audited-terminal; not a zombie
     evidence = (has_open_pending(slug) or
                 any(s == slug for (s, _st) in live_blocked) or
                 status == 'error')
@@ -1271,6 +1401,12 @@ def scan_attention(root, label):
             continue
         sess = rec.get('session')
         slug = rec.get('slug'); stage = rec.get('stage'); worker = rec.get('worker')
+        # stale-alert-lifecycle: suppress a stage-mode ask whose (slug, stage) is
+        # fully resolved in the forge-log (>=1 entry, all closed). Session-scope asks
+        # (no slug/stage) and unresolved/unparseable stages are never suppressed.
+        if (rec.get('mode') == 'stage' and slug and stage
+                and (slug, stage) in RESOLVED_STAGES_BY_ROOT.get(root, set())):
+            continue
         q = (rec.get('question_snippet') or '').strip()
         who = sess or label
         tag = f" ({slug}/{stage})" if slug and stage else ""
@@ -1712,7 +1848,9 @@ NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
           'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK',
           'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'STATE-UNPARSEABLE',
-          'RECOVER-PENDING']
+          'RECOVER-PENDING',
+          'RESET-UNAVAILABLE', 'PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED',
+          'HYGIENE-CLEANUP']
 order = {c: i for i, c in enumerate(
     NOTIFY + ['ITEM-PARKED',
               'SESSION-QUEUED', 'SESSION-WORKING', 'EPISODE-ACTIVE', 'SESSION-DONE',
@@ -1725,7 +1863,7 @@ HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
        'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'ITEM-BLOCKED', 'NEEDS-PERMISSION',
        'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
-       'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING'}
+       'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING', 'RESET-UNAVAILABLE'}
 ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE',
           'EPISODE-ACTIVE', 'EPISODE-SETTLED'}
 STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
@@ -2079,11 +2217,16 @@ if PRETTY:
             print(paint('2', f"  … {older} older task(s) in maintenance"))
 
     pipes = [f for f in active if f['condition'] == 'PIPELINE-COMPLETE']
-    if pipes:
+    qpipes = [f for f in findings
+              if f['condition'] in ('PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED')]
+    if pipes or qpipes:
         print()
         print(sect('PIPELINES'))
         for f in pipes:
             print('  ' + paint('32', '+ ') + clip(flat(f['msg']), R_WIDTH - 4))
+        for f in qpipes:
+            # Worker-context-hygiene: shipped-but-unclean / abandoned — NEVER green.
+            print('  ' + paint('33', '! ') + clip(flat(f['msg']), R_WIDTH - 4))
 
     if maint:
         print()

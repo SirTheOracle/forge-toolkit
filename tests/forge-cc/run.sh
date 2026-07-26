@@ -914,4 +914,35 @@ FORGE_BRIDGE_BIN="$D/forge-bridge" "$ROOT/bin/forge" parked --resolve p coding -
 grep -q 'park --resolve --slug p --stage coding --note a b c' "$D/called" && ok "P-1 --resolve proxies bridge (note one argv)" || bad "P-1 resolve proxy wrong: $(cat "$D/called")"
 rm -rf "$D"
 
+echo "── T-HYG-LOCKSTEP: bridge-owned hygiene prose in lockstep + emit whitelist ──"
+BRIDGE_BIN="$ROOT/bin/forge-bridge"
+for et in RESET HYGIENE_DECISION HYGIENE_ABANDON HYGIENE_BYPASSED RESET_UNAVAILABLE OBSERVE_ONLY; do
+  grep -q "RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY" "$BRIDGE_BIN" \
+    && ok "emit whitelist declares $et" || bad "emit whitelist missing $et"
+done
+for f in "$ROOT/skills/forge-orchestrator/SKILL.md" "$ROOT/agents/forge-orchestrator.md" \
+         "$HOME/.claude/skills/forge-orchestrator/SKILL.md" "$HOME/.claude/agents/forge-orchestrator.md"; do
+  [ -f "$f" ] || continue
+  for needle in "bridge owns context" "FORGE_WORKER_MIN_HEADROOM" "verify-decision" "finalize"; do
+    grep -q "$needle" "$f" && ok "T-HYG-LOCKSTEP has '$needle': $(basename "$f")" \
+      || bad "T-HYG-LOCKSTEP missing '$needle': $f"
+  done
+  grep -q "observed, never reset" "$f" && bad "T-HYG-LOCKSTEP obsolete 'observed, never reset' in $f" \
+    || ok "T-HYG-LOCKSTEP obsolete reset prose absent: $(basename "$f")"
+  grep -qE "≤ 20|<=20" "$f" && bad "T-HYG-LOCKSTEP obsolete route-away threshold in $f" \
+    || ok "T-HYG-LOCKSTEP route-away threshold absent: $(basename "$f")"
+done
+
+echo "── T-HYG-INSTALL: clean-install seeds fail-closed reset-capability ──"
+IH="$(mktemp -d)"
+( cd "$ROOT" && HOME="$IH" bash install.sh ) >/dev/null 2>&1 || true
+if [ -f "$IH/.config/forge/reset-capability.yml" ] \
+   && grep -q 'proven: false' "$IH/.config/forge/reset-capability.yml" \
+   && ! grep -q 'proven: true' "$IH/.config/forge/reset-capability.yml"; then
+  ok "T-HYG-INSTALL clean install provisions the fail-closed capability seed"
+else
+  bad "T-HYG-INSTALL capability seed missing/not fail-closed in $IH/.config/forge/"
+fi
+rm -rf "$IH"
+
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]

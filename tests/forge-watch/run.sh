@@ -83,6 +83,23 @@ entries:
 EOF
 }
 
+two_entry_log() {  # two_entry_log <root> <slug> <stage> <to1> <ts1> <to2> <ts2> <resp2>
+    # Open entry first, then a closed entry (append order). Used for the
+    # stale-alert reconciliation cases (orphan open + newer/older closed twin).
+    local d="$1/.dev/proposals/$2"; mkdir -p "$d"
+    cat > "$d/forge-log.yml" <<EOF
+entries:
+  - timestamp: "$5"
+    stage: $3
+    to: $4
+    response: null
+  - timestamp: "$7"
+    stage: $3
+    to: $6
+    response: "$8"
+EOF
+}
+
 callback() {  # callback <root> <slug> <stage> <STATUS> <worker>
     cat > "$1/.dev/forge-tmp/callbacks/$2-$3.callback" <<EOF
 slug: $2
@@ -1056,6 +1073,142 @@ assert_notified "worker asks" "ask fires a notification on first scan"
 [ "$(wc -l < "$CAP")" -eq 0 ] && ok "NEEDS-ASK debounced on immediate re-scan" || bad "re-notified within backoff"
 : > "$CAP"; "$WATCH" ack forge-1 >/dev/null; run_check >/dev/null
 [ "$(wc -l < "$CAP")" -eq 0 ] && ok "ack silences NEEDS-ASK" || bad "ack did not silence the ask"
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo "── stale-alert reconciliation (C1–C5 / D3) ──"
+
+# §3a: NEEDS-ASK clears once its stage is closed in forge-log.
+new_env recon_ask_resolved
+R=$(mk_root proj); live_session forge-1 "$R"
+closed_log "$R" p-inc incorporate claude-sonnet "$(iso_ago 172800)"
+askf "$R" forge-1 ask-ri p-inc incorporate 172800
+run_check >/dev/null
+assert_not_notified "p-inc" "NEEDS-ASK clears on a clean stage close (§3a)"
+
+# §3b: WORKER-STALLED demoted when a strictly-newer closed twin exists.
+new_env recon_stall_demote
+R=$(mk_root proj); live_session forge-1 "$R"
+two_entry_log "$R" p-orph fix-code claude "$(iso_ago 172800)" claude-sonnet "$(iso_ago 172700)" "FORGE_DONE: fix-code"
+run_check >/dev/null
+assert_not_notified "p-orph.*stalled" "orphan open pending demoted when a newer closed twin exists (§3b)"
+assert_status_has "STALE-PENDING.*p-orph" "the superseded orphan stays visible as residue"
+
+# D3: a superseded orphan no longer hides a live NEEDS-DECISION.
+new_env recon_d3_reveal
+R=$(mk_root proj); live_session forge-1 "$R"
+two_entry_log "$R" p-dec qa claude "$(iso_ago 172800)" claude-sonnet "$(iso_ago 172700)" "FORGE_DONE: qa"
+ctx "$R" forge-1 <<EOF
+active_pipeline: p-dec
+last_stage_completed: qa
+last_stage_status: done
+next_stage: pending-orchestrator-decision
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_notified "p-dec.*decision needed" "D3: superseded orphan does not hide a live NEEDS-DECISION"
+
+# D3 paired negative: a genuinely-live pending still suppresses NEEDS-DECISION.
+new_env recon_d3_live
+R=$(mk_root proj); live_session forge-1 "$R"
+pending_log "$R" p-dl qa claude-sonnet "$(iso_ago 120)"
+ctx "$R" forge-1 <<EOF
+active_pipeline: p-dl
+last_stage_completed: qa
+last_stage_status: done
+next_stage: pending-orchestrator-decision
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_not_notified "p-dl.*decision" "live pending still suppresses NEEDS-DECISION (unchanged)"
+
+# Regression: a live stage-mode ask (open pending → stage not resolved) stays hot.
+new_env recon_ask_live
+R=$(mk_root proj); live_session forge-1 "$R"
+pending_log "$R" p-la coding codex-a "$(iso_ago 120)"
+askf "$R" forge-1 ask-la p-la coding 60 "which config?"
+run_check >/dev/null
+assert_notified "worker asks.*p-la/coding" "live stage-mode ask stays hot (open entry → stage not resolved)"
+
+# Regression: a session-scope ask (no slug/stage) is never suppressed.
+new_env recon_ask_session
+R=$(mk_root proj); live_session forge-1 "$R"
+askf "$R" forge-1 ask-ss "" "" 60 "global question?"
+run_check >/dev/null
+assert_notified "worker asks" "session-scope ask (no slug/stage) never suppressed"
+
+# Regression: a genuine single-entry stall still fires (no closed sibling).
+new_env recon_stall_single
+R=$(mk_root proj); live_session forge-1 "$R"
+pending_log "$R" p-ss coding codex-a "$(iso_ago 1800)"
+run_check >/dev/null
+assert_notified "p-ss.*stalled" "genuine single-entry stall still fires (no closed sibling → not superseded)"
+
+# ADV-2 fail-safe: a malformed log whose fallback DROPS a response-less block is
+# non-authoritative — the stage must NOT be treated as resolved, ask stays hot.
+new_env recon_failsafe_adv2
+R=$(mk_root proj); live_session forge-1 "$R"
+d="$R/.dev/proposals/p-adv2"; mkdir -p "$d"
+{ printf 'entries:\n';
+  printf '  - timestamp: "%s"\n' "$(iso_ago 172900)"; printf '    stage: incorporate\n';
+  printf '    to: claude-sonnet\n'; printf '    response: "FORGE_DONE: incorporate"\n';
+  printf '  - timestamp: "%s"\n' "$(iso_ago 172800)"; printf '    stage: incorporate\n';
+  printf '    to: claude\n'; printf '\tfiles:- legacy malformed tab line\n'; } > "$d/forge-log.yml"
+askf "$R" forge-1 ask-adv2 p-adv2 incorporate 172700
+run_check >/dev/null
+assert_notified "worker asks" "ADV-2 fail-safe: a dropped response-less block keeps the stage unresolved → ask stays hot"
+
+# Fail-safe: an ask for a stage with NO log entry is not suppressed.
+new_env recon_failsafe_unknown
+R=$(mk_root proj); live_session forge-1 "$R"
+closed_log "$R" p-unk coding claude-sonnet "$(iso_ago 172800)"
+askf "$R" forge-1 ask-unk p-unk qa 172700
+run_check >/dev/null
+assert_notified "worker asks" "fail-safe: ask for a stage with no log entry is not suppressed (absence ≠ resolution)"
+
+# Reorder safety: a live pending newer than an older closed sibling still stalls,
+# and an ask for that stage stays hot (an open entry exists → not resolved).
+new_env recon_reorder
+R=$(mk_root proj); live_session forge-1 "$R"
+two_entry_log "$R" p-ro coding claude-sonnet "$(iso_ago 1800)" claude "$(iso_ago 172800)" "FORGE_DONE: old-round"
+askf "$R" forge-1 ask-ro p-ro coding 172700
+run_check >/dev/null
+assert_notified "p-ro.*stalled" "reorder: live pending newer than the closed sibling still stalls (ts guard)"
+assert_notified "worker asks.*p-ro/coding" "reorder: ask stays hot while an open entry exists"
+
+# Multi-round: closed, closed, open(newest) + fresh ask → ask hot AND live stall fires.
+new_env recon_multiround
+R=$(mk_root proj); live_session forge-1 "$R"
+d="$R/.dev/proposals/p-mr"; mkdir -p "$d"
+cat > "$d/forge-log.yml" <<EOF
+entries:
+  - timestamp: "$(iso_ago 260000)"
+    stage: qa
+    to: claude
+    response: "FORGE_DONE: r1"
+  - timestamp: "$(iso_ago 200000)"
+    stage: qa
+    to: claude
+    response: "FORGE_DONE: r2"
+  - timestamp: "$(iso_ago 1800)"
+    stage: qa
+    to: claude-sonnet
+    response: null
+EOF
+askf "$R" forge-1 ask-mr p-mr qa 300
+run_check >/dev/null
+assert_notified "worker asks.*p-mr/qa" "multi-round: fresh ask on a live round stays hot despite older closed rounds"
+assert_notified "p-mr.*stalled" "multi-round: the live newest pending still stalls (older closed rounds do not suppress)"
+
+# A resolved stage with a leftover BLOCKED callback renders CALLBACK-FOREIGN only —
+# never unmasks a hot ITEM-BLOCKED (documents the unmask-unreachable claim).
+new_env recon_resolved_blocked
+R=$(mk_root proj); live_session forge-1 "$R"
+closed_log "$R" p-rb coding claude-sonnet "$(iso_ago 172800)"
+callback "$R" p-rb coding BLOCKED codex-a
+askf "$R" forge-1 ask-rb p-rb coding 172700
+run_check >/dev/null
+assert_not_notified "p-rb.*blocked at" "resolved stage: leftover BLOCKED callback does NOT unmask ITEM-BLOCKED"
+assert_not_notified "p-rb" "NEEDS-ASK also suppressed on the resolved stage"
 
 echo "── return-path: W1 correlated question → NEEDS-REPLY (no bell) ──"
 new_env wreply1
@@ -2222,6 +2375,99 @@ sed -i '' 's/callback_id: e16p-coding-x/callback_id: e16p-coding-b/' "$PR/.dev/f
 o=$("$WATCH" status --board 2>/dev/null)
 python3 -c 'import json,sys; d=json.load(sys.stdin); assert len([x for x in d.get("parked",[]) if x.get("slug")=="e16p"])==2' <<<"$o" \
   && ok "W18 concurrent PARKED owners remain distinct" || bad "W18 concurrent PARKED owners collapsed"
+
+echo "── W-HYG: worker-context-hygiene vocabulary ──"
+# Green only for a published (completion_id) or legacy completion.
+new_env whyg1
+R=$(mk_root proj); live_session forge-1 "$R"
+evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "COMPLETE: pipeline=ph1 completion_id=abc123def"
+run_check >/dev/null
+assert_notified "ph1 — pipeline COMPLETE" "W-HYG published completion (completion_id) stays green"
+new_env whyg1b
+R=$(mk_root proj); live_session forge-1 "$R"
+ctx "$R" forge-1 <<EOF
+active_pipeline: ph1b
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete
+completion_id: abc123def
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_notified "ph1b — pipeline COMPLETE" "W-HYG context complete WITH id is green"
+# A torn complete (hygiene vocab present, id dropped) must NOT go green.
+new_env whyg1c
+R=$(mk_root proj); live_session forge-1 "$R"
+evlog_append "$R" "HYGIENE_DECISION: pipeline=ph1c stage=verify worker=codex-a action=RESET_CONFIRMED reason=threshold threshold=75 confidence=none mode=enforce generation=3"
+ctx "$R" forge-1 <<EOF
+active_pipeline: ph1c
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_not_notified "ph1c — pipeline COMPLETE" "W-HYG torn complete (id dropped) never green"
+assert_status_has "partial finalize" "W-HYG torn complete surfaces as HYGIENE-CLEANUP"
+# Qualified completion: shipped-but-unclean, never green.
+new_env whyg2
+R=$(mk_root proj); live_session forge-1 "$R"
+evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "COMPLETE: pipeline=ph2 completion_id=beef qualifier=hygiene-disabled workers_dirty=codex-a,codex-b"
+run_check >/dev/null
+assert_notified "ph2 — shipped, workers left dirty" "W-HYG hygiene-disabled completion is qualified"
+assert_not_notified "ph2 — pipeline COMPLETE" "W-HYG qualified completion is NOT plain green"
+new_env whyg2b
+R=$(mk_root proj); live_session forge-1 "$R"
+ctx "$R" forge-1 <<EOF
+active_pipeline: ph2b
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete-qualified
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_notified "ph2b — shipped, workers left dirty" "W-HYG context complete-qualified renders qualified"
+# RESET_UNAVAILABLE is actionable.
+new_env whyg3
+R=$(mk_root proj); live_session forge-1 "$R"
+evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "RESET_UNAVAILABLE: pipeline=ph3 stage=coding worker=codex-a family=codex reason=auto-reset-disabled"
+run_check >/dev/null
+assert_notified "ph3 — reset unavailable" "W-HYG RESET_UNAVAILABLE fires actionable"
+# Abandoned cleanup: audited, distinct, not a zombie, not complete.
+new_env whyg4
+R=$(mk_root proj); live_session forge-1 "$R"
+evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "HYGIENE_ABANDON: pipeline=ph4 reason=operator-stuck parked=1 blocked=0 state_was=terminal-cleanup workers=x"
+run_check >/dev/null
+assert_notified "ph4 — cleanup abandoned" "W-HYG HYGIENE_ABANDON surfaces CLEANUP-ABANDONED"
+new_env whyg4b
+R=$(mk_root proj)   # session NOT live -> zombie scan path
+ctx "$R" ghost-1 <<EOF
+active_pipeline: ph4b
+last_stage_completed: verify
+last_stage_status: done
+next_stage: cleanup-abandoned
+updated_at: "$(iso_ago 120)"
+EOF
+run_check >/dev/null
+assert_not_notified "ph4b" "W-HYG cleanup-abandoned context is not a ZOMBIE and not green"
+# Transient terminal states: no notify, no NEEDS-DECISION, not zombie.
+for tstate in awaiting-verify-decision verified-incomplete terminal-cleanup; do
+  new_env "whyg5-$tstate"
+  R=$(mk_root proj); live_session forge-1 "$R"
+  ctx "$R" forge-1 <<EOF
+active_pipeline: ph5
+last_stage_completed: qa
+last_stage_status: done
+next_stage: $tstate
+updated_at: "$(iso_ago 600)"
+EOF
+  run_check >/dev/null
+  assert_not_notified "ph5" "W-HYG $tstate is transient: no notify, no NEEDS-DECISION"
+done
 
 WATCH_SOURCE_AFTER="$(shasum -a 256 "$WATCH" | awk '{print $1}')"
 [ "$WATCH_SOURCE_BEFORE" = "$WATCH_SOURCE_AFTER" ] \

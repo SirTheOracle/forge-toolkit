@@ -1,0 +1,24 @@
+╭─────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.144.6)                      │
+│                                                 │
+│ model:     gpt-5.6-luna high   /model to change │
+│ directory: /tmp/spike-project               │
+╰─────────────────────────────────────────────────╯
+
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+Token usage: total=9,322 input=9,141 (+ 8,960 cached) output=181 (reasoning 16)
+To continue this session, run codex resume 00000000-0000-4000-8000-000000000001
+
+
+› Explain this codebase
+
+  gpt-5.6-luna high · /tmp/spike-project      
+
+
+
+
+
+
+
+
