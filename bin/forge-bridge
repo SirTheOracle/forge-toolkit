@@ -1155,6 +1155,16 @@ cmd_hygiene_status() {
     echo "  claude auto_reset=$(_reset_automation_enabled claude 2>/dev/null) degraded=$FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE"
     echo "  codex  auto_reset=$(_reset_automation_enabled codex 2>/dev/null)  degraded=$FORGE_WORKER_HYGIENE_DEGRADED_CODEX"
     echo "  min_headroom shared=$FORGE_WORKER_MIN_HEADROOM claude=${FORGE_WORKER_MIN_HEADROOM_CLAUDE-inherit} codex=${FORGE_WORKER_MIN_HEADROOM_CODEX-inherit}"
+    # S4.2/S11: EVERY threshold with the question it answers, resolved through the helpers so
+    # family inheritance and overrides are visible as EFFECTIVE values. The gate threshold is
+    # the only one that can move a hygiene decision; the rest decide when a HUMAN is told.
+    echo "  thresholds (effective):"
+    echo "    gate   min_headroom          claude=$(_worker_min_headroom claude-opus 2>/dev/null) codex=$(_worker_min_headroom codex-a 2>/dev/null)   (should a new stage start here?)"
+    echo "    alert  context_alert         claude=$(_context_alert_headroom claude-opus 2>/dev/null) codex=$(_context_alert_headroom codex-a 2>/dev/null)   (is this worker in trouble?)"
+    echo "    alert  orchestrator_alert    $(_orchestrator_alert_headroom 2>/dev/null)              (does pane 1 need a handoff?)"
+    echo "    show   usage_max_age_s       $(_usage_max_age_s)             (DISPLAY ONLY — never a gate input)"
+    echo "    send   send_min_headroom     $FORGE_SEND_MIN_HEADROOM               (0 = disabled; opt-in floor, strictly-below)"
+    echo "    wait   usage_sample_interval $FORGE_USAGE_SAMPLE_INTERVAL_S             (0 = sampler off)"
     local cu; cu="$(_completion_unresolved "$pr" 2>/dev/null)"
     echo "  unresolved: ${cu:-parked=0 blocked=0}"
     echo "  terminal_state: $(_terminal_state "$pr")"
@@ -1167,6 +1177,17 @@ cmd_hygiene_status() {
         printf '%s\n' "$_blk" | while IFS= read -r b; do [ -n "$b" ] && echo "    - $b"; done
     else
         echo "  ACTIVATION: eligible (no open pending / verify callback / parked/blocked) — confirm spike + live gate before enforce"
+    fi
+    # S4.2: the last ten decisions, so "did the check run?" is answerable without opening the
+    # events log. `tail` is bounded by construction.
+    local _ev="$pr/.dev/forge-tmp/orchestrator-events.log"
+    echo "  recent decisions:"
+    if [ -f "$_ev" ]; then
+        tail -n 400 "$_ev" 2>/dev/null \
+          | grep -E '^(HYGIENE_DECISION|RESET|WORKER_LOW_CONTEXT|ORCHESTRATOR_LOW_CONTEXT):' \
+          | tail -n 10 | sed 's/^/    /' || true
+    else
+        echo "    (no events log yet)"
     fi
     [ -f "$jf" ] && { echo "  journal: $jf"; sed -n '1,40p' "$jf"; } || echo "  journal: (none — unproven, normal at upgrade)"
 }
@@ -3501,11 +3522,22 @@ _render_status_file() {
     # `infra-lock status` does not call _render_status_file, so no recursion.
     local il_line=""
     il_line=$(cmd_infra_lock status 2>/dev/null | sed 's/^INFRA_LOCK: //')
-    python3 - "$project_root/$CONTEXT_FILE" "$project_root/$DEV_DIR" "$out_file" "$il_line" <<'PYEOF'
+    python3 - "$project_root/$CONTEXT_FILE" "$project_root/$DEV_DIR" "$out_file" "$il_line" \
+              "$project_root/$(_usage_file)" "$project_root/$DEV_DIR/forge-tmp/orchestrator-events.log" \
+              "$(_usage_max_age_s)" <<'PYEOF'
 import sys, os, yaml, datetime
 
 context_file, dev_dir, out_file = sys.argv[1:4]
 infra_lock_line = sys.argv[4] if len(sys.argv) > 4 else ''
+# ACM S4.1: three additive inputs, appended positionally so nothing above shifts.
+# usage_max_age arrives as ARGV, not os.environ: bin/forge-bridge assigns its knob defaults
+# WITHOUT `export`, so reading it from the environment here would silently always yield 900.
+usage_file  = sys.argv[5] if len(sys.argv) > 5 else ''
+events_file = sys.argv[6] if len(sys.argv) > 6 else ''
+try:
+    usage_max_age = int(sys.argv[7]) if len(sys.argv) > 7 else 900
+except ValueError:
+    usage_max_age = 900
 
 # Worker callback responses (and notes) arrive as raw markdown source; the
 # status file is a plain-text surface, so `**bold**`/backticks/[x](url) would
@@ -3684,6 +3716,96 @@ if pending:
 else:
     L.append("  (none)")
 L.append("")
+
+# ── S4.1: Worker context ────────────────────────────────────────────────────
+# The consumption half of the problem: the bridge writes an accurate ledger at every callback
+# and, until now, NOTHING on the machine read it. A worker sat at 9% headroom, correctly
+# recorded, and nobody was told. Freshness is per-record `measured_at` (F5).
+def _u_age(rec):
+    ts = rec.get('measured_at') if isinstance(rec, dict) else None
+    if not isinstance(ts, str) or not ts:
+        return None
+    iso = ts[:-1] + '+00:00' if ts.endswith('Z') else ts
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int((datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds())
+
+def _u_hage(a):
+    if a is None:
+        return '?'
+    if a < 90:
+        return f"{a}s"
+    if a < 5400:
+        return f"{a // 60}m"
+    if a < 172800:
+        return f"{a // 3600}h"
+    return f"{a // 86400}d"
+
+ctx_rows = []
+if usage_file and os.path.exists(usage_file):
+    try:
+        with open(usage_file) as f:
+            _ud = yaml.safe_load(f) or {}
+    except Exception:
+        _ud = {}
+    if isinstance(_ud, dict):
+        _uwm = _ud.get('workers') or {}
+        if isinstance(_uwm, dict):
+            for _w in ['claude-opus', 'claude-sonnet', 'codex-a', 'codex-b']:
+                _r = _uwm.get(_w)
+                if not isinstance(_r, dict):
+                    continue
+                _a = _u_age(_r)
+                _tag = '  STALE' if (_a is None or _a > usage_max_age) else ''
+                if _r.get('divergent'):
+                    _tag += '  DIVERGENT'
+                ctx_rows.append(
+                    f"  {_w:<15} headroom={str(_r.get('headroom')):<8} "
+                    f"confidence={str(_r.get('confidence')):<5} age={_u_hage(_a):<5} "
+                    f"by={str(_r.get('observed_by') or '?'):<9}{_tag}")
+        _o = _ud.get('orchestrator')
+        if isinstance(_o, dict):
+            _a = _u_age(_o)
+            _tag = '  STALE' if (_a is None or _a > usage_max_age) else ''
+            ctx_rows.append(
+                f"  {'pane-1 (orch)':<15} headroom={str(_o.get('headroom')):<8} "
+                f"confidence={str(_o.get('confidence')):<5} age={_u_hage(_a):<5} "
+                f"by={str(_o.get('observed_by') or '?'):<9}{_tag}  OBSERVE-ONLY")
+L.append("## Worker context")
+L.append("")
+L.extend(ctx_rows or ["  (no usage recorded yet)"])
+L.append("")
+
+# ── S4.1: Recent hygiene decisions ──────────────────────────────────────────
+# From pane 1 a working feature and an absent feature looked IDENTICAL, because every
+# HYGIENE_DECISION landed only in the events log. BYTE-BOUNDED tail — never a full scan.
+# forge-watch already full-file-scans this log per slug per 30s tick, and this renderer runs
+# from twelve call sites (R8).
+hyg_rows = []
+if events_file and os.path.exists(events_file):
+    try:
+        with open(events_file, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            _end = f.tell()
+            f.seek(max(0, _end - 65536))
+            _tail = f.read().decode('utf-8', 'replace').splitlines()
+        if _end > 65536 and _tail:
+            _tail = _tail[1:]          # drop a partial first line
+        for _ln in _tail[-400:]:
+            if _ln.startswith('HYGIENE_DECISION:') or _ln.startswith('RESET:') \
+               or _ln.startswith('WORKER_LOW_CONTEXT:') or _ln.startswith('ORCHESTRATOR_LOW_CONTEXT:'):
+                hyg_rows.append('  ' + strip_md(_ln))
+    except Exception:
+        hyg_rows = []
+L.append("## Recent hygiene decisions")
+L.append("")
+L.extend(hyg_rows[-5:] or ["  (none recorded)"])
+L.append("")
+
 L.append("## Artifacts")
 L.append("")
 if artifacts:

@@ -3372,6 +3372,65 @@ else
   echo "  (skip: tmux unavailable — ACM §J)"
 fi
 
+echo "── ACM §V: render surfaces ──"
+AV="$WORK/acmView"; mkdir -p "$AV/.dev/forge-tmp"
+_resolve_project_root(){ printf '%s' "$AV"; }
+_session_or_sentinel(){ printf 'acmV'; }
+# r1 · $HFNS (run.sh:1259) extracts the hygiene/usage helpers only — `_render_status_file`
+# and the two path helpers it calls are NOT in it, so calling it here is `command not found`
+# and every assertion below degrades to a vacuous pass on a status file that was never
+# written. Extract them block-locally instead of widening the C1-committed extraction list;
+# T-ACM-EXTRACT builds its want-list by grepping THIS file for /^name()/ patterns, so the
+# three added patterns only widen `want` and the got-minus-want check is unaffected.
+AVFNS="$WORK/acmV-fns.sh"
+# `_context_file` and `_status_file_name` are ONE-LINE functions: a `,/^}$/` range over
+# either over-runs to the next `^}$` far below and drags neighbouring code in (the exact
+# hazard T-ACM-EXTRACT exists for), so print the single line — the `/^_usage_file()/p` idiom.
+sed -n '/^_context_file()/p; /^_status_file_name()/p; /^_render_status_file()/,/^}$/p' "$BRIDGE" > "$AVFNS"
+cmd_infra_lock(){ :; }   # best-effort line in the renderer; not under test here
+# shellcheck disable=SC1090
+. "$AVFNS"
+python3 - "$AV/.dev/forge-usage.acmV.yml" <<'PY'
+import sys,yaml,datetime
+now=datetime.datetime.now(datetime.timezone.utc)
+old=(now-datetime.timedelta(hours=22)).strftime('%Y-%m-%dT%H:%M:%SZ')
+yaml.safe_dump({"updated":now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+  "workers":{"codex-a":{"family":"codex","headroom":9,"confidence":"high","measured_at":old,
+                        "observed_by":"callback","pct":91,"tokens":None,"stage":"coding",
+                        "reason":None,"raw":"Context 9% left","source":"pane-footer"}},
+  "orchestrator":{"family":"claude","headroom":22,"confidence":"high",
+                  "measured_at":now.strftime('%Y-%m-%dT%H:%M:%SZ'),"observed_by":"pane1"}},
+  open(sys.argv[1],"w"), default_flow_style=False, sort_keys=True)
+PY
+printf 'HYGIENE_DECISION: pipeline=v1 worker=codex-a action=RESET_CONFIRMED reason=headroom=9<=75 source=live\n' \
+  > "$AV/.dev/forge-tmp/orchestrator-events.log"
+# r1 · $FORGE_USAGE_MAX_AGE_S is a bridge-level default that $HFNS does not carry, and the
+# suite runs under `set -u`, so an unprefixed call prints "unbound variable". Pin the
+# documented default explicitly here; the second render below moves it.
+FORGE_USAGE_MAX_AGE_S=900 _render_status_file
+SF="$AV/.dev/forge-status.acmV.md"
+# r1 · section slicing: the renderer puts a BLANK LINE directly under every `## ` heading, so
+# `/## Worker context/,/^$/` stops one line into the section and can never see a row. Slice to
+# the next heading instead.
+acm_vsec(){ sed -n '/^## Worker context/,/^## Recent hygiene decisions/p' "$SF"; }
+[ -s "$SF" ] || bad "T-ACM-STATUS the renderer produced no status file (the negative below would be vacuous)"
+grep -q '^## Worker context' "$SF" && grep -q 'codex-a .*headroom=9' "$SF" && grep -q 'STALE' "$SF" \
+  && ok "T-ACM-STATUS the status file renders Worker context with a per-record STALE tag" \
+  || bad "T-ACM-STATUS Worker context block wrong: $(acm_vsec)"
+grep -q '^## Recent hygiene decisions' "$SF" && grep -q 'action=RESET_CONFIRMED' "$SF" \
+  && ok "T-ACM-STATUS the status file renders Recent hygiene decisions" || bad "T-ACM-STATUS decisions block missing"
+acm_vsec | grep -q 'pane-1 (orch).*OBSERVE-ONLY' \
+  && ok "T-ACM-STATUS the orchestrator row is present and distinct from the worker rows" \
+  || bad "T-ACM-STATUS orchestrator row wrong"
+# The freshness bound must actually be honored (it arrives as argv, not os.environ).
+FORGE_USAGE_MAX_AGE_S=999999 _render_status_file
+if [ -s "$SF" ] && ! acm_vsec | grep -q 'STALE'; then
+  ok "T-ACM-STATUS FORGE_USAGE_MAX_AGE_S is honored by the renderer (argv, not environ)"
+else
+  bad "T-ACM-STATUS FORGE_USAGE_MAX_AGE_S is inert in the renderer"
+fi
+unset -f cmd_infra_lock acm_vsec
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
