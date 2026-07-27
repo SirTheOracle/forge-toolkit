@@ -857,6 +857,16 @@ instruction outside pipeline mode.
 
 Routing starts from **reasoning tier** (Hard Rule 22), then availability:
 
+0. **Batch planning (two or more tasks).** Before distributing a batch, run
+   `~/bin/forge-bridge usage --refresh` **once** and record the snapshot in the
+   plan. It live-measures all four workers plus pane 1 and prints a tier-free
+   `recommendation` per worker (`reset-first` | `ok` | `busy` | `unknown`) — the
+   bridge reporting its own gate's verdict, so you never re-derive the
+   inclusive-boundary arithmetic yourself. Not required for a single dispatch:
+   the dispatch gate measures at the moment of use and is strictly stronger.
+   A row tagged `in-flight` is a **floor** — that worker will consume more
+   before its stage ends.
+
 1. **Pick the tier and its panes** for the stage:
 
    | Tier | Stages | Valid panes |
@@ -893,13 +903,27 @@ Routing starts from **reasoning tier** (Hard Rule 22), then availability:
    hygiene** — you never `/clear` a worker yourself. The bridge resets a worker at the
    next safe boundary (before dispatch, and at terminal cleanup) when its high-confidence
    `headroom` is **at or below** the shared minimum (`FORGE_WORKER_MIN_HEADROOM`, default
-   75), or when its evidence is missing/unknown/stale (unknown means **unproven**, which
-   triggers a reset — never "fine" or "exhausted"). Read `~/bin/forge-bridge usage` for a
-   read-only snapshot (normalized `headroom` 0-100; Claude parses `ctx: Nk (P%)`, Codex
-   parses `Context N% left`). Usage **never** authorizes a mid-stage reset and **never**
+   75), when its evidence is missing or unknown, or when it has only
+   **stale generation coverage** — a delivery has landed since the last reading, so the
+   reading no longer describes the pane. "Stale" means *generation*, never wall-clock:
+   there is **no** age expiry on hygiene evidence, and a reading is not invalidated by
+   being old. Unknown means **unproven**, which triggers a reset — never "fine" or
+   "exhausted". Read `~/bin/forge-bridge usage` for a read-only snapshot and
+   `~/bin/forge-bridge usage --refresh` for a live one (normalized `headroom` 0-100;
+   Claude parses `ctx: Nk (P%)`, Codex parses `Context N% left`).
+   **Tie-break within tier:** when two panes are tier-eligible for a stage and both are
+   available, prefer the one with more proven headroom. This is a tie-break **within**
+   Hard Rule 22, never a substitution across tiers: if the higher-headroom pane is not
+   tier-eligible, it is not a candidate. If the preferred pane is at or below the minimum,
+   either send anyway (the bridge resets it at the boundary) or run
+   `~/bin/forge-bridge reset-idle --worker <w>` first so the reset happens off the
+   critical path. Never `/clear` a worker yourself.
+   Usage **never** authorizes a mid-stage reset and **never**
    changes the reasoning tier (Hard Rule 22); BLOCKED fix-and-continue retains context but
    advances the delivery generation. All four worker panes share the policy; pane 1 is
-   excluded. Every boundary emits a `HYGIENE_DECISION` audit record. `observe` mode is the
+   observed but never reset. Every boundary emits a `HYGIENE_DECISION` audit record, and
+   every dispatch and send now echoes one `HYGIENE …` line to stderr so the check is
+   visible from pane 1. `observe` mode is the
    rollout kill switch (legacy behavior + a loud `HYGIENE_BYPASSED`); `enforce` is the
    accepted feature mode. A clean verify is closed with `verify-decision` then `finalize`;
    a bare `COMPLETE` means the finalization outbox published after all four workers were
@@ -1118,6 +1142,24 @@ Background agent failures follow this protocol:
     Exception (unchanged): when sending a FORGE_BLOCKED follow-up on the SAME task,
     use raw `forge-bridge send --force` — do NOT `dispatch` again. It retains the
     worker's task context and advances the delivery generation; it never resets.
+
+    **Pane 1 is OBSERVED, never reset (active-context-management).** Pane 1's own
+    context is recorded under the top-level `orchestrator:` key of the usage ledger
+    and surfaced in `forge-bridge status`, `hygiene-status` and `forge board`. It is
+    **never auto-reset** and remains structurally un-resettable. At or below
+    `FORGE_ORCHESTRATOR_ALERT_HEADROOM` the response is a **handoff**: write the
+    handoff note, then let the operator start a fresh pane-1 session. Never `/clear`
+    pane 1 mid-pipeline — pane 1 holds the only un-journaled state in the system.
+
+    **Direct sends are measured too.** `send` records the target's headroom, warns
+    loudly at or below `FORGE_CONTEXT_ALERT_HEADROOM` (25, family-overridable), and
+    continues. `FORGE_SEND_MIN_HEADROOM` (default 0 = off) is an opt-in floor;
+    `--force` is never blocked by it.
+
+    **Proactive reset:** `forge-bridge reset-idle --worker <w>` (or `--all`) clears an
+    IDLE worker off the dispatch critical path. It inherits every dispatch-time
+    precondition, so it refuses on an open pending, on non-idle health, in a terminal
+    state, in `observe` mode, and on pane 1.
 
 21. **Worker permission-mode and ident contract.**
     Launch flags:

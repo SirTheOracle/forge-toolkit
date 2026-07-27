@@ -931,8 +931,11 @@ rm -rf "$D"
 
 echo "── T-HYG-LOCKSTEP: bridge-owned hygiene prose in lockstep + emit whitelist ──"
 BRIDGE_BIN="$ROOT/bin/forge-bridge"
-for et in RESET HYGIENE_DECISION HYGIENE_ABANDON HYGIENE_BYPASSED RESET_UNAVAILABLE OBSERVE_ONLY; do
-  grep -q "RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY" "$BRIDGE_BIN" \
+# The original loop grepped ONE literal for every $et, so it passed six times for one match.
+# Grep "$et" per iteration, and cover the two new types in the same loop.
+for et in RESET HYGIENE_DECISION HYGIENE_ABANDON HYGIENE_BYPASSED RESET_UNAVAILABLE OBSERVE_ONLY \
+          WORKER_LOW_CONTEXT ORCHESTRATOR_LOW_CONTEXT; do
+  grep -qE "(\||^| )$et(\||\)| )" "$BRIDGE_BIN" \
     && ok "emit whitelist declares $et" || bad "emit whitelist missing $et"
 done
 for f in "$ROOT/skills/forge-orchestrator/SKILL.md" "$ROOT/agents/forge-orchestrator.md" \
@@ -946,6 +949,27 @@ for f in "$ROOT/skills/forge-orchestrator/SKILL.md" "$ROOT/agents/forge-orchestr
     || ok "T-HYG-LOCKSTEP obsolete reset prose absent: $(basename "$f")"
   grep -qE "≤ 20|<=20" "$f" && bad "T-HYG-LOCKSTEP obsolete route-away threshold in $f" \
     || ok "T-HYG-LOCKSTEP route-away threshold absent: $(basename "$f")"
+  # active-context-management (S12.5). grep -F on literal sentences — a BRE would mis-handle
+  # the `**` emphasis markers, and BSD and GNU grep disagree on where a `*` is literal.
+  # EVERY needle sits on ONE prose line; grep is line-oriented, so a wrapped needle silently
+  # never matches. The DoD re-checks that property independently.
+  for needle in \
+    "forge-bridge usage --refresh" \
+    "prefer the one with more proven headroom" \
+    "tie-break **within**" \
+    "stale generation coverage" \
+    "reset-idle --worker" \
+    "Pane 1 is OBSERVED, never reset" \
+    "Batch planning (two or more tasks)" \
+    "FORGE_ORCHESTRATOR_ALERT_HEADROOM"; do
+    grep -qF "$needle" "$f" && ok "T-ACM-LOCKSTEP has '$needle': $(basename "$f")" \
+      || bad "T-ACM-LOCKSTEP missing (or line-wrapped) '$needle': $f"
+  done
+  # POSITIVE pin, not a negative pattern-match: a case-sensitive "does it mention hours?"
+  # grep is near-vacuous and false-positive-prone. Pin the sentence that must be present.
+  grep -qF 'there is **no** age expiry on hygiene evidence' "$f" \
+    && ok "T-ACM-LOCKSTEP the no-wall-clock-expiry sentence is present: $(basename "$f")" \
+    || bad "T-ACM-LOCKSTEP the no-wall-clock-expiry sentence is missing from $f"
 done
 
 echo "── T-HYG-INSTALL: clean-install seeds fail-closed reset-capability ──"

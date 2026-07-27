@@ -291,6 +291,58 @@ lives at `.dev/forge-status.md`; bridge code is authoritative and renders
 `.dev/forge-status.<session>.md`. -->
 <!-- docs-refresh:end section=status-and-health -->
 
+### Active context management
+
+Context hygiene has two halves. The **gate** (shipped) decides whether a worker may start a
+new stage. **Active management** (this feature) makes usage visible and measures it at every
+moment a pane's context actually changes.
+
+| Command | What it does |
+|---|---|
+| `~/bin/forge-bridge usage` | Read-only snapshot. Freshness is **per-record** `measured_at`, so a row that has not been re-measured shows `STALE` even when another worker's callback just refreshed the file |
+| `~/bin/forge-bridge usage --refresh` | Live-measures all four workers **and pane 1**, then renders. The batch-planning snapshot — run it once before distributing two or more tasks. In-flight panes are sampled, not skipped; their number is a **floor** |
+| `~/bin/forge-bridge usage --json` | Same data, stable keys, plus a tier-free `recommendation` per worker: `reset-first` \| `ok` \| `busy` \| `unknown` |
+| `~/bin/forge-bridge reset-idle --worker <w>` | Reset an **idle** worker off the dispatch critical path. Refuses on an open pending, non-idle health, a terminal state, `observe` mode, and pane 1 |
+| `~/bin/forge-bridge hygiene-status` | Now also prints every **effective** threshold and the last ten hygiene decisions |
+
+Five thresholds, five different questions:
+
+| Knob | Default | Question |
+|---|---|---|
+| `FORGE_WORKER_MIN_HEADROOM` (+`_CLAUDE`/`_CODEX`) | 75 | Should a new stage start in this conversation? **This is the gate — unchanged.** |
+| `FORGE_CONTEXT_ALERT_HEADROOM` (+`_CLAUDE`/`_CODEX`) | 25 | Is this worker in trouble? (board finding + send warning) |
+| `FORGE_ORCHESTRATOR_ALERT_HEADROOM` | 30 | Does pane 1 need a handoff? |
+| `FORGE_USAGE_MAX_AGE_S` | 900 | **Display only** — is this reading too old to show as current? It is *never* a gate input; hygiene evidence has no wall-clock expiry |
+| `FORGE_SEND_MIN_HEADROOM` | 0 (off) | Opt-in hard floor on non-`--force` sends. This one is **strictly below** the floor; the other four are inclusive |
+
+Plus `FORGE_USAGE_SAMPLE_INTERVAL_S` (300, `0` disables the mid-stage sampler) and the
+watcher-side mirror `FORGE_WATCH_ALERT_HEADROOM` (25, set in `~/.config/forge/watch.env`).
+
+**What you will see.** Every dispatch and every direct send now prints one
+`HYGIENE <worker>: <ACTION> — <reason>` line to stderr, so the check is visible from pane 1
+instead of only in the events log. `forge-bridge status` gains a **Worker context** table and
+a **Recent hygiene decisions** tail. When a worker crosses the alert threshold the menubar
+grows a `◐N` segment (after `⏸N`, before `✓`) and `forge board` shows a `WORKER-LOW-CONTEXT`
+row — visible and silent, no notification. **The row clears itself**: it is rebuilt from the
+ledger on every scan, so it disappears on its own once that pane is reset or reads healthy
+again.
+
+**Why the menubar shows `1! ◐1` for one low pane.** The two counters answer different
+questions and deliberately overlap, exactly as `DELIVERY-UNVERIFIED` already does: `◐N`
+counts low-context panes, and `N!` counts board rows you have not looked at yet. Acking the
+row from `forge board` removes it from `N!` and leaves `◐N` until the pane is actually reset.
+
+**Direct sends warn, they never block by default.** A send is a *continuation* — resetting
+the pane would destroy the exact context the send exists to continue — so a low reading
+prints a loud warning and delivers anyway. Set `FORGE_SEND_MIN_HEADROOM` if you want a hard
+floor; `--force` is never refused by it, because `--force` is the BLOCKED fix-and-continue
+path.
+
+**Pane 1 is observed, never touched.** Its reading lands under the ledger's top-level
+`orchestrator:` key. At or below its threshold you get a board row and one notification; the
+response is to write a handoff note and start a fresh pane-1 session. Forge sends no reset,
+no compact, and no keystroke of any kind to pane 1.
+
 ## Blocked-on-You Notifications (`forge-watch`)
 
 `forge-watch` inverts the polling workflow: instead of clicking through tabs
