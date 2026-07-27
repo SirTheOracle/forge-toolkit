@@ -1171,6 +1171,90 @@ cmd_hygiene_status() {
     [ -f "$jf" ] && { echo "  journal: $jf"; sed -n '1,40p' "$jf"; } || echo "  journal: (none — unproven, normal at upgrade)"
 }
 
+# S9: proactive idle reset — move the reset OFF the dispatch critical path.
+#   forge-bridge reset-idle [--worker <canonical> | --all] [--dry-run] [--slug <s>]
+#
+# EVERY safety precondition is INHERITED UNMODIFIED from _reset_worker_locked: non-worker
+# refusal and pane-index cross-check, the family capability gate (reason is `idle-proactive`,
+# NOT `operator`, so the gate applies), incarnation match, journal identity preflight,
+# fail-closed pending scan, idle health before AND after the clear, and semantic proof. It
+# therefore cannot touch pane 1 and cannot touch a pane with an open pending — the mid-stage
+# and BLOCKED fix-and-continue invariants hold BY CONSTRUCTION, not by a new check.
+#
+# Payoff: the next dispatch decides KEEP_RESET_PROVEN because reset.covers_generation still
+# equals latest_generation (no delivery intervened), so the reset cost is paid while the
+# operator is thinking rather than while a stage is waiting.
+#
+# Locks ONE worker at a time in canonical order under --all — strictly safer than holding all
+# four: no lock is ever held while acquiring another, so the shipped deadlock analysis is
+# unchanged. A concurrent dispatch simply blocks on the same per-worker lock (R10).
+cmd_reset_idle() {
+    require_identity "reset-idle" host-pane || return 1
+    local want="" all=0 dry=0 slug="${FORGE_SEND_SLUG:-adhoc}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --worker)  want="$(canonical_pane_name "$2")"; shift 2 ;;
+            --all)     all=1; shift ;;
+            --dry-run) dry=1; shift ;;
+            --slug)    slug="$2"; shift 2 ;;
+            *)         shift ;;
+        esac
+    done
+    if [ -z "$want" ] && [ "$all" != 1 ]; then
+        echo "Usage: forge-bridge reset-idle [--worker <w> | --all] [--dry-run]" >&2; return 1
+    fi
+    local pr; pr="$(_resolve_project_root "" 2>/dev/null)"
+    [ -n "$pr" ] || { echo "reset-idle: no project root" >&2; return 1; }
+    local mode; mode="$(_hygiene_mode)" || { echo "ERROR: FORGE_WORKER_HYGIENE_MODE must be observe|enforce." >&2; return 1; }
+    if [ "$mode" != enforce ]; then
+        # observe is the kill switch: audit, never mutate.
+        _emit_event OBSERVE_ONLY "$slug" "command=reset-idle reason=observe-mode targets=${want:-all}"
+        echo "reset-idle: observe mode — nothing reset (OBSERVE_ONLY audited)."
+        return 0
+    fi
+    case "$(_terminal_state "$pr")" in
+        awaiting-verify-decision|verified-incomplete|terminal-cleanup|outbox-pending)
+            echo "HOOK BLOCKED: terminal state blocks reset-idle (same four states as send). Resolve/finalize or hygiene-abandon first." >&2
+            return 1 ;;
+    esac
+    local order="claude-opus codex-a codex-b claude-sonnet" targets="" w
+    if [ "$all" = 1 ]; then
+        targets="$order"
+    else
+        _hygiene_worker_ok "$want" || { echo "reset-idle: '$want' is not a policy-covered worker pane (pane 1 is structurally un-resettable)." >&2; return 1; }
+        targets="$want"
+    fi
+    # P0-4 single cleanup path: every return below releases any held fd.
+    trap _hygiene_release_all RETURN
+    local rc_all=0
+    for w in $targets; do
+        _hygiene_worker_ok "$w" || continue
+        local idx; idx="$(pane_index "$w")"
+        if ! _worker_lock "$w"; then
+            echo "reset-idle: $w lock busy — skipped (another boundary owns it)." >&2
+            rc_all=1; continue
+        fi
+        if [ "$dry" = 1 ]; then
+            local _h _op _oprc
+            _h="$(_worker_health "$SESSION" "$idx" "$w")"
+            _op="$(_worker_open_pending_ts "$pr" "$w" "")"; _oprc=$?
+            printf 'DRY-RUN %-13s idx=%s health=%-9s pending=%-24s decision=%s\n' \
+                "$w" "$idx" "$_h" \
+                "$([ "$_oprc" -eq 0 ] && echo "${_op:-none}" || echo scan-failed)" \
+                "$(_hygiene_decide "$pr" "$w" '' '')"
+            _worker_unlock "$w"; continue
+        fi
+        if _reset_worker_locked "$SESSION" "$idx" "$w" idle-proactive "$slug"; then
+            _emit_event HYGIENE_DECISION "$slug" "stage=idle worker=$w action=RESET_CONFIRMED reason=idle-proactive threshold=$(_worker_min_headroom "$w" 2>/dev/null) confidence=none mode=$mode generation=$(_hygiene_current_gen "$pr" "$w") source=idle live_headroom=none divergent=0"
+            echo "HYGIENE $w: RESET_CONFIRMED — idle-proactive (gen $(_hygiene_current_gen "$pr" "$w"))" >&2
+        else
+            rc_all=1
+        fi
+        _worker_unlock "$w"
+    done
+    return $rc_all
+}
+
 cmd_hygiene_gc() {
     require_identity "hygiene-gc" host-session || return 1
     local days=30 dry=0
@@ -6207,13 +6291,28 @@ cmd_emit() {
     _emit_event "$type" "$slug" "$fields"
 }
 
-# usage — print the per-worker usage snapshot for the current session.
-#   forge-bridge usage [<worker>]
-# Read-only FILE read (forge-usage.<session>.yml); never scrapes a pane — a
-# status query must not perturb workers. Recorded per task by _observe_usage.
+# usage — per-worker context snapshot for the current session (+ the orchestrator row).
+#   forge-bridge usage [<worker>] [--refresh] [--json]
+#
+# Default: a read-only FILE read (forge-usage.<session>.yml); it never scrapes a pane, so a
+# status query cannot perturb a worker. --refresh DOES measure: it live-samples the four
+# workers and pane 1, upserts, then renders — that is the batch-planning snapshot.
+#
+# FRESHNESS COMES FROM PER-RECORD `measured_at`, NEVER from the file-level `updated:` key.
+# That key is refreshed by ANY worker's callback, which is exactly how a 22-hour-old codex-b
+# reading rendered under `updated: <two minutes ago>` (F5). Post-S2.4 the only remaining
+# reader of `updated:` is the --json passthrough, where it is informational provenance only.
 cmd_usage() {
     require_identity "usage" host-session || return 1
-    local filter="${1:-}"
+    local filter="" refresh=0 as_json=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --refresh) refresh=1; shift ;;
+            --json)    as_json=1; shift ;;
+            --*)       shift ;;
+            *)         [ -z "$filter" ] && filter="$1"; shift ;;
+        esac
+    done
     local project_root
     project_root=$(_resolve_project_root "")
     if [ -z "$project_root" ]; then
@@ -6227,44 +6326,188 @@ cmd_usage() {
         return 0
     fi
     local usage_file="$project_root/$(_usage_file)"
+    local _uw
+    if [ "$refresh" = 1 ]; then
+        # S10: live-measure the four workers and pane 1. Panes with an OPEN PENDING are
+        # SAMPLED, NOT SKIPPED — a mid-stage reading is the most decision-relevant number in a
+        # planning snapshot; it renders as `in-flight` and is worded as a FLOOR (the worker
+        # will consume more before its stage ends). S3.2's non-destructive sample rule is what
+        # makes sampling a streaming pane safe: a bad parse cannot clobber a good record.
+        for _uw in claude-opus codex-a codex-b claude-sonnet; do
+            if [ -n "$filter" ] && [ "$_uw" != "$filter" ]; then continue; fi
+            _observe_usage "$_uw" "${FORGE_SEND_SLUG:-adhoc}" refresh "$(pane_index "$_uw")" \
+                "$project_root" "" sample refresh >/dev/null 2>&1 || true
+        done
+        _observe_pane1 "$project_root" "${FORGE_SEND_SLUG:-adhoc}" >/dev/null 2>&1 || true
+    fi
     if [ ! -f "$usage_file" ]; then
-        echo "usage: no usage recorded yet for session '$sess_token'"
-        echo "       ($usage_file)"
+        if [ "$as_json" = 1 ]; then
+            printf '{"schema":"forge-usage/1","session":"%s","updated":null,"workers":[],"orchestrator":null}\n' "$sess_token"
+        else
+            echo "usage: no usage recorded yet for session '$sess_token'"
+            echo "       ($usage_file)"
+        fi
         return 0
     fi
-    FORGE_U_FILTER="$filter" python3 - "$usage_file" 2>/dev/null <<'PYEOF'
-import os, sys, yaml
+    # Bridge-owned inputs the renderer needs for the recommendation: the effective GATE
+    # threshold per worker, and which panes have an open pending. Computed ONLY when a
+    # recommendation will actually be shown — a plain `usage` must stay a pure file read and
+    # not run four YAML scans over every .dev/proposals/*/forge-log.yml.
+    local _mins="" _busy=""
+    if [ "$refresh" = 1 ] || [ "$as_json" = 1 ]; then
+        for _uw in claude-opus codex-a codex-b claude-sonnet; do
+            _mins="$_mins $_uw=$(_worker_min_headroom "$_uw" 2>/dev/null || echo 75)"
+            local _op _oprc; _op="$(_worker_open_pending_ts "$project_root" "$_uw" "" 2>/dev/null)"; _oprc=$?
+            if [ "$_oprc" -ne 0 ] || [ -n "$_op" ]; then _busy="$_busy $_uw"; fi
+        done
+    fi
+    FORGE_U_FILTER="$filter" FORGE_U_JSON="$as_json" FORGE_U_MAXAGE="$(_usage_max_age_s)" \
+    FORGE_U_MINS="$_mins" FORGE_U_BUSY="$_busy" FORGE_U_SESS="$sess_token" \
+    FORGE_U_RECO="$([ "$refresh" = 1 ] || [ "$as_json" = 1 ] && echo 1 || echo 0)" \
+    python3 - "$usage_file" 2>/dev/null <<'PYEOF'
+import os, sys, yaml, json, datetime
 usage_file = sys.argv[1]
-flt = os.environ.get("FORGE_U_FILTER", "")
+flt   = os.environ.get("FORGE_U_FILTER", "")
+asj   = os.environ.get("FORGE_U_JSON") == "1"
+reco_on = os.environ.get("FORGE_U_RECO") == "1"
+sess  = os.environ.get("FORGE_U_SESS", "")
+try:
+    maxage = int(os.environ.get("FORGE_U_MAXAGE") or "900")
+except ValueError:
+    maxage = 900
+mins = {}
+for tok in (os.environ.get("FORGE_U_MINS") or "").split():
+    if "=" in tok:
+        k, v = tok.split("=", 1)
+        try:
+            mins[k] = int(v)
+        except ValueError:
+            pass
+busy = set((os.environ.get("FORGE_U_BUSY") or "").split())
+
 try:
     with open(usage_file) as f:
         data = yaml.safe_load(f) or {}
 except Exception as e:
-    print("usage: snapshot unreadable: %s" % e); sys.exit(0)
+    if asj:
+        print(json.dumps({"schema": "forge-usage/1", "session": sess, "error": str(e),
+                          "workers": [], "orchestrator": None}))
+    else:
+        print("usage: snapshot unreadable: %s" % e)
+    sys.exit(0)
 if not isinstance(data, dict):
     data = {}
 workers = data.get("workers") or {}
-updated = data.get("updated", "?")
-print("usage snapshot (updated %s):" % updated)
-if not isinstance(workers, dict) or not workers:
-    print("  (empty)"); sys.exit(0)
+orch = data.get("orchestrator")
+
+def age_of(rec):
+    ts = rec.get("measured_at") if isinstance(rec, dict) else None
+    if not isinstance(ts, str) or not ts:
+        return None
+    iso = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return int((datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds())
+
+def h_age(a):
+    if a is None:
+        return "?"
+    if a < 90:
+        return "%ds" % a
+    if a < 5400:
+        return "%dm" % (a // 60)
+    if a < 172800:
+        return "%dh" % (a // 3600)
+    return "%dd" % (a // 86400)
+
+def recommend(w, rec):
+    """TIER-FREE. This is the bridge reporting its OWN gate's verdict, not routing policy —
+    Hard Rule 22 tier eligibility lives in the skill and its agent mirror, both under lockstep
+    tests, and a third representation here would have to be kept consistent with both. It
+    exists because the shipped comparison is INCLUSIVE (headroom > mn keeps, else resets) and
+    re-deriving an off-by-one boundary on every planning pass is exactly what an LLM gets
+    wrong."""
+    if not reco_on:
+        return "unknown"
+    if w in busy:
+        return "busy"
+    hr = rec.get("headroom")
+    if rec.get("confidence") != "high" or not isinstance(hr, int) or isinstance(hr, bool):
+        return "unknown"
+    mn = mins.get(w, 75)
+    return "ok" if hr > mn else "reset-first"
+
 order = ["claude-opus", "claude-sonnet", "codex-a", "codex-b"]
 keys = [k for k in order if k in workers] + [k for k in workers if k not in order]
-shown = 0
+
+rows = []
 for w in keys:
     if flt and w != flt:
         continue
-    r = workers[w] if isinstance(workers[w], dict) else {}
-    hr = r.get("headroom", "?")
-    if hr == "unknown":
-        extra = "reason=%s" % r.get("reason", "?")
-    else:
-        extra = "pct=%s tokens=%s" % (r.get("pct", "?"), r.get("tokens", "?"))
-    print("  %-13s family=%-6s headroom=%-7s confidence=%-5s stage=%-13s %s" % (
-        w, r.get("family", "?"), hr, r.get("confidence", "?"),
-        r.get("stage", "?"), extra))
-    shown += 1
-if flt and shown == 0:
+    r = workers[w] if isinstance(workers.get(w), dict) else {}
+    a = age_of(r)
+    rows.append({"worker": w, "family": r.get("family"), "headroom": r.get("headroom"),
+                 "confidence": r.get("confidence"), "pct": r.get("pct"),
+                 "tokens": r.get("tokens"), "stage": r.get("stage"),
+                 "reason": r.get("reason"), "observed_by": r.get("observed_by"),
+                 "generation": r.get("generation"), "measured_at": r.get("measured_at"),
+                 "age_s": a, "stale": (a is None or a > maxage),
+                 "sampled_state": ("in-flight" if w in busy else "idle"),
+                 "divergent": bool(r.get("divergent")),
+                 "recommendation": recommend(w, r)})
+
+orow = None
+if isinstance(orch, dict) and not flt:
+    a = age_of(orch)
+    orow = {"worker": "claude-orchestrator", "role": "orchestrator",
+            "headroom": orch.get("headroom"), "confidence": orch.get("confidence"),
+            "pct": orch.get("pct"), "tokens": orch.get("tokens"),
+            "observed_by": orch.get("observed_by"), "measured_at": orch.get("measured_at"),
+            "age_s": a, "stale": (a is None or a > maxage),
+            "incarnation": orch.get("incarnation"),
+            "sampled_state": "idle",
+            "recommendation": "observe-only"}
+
+if asj:
+    print(json.dumps({"schema": "forge-usage/1", "session": sess,
+                      "updated": data.get("updated"),
+                      "max_age_s": maxage,
+                      "workers": rows, "orchestrator": orow},
+                     indent=2, sort_keys=True))
+    sys.exit(0)
+
+print("usage snapshot (session %s; freshness is PER-RECORD measured_at, not the file-level updated: key):" % sess)
+if not rows and orow is None:
+    print("  (empty)"); sys.exit(0)
+for r in rows:
+    hr = r["headroom"] if r["headroom"] is not None else "?"
+    extra = ("reason=%s" % (r.get("reason") or "?")) if hr == "unknown" \
+        else ("pct=%s tokens=%s" % (r.get("pct"), r.get("tokens")))
+    tags = []
+    if r["stale"]:
+        tags.append("STALE")
+    if r["sampled_state"] == "in-flight":
+        tags.append("in-flight(FLOOR — will consume more before the stage ends)")
+    if r["divergent"]:
+        tags.append("DIVERGENT")
+    # `reco=` replaces `stage=` in the HUMAN row: the recommendation is the decision-relevant
+    # field and the row must stay inside 120 columns. `stage` is still in --json.
+    print("  %-13s family=%-6s headroom=%-7s confidence=%-5s age=%-5s observed_by=%-9s reco=%-11s %s %s" % (
+        r["worker"], r.get("family") or "?", hr, r.get("confidence") or "?",
+        h_age(r["age_s"]), r.get("observed_by") or "?", r["recommendation"],
+        extra, (" ".join(tags))))
+if orow is not None:
+    hr = orow["headroom"] if orow["headroom"] is not None else "?"
+    print("  %-13s role=orchestrator headroom=%-7s confidence=%-5s age=%-5s %s" % (
+        "pane-1", hr, orow.get("confidence") or "?", h_age(orow["age_s"]),
+        "STALE" if orow["stale"] else ""))
+    print("      -> observe-only (pane 1 is NEVER auto-reset; at or below the orchestrator")
+    print("         threshold the response is a HANDOFF NOTE, not a /clear)")
+if flt and not rows:
     print("  (no record for worker '%s')" % flt)
 PYEOF
     return 0
@@ -7308,6 +7551,7 @@ case "${1:-help}" in
     verify-decision)     shift; cmd_verify_decision "$@" ;;
     finalize)            shift; cmd_finalize "$@" ;;
     hygiene-status)      shift; cmd_hygiene_status "$@" ;;
+    reset-idle)          shift; cmd_reset_idle "$@" ;;
     hygiene-gc)          shift; cmd_hygiene_gc "$@" ;;
     hygiene-abandon)     shift; cmd_hygiene_abandon "$@" ;;
     help|*)
@@ -7341,7 +7585,13 @@ case "${1:-help}" in
         echo "  context                       Show current pipeline state"
         echo "  set-context --slug <s>        Set active pipeline (auto-derives state)"
         echo "  add-note <text>               Add a note to context (persists across sessions)"
-        echo "  usage [<worker>]              Show per-worker usage snapshot (read-only; from forge-usage.<session>.yml)"
+        echo "  usage [<worker>] [--refresh] [--json]"
+        echo "                                Per-worker usage snapshot (+ pane 1). --refresh live-measures first;"
+        echo "                                --json emits stable keys with a tier-free recommendation (reset-first|ok|busy|unknown)"
+        echo "  reset-idle [--worker <w> | --all] [--dry-run]"
+        echo "                                Proactively reset an IDLE worker off the dispatch critical path. Inherits every"
+        echo "                                dispatch-time safety precondition; refuses on an open pending, non-idle health,"
+        echo "                                a terminal state, in observe mode, and on pane 1"
         echo "  identity                      Print host/target identity descriptor; exit 0 (MATCH/CROSS) or 3 (MISMATCH/AMBIGUOUS/UNAVAILABLE)"
         echo "  stall-check-status [--project-root <p>]"
         echo "                                List panes with pending dispatch and stale stall-check coverage"

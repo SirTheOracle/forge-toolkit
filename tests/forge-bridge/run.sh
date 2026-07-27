@@ -3281,6 +3281,97 @@ else
   echo "  (skip: tmux unavailable — ACM §W)"
 fi
 
+echo "── ACM §J: reset-idle + planning snapshot (real tmux) ──"
+if command -v tmux >/dev/null 2>&1; then
+  # r1 · BLOCK-LOCAL SESSION (see ACM §D).
+  DS="fbacmj-$$"; DCA="$(mkR acmj)"
+  tmux new-session -d -s "$DS" -x 220 -y 50 -c "$DCA"
+  i=0; while [ "$i" -lt 4 ]; do tmux split-window -d -t "$DS:0" -c "$DCA"; tmux select-layout -t "$DS:0" tiled >/dev/null 2>&1; i=$((i+1)); done
+  DINC="$(tmux display-message -p -t "$DS:0.0" '#{session_created}')"
+  sleep 1
+  EVL="$DCA/.dev/forge-tmp/orchestrator-events.log"
+  mkdir -p "$DCA/.dev/forge-tmp"
+  # r1 · the journal path comes from $DINC. The suite's `session_incarnation_of` is a stub
+  # pinned to 42 (run.sh:1983), so "$DS.$(session_incarnation_of "$DS").yml" names a file that
+  # does not exist and every assertion reading it is vacuous or errors.
+  jf="$DCA/.dev/forge-hygiene.$DS.$DINC.yml"
+  run_in_pane "$DS:0.1" acmri1 "( cd $DCA && $ENF FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE reset-idle --worker codex-a )"
+  out_of acmri1 | grep -q 'observe mode' && grep -q '^OBSERVE_ONLY: .*command=reset-idle' "$EVL" \
+    && ok "T-ACM-RESETIDLE observe mode is a no-op with an OBSERVE_ONLY audit" || bad "T-ACM-RESETIDLE observe wrong"
+  run_in_pane "$DS:0.1" acmri2 "( cd $DCA && $ENF $BRIDGE reset-idle --worker claude )"
+  [ "$(rc_of acmri2)" != 0 ] && out_of acmri2 | grep -q 'structurally un-resettable' \
+    && ok "T-ACM-RESETIDLE refuses pane 1" || bad "T-ACM-RESETIDLE pane 1 not refused"
+  run_in_pane "$DS:0.1" acmri3 "( cd $DCA && $ENF FORGE_HEALTH_FIXTURE=$WORK/hyg-busy.txt $BRIDGE reset-idle --worker claude-opus )"
+  [ "$(rc_of acmri3)" != 0 ] && out_of acmri3 | grep -q 'not-idle' \
+    && ok "T-ACM-RESETIDLE refuses non-idle health" || bad "T-ACM-RESETIDLE non-idle accepted"
+  # r1 · the journal must EXIST before a hash can prove --dry-run did not change it; on a
+  # fresh root nothing has written one yet, so seed a generation with a real send.
+  run_in_pane "$DS:0.1" acmri-seed "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$AFIX/codex-73.txt $BRIDGE send --force claude-opus seed )"
+  [ -s "$jf" ] || bad "T-ACM-RESETIDLE journal seed failed (no $jf)"
+  ju_before="$(shasum -a 256 "$jf" | awk '{print $1}')"
+  run_in_pane "$DS:0.1" acmri4 "( cd $DCA && $ENF FORGE_HEALTH_FIXTURE=$CLB $BRIDGE reset-idle --worker claude-opus --dry-run )"
+  out_of acmri4 | grep -q '^DRY-RUN claude-opus' \
+    && [ "$(shasum -a 256 "$jf" | awk '{print $1}')" = "$ju_before" ] \
+    && ok "T-ACM-RESETIDLE --dry-run reports health, pending and decision, and mutates nothing" \
+    || bad "T-ACM-RESETIDLE dry-run mutated"
+  run_in_pane "$DS:0.1" acmri5 "( cd $DCA && $ENF FORGE_HEALTH_FIXTURE=$CLB FORGE_RESET_BASELINE_FIXTURE=$CLB FORGE_RESET_PROOF_FIXTURE=$CLA $BRIDGE reset-idle --worker claude-opus )"
+  [ "$(rc_of acmri5)" = 0 ] && out_of acmri5 | grep -q 'RESET_CONFIRMED — idle-proactive' \
+    && ok "T-ACM-RESETIDLE the success path confirms" || bad "T-ACM-RESETIDLE success rc=$(rc_of acmri5)"
+  # r1 · NOT --dry-run. cmd_dispatch returns at bin/forge-bridge:3803 on the dry-run path,
+  # which is BEFORE the whole hygiene gate (:3878-:4010) — no HYGIENE_DECISION is ever
+  # emitted, so the assertion below could never see action=KEEP_RESET_PROVEN.
+  run_in_pane "$DS:0.1" acmri6 "( cd $DCA && $ENF FORGE_HEALTH_FIXTURE=$CLA $BRIDGE dispatch --slug ari --stage adhoc --worker claude-opus )"
+  grep -q 'action=KEEP_RESET_PROVEN' "$EVL" \
+    && ok "T-ACM-RESETIDLE the following dispatch reads KEEP_RESET_PROVEN (the reset moved off the critical path)" \
+    || bad "T-ACM-RESETIDLE the follow-on dispatch did not reuse the proof: $(grep 'HYGIENE_DECISION' "$EVL" | tail -1)"
+  tmux send-keys -t "$DS:0.0" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$DS:0.0" acmri6-close "( cd $DCA && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug ari --stage adhoc --status DONE --worker claude-opus --message d --quiet )"
+  run_in_pane "$DS:0.1" acmri7 "( cd $DCA && $ENF FORGE_HEALTH_FIXTURE=$CLB $BRIDGE reset-idle --all --dry-run )"
+  ord="$(out_of acmri7 | sed -n 's/^DRY-RUN \([a-z-]*\) .*/\1/p' | tr '\n' ' ')"
+  [ "$ord" = "claude-opus codex-a codex-b claude-sonnet " ] \
+    && ok "T-ACM-RESETIDLE --all walks the canonical worker order" || bad "T-ACM-RESETIDLE order was '$ord'"
+  # T-ACM-JSON — schema, recommendation domain, sampled_state domain, orchestrator row.
+  run_in_pane "$DS:0.1" acmjson "( cd $DCA && $ENF $BRIDGE usage --json )"
+  out_of acmjson | sed 's/^DONE_.*//' | python3 -c '
+import json,sys
+b=json.loads(sys.stdin.read().strip())
+assert b["schema"]=="forge-usage/1", b.get("schema")
+assert b["workers"], b          # a vacuous pass is a failure: the resets above wrote records
+for w in b["workers"]:
+    assert w["recommendation"] in ("reset-first","ok","busy","unknown"), w
+    assert w["sampled_state"] in ("idle","in-flight"), w
+    for k in ("age_s","stale","observed_by","measured_at","stage"): assert k in w, (k,w)
+o=b.get("orchestrator")
+if o is not None:
+    assert o["recommendation"]=="observe-only", o
+' && ok "T-ACM-JSON usage --json schema, recommendation/sampled_state domains, observe-only orchestrator" \
+  || bad "T-ACM-JSON schema wrong: [$(out_of acmjson | tail -3 | tr '\n' '|')]"
+  # T-ACM-ISOLATION-WRITE — the strongest test in the suite.
+  # r1 · project only the observations that EXIST. A send or a reset legitimately creates a
+  # worker entry that carries no `observation` key at all, and comparing the raw per-worker
+  # map would fail on those `null`s — reporting "wrote an observation" for a path that wrote
+  # none. Filtering to non-null keeps the obligation intact in BOTH directions: an existing
+  # observation may not change, and a NEW one may not appear.
+  acm_obs(){ python3 - "$1" <<'PY'
+import sys,yaml,json
+d=yaml.safe_load(open(sys.argv[1])) or {}
+o={w:(r or {}).get("observation") for w,r in (d.get("workers") or {}).items()}
+print(json.dumps({w:v for w,v in o.items() if v is not None},sort_keys=True))
+PY
+  }
+  ob="$(acm_obs "$jf")"
+  run_in_pane "$DS:0.1" acmiso1 "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$AFIX/codex-9.txt $BRIDGE send --force codex-a x )"
+  run_in_pane "$DS:0.1" acmiso2 "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$AFIX/codex-9.txt $BRIDGE usage --refresh )"
+  run_in_pane "$DS:0.1" acmiso3 "( cd $DCA && $ENF FORGE_HEALTH_FIXTURE=$CLB FORGE_RESET_BASELINE_FIXTURE=$CLB FORGE_RESET_PROOF_FIXTURE=$CLA $BRIDGE reset-idle --worker claude-sonnet )"
+  [ "$ob" != "{}" ] && [ "$ob" = "$(acm_obs "$jf")" ] \
+    && ok "T-ACM-ISOLATION-WRITE send / --refresh / reset-idle leave every journal observation byte-unchanged" \
+    || bad "T-ACM-ISOLATION-WRITE a non-callback path wrote journal observation: before=$ob after=$(acm_obs "$jf")"
+  unset -f acm_obs
+  tmux kill-session -t "$DS" 2>/dev/null
+else
+  echo "  (skip: tmux unavailable — ACM §J)"
+fi
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
