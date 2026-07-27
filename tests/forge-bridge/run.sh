@@ -1256,8 +1256,23 @@ fi
 # §0 harness: pure-helper extraction (FNS idiom), fixture seams, env defaults.
 echo "── HYG §0: pure-helper extraction ──"
 HFNS="$WORK/hfns.sh"
-sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p; /^_hygiene_file()/,/^}$/p; /^_hygiene_write()/,/^}$/p; /^_hygiene_decide()/,/^}$/p; /^_hygiene_current_gen()/,/^}$/p; /^_terminal_state()/,/^}$/p; /^_hygiene_journal_preflight()/,/^}$/p; /^_hygiene_finalization_field()/,/^}$/p; /^_hygiene_activation_blockers()/,/^}$/p; /^cmd_hygiene_gc()/,/^}$/p; /^_worker_lock_fd()/,/^}$/p; /^_worker_lock()/,/^}$/p; /^_worker_unlock()/,/^}$/p; /^_terminal_lock()/,/^}$/p; /^_terminal_unlock()/,/^}$/p; /^_hygiene_release_all()/,/^}$/p; /^_reset_worker_locked()/,/^}$/p; /^_worker_open_pending_ts()/,/^}$/p; /^_worker_health()/,/^}$/p; /^pane_index()/,/^}$/p; /^_completion_id()/,/^}$/p; /^_event_has_completion()/,/^}$/p' "$BRIDGE" > "$HFNS"
+sed -n '/^_worker_family()/,/^}$/p; /^_hygiene_worker_ok()/,/^}$/p; /^_hygiene_valid_pct()/,/^}$/p; /^_hygiene_mode()/,/^}$/p; /^_hygiene_enforcing()/,/^}$/p; /^_hygiene_crash_at()/,/^}$/p; /^_worker_min_headroom()/,/^}$/p; /^_reset_proof_timeout()/,/^}$/p; /^_reset_automation_enabled()/,/^}$/p; /^_reset_baseline()/,/^}$/p; /^_reset_proof_probe()/,/^}$/p; /^_hygiene_file()/,/^}$/p; /^_hygiene_write()/,/^}$/p; /^_hygiene_decide()/,/^}$/p; /^_hygiene_current_gen()/,/^}$/p; /^_terminal_state()/,/^}$/p; /^_hygiene_journal_preflight()/,/^}$/p; /^_hygiene_finalization_field()/,/^}$/p; /^_hygiene_activation_blockers()/,/^}$/p; /^cmd_hygiene_gc()/,/^}$/p; /^_worker_lock_fd()/,/^}$/p; /^_worker_lock()/,/^}$/p; /^_worker_unlock()/,/^}$/p; /^_terminal_lock()/,/^}$/p; /^_terminal_unlock()/,/^}$/p; /^_hygiene_release_all()/,/^}$/p; /^_reset_worker_locked()/,/^}$/p; /^_worker_open_pending_ts()/,/^}$/p; /^_worker_health()/,/^}$/p; /^pane_index()/,/^}$/p; /^_completion_id()/,/^}$/p; /^_event_has_completion()/,/^}$/p; /^_usage_file()/p; /^_session_or_sentinel()/,/^}$/p; /^timestamp()/,/^}$/p; /^_context_alert_headroom()/,/^}$/p; /^_orchestrator_alert_headroom()/,/^}$/p; /^_usage_max_age_s()/,/^}$/p; /^_usage_parse_capture()/,/^}$/p; /^_usage_upsert()/,/^}$/p; /^_usage_mark_post_reset()/,/^}$/p; /^_usage_record_hash()/,/^}$/p; /^_usage_record_headroom()/,/^}$/p; /^_usage_record_age_s()/,/^}$/p; /^_hygiene_reset_proof_kind()/,/^}$/p; /^_hygiene_notified_gen()/,/^}$/p; /^_hygiene_live_override()/,/^}$/p; /^_observe_usage()/,/^}$/p; /^_observe_pane1()/,/^}$/p; /^_acm_sample_tick()/,/^}$/p' "$BRIDGE" > "$HFNS"
 grep -q '_reset_proof_probe' "$HFNS" && ok "HYG helper extraction non-empty" || bad "HYG helper extraction empty"
+# T-ACM-EXTRACT — a sed RANGE over a one-line function over-runs to the next `^}$` and drags
+# neighbouring code in. The over-run is VALID BASH, so `bash -n` alone cannot see it; the
+# function inventory is what catches it. Both guards ship.
+bash -n "$HFNS" \
+  && ok "T-ACM-EXTRACT extracted helpers parse" || bad "T-ACM-EXTRACT extracted helpers do not parse"
+sed -n 's/^\([a-z_][a-z0-9_]*\)() *{.*/\1/p; s/^\([a-z_][a-z0-9_]*\)()$/\1/p' "$HFNS" | sort -u > "$WORK/hfns-got.txt"
+grep -o '/\^[a-z_][a-z0-9_]*()' "$0" | sed 's|/\^||; s|()||' | sort -u > "$WORK/hfns-want.txt"
+if comm -23 "$WORK/hfns-got.txt" "$WORK/hfns-want.txt" | grep -q .; then
+  bad "T-ACM-EXTRACT extraction pulled in unrequested functions: $(comm -23 "$WORK/hfns-got.txt" "$WORK/hfns-want.txt" | tr '\n' ' ')"
+else
+  ok "T-ACM-EXTRACT extraction contains only requested functions"
+fi
+grep -q 'FORGE_IDENTITY_ENFORCE=' "$HFNS" \
+  && bad "T-ACM-EXTRACT a stray FORGE_IDENTITY_ENFORCE assignment leaked into the sourced helpers" \
+  || ok "T-ACM-EXTRACT no stray identity assignment in the sourced helpers"
 HFIX="$ROOT/tests/forge-bridge/fixtures"
 # Shared env for every hygiene subshell: hermetic defaults + capability fixture.
 hyg_env() {
@@ -2716,6 +2731,87 @@ o=$( cd "$MR" && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe "$BRIDG
 [ "$rc" != 0 ] && echo "$o" | grep -q 'OBSERVE_ONLY; got' \
   && ok "T-HYG-EMIT BOGUS rejected with the updated whitelist error" \
   || bad "T-HYG-EMIT BOGUS: rc=$rc $o"
+
+echo "── ACM §T: threshold resolution ──"
+[ "$(FORGE_CONTEXT_ALERT_HEADROOM=25 _context_alert_headroom claude-opus)" = 25 ] \
+  && ok "T-ACM-THRESHOLDS shared 25 resolves" || bad "T-ACM-THRESHOLDS shared wrong"
+[ "$(FORGE_CONTEXT_ALERT_HEADROOM=25 FORGE_CONTEXT_ALERT_HEADROOM_CODEX=15 _context_alert_headroom codex-b)" = 15 ] \
+  && ok "T-ACM-THRESHOLDS codex family override wins" || bad "T-ACM-THRESHOLDS codex override lost"
+[ "$(FORGE_CONTEXT_ALERT_HEADROOM=25 FORGE_CONTEXT_ALERT_HEADROOM_CODEX=15 _context_alert_headroom claude-sonnet)" = 25 ] \
+  && ok "T-ACM-THRESHOLDS unset family inherits shared" || bad "T-ACM-THRESHOLDS inherit broken"
+o=$(FORGE_CONTEXT_ALERT_HEADROOM=abc _context_alert_headroom claude-opus 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$o" | grep -q CONFIG_ERROR \
+  && ok "T-ACM-THRESHOLDS non-integer → CONFIG_ERROR rc1" || bad "T-ACM-THRESHOLDS abc accepted: rc=$rc"
+o=$(FORGE_CONTEXT_ALERT_HEADROOM=25 FORGE_CONTEXT_ALERT_HEADROOM_CLAUDE=200 _context_alert_headroom claude-opus 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$o" | grep -q 'FORGE_CONTEXT_ALERT_HEADROOM_CLAUDE' \
+  && ok "T-ACM-THRESHOLDS family out-of-range → CONFIG_ERROR rc1" || bad "T-ACM-THRESHOLDS 200 accepted"
+[ "$(FORGE_ORCHESTRATOR_ALERT_HEADROOM=30 _orchestrator_alert_headroom)" = 30 ] \
+  && ok "T-ACM-THRESHOLDS orchestrator alert resolves" || bad "T-ACM-THRESHOLDS orch wrong"
+[ "$(FORGE_USAGE_MAX_AGE_S=abc _usage_max_age_s)" = 900 ] \
+  && ok "T-ACM-THRESHOLDS max-age falls back (display-only knobs are never fatal)" || bad "T-ACM-THRESHOLDS max-age wrong"
+
+echo "── ACM §M: MONOTONE-CONSERVATIVE property table ──"
+mono_rank() { case "$1" in RESET_THRESHOLD|RESET_UNPROVEN) echo 1 ;; *) echo 0 ;; esac; }
+mono() {  # mono <dec> <hr> <conf> <min> <proof_kind> <want_dec> <want_src> <want_div>
+  local out d r s v
+  out="$(_hygiene_live_override "$1" seed "$2" "$3" "$4" "$5")"
+  IFS=$'\t' read -r d r s v <<< "$out"
+  if [ "$d" = "$6" ] && [ "$s" = "$7" ] && [ "$v" = "$8" ] \
+     && [ -n "$d" ] && [ -n "$r" ] && [ -n "$s" ] && [ -n "$v" ] \
+     && [ "$(mono_rank "$d")" -ge "$(mono_rank "$1")" ]; then
+    ok "T-ACM-MONOTONE $1 + live($2,$3) pk=${5:-none} → $d source=$s divergent=$v"
+  else
+    bad "T-ACM-MONOTONE $1 + live($2,$3) pk=${5:-none} got '$out' want '$6/$7/$8'"
+  fi
+}
+# live high-LOW
+mono KEEP_OBSERVED     20 high 75 ''                    RESET_THRESHOLD live 0
+mono KEEP_RESET_PROVEN 20 high 75 pristine-state        RESET_THRESHOLD live 0
+mono KEEP_RESET_PROVEN 20 high 75 post-baseline-anchor  KEEP_RESET_PROVEN journal 1
+mono KEEP_RESET_PROVEN 20 high 75 session-id-change     KEEP_RESET_PROVEN journal 1
+mono KEEP_RESET_PROVEN 20 high 75 ''                    KEEP_RESET_PROVEN journal 1
+mono KEEP_RESET_PROVEN 20 high 75 nonsense-kind         KEEP_RESET_PROVEN journal 1
+mono RESET_THRESHOLD   20 high 75 ''                    RESET_THRESHOLD journal 0
+mono RESET_UNPROVEN    20 high 75 ''                    RESET_UNPROVEN  journal 0
+# live high-OK (above threshold) — must NEVER relax anything
+mono KEEP_OBSERVED     90 high 75 ''                    KEEP_OBSERVED     journal 0
+mono KEEP_RESET_PROVEN 90 high 75 pristine-state        KEEP_RESET_PROVEN journal 0
+mono RESET_THRESHOLD   90 high 75 ''                    RESET_THRESHOLD   journal 0
+mono RESET_UNPROVEN    90 high 75 ''                    RESET_UNPROVEN    journal 0
+# live UNKNOWN / low confidence — inert in both directions
+mono KEEP_OBSERVED     unknown none 75 ''               KEEP_OBSERVED   journal 0
+mono KEEP_OBSERVED     20 low  75 ''                    KEEP_OBSERVED   journal 0
+mono RESET_UNPROVEN    unknown none 75 ''               RESET_UNPROVEN  journal 0
+# NO live capture at all (supersede path, observe mode)
+mono KEEP_OBSERVED     '' none 75 ''                    KEEP_OBSERVED   journal 0
+mono KEEP_RESET_PROVEN '' none 75 pristine-state        KEEP_RESET_PROVEN journal 0
+# BOUNDARY: exactly at the threshold is INCLUSIVE (shipped contract, headroom <= mn resets)
+mono KEEP_OBSERVED     75 high 75 ''                    RESET_THRESHOLD live 0
+mono KEEP_OBSERVED     76 high 75 ''                    KEEP_OBSERVED  journal 0
+# An empty journal reason must not collapse the tab-separated output.
+out="$(_hygiene_live_override KEEP_OBSERVED '' 20 high 75 '')"
+IFS=$'\t' read -r d r s v <<< "$out"
+[ "$d" = RESET_THRESHOLD ] && [ "$s" = live ] && [ "$v" = 0 ] && [ -n "$r" ] \
+  && ok "T-ACM-MONOTONE empty reason does not shift the tab fields" \
+  || bad "T-ACM-MONOTONE field shift on empty reason: '$out'"
+
+echo "── ACM §F: freshness source ──"
+AF="$WORK/acmFresh"; mkdir -p "$AF/.dev"
+python3 - "$AF/.dev/forge-usage.acmF.yml" <<'PY'
+import sys,yaml,datetime
+now=datetime.datetime.now(datetime.timezone.utc)
+old=(now-datetime.timedelta(hours=22)).strftime('%Y-%m-%dT%H:%M:%SZ')
+yaml.safe_dump({"updated":now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "workers":{"codex-b":{"family":"codex","headroom":40,"confidence":"high",
+                                      "measured_at":old,"observed_by":"callback",
+                                      "pct":60,"tokens":None,"stage":"coding","reason":None,
+                                      "raw":"Context 40% left","source":"pane-footer"}}},
+               open(sys.argv[1],"w"), default_flow_style=False, sort_keys=True)
+PY
+a=$(_usage_record_age_s "$AF/.dev/forge-usage.acmF.yml" codex-b)
+[ -n "$a" ] && [ "$a" -gt 79000 ] \
+  && ok "T-ACM-FRESHNESS-SOURCE age derives from per-record measured_at (${a}s), not the fresh file-level updated:" \
+  || bad "T-ACM-FRESHNESS-SOURCE age wrong: '$a'"
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"

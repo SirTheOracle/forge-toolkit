@@ -84,6 +84,34 @@ FORGE_WORKER_MIN_HEADROOM="${FORGE_WORKER_MIN_HEADROOM:-75}"
 # Capability/anchor fixture path (data-driven; never hard-coded).
 FORGE_RESET_CAPABILITY_FILE="${FORGE_RESET_CAPABILITY_FILE:-$HOME/.config/forge/reset-capability.yml}"
 
+# ---- Active-context-management controls (S11) ----
+# FIVE knobs, FIVE different questions. The GATE threshold above is UNTOUCHED; nothing
+# below may move a hygiene decision (MONOTONE-CONSERVATIVE RULE).
+#   MIN_HEADROOM        should a new stage start in this conversation?   (gate, 75)
+#   CONTEXT_ALERT       is this worker in trouble?                       (alerting, 25)
+#   ORCHESTRATOR_ALERT  does pane 1 need a handoff?                      (30)
+#   USAGE_MAX_AGE_S     is this reading too old to SHOW as current?      (DISPLAY ONLY)
+#   SEND_MIN_HEADROOM   opt-in hard floor on non---force sends           (0 = disabled)
+# USAGE_MAX_AGE_S is display-only BY DESIGN: a wall-clock TTL at the gate was explicitly
+# rejected, and tests/forge-bridge/run.sh's "T-HYG-DEC age TTL crept in" exists to forbid it.
+# NOTE: these are shell variables and are NOT exported. Any python heredoc that needs one
+# must receive it as argv or via an explicit env prefix on the `python3` line.
+# Family overrides are load-bearing, not decorative: codex panes read above 75 in ~0.7% of
+# live samples, so one global alert number cannot serve both families.
+FORGE_CONTEXT_ALERT_HEADROOM="${FORGE_CONTEXT_ALERT_HEADROOM:-25}"
+FORGE_ORCHESTRATOR_ALERT_HEADROOM="${FORGE_ORCHESTRATOR_ALERT_HEADROOM:-30}"
+FORGE_USAGE_MAX_AGE_S="${FORGE_USAGE_MAX_AGE_S:-900}"
+# SEND floor is the ONE exclusive comparison in this feature: refusal is `headroom < floor`,
+# strictly below, because S6.4 says "a hard floor BELOW WHICH ... is refused" and because an
+# inclusive test would refuse at headroom 0 if the `> 0` disable guard were ever removed.
+# The other four thresholds are INCLUSIVE (`<=`). The asymmetry is deliberate; do not
+# "correct" it.
+FORGE_SEND_MIN_HEADROOM="${FORGE_SEND_MIN_HEADROOM:-0}"
+# Mid-stage sampler cadence. DECOUPLED from FORGE_WAIT_INTERVAL_S (default 15) on purpose:
+# per-tick sampling would mean ~120 captures, 120 python3 spawns and 120 log lines per
+# 30-minute stage, and forge-watch full-file-scans the events log per slug per 30s scan.
+FORGE_USAGE_SAMPLE_INTERVAL_S="${FORGE_USAGE_SAMPLE_INTERVAL_S:-300}"
+
 # --- Session Detection (called explicitly by tmux-required commands) ---
 
 require_pane_count() {
@@ -525,6 +553,48 @@ _worker_min_headroom() {   # <worker_canonical>
     printf '%s' "$shared"
 }
 
+# Effective ALERT headroom for a worker (S11). Mirrors _worker_min_headroom exactly — same
+# validation, same family-override precedence, same hard config error (rc1). This is NOT the
+# gate threshold and can never move a hygiene decision: it only decides when a human is told.
+# Default 25; the gate stays at FORGE_WORKER_MIN_HEADROOM (75).
+_context_alert_headroom() {   # <worker_canonical>
+    local fam; fam="$(_worker_family "$1")"
+    local shared="$FORGE_CONTEXT_ALERT_HEADROOM" fam_raw=""
+    case "$fam" in
+        claude) fam_raw="${FORGE_CONTEXT_ALERT_HEADROOM_CLAUDE-}" ;;
+        codex)  fam_raw="${FORGE_CONTEXT_ALERT_HEADROOM_CODEX-}"  ;;
+    esac
+    if ! _hygiene_valid_pct "$shared"; then
+        echo "CONFIG_ERROR: FORGE_CONTEXT_ALERT_HEADROOM='$shared' not integer 0..100" >&2; return 1
+    fi
+    if [ -n "$fam_raw" ]; then
+        if ! _hygiene_valid_pct "$fam_raw"; then
+            echo "CONFIG_ERROR: FORGE_CONTEXT_ALERT_HEADROOM_$(printf '%s' "$fam" | tr a-z A-Z)='$fam_raw' not integer 0..100" >&2; return 1
+        fi
+        printf '%s' "$fam_raw"; return 0
+    fi
+    printf '%s' "$shared"
+}
+
+# Effective pane-1 alert headroom (S11/S13.3). No family dimension — pane 1 is always Claude.
+# Deliberately NOT named *_MIN_HEADROOM: it is not gate vocabulary and never authorizes an
+# action against pane 1.
+_orchestrator_alert_headroom() {
+    local v="$FORGE_ORCHESTRATOR_ALERT_HEADROOM"
+    if ! _hygiene_valid_pct "$v"; then
+        echo "CONFIG_ERROR: FORGE_ORCHESTRATOR_ALERT_HEADROOM='$v' not integer 0..100" >&2; return 1
+    fi
+    printf '%s' "$v"
+}
+
+# Display-only staleness bound (S11). NEVER consulted by _hygiene_decide. Deliberately does
+# NOT hard-error: a display knob must never be fatal.
+_usage_max_age_s() {
+    local v="$FORGE_USAGE_MAX_AGE_S"
+    case "$v" in ''|*[!0-9]*) v=900 ;; esac
+    printf '%s' "$v"
+}
+
 _reset_proof_timeout() {
     local t="${FORGE_WORKER_RESET_PROOF_TIMEOUT_S:-5}"
     case "$t" in ''|*[!0-9]*) t=5 ;; esac
@@ -675,6 +745,7 @@ _hygiene_file() {
 # invalidates observation BEFORE lifecycle per plan Step 5). rc: 0 ok; 1 lock/open;
 # 4 identity-mismatch; 5 malformed/non-mapping (journal NOT replaced); 6 write/fsync failed.
 # ops: next-gen|delivery|delivered|promote|observe-pending|observe-known|observe-unknown|
+#      notify-low-context|
 # reset|terminal|finalize.
 _hygiene_write() {   # <project_root> <op> <worker> key=val...
     local pr="$1" op="$2" worker="$3"; shift 3
@@ -755,6 +826,11 @@ elif op=="reset" and w is not None:
     w["reset"]={"id":kv.get("id"),"covers_generation":int(kv.get("generation") or 0),
                 "reason":kv.get("reason"),"proof_kind":kv.get("proof_kind"),
                 "proof_hash":kv.get("proof_hash"),"confirmed_at":now}
+elif op=="notify-low-context" and w is not None:
+    # S7.4 — the ONE journal field written outside cmd_callback. A notification dedup marker
+    # ONLY: _hygiene_decide never reads it, so it cannot influence enforcement. Keyed on
+    # generation so the next delivery re-arms it like all other coverage.
+    w["low_context_notified_gen"]=int(kv.get("generation") or 0)
 elif op=="invalidate-worker" and w is not None:
     # P1-2: advance the worker to a fresh generation so its prior reset/observation no
     # longer cover latest_generation -> _hygiene_decide returns RESET_UNPROVEN. Used by
@@ -851,6 +927,91 @@ w=((d.get("workers") or {}).get(sys.argv[2]) or {}); print(w.get("latest_generat
 PY
 }
 
+# Proof KIND of the reset that CURRENTLY covers latest_generation; empty when there is none.
+# The live override at the dispatch gate is admissible ONLY against a `pristine-state` proof,
+# because that anchor ('ctx: 0k (0%)' / 'Context 100% left') is THE SAME PHYSICAL LINE the
+# usage parser reads — it asserts zero consumption at reset time, so a later high-confidence
+# low reading is genuine consumption and not a lagging repaint. `post-baseline-anchor` and
+# `session-id-change` prove a redraw or a new session and say NOTHING about the footer
+# percentage. Absent/unrecognized reads as non-pristine (conservative).
+#
+# The coverage conjunct is redundant at today's only call site (it is consulted only on a
+# KEEP_RESET_PROVEN decision, which already implies coverage) and is present so the helper is
+# safe for the next caller: a stale reset record would otherwise return `pristine-state` and
+# authorize an override it cannot justify.
+_hygiene_reset_proof_kind() {   # <project_root> <worker>
+    python3 - "$1/$(_hygiene_file)" "$2" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+if not isinstance(d,dict): d={}
+w=((d.get("workers") or {}).get(sys.argv[2]) or {})
+rs=w.get("reset") or {}
+covers = rs.get("covers_generation")==w.get("latest_generation") and bool(rs.get("proof_hash"))
+print((rs.get("proof_kind") or "") if covers else "")
+PY
+}
+
+# Generation for which a WORKER_LOW_CONTEXT notification has already been emitted (S7.4).
+# `low_context_notified_gen` is the ONLY journal field written outside cmd_callback. It is a
+# notification marker, never an input to _hygiene_decide, and it is invalidated by the next
+# generation exactly like every other form of coverage.
+_hygiene_notified_gen() {   # <project_root> <worker>
+    python3 - "$1/$(_hygiene_file)" "$2" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+if not isinstance(d,dict): d={}
+w=((d.get("workers") or {}).get(sys.argv[2]) or {})
+g=w.get("low_context_notified_gen")
+print(g if isinstance(g,int) and not isinstance(g,bool) else "")
+PY
+}
+
+# S5.3/S5.4 — THE MONOTONE-CONSERVATIVE OVERRIDE, as a pure function so it can be
+# table-tested cell by cell.
+#
+#   _hygiene_live_override <journal_decision> <journal_reason> <live_headroom>
+#                          <live_confidence> <min> <reset_proof_kind>
+#   -> "<decision>\t<reason>\t<source>\t<divergent>"
+#
+# INVARIANT (the whole point): every output is either the input decision unchanged, or a
+# STRICTLY MORE CONSERVATIVE one. There is no path that produces a KEEP_* the journal did not
+# already produce, and no path that turns a RESET_* into anything weaker. Live measurement may
+# tighten the shipped gate; it may never relax it.
+#
+# EVERY OUTPUT FIELD IS GUARANTEED NON-EMPTY. TAB is an IFS whitespace character, so an empty
+# field would collapse under `IFS=$'\t' read` and shift `source` into `reason` at the call
+# site. `reason` degrades to `none` rather than empty for exactly that reason.
+_hygiene_live_override() {
+    local dec="$1" reason="${2:-none}" hr="$3" conf="$4" mn="$5" pk="${6:-}"
+    local src=journal div=0
+    [ -n "$reason" ] || reason=none
+    case "$hr" in ''|*[!0-9]*) printf '%s\t%s\t%s\t%s\n' "$dec" "$reason" "$src" "$div"; return 0 ;; esac
+    case "$mn" in ''|*[!0-9]*) printf '%s\t%s\t%s\t%s\n' "$dec" "$reason" "$src" "$div"; return 0 ;; esac
+    if [ "$conf" = high ] && [ "$hr" -le "$mn" ]; then
+        case "$dec" in
+            KEEP_OBSERVED)
+                dec=RESET_THRESHOLD; reason="headroom=$hr<=$mn"; src=live ;;
+            KEEP_RESET_PROVEN)
+                # §4 Conflict 1: split by the proof kind the journal already records.
+                if [ "$pk" = pristine-state ]; then
+                    dec=RESET_THRESHOLD; reason="headroom=$hr<=$mn"; src=live
+                else
+                    # post-baseline-anchor / session-id-change / absent / unrecognized: those
+                    # proofs assert a redraw or a new session and say NOTHING about the footer
+                    # percentage, so a low reading is ambiguous between a lagging repaint and
+                    # real consumption. RECORD, do not act — the watcher raises it (S8.5).
+                    div=1
+                fi ;;
+            *) : ;;   # already RESET_THRESHOLD / RESET_UNPROVEN — nothing left to tighten
+        esac
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$dec" "$reason" "$src" "$div"
+}
+
 _usage_record_hash() {   # <usage_file> <worker>
     [ -f "$1" ] || { printf ''; return 0; }
     python3 - "$1" "$2" <<'PY'
@@ -869,6 +1030,30 @@ try: d=yaml.safe_load(open(sys.argv[1])) or {}
 except Exception: print(" none"); sys.exit(0)
 r=((d.get("workers") or {}).get(sys.argv[2]) or {})
 hr=r.get("headroom"); print("%s %s" % (hr if isinstance(hr,int) else "", r.get("confidence") or "none"))
+PY
+}
+
+# Age in whole seconds of a record's OWN measured_at (S2.3/S2.4/F5). ALL freshness derives
+# from this, NEVER from the file-level `updated:` key — one worker's callback refreshes
+# `updated:` for every record in the file, which is exactly how a 22-hour-old reading
+# rendered as current. Empty output = no record / unparseable timestamp.
+_usage_record_age_s() {   # <usage_file> <worker>   ('orchestrator' selects the pane-1 record)
+    [ -f "$1" ] || { printf ''; return 0; }
+    python3 - "$1" "$2" <<'PY'
+import sys,yaml,datetime
+try: d=yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: print(""); sys.exit(0)
+if not isinstance(d,dict): print(""); sys.exit(0)
+wk=sys.argv[2]
+r=d.get("orchestrator") if wk=="orchestrator" else ((d.get("workers") or {}).get(wk))
+if not isinstance(r,dict): print(""); sys.exit(0)
+ts=r.get("measured_at")
+if not isinstance(ts,str) or not ts: print(""); sys.exit(0)
+iso=ts[:-1]+"+00:00" if ts.endswith("Z") else ts
+try: dt=datetime.datetime.fromisoformat(iso)
+except ValueError: print(""); sys.exit(0)
+if dt.tzinfo is None: dt=dt.replace(tzinfo=datetime.timezone.utc)
+print(int((datetime.datetime.now(datetime.timezone.utc)-dt).total_seconds()))
 PY
 }
 
@@ -1103,7 +1288,224 @@ _emit_event() {
     fi
 }
 
+# _usage_parse_capture <capture_file> <family>  (S3.1)
+# THE single V2 footer parser. Body lifted verbatim from _observe_usage so there is exactly
+# ONE implementation over both capture regions.
+#
+# Echoes ONE tab-separated line (the _reset_baseline idiom, bin/forge-bridge:2002):
+#     pct \t tokens \t headroom \t confidence \t reason \t raw
+#
+# THE LITERAL STRING `null` IS THE ABSENT-VALUE SENTINEL AND IS LOAD-BEARING. Do not
+# "simplify" it to an empty field. TAB is an IFS *whitespace* character, so with IFS=$'\t'
+# bash COLLAPSES runs of tabs and an empty field silently shifts every later field left:
+#     IFS=$'\t' read -r p q r s t u <<< "$(printf 'a\t\tc\td\te\tf1\tf2')"
+#         -> p=a q=c r=d s=e t=f1 u=f2      # WRONG: headroom would land in `tokens`
+# `reason` is empty on every successful parse and `tokens` is empty for every Codex reading,
+# so the empty-field case is the common case, not the edge case. `raw` is LAST because the
+# final `read` variable absorbs the remainder, tabs included.
+# NEVER writes anything, NEVER touches tmux.
+_usage_parse_capture() {   # <capture_file> <family>
+    FORGE_UP_FAM="$2" python3 - "${1:-}" <<'PYEOF'
+import os, sys, re
+fam  = os.environ.get("FORGE_UP_FAM", "")
+rawf = sys.argv[1] if len(sys.argv) > 1 else ""
+rec = {"pct": None, "tokens": None, "headroom": "unknown", "raw": None,
+       "confidence": "none",
+       "reason": ("codex-context-anchor-missing" if fam == "codex" else "no-anchor")}
+try:
+    raw = ""
+    if rawf and os.path.exists(rawf):
+        with open(rawf) as f:
+            raw = f.read()
+    if not raw.strip():
+        rec["reason"] = "capture-failed"
+    else:
+        # Strip ANSI/OSC, then scan the last twelve non-empty lines newest-first.
+        norm = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', raw)
+        norm = re.sub(r'\x1b\][0-9;]*\x07', '', norm)
+        lines = [line for line in norm.splitlines() if line.strip()][-12:]
+        if fam == "claude":
+            found = None
+            for line in reversed(lines):
+                mm = re.search(r'ctx:\s*(\d+)(k?)\s*\((\d+)%\)', line)
+                if mm:
+                    found = (mm, line.strip()); break
+            if found:
+                mm, line = found
+                pct = int(mm.group(3))
+                tokens = mm.group(1) + (mm.group(2) or "")
+                headroom = max(0, min(100, 100 - pct))
+                rec.update({"pct": pct, "tokens": tokens, "headroom": headroom,
+                            "raw": line,
+                            "confidence": ("high" if 0 <= pct <= 100 else "low"),
+                            "reason": None})
+        elif fam == "codex":
+            found = None
+            for line in reversed(lines):
+                mm = re.search(r'\bContext\s+(\d{1,3})%\s+left\b', line)
+                if mm:
+                    found = (mm, line.strip()); break
+            if found:
+                mm, line = found
+                remaining = int(mm.group(1))
+                if 0 <= remaining <= 100:
+                    rec.update({"pct": 100 - remaining, "tokens": None,
+                                "headroom": remaining, "raw": line,
+                                "confidence": "high", "reason": None})
+                else:
+                    rec.update({"raw": line, "reason": "bad-percent"})
+except Exception:
+    rec = {"pct": None, "tokens": None, "headroom": "unknown", "raw": None,
+           "confidence": "none", "reason": "observe-error"}
+def v(x):
+    return "null" if x is None else str(x)
+sys.stdout.write("\t".join([v(rec["pct"]), v(rec["tokens"]), v(rec["headroom"]),
+                            v(rec["confidence"]), v(rec["reason"]), v(rec["raw"])]) + "\n")
+PYEOF
+}
+
+# ACM S3 — THE ledger writer. ONE implementation of the fcntl lock protocol over
+# forge-usage.<session>.yml; _observe_usage, _observe_pane1, _usage_mark_post_reset and
+# cmd_dispatch's gate all route through it. Two implementations of one lock protocol over one
+# file is a correctness hazard, not a style question.
+#
+#   slot   workers/<canonical> | orchestrator     (pane 1 is NEVER under workers:)
+#   mode   record  today's behavior; a failed parse overwrites the record to unknown
+#          sample  NON-DESTRUCTIVE — a parse that did not reach confidence:high never
+#                  replaces an existing record, so a mid-turn parse miss cannot destroy
+#                  last-known-good (R6 mitigation)
+#   alert  effective alert headroom, or -1 to disable crossing detection
+#   line   a _usage_parse_capture line (six TAB fields, `null` = absent)
+#
+# The non-destructive rule and the crossing edge are BOTH decided INSIDE the lock, against
+# the record about to be replaced. Echoes "<headroom> <confidence> <crossed>" — three fields.
+# The third is INTERNAL: every caller consumes it and re-prints only the first two, so the
+# plan's `<headroom> <confidence>` stdout contract holds at every public seam.
+_usage_upsert() {   # <usage_file> <slot> <mode> <alert> <parse_line>
+    python3 - "$1" "$2" "$3" "$4" "$5" <<'PYEOF'
+import os, sys, yaml, fcntl
+path, slot, mode, alert_s, pline = sys.argv[1:6]
+
+def _int(s):
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+try:
+    alert = int(alert_s)
+except (TypeError, ValueError):
+    alert = -1
+
+f = pline.split("\t")
+while len(f) < 6:
+    f.append("null")
+pct, tokens, hr_raw, conf, reason, rawline = f[:6]
+
+def n(v):
+    return None if v == "null" else v
+
+headroom = "unknown" if hr_raw in ("null", "unknown") else _int(hr_raw)
+if headroom is None:
+    headroom = "unknown"
+
+rec = {"family": os.environ.get("FORGE_U_FAMILY", ""),
+       "pct": _int(pct), "tokens": n(tokens), "headroom": headroom,
+       "raw": n(rawline), "source": "pane-footer",
+       "confidence": (n(conf) or "none"), "reason": n(reason),
+       "stage": n(os.environ.get("FORGE_U_STAGE", "null")),
+       "measured_at": os.environ.get("FORGE_U_AT", ""),
+       "observed_by": os.environ.get("FORGE_U_OBSBY", "callback")}
+_g = os.environ.get("FORGE_U_GEN", "")
+if _g:
+    rec["generation"] = _g
+_ra = os.environ.get("FORGE_U_RESET_AT", "")
+if _ra:
+    rec["reset_at"] = _ra
+for _k in ("SESSION", "INCARNATION"):
+    _v = os.environ.get("FORGE_U_" + _k, "")
+    if _v:
+        rec[_k.lower()] = _v
+# S5.4 divergence, written by the SAME upsert that writes the reading it describes: no
+# read-modify-write, no race with a concurrent writer, and the flag disappears on the next
+# wholesale upsert, which is exactly the self-clearing lifetime the watcher relies on (R2).
+if os.environ.get("FORGE_U_DIVERGENT", "") == "1":
+    rec["divergent"] = True
+    _dh = _int(os.environ.get("FORGE_U_DIVERGENT_HEADROOM", ""))
+    if _dh is not None:
+        rec["divergent_headroom"] = _dh
+    rec["divergent_proof_kind"] = os.environ.get("FORGE_U_DIVERGENT_PROOF", "") or "none"
+
+def _low(r):
+    h = r.get("headroom") if isinstance(r, dict) else None
+    return (isinstance(r, dict) and r.get("confidence") == "high"
+            and isinstance(h, int) and not isinstance(h, bool)
+            and alert >= 0 and h <= alert)
+
+crossed = 0
+try:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path + ".lock", "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            data = {}
+            if os.path.exists(path):
+                try:
+                    with open(path) as fh:
+                        data = yaml.safe_load(fh) or {}
+                except Exception:
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            workers = data.get("workers")
+            if not isinstance(workers, dict):
+                workers = {}
+            wk = slot.split("/", 1)[1] if slot.startswith("workers/") else ""
+            prior = data.get("orchestrator") if slot == "orchestrator" else workers.get(wk)
+            if not isinstance(prior, dict):
+                prior = None
+            crossed = 1 if (_low(rec) and not _low(prior)) else 0
+            if not (mode == "sample" and rec.get("confidence") != "high" and prior is not None):
+                if slot == "orchestrator":
+                    data["orchestrator"] = rec
+                else:
+                    workers[wk] = rec
+                    data["workers"] = workers
+                data["updated"] = rec["measured_at"]
+                tmp = path + ".tmp"
+                with open(tmp, "w") as fh:
+                    yaml.safe_dump(data, fh, default_flow_style=False, sort_keys=True)
+                os.replace(tmp, path)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+except Exception:
+    crossed = 0
+# The control line always reports the LIVE parse, even when the upsert was skipped to
+# preserve last-known-good: callers must act on what the pane just said, and `unknown`
+# never alerts and never relaxes a gate.
+print("%s %s %d" % (rec["headroom"], rec["confidence"], crossed))
+PYEOF
+}
+
+# ACM S2.1 — after a PROVEN reset the ledger record describes a conversation the pane no
+# longer holds. Overwrite it with an honest `unknown`. NEVER synthesize headroom 100 — the
+# shipped plan forbids it, and `unknown` already means exactly what is true here: no alert,
+# still gate-unproven.
+#
+# `record` mode is LOAD-BEARING. If this ever passed `sample`, the non-destructive rule would
+# see confidence != high with a prior record present and SKIP the write: S2 would silently
+# stop working and only T-ACM-RESET-LEDGER would stand between that and shipping.
+_usage_mark_post_reset() {   # <project_root> <worker> [generation]
+    local at; at="$(timestamp)"
+    FORGE_U_FAMILY="$(_worker_family "$2")" FORGE_U_STAGE=reset FORGE_U_AT="$at" \
+    FORGE_U_OBSBY=reset FORGE_U_GEN="${3:-}" FORGE_U_RESET_AT="$at" \
+    _usage_upsert "$1/$(_usage_file)" "workers/$2" record -1 \
+        "$(printf 'null\tnull\tunknown\tnone\tpost-reset-unmeasured\tnull')" >/dev/null 2>&1
+    return 0
+}
+
 # _observe_usage <worker_canonical> <slug> <stage> <worker_idx> <project_root>
+#                [capture_file] [mode] [observed_by]
 # Read-only, family-aware per-task usage observation. Invoked from cmd_callback
 # AFTER all critical callback work, wrapped `|| true`. ALWAYS returns 0 — usage
 # observation must never delay or break a callback or the pipeline. It NEVER
