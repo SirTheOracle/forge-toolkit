@@ -1518,6 +1518,21 @@ _usage_mark_post_reset() {   # <project_root> <worker> [generation]
 # degrades to unknown. See .dev/proposals/codex-usage-parity-v2/final-plan.md.
 _observe_usage() {
     local worker="$1" slug="$2" stage="$3" worker_idx="$4" project_root="$5"
+    # S3.2 additive positionals. Every existing caller passes five arguments and gets
+    # byte-for-byte today's behavior.
+    #   capture_file  non-empty => parse THAT file instead of running `tmux capture-pane`
+    #                 (generalizes the mechanism FORGE_USAGE_FIXTURE already uses; the caller
+    #                 owns the file's lifetime and it is never deleted here)
+    #   mode          record (default, today's behavior) | sample
+    #                 sample is NON-DESTRUCTIVE (a parse that did not reach confidence:high
+    #                 leaves an existing record byte-identical, preserving last-known-good)
+    #                 and QUIET (no per-call USAGE event; one `USAGE ... sampled=1` only on an
+    #                 alert-threshold crossing)
+    #   observed_by   EXPLICIT provenance label persisted on the record. Never inferred from
+    #                 `mode` — a caller that forgets it gets `callback`, which is wrong and
+    #                 visible, rather than `sample`, which is wrong and plausible.
+    #                 (callback|dispatch|send|wait|refresh|reset|sample|pane1)
+    local capture_file="${6:-}" mode="${7:-record}" observed_by="${8:-callback}"
 
     # Guard 1: only the four worker panes (an orchestrator self-callback that
     # resolves to `claude` is silently skipped — no usage signal wanted there).
@@ -1543,20 +1558,25 @@ _observe_usage() {
     # Test seam: FORGE_USAGE_FIXTURE points at a pre-captured pane file and
     # bypasses tmux entirely (used by T1 unit tests; never set in production).
     local raw_file="" fixture_mode=""
-    if [ -n "${FORGE_USAGE_FIXTURE:-}" ] && [ -f "${FORGE_USAGE_FIXTURE}" ]; then
+    if [ -n "$capture_file" ] && [ -f "$capture_file" ]; then
+        # S3.2/S5: reuse a capture the caller already took (no new tmux round-trip).
+        raw_file="$capture_file"; fixture_mode=1
+    elif [ -n "${FORGE_USAGE_FIXTURE:-}" ] && [ -f "${FORGE_USAGE_FIXTURE}" ]; then
         raw_file="$FORGE_USAGE_FIXTURE"; fixture_mode=1
     else
         # cmd_callback ran require_identity, so ID_target_session is authoritative
         # (host for a worker self-callback; the declared target for a seat relay).
         case "$worker_idx" in
             ''|*[!0-9]*) fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=bad-pane"
-                         _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+                         [ "$mode" = record ] && _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+                         printf 'unknown none\n'
                          return 0 ;;
         esac
         local sess="${ID_target_session:-}"
         if [ -z "$sess" ]; then
             fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=no-session"
-            _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+            [ "$mode" = record ] && _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+            printf 'unknown none\n'
             return 0
         fi
         raw_file=$(mktemp -t forge-usage-XXXXXX 2>/dev/null) || raw_file=""
@@ -1565,121 +1585,51 @@ _observe_usage() {
         fi
     fi
 
-    # Parse + persist in one python pass; it prints the USAGE event fields (NOT
-    # the raw footer line — raw lives only in the snapshot YAML, never in the
-    # line-oriented event log) and always exits 0 with a well-formed fields line.
-    fields=$(FORGE_U_FAMILY="$family" FORGE_U_WORKER="$worker" FORGE_U_STAGE="$stage" \
-             FORGE_U_AT="$measured_at" FORGE_U_RAWFILE="${raw_file:-}" \
-             python3 - "$usage_file" 2>/dev/null <<'PYEOF'
-import os, sys, re, yaml, fcntl
-usage_file = sys.argv[1]
-fam   = os.environ.get("FORGE_U_FAMILY", "")
-wk    = os.environ.get("FORGE_U_WORKER", "")
-stage = os.environ.get("FORGE_U_STAGE", "")
-at    = os.environ.get("FORGE_U_AT", "")
-rawf  = os.environ.get("FORGE_U_RAWFILE", "")
+    # S3.1: ONE parser, over whichever capture region this call received.
+    local _p_pct _p_tok _p_hr _p_conf _p_reason _p_raw
+    IFS=$'\t' read -r _p_pct _p_tok _p_hr _p_conf _p_reason _p_raw <<< "$(_usage_parse_capture "${raw_file:-}" "$family")"
 
-def fields_line(d):
-    def v(x):
-        return "null" if x is None else x
-    return ("pct=%s tokens=%s headroom=%s source=%s confidence=%s%s" % (
-        v(d.get("pct")), v(d.get("tokens")), v(d.get("headroom")), v(d.get("source")),
-        v(d.get("confidence")),
-        (" reason=%s" % d["reason"]) if d.get("reason") else ""))
+    # Alert threshold is needed ONLY for sample-mode crossing detection, so it is resolved
+    # only there. A CONFIG_ERROR degrades to -1 (crossing detection off) and NEVER breaks the
+    # observation: usage observation must never delay or break a callback or the pipeline.
+    local _alert=-1
+    if [ "$mode" = sample ]; then
+        _alert="$(_context_alert_headroom "$worker" 2>/dev/null)" || _alert=-1
+        case "$_alert" in ''|*[!0-9]*) _alert=-1 ;; esac
+    fi
+    # Additive record key (S2.2). Lazily resolved: no journal, no python3 spawn — which is
+    # also what keeps the hermetic parser tests from needing one. Existing readers ignore
+    # unknown keys, and _usage_record_hash only ever compares a record's hash to itself.
+    local _gen=""
+    [ -f "$project_root/$(_hygiene_file)" ] && _gen="$(_hygiene_current_gen "$project_root" "$worker" 2>/dev/null)"
 
-def upsert(path, worker, rec, updated):
-    d = os.path.dirname(path) or "."
-    os.makedirs(d, exist_ok=True)
-    lp = path + ".lock"
-    with open(lp, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            data = {}
-            if os.path.exists(path):
-                try:
-                    with open(path) as f:
-                        data = yaml.safe_load(f) or {}
-                except Exception:
-                    data = {}
-            if not isinstance(data, dict):
-                data = {}
-            workers = data.get("workers")
-            if not isinstance(workers, dict):
-                workers = {}
-            workers[worker] = rec
-            data["workers"] = workers
-            data["updated"] = updated
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
-            os.replace(tmp, path)
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
-
-# Defaults → unknown; refined on a successful family-specific parse.
-rec = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
-       "raw": None, "source": "pane-footer", "confidence": "none",
-       "reason": ("codex-context-anchor-missing" if fam == "codex" else "no-anchor"),
-       "stage": stage, "measured_at": at}
-try:
-    raw = ""
-    if rawf and os.path.exists(rawf):
-        with open(rawf) as f:
-            raw = f.read()
-    if not raw.strip():
-        rec["reason"] = "capture-failed"
-    else:
-        # Strip ANSI/OSC, then scan the last twelve non-empty lines newest-first.
-        norm = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', raw)
-        norm = re.sub(r'\x1b\][0-9;]*\x07', '', norm)
-        lines = [line for line in norm.splitlines() if line.strip()][-12:]
-        if fam == "claude":
-            found = None
-            for line in reversed(lines):
-                mm = re.search(r'ctx:\s*(\d+)(k?)\s*\((\d+)%\)', line)
-                if mm:
-                    found = (mm, line.strip()); break
-            if found:
-                mm, line = found
-                pct = int(mm.group(3))
-                tokens = mm.group(1) + (mm.group(2) or "")
-                headroom = max(0, min(100, 100 - pct))
-                rec.update({"pct": pct, "tokens": tokens, "headroom": headroom,
-                            "raw": line, "source": "pane-footer",
-                            "confidence": ("high" if 0 <= pct <= 100 else "low"),
-                            "reason": None})
-        elif fam == "codex":
-            found = None
-            for line in reversed(lines):
-                mm = re.search(r'\bContext\s+(\d{1,3})%\s+left\b', line)
-                if mm:
-                    found = (mm, line.strip()); break
-            if found:
-                mm, line = found
-                remaining = int(mm.group(1))
-                if 0 <= remaining <= 100:
-                    rec.update({"pct": 100 - remaining, "tokens": None,
-                                "headroom": remaining, "raw": line,
-                                "source": "pane-footer", "confidence": "high",
-                                "reason": None})
-                else:
-                    rec.update({"raw": line, "reason": "bad-percent"})
-except Exception:
-    rec = {"family": fam, "pct": None, "tokens": None, "headroom": "unknown",
-           "raw": None, "source": "pane-footer", "confidence": "none",
-           "reason": "observe-error", "stage": stage, "measured_at": at}
-
-try:
-    upsert(usage_file, wk, rec, at)
-except Exception:
-    pass
-
-print(fields_line(rec))
-PYEOF
-)
+    local _ctl
+    _ctl="$(FORGE_U_FAMILY="$family" FORGE_U_STAGE="$stage" FORGE_U_AT="$measured_at" \
+            FORGE_U_OBSBY="$observed_by" FORGE_U_GEN="${_gen:-}" \
+            _usage_upsert "$usage_file" "workers/$worker" "$mode" "$_alert" \
+              "$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$_p_pct" "$_p_tok" "$_p_hr" "$_p_conf" "$_p_reason" "$_p_raw")")"
     [ -z "$fixture_mode" ] && [ -n "$raw_file" ] && rm -f "$raw_file" 2>/dev/null
-    [ -z "$fields" ] && fields="pct=null tokens=null headroom=unknown source=pane-footer confidence=none reason=observe-error"
-    _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+    local _r_hr _r_conf _r_cross
+    read -r _r_hr _r_conf _r_cross <<< "${_ctl:-unknown none 0}"
+
+    # The USAGE event fields, in the shipped shape (NOT the raw footer line — raw lives only
+    # in the snapshot YAML, never in the line-oriented event log).
+    fields="pct=$_p_pct tokens=$_p_tok headroom=${_r_hr:-unknown} source=pane-footer confidence=${_r_conf:-none}"
+    [ "$_p_reason" != null ] && fields="$fields reason=$_p_reason"
+    # Event policy (R8): `record` keeps today's per-observation USAGE line. `sample` is QUIET
+    # — a 30-minute stage would otherwise add ~120 lines that _has_hygiene_terminal_vocab
+    # full-file-scans per slug on every 30s watcher tick. The one line a sample may emit is
+    # the downward crossing of the alert threshold.
+    if [ "$mode" = record ]; then
+        _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields"
+    elif [ "${_r_cross:-0}" = 1 ]; then
+        _emit_event USAGE "$slug" "stage=$stage worker=$worker family=$family $fields sampled=1"
+    fi
+    # S3.2 stdout contract: EXACTLY two fields. `crossed` is consumed above and never
+    # printed, so a caller writing `read -r hr conf` cannot mis-parse. cmd_callback's call
+    # site is redirected in the SAME commit (R9) — its stdout ends with the CALLBACK line
+    # that cmd_wait and the orchestrator parse.
+    printf '%s %s\n' "${_r_hr:-unknown}" "${_r_conf:-none}"
     return 0
 }
 
@@ -2469,14 +2419,21 @@ PY
 # idle|busy|prompting|unknown. Test seam FORGE_HEALTH_FIXTURE. P1-4: captures the VISIBLE
 # SCREEN ONLY (no -S), so a historical idle prompt in scrollback cannot read as idle while the
 # visible pane is busy; `unknown` (the fail-closed value) is never accepted as idle by callers.
-_worker_health() {   # <session> <idx> <worker>
-    local sess="$1" idx="$2" wk="$3"
+_worker_health() {   # <session> <idx> <worker> [keep_capture_path]
+    local sess="$1" idx="$2" wk="$3" keep="${4:-}"
     local cap; cap=$(mktemp -t forge-wh-XXXXXX 2>/dev/null) || { printf unknown; return 0; }
     if [ -n "${FORGE_HEALTH_FIXTURE:-}" ] && [ -f "${FORGE_HEALTH_FIXTURE}" ]; then
         cp "$FORGE_HEALTH_FIXTURE" "$cap"
     else
         tmux capture-pane -p -t "$sess:$WINDOW.$idx" > "$cap" 2>/dev/null || true   # visible screen only
     fi
+    # S3.3: optional copy-out of the capture this function ALREADY took, so the dispatch gate
+    # gets a live reading for free. Placed AFTER the fixture branch on purpose so
+    # fixture-driven tests exercise the same copy-out the live path does. stdout is
+    # byte-for-byte unchanged and all four existing callers pass nothing — each is a
+    # fail-closed `case "$state" in idle) ;; *) refuse` gate whose return string must not
+    # change (R7). A failed copy-out must never change the verdict.
+    if [ -n "$keep" ]; then cp "$cap" "$keep" 2>/dev/null || true; fi
     local out; out=$(python3 - "$cap" "$wk" "$FORGE_IDLE_PROMPTS_FILE" <<'PYEOF'
 import sys,re,yaml
 raw=open(sys.argv[1]).read(); kind=sys.argv[2]
@@ -4365,7 +4322,10 @@ EOF
     # promotes an attempting delivery. Never issues /clear, /new, /compact.
     local _uf="$project_root/$(_usage_file)"
     local _h_before; _h_before="$(_usage_record_hash "$_uf" "$worker_canonical")"
-    _observe_usage "$worker_canonical" "$slug" "$stage" "$worker_idx" "$project_root" || true
+    # >/dev/null is LOAD-BEARING (R9): _observe_usage gained a `<headroom> <confidence>`
+    # stdout contract in S3.2, and cmd_callback's stdout ends with the CALLBACK line that
+    # cmd_wait and the orchestrator parse. Do not remove this redirect.
+    _observe_usage "$worker_canonical" "$slug" "$stage" "$worker_idx" "$project_root" >/dev/null || true
     if [ "$_cb_worker_locked" = 1 ]; then
         local _h_after; _h_after="$(_usage_record_hash "$_uf" "$worker_canonical")"
         local _hr _conf; read -r _hr _conf < <(_usage_record_headroom "$_uf" "$worker_canonical")

@@ -2813,6 +2813,137 @@ a=$(_usage_record_age_s "$AF/.dev/forge-usage.acmF.yml" codex-b)
   && ok "T-ACM-FRESHNESS-SOURCE age derives from per-record measured_at (${a}s), not the fresh file-level updated:" \
   || bad "T-ACM-FRESHNESS-SOURCE age wrong: '$a'"
 
+echo "── ACM §P: parser extraction equivalence ──"
+. "$ROOT/tests/forge-bridge/fixtures/observe-usage-pre-extraction.sh"
+AP1="$WORK/acmPreA"; AP2="$WORK/acmPreB"; mkdir -p "$AP1/.dev" "$AP2/.dev"
+acm_norm() {  # acm_norm <usage_file> <worker>  -> the record with measured_at blanked
+  python3 - "$1" "$2" <<'PY'
+import sys,yaml,json
+d=yaml.safe_load(open(sys.argv[1])) or {}
+r=dict(((d.get("workers") or {}).get(sys.argv[2]) or {}))
+for k in ("measured_at","observed_by","generation","stage"): r.pop(k,None)
+print(json.dumps(r,sort_keys=True))
+PY
+}
+peq_fail=0
+for pf in "$UFIX"/*.txt; do
+  [ -f "$pf" ] || continue
+  case "$(basename "$pf")" in claude-*|*opus*|*sonnet*) pfam=claude; pw=claude-opus ;; *) pfam=codex; pw=codex-a ;; esac
+  rm -f "$AP1/.dev/u.yml" "$AP2/.dev/u.yml"
+  # NEW path: extracted parser + shared upsert.
+  FORGE_U_FAMILY="$pfam" FORGE_U_STAGE=x FORGE_U_AT=T FORGE_U_OBSBY=callback \
+    _usage_upsert "$AP1/.dev/u.yml" "workers/$pw" record -1 "$(_usage_parse_capture "$pf" "$pfam")" >/dev/null
+  # PRE-EXTRACTION path: the verbatim b1f5142 body, driven through its fixture seam.
+  ( _usage_file(){ printf '.dev/u.yml'; }
+    _emit_event(){ :; }
+    timestamp(){ printf 'T'; }
+    FORGE_USAGE_FIXTURE="$pf" _observe_usage_pre "$pw" s x 0 "$AP2" >/dev/null 2>&1 )
+  if [ "$(acm_norm "$AP1/.dev/u.yml" "$pw")" != "$(acm_norm "$AP2/.dev/u.yml" "$pw")" ]; then
+    peq_fail=1
+    echo "    parser drift on $(basename "$pf"):"
+    echo "      new: $(acm_norm "$AP1/.dev/u.yml" "$pw")"
+    echo "      pre: $(acm_norm "$AP2/.dev/u.yml" "$pw")"
+  fi
+done
+[ "$peq_fail" = 0 ] \
+  && ok "T-ACM-PARSER-EQUIV extracted parser reproduces the pre-extraction record on every V2 fixture" \
+  || bad "T-ACM-PARSER-EQUIV extracted parser drifted from the pre-extraction path"
+# The `null` sentinel must survive the round trip: a codex reading has an EMPTY tokens field,
+# which would collapse under IFS=$'\t' if the sentinel were dropped.
+pl="$(_usage_parse_capture "$UFIX/codex-73.txt" codex)"
+IFS=$'\t' read -r q_pct q_tok q_hr q_cf q_rs q_raw <<< "$pl"
+[ "$q_pct" = 27 ] && [ "$q_tok" = null ] && [ "$q_hr" = 73 ] && [ "$q_cf" = high ] && [ "$q_rs" = null ] \
+  && ok "T-ACM-PARSER-SENTINEL absent fields are 'null', so no tab field can collapse" \
+  || bad "T-ACM-PARSER-SENTINEL field shift: pct=$q_pct tok=$q_tok hr=$q_hr cf=$q_cf rs=$q_rs"
+
+echo "── ACM §S: sample mode ──"
+AFIX="$WORK/acmfix"; mkdir -p "$AFIX"
+printf '  [Opus 4.8] ctx: 42k (81%%)\n' > "$AFIX/claude-81.txt"
+printf '  gpt-5.5 · Context 9%% left · ~/repo\n'  > "$AFIX/codex-9.txt"
+printf '  gpt-5.5 · Context 73%% left · ~/repo\n' > "$AFIX/codex-73.txt"
+printf 'no anchor anywhere\n' > "$AFIX/no-anchor.txt"
+AS="$WORK/acmSample"; mkdir -p "$AS/.dev"
+_resolve_project_root(){ printf '%s' "$AS"; }
+_session_or_sentinel(){ printf 'acmS'; }
+ACM_UF="$AS/$(_usage_file)"
+ACM_EV="$AS/events.log"; : > "$ACM_EV"
+_emit_event(){ printf '%s: pipeline=%s %s\n' "$1" "$2" "$3" >> "$ACM_EV"; }
+# T-ACM-SAMPLE-1 — a high-confidence sample upserts and labels its provenance.
+_observe_usage codex-a s1 st 2 "$AS" "$AFIX/codex-73.txt" sample sample >/dev/null
+python3 - "$ACM_UF" <<'PY' && ok "T-ACM-SAMPLE-1 sample upserts with observed_by" || bad "T-ACM-SAMPLE-1 wrong"
+import sys,yaml
+r=yaml.safe_load(open(sys.argv[1]))['workers']['codex-a']
+assert r['headroom']==73 and r['confidence']=='high' and r['observed_by']=='sample', r
+PY
+# T-ACM-SAMPLE-2 — a NO-ANCHOR sample over a good record leaves it BYTE-IDENTICAL.
+sha_b=$(shasum -a 256 "$ACM_UF" | awk '{print $1}')
+_observe_usage codex-a s1 st 2 "$AS" "$AFIX/no-anchor.txt" sample sample >/dev/null
+sha_a=$(shasum -a 256 "$ACM_UF" | awk '{print $1}')
+[ "$sha_b" = "$sha_a" ] && ok "T-ACM-SAMPLE-2 non-destructive: a bad parse preserves last-known-good byte-identically" \
+  || bad "T-ACM-SAMPLE-2 sample clobbered a good record"
+# T-ACM-SAMPLE-3 — RECORD mode with the same fixture DOES overwrite to unknown.
+_observe_usage codex-a s1 st 2 "$AS" "$AFIX/no-anchor.txt" record callback >/dev/null
+python3 - "$ACM_UF" <<'PY' && ok "T-ACM-SAMPLE-3 record mode still degrades honestly to unknown" || bad "T-ACM-SAMPLE-3 wrong"
+import sys,yaml
+r=yaml.safe_load(open(sys.argv[1]))['workers']['codex-a']
+assert r['headroom']=='unknown' and r['confidence']=='none', r
+PY
+# T-ACM-SAMPLE-4 — a CROSSING emits exactly one `USAGE ... sampled=1`; a second sample at the
+# same level emits none; a sample NEVER emits a per-call USAGE event (R8).
+: > "$ACM_EV"
+FORGE_CONTEXT_ALERT_HEADROOM=25 _observe_usage codex-a s1 st 2 "$AS" "$AFIX/codex-73.txt" sample sample >/dev/null
+: > "$ACM_EV"
+FORGE_CONTEXT_ALERT_HEADROOM=25 _observe_usage codex-a s1 st 2 "$AS" "$AFIX/codex-9.txt" sample sample >/dev/null
+n1=$(grep -c 'USAGE: .*sampled=1' "$ACM_EV" | tr -d ' ')
+FORGE_CONTEXT_ALERT_HEADROOM=25 _observe_usage codex-a s1 st 2 "$AS" "$AFIX/codex-9.txt" sample sample >/dev/null
+n2=$(grep -c 'USAGE: .*sampled=1' "$ACM_EV" | tr -d ' ')
+[ "$n1" = 1 ] && [ "$n2" = 1 ] && [ "$(grep -c 'USAGE: ' "$ACM_EV" | tr -d ' ')" = 1 ] \
+  && ok "T-ACM-SAMPLE-4 one crossing event, silent re-sample, zero per-call USAGE events" \
+  || bad "T-ACM-SAMPLE-4 counts n1=$n1 n2=$n2 total=$(grep -c 'USAGE: ' "$ACM_EV")"
+# A CONFIG_ERROR in the alert knob degrades crossing detection, never the observation.
+o=$(FORGE_CONTEXT_ALERT_HEADROOM=abc _observe_usage codex-a s1 st 2 "$AS" "$AFIX/codex-73.txt" sample sample 2>/dev/null)
+[ "$o" = "73 high" ] \
+  && ok "T-ACM-SAMPLE a bad alert knob never breaks an observation" \
+  || bad "T-ACM-SAMPLE alert config error broke an observation: '$o'"
+# T-ACM-CAPTURE-REUSE — with a POSITIVE CONTROL. Assertion (a) proves nothing unless
+# assertion (b) shows the spy records a capture when one is actually taken.
+ACM_SPY="$AS/tmux.spy"; : > "$ACM_SPY"
+tmux(){ echo "tmux $*" >> "$ACM_SPY"; return 0; }
+_observe_usage claude-opus s1 st 0 "$AS" "$AFIX/claude-81.txt" record callback >/dev/null
+grep -q 'capture-pane' "$ACM_SPY" \
+  && bad "T-ACM-CAPTURE-REUSE issued a tmux capture-pane despite a supplied capture" \
+  || ok "T-ACM-CAPTURE-REUSE (a) supplied capture issues no tmux capture-pane"
+: > "$ACM_SPY"
+# sample mode: capture attempt still proves the live path; non-destructive rule keeps the record intact for the agreement check below.
+ID_target_session=acmS WINDOW=0 _observe_usage claude-opus s1 st 0 "$AS" "" sample callback >/dev/null
+grep -q 'capture-pane' "$ACM_SPY" \
+  && ok "T-ACM-CAPTURE-REUSE (b) POSITIVE CONTROL: no capture supplied => the spy DOES record capture-pane" \
+  || bad "T-ACM-CAPTURE-REUSE positive control failed — assertion (a) is vacuous"
+unset -f tmux
+python3 - "$ACM_UF" <<'PY' && ok "T-ACM-CAPTURE-REUSE capture_file and the live path agree" || bad "T-ACM-CAPTURE-REUSE differ"
+import sys,yaml
+r=yaml.safe_load(open(sys.argv[1]))['workers']['claude-opus']
+assert (r['pct'],r['tokens'],r['headroom'],r['confidence'])==(81,'42k',19,'high'), r
+PY
+# Stdout contract: EXACTLY two fields, on both the written and the skipped path.
+[ "$(_observe_usage codex-b s1 st 3 "$AS" "$AFIX/codex-9.txt" sample sample)" = "9 high" ] \
+  && ok "T-ACM-STDOUT _observe_usage echoes exactly '<headroom> <confidence>'" || bad "T-ACM-STDOUT wrong"
+[ "$(_observe_usage codex-b s1 st 3 "$AS" "$AFIX/no-anchor.txt" sample sample)" = "unknown none" ] \
+  && ok "T-ACM-STDOUT a skipped upsert still reports the LIVE parse" || bad "T-ACM-STDOUT skip path wrong"
+
+echo "── ACM §H: _worker_health compatibility ──"
+h3="$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" _worker_health s 0 claude-opus)"
+ACM_KEEP="$WORK/acm-keep.txt"; rm -f "$ACM_KEEP"
+h4="$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" _worker_health s 0 claude-opus "$ACM_KEEP")"
+[ "$h3" = "$h4" ] && ok "T-ACM-HEALTH-COMPAT stdout byte-identical with and without the out-param" \
+  || bad "T-ACM-HEALTH-COMPAT stdout changed: '$h3' vs '$h4'"
+[ -s "$ACM_KEEP" ] && cmp -s "$ACM_KEEP" "$HFIX/claude-opus-clear-before.txt" \
+  && ok "T-ACM-HEALTH-COMPAT copy-out works UNDER FORGE_HEALTH_FIXTURE (hermetic live path)" \
+  || bad "T-ACM-HEALTH-COMPAT copy-out empty or wrong"
+h5="$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" _worker_health s 0 claude-opus /nonexistent-dir/x.txt)"
+[ "$h5" = "$h3" ] && ok "T-ACM-HEALTH-COMPAT an unwritable copy-out never changes the verdict" \
+  || bad "T-ACM-HEALTH-COMPAT unwritable path leaked: $h5"
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
