@@ -898,6 +898,21 @@ T6=$(sb_render "$J6" | head -1)
 echo "$T6" | grep -q '1!' && echo "$T6" | grep -q '⏸1' && ! echo "$T6" | grep -q '✓' \
   && ok "S6 both 1! and ⏸1, no ✓" || bad "S6 title wrong: $T6"
 
+echo "── T-ACM-SWIFTBAR: ◐N segment + dropdown + degradation ──"
+JC='{"schema":"cc-board/1","hot":[],"active":[],"parked":[],"episodes":[],"tasks":[],"context":[{"session":"forge-1","worker":"codex-a","role":"worker","headroom":9,"confidence":"high","age_s":30}]}'
+TC=$(sb_render "$JC" | head -1)
+echo "$TC" | grep -q '◐1' && ! echo "$TC" | grep -q '✓' \
+  && ok "T-ACM-SWIFTBAR ◐1 renders and suppresses ✓" || bad "T-ACM-SWIFTBAR title wrong: $TC"
+sb_render "$JC" | grep -q '◐ forge-1/codex-a · 9% headroom' \
+  && ok "T-ACM-SWIFTBAR dropdown row" || bad "T-ACM-SWIFTBAR dropdown missing"
+JE='{"schema":"cc-board/1","hot":[],"active":[],"parked":[],"episodes":[],"tasks":[],"context":[]}'
+sb_render "$JE" | head -1 | grep -q '✓' \
+  && ok "T-ACM-SWIFTBAR an empty context array still renders ✓" || bad "T-ACM-SWIFTBAR ✓ lost"
+# R14: board JSON from an OLDER forge-watch has no `context` key at all.
+JO='{"schema":"cc-board/1","hot":[],"active":[],"parked":[],"episodes":[],"tasks":[]}'
+sb_render "$JO" | head -1 | grep -q '✓' \
+  && ok "T-ACM-SWIFTBAR an absent context key degrades exactly as parked did" || bad "T-ACM-SWIFTBAR degrade wrong"
+
 echo "── forge parked: exit codes + filters + --resolve proxy (P-1) ──"
 watch_stub() { local d; d="$(mktemp -d)"; printf '#!/bin/sh\n[ "$1" = status ] && cat <<'\''JSON'\''\n%s\nJSON\n' "$2" > "$d/forge-watch"; chmod +x "$d/forge-watch"; echo "$d"; }
 J='{"parked":[{"slug":"p","stage":"coding","worker":"codex-a","session":"forge-1","uncommitted":true,"reason":"r","root":"'"$PWD"'"}]}'

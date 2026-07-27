@@ -2469,6 +2469,135 @@ EOF
   assert_not_notified "ph5" "W-HYG $tstate is transient: no notify, no NEEDS-DECISION"
 done
 
+
+echo "── WORKER-LOW-CONTEXT / ORCHESTRATOR-LOW-CONTEXT (active-context-management) ──"
+usage_ledger() {  # <root> <session> <worker> <headroom> <conf> <age_s> [extra-yaml]
+    { echo "updated: \"$(iso_ago 5)\""
+      echo "workers:"
+      echo "  $3:"
+      echo "    family: codex"
+      echo "    headroom: $4"
+      echo "    confidence: $5"
+      echo "    measured_at: \"$(iso_ago "$6")\""
+      echo "    observed_by: callback"
+      [ -n "${7:-}" ] && printf '%s\n' "$7"
+    } > "$1/.dev/forge-usage.$2.yml"
+}
+orch_ledger() {  # <root> <session> <headroom> <conf> <age_s> <incarnation>
+    { echo "updated: \"$(iso_ago 5)\""
+      echo "orchestrator:"
+      echo "  family: claude"
+      echo "  headroom: $3"
+      echo "  confidence: $4"
+      echo "  measured_at: \"$(iso_ago "$5")\""
+      echo "  observed_by: pane1"
+      echo "  incarnation: \"$6\""
+    } > "$1/.dev/forge-usage.$2.yml"
+}
+
+new_env lowctx1; R=$(mk_root proj); live_session forge-1 "$R"
+usage_ledger "$R" forge-1 codex-a 9 high 30
+run_check >/dev/null
+assert_status_has "codex-a at 9% headroom" "T-FW-LOWCTX below threshold + fresh + high → finding"
+assert_not_notified "WORKER-LOW-CONTEXT" "T-FW-LOWCTX is silent (policy=never)"
+# The double-count is DELIBERATE and matches DELIVERY-UNVERIFIED: the row is hot+unacked, so
+# it counts toward the menubar's N! badge as well as ◐N. Pinned with exact counts so a
+# future change to either surface is a visible decision.
+run_status --board | python3 -c '
+import json,sys
+b=json.load(sys.stdin)
+hot=[r for r in b["hot"] if r["condition"]=="WORKER-LOW-CONTEXT"]
+assert len(hot)==1 and not hot[0].get("acked"), hot
+assert len(b.get("context") or [])==1, b.get("context")
+' && ok "T-FW-LOWCTX one hot unacked row AND one context[] row (N! and ◐N both count it, by design)" \
+  || bad "T-FW-LOWCTX double-count shape changed"
+
+# T-FW-LOWCTX-SELFCLEAR — THE R2 GUARD, named for it.
+usage_ledger "$R" forge-1 codex-a 80 high 30
+run_check >/dev/null
+assert_status_missing "WORKER-LOW-CONTEXT" "T-FW-LOWCTX-SELFCLEAR a healthy reading clears the row with no ack"
+run_status --board | python3 -c 'import json,sys; assert (json.load(sys.stdin).get("context") or [])==[]' \
+  && ok "T-FW-LOWCTX-SELFCLEAR context[] empties with the finding" || bad "T-FW-LOWCTX-SELFCLEAR context[] retained a cleared row"
+usage_ledger "$R" forge-1 codex-a 9 high 30
+run_check >/dev/null
+usage_ledger "$R" forge-1 codex-a unknown none 5 "    reason: post-reset-unmeasured
+    observed_by: reset"
+run_check >/dev/null
+assert_status_missing "WORKER-LOW-CONTEXT" "T-FW-LOWCTX-SELFCLEAR S2's post-reset marker clears the row (R1: no false alarm on a fresh pane)"
+
+# Negatives.
+new_env lowctx2; R=$(mk_root proj); live_session forge-1 "$R"
+usage_ledger "$R" forge-1 codex-a unknown none 30; run_check >/dev/null
+assert_status_missing "WORKER-LOW-CONTEXT" "T-FW-LOWCTX unknown never alerts"
+usage_ledger "$R" forge-1 codex-a 9 low 30; run_check >/dev/null
+assert_status_missing "WORKER-LOW-CONTEXT" "T-FW-LOWCTX low confidence never alerts"
+usage_ledger "$R" forge-1 codex-a 9 high 4000; run_check >/dev/null
+assert_status_missing "WORKER-LOW-CONTEXT" "T-FW-LOWCTX a stale reading never alerts"
+
+# A dead session, and a live session name that belongs to a DIFFERENT root.
+new_env lowctx3; R=$(mk_root proj)
+usage_ledger "$R" ghost-9 codex-a 9 high 30; run_check >/dev/null
+assert_status_missing "WORKER-LOW-CONTEXT" "T-FW-LOWCTX a dead session produces no finding"
+new_env lowctx3b; R=$(mk_root proj); R2=$(mk_root other); live_session forge-1 "$R2"
+usage_ledger "$R" forge-1 codex-a 9 high 30; run_check >/dev/null
+assert_status_missing "WORKER-LOW-CONTEXT" "T-FW-LOWCTX a live session name at a DIFFERENT root is not misattributed"
+
+# Classification + board payload.
+new_env lowctx4; R=$(mk_root proj); live_session forge-1 "$R"
+usage_ledger "$R" forge-1 codex-a 9 high 30; run_check >/dev/null
+run_status --board > "$TDIR/lc.json"
+python3 - "$TDIR/lc.json" <<'PY' && ok "T-FW-LOWCTX classification: hot, not active, no STATE_OF glyph" || bad "T-FW-LOWCTX classification wrong"
+import json,sys
+b=json.load(open(sys.argv[1]))
+hot=[r for r in b["hot"] if r["condition"]=="WORKER-LOW-CONTEXT"]
+assert hot and hot[0]["class"]=="hot", b["hot"]
+assert not [r for r in b["active"] if r["condition"]=="WORKER-LOW-CONTEXT"]
+assert hot[0].get("state") is None, hot[0]
+PY
+python3 - "$TDIR/lc.json" <<'PY' && ok "T-FW-CONTEXT-ARRAY the board carries a well-formed context[] row" || bad "T-FW-CONTEXT-ARRAY malformed"
+import json,sys
+c=json.load(open(sys.argv[1])).get("context")
+assert isinstance(c,list) and len(c)==1, c
+r=c[0]
+for k in ("session","worker","role","headroom","confidence","age_s"): assert k in r, r
+assert r["worker"]=="codex-a" and r["headroom"]==9 and r["role"]=="worker"
+PY
+new_env lowctx5; R=$(mk_root proj); live_session forge-1 "$R"; run_check >/dev/null
+run_status --board | python3 -c 'import json,sys; assert json.load(sys.stdin).get("context")==[]' \
+  && ok "T-FW-CONTEXT-ARRAY an empty ledger yields []" || bad "T-FW-CONTEXT-ARRAY empty case wrong"
+
+# ORCHESTRATOR-LOW-CONTEXT notifies ONCE and re-arms on a new incarnation.
+new_env lowctx6; R=$(mk_root proj); live_session forge-1 "$R"
+orch_ledger "$R" forge-1 12 high 30 1; run_check >/dev/null
+assert_notified "orchestrator (pane 1) at 12% headroom" "T-FW-ORCH notifies on the crossing"
+: > "$CAP"; run_check >/dev/null
+assert_not_notified "orchestrator (pane 1)" "T-FW-ORCH policy=once does not re-notify while it persists"
+assert_status_has "ORCHESTRATOR-LOW-CONTEXT" "T-FW-ORCH the board row stays ambient"
+orch_ledger "$R" forge-1 12 high 30 2; run_check >/dev/null
+assert_notified "orchestrator (pane 1) at 12% headroom" "T-FW-ORCH re-arms on a new incarnation"
+
+# RESET-PROOF-DIVERGENT.
+new_env lowctx7; R=$(mk_root proj); live_session forge-1 "$R"
+usage_ledger "$R" forge-1 codex-a 80 high 30 "    divergent: true
+    divergent_headroom: 12
+    divergent_proof_kind: post-baseline-anchor"
+run_check >/dev/null
+assert_status_has "RESET-PROOF-DIVERGENT" "T-FW-DIVERGENT the ledger flag raises its own condition"
+run_status | grep -q 'proof kind post-baseline-anchor' \
+  && ok "T-FW-DIVERGENT the message names the inadequate proof kind" || bad "T-FW-DIVERGENT proof kind missing from the message"
+usage_ledger "$R" forge-1 codex-a 80 high 30; run_check >/dev/null
+assert_status_missing "RESET-PROOF-DIVERGENT" "T-FW-DIVERGENT self-clears when the next upsert drops the flag"
+
+# T-FW-READONLY.
+new_env lowctx8; R=$(mk_root proj); live_session forge-1 "$R"
+usage_ledger "$R" forge-1 codex-a 9 high 30
+before=$(find "$R/.dev" -type f | sort | xargs shasum -a 256 2>/dev/null | shasum -a 256)
+run_check >/dev/null; run_status --board >/dev/null
+after=$(find "$R/.dev" -type f | sort | xargs shasum -a 256 2>/dev/null | shasum -a 256)
+[ "$before" = "$after" ] \
+  && ok "T-FW-READONLY the watcher wrote nothing under .dev/ with usage files present" \
+  || bad "T-FW-READONLY the watcher mutated project .dev/"
+
 WATCH_SOURCE_AFTER="$(shasum -a 256 "$WATCH" | awk '{print $1}')"
 [ "$WATCH_SOURCE_BEFORE" = "$WATCH_SOURCE_AFTER" ] \
   && ok "W19 watcher product source hash unchanged during P1-WC compatibility run" \

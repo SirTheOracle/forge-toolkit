@@ -63,6 +63,7 @@ def h_iso_age(ts):
 hot   = b.get("hot") or []
 tasks = b.get("tasks") or []
 parked = b.get("parked") or []             # additive cc-board/1 key (.get or [])
+ctx   = b.get("context") or []             # additive cc-board/1 key; ALERTING ROWS ONLY
 eps   = b.get("episodes") or []            # absent on an older forge-watch → today's render
 # In-progress = worker-pane episodes only, by decision (final-plan D5): SESSION-WORKING
 # (pane-1/operator seat) is deliberately NOT counted — the gear means worker progress.
@@ -77,9 +78,11 @@ if inprog:
     parts.append(f"⚙{len(inprog)}")
 if parked:
     parts.append(f"⏸{len(parked)}")        # between ⚙N and ✓; never part of `unseen`
-# ✓ only when unseen, in-progress, AND parked are all empty — a parked-only board must
-# never render "⏸1 ✓".
-if not unseen and not inprog and not parked:
+if ctx:
+    parts.append(f"◐{len(ctx)}")           # after ⏸N, before ✓; low-context panes
+# ✓ only when unseen, in-progress, parked, AND context are all empty — a context-only board
+# must never render "◐1 ✓".
+if not unseen and not inprog and not parked and not ctx:
     parts.append("✓")
 print(" ".join(parts) + (" ⚠" if stale else "") + f" | templateImage={ICON}")
 print("---")
@@ -112,6 +115,13 @@ for r in parked[:3]:
     print(f'⏸ {slug}/{stage} · parked {age}{unco} · "{reason}" | color=gray')
 if len(parked) > 3:
     print(f"+{len(parked) - 3} more parked · forge board | color=gray")
+for r in ctx[:4]:
+    who = esc(r.get("session") or r.get("label") or "?")
+    w = esc(r.get("worker") or "?")
+    tail = " · pane 1 — handoff, never a reset" if r.get("role") == "orchestrator" else ""
+    print(f'◐ {who}/{w} · {r.get("headroom")}% headroom{tail} | color=orange')
+if len(ctx) > 4:
+    print(f"+{len(ctx) - 4} more low-context · forge board | color=gray")
 for e in inprog[:8]:
     who = esc(e.get("session") or e.get("label") or "?")
     pane = f" p{e['pane']}" if e.get("pane") not in (None, "") else ""

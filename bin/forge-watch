@@ -157,6 +157,11 @@ ALLOWED_KEYS = {
     'FORGE_WATCH_TASK_WINDOW_S',
     'FORGE_WATCH_TASK_STUCK_S', 'FORGE_WATCH_CHECK_TIMEOUT_S',
     'FORGE_WATCH_QUIET_UNCHANGED',
+    # active-context-management (S8/S11). All three are ALERTING/DISPLAY knobs; none can move
+    # a hygiene decision — the gate threshold lives in the bridge and is not readable here by
+    # design. Unknown keys are warned-and-ignored, so watch.env would reject them otherwise.
+    'FORGE_WATCH_ALERT_HEADROOM', 'FORGE_USAGE_MAX_AGE_S',
+    'FORGE_ORCHESTRATOR_ALERT_HEADROOM',
 }
 # Conservative value grammar: allow path-ish chars (incl. space and ~ for real
 # paths) but no shell metacharacters, substitutions, or quotes. Values are only
@@ -230,6 +235,17 @@ EPISODE_SETTLE_S    = cfg_int('FORGE_WATCH_EPISODE_SETTLE_S', 600)   # 10m quiet
 NOTIFY_EPISODE_DONE = cfg_bool('FORGE_WATCH_NOTIFY_EPISODE_DONE', False)
 TASK_WINDOW_S    = cfg_int('FORGE_WATCH_TASK_WINDOW_S', 86400)   # 24h live-task window
 TASK_STUCK_S     = cfg_int('FORGE_WATCH_TASK_STUCK_S', 21600)    # 6h → TASK-STUCK
+# Context alerting (S8/S11). The watcher-side mirror of FORGE_CONTEXT_ALERT_HEADROOM. At 75
+# (the GATE threshold) three of four workers alert in a healthy session, so a board pinned to
+# the gate would be pure noise — codex panes read above 75 in ~0.7% of live samples.
+ALERT_HEADROOM      = cfg_int('FORGE_WATCH_ALERT_HEADROOM', 25)
+ORCH_ALERT_HEADROOM = cfg_int('FORGE_ORCHESTRATOR_ALERT_HEADROOM', 30)
+# A reading older than this is not shown as current. There is deliberately NO
+# WORKER-USAGE-STALE condition: a worker that simply has not been used recently is not in
+# trouble, and as a board condition it would hold a permanent row. Staleness is a DISPLAY
+# label; the underlying stale reading is closed at its source by S5 and S6, which measure at
+# the point of use.
+USAGE_MAX_AGE_S     = cfg_int('FORGE_USAGE_MAX_AGE_S', 900)
 STALE_TICK_S     = 3 * 30    # board/ambient freshness: ~3x the 30s launchd interval
 # Cold-restart ring bound (D4): a settled episode may carry the 'once' ring only while its
 # quiet time is inside this band; longer-settled history renders rows but never rings. Do not
@@ -597,6 +613,10 @@ RESOLVED_STAGES_BY_ROOT = {}  # root -> set of (slug, stage) fully resolved in f
                               # scan_root; read by scan_attention (C4 NEEDS-ASK suppress).
 TASKS = []     # cc-board/1 tasks[] projection (Step 3): read-time fold, no ledger
 EPISODES = []  # episode records, ALL roots (R3a) — board assembles/sorts/caps once at render
+CONTEXT_ROWS = []  # cc-board/1 context[] projection (S8.6). ALERTING ROWS ONLY — one row per
+                   # worker/orchestrator currently at or below its alert threshold with a
+                   # FRESH high-confidence reading. Carrying every worker row would make the
+                   # SwiftBar ◐N segment permanent and the ✓ unreachable (plan correction 2).
 task_stuck_ids = set()  # (root, session, dispatch_id) collected at the TASK-STUCK emission
                         # site (R1b) — never parsed back out of composite finding keys
 
@@ -1641,6 +1661,98 @@ def scan_attention(root, label):
                         f"{label} — codex hooks installed but no codex emission seen; complete the "
                         f"one-time `/hooks` trust review in a codex pane at this root", policy='never')
 
+def scan_usage(root, label):
+    """S8: context findings derived from the bridge-owned usage ledger.
+
+    READ-ONLY: one more file opened for reading, nothing written — the watcher's stated
+    invariant (it NEVER writes under any project's .dev/) is untouched.
+
+    STATE-DERIVED, NOT EVENT-DERIVED. add_finding rebuilds findings from live state on every
+    scan, so a finding disappears BY ITSELF the moment S2's post-reset marker lands or a
+    healthy reading is recorded — no ack, no state mutation. Event-derived conditions fold
+    against a persisted byte offset and would reproduce the known stale-alert bug (R2).
+    RESET-PROOF-DIVERGENT is state-derived for the same reason: the bridge records the
+    divergence ON THE LEDGER RECORD, and the next wholesale upsert drops the flag.
+
+    Live sessions only, using the SAME liveness test the context-file scan uses
+    (bin/forge-watch:965) — the `== root` conjunct matters, or a reused session name
+    misattributes a finding to a different project.
+    """
+    if not HAVE_YAML:
+        return
+    dev = os.path.join(root, '.dev')
+    for up in sorted(glob.glob(os.path.join(dev, 'forge-usage.*.yml'))):
+        m = re.match(r'^forge-usage\.(.+)\.yml$', os.path.basename(up))
+        sess = m.group(1) if m else ''
+        if not (sess and sess in SESSIONS and SESSIONS[sess] == root):
+            continue
+        try:
+            with open(up) as f:
+                data = yaml.safe_load(f) or {}
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        def _fresh(rec):
+            a = age_s(rec.get('measured_at'))
+            return (a is not None and a <= USAGE_MAX_AGE_S), a
+
+        def _hi(rec):
+            h = rec.get('headroom')
+            # `unknown` NEVER means safe and NEVER means exhausted — it simply never alerts.
+            return (rec.get('confidence') == 'high'
+                    and isinstance(h, int) and not isinstance(h, bool))
+
+        workers = data.get('workers')
+        if isinstance(workers, dict):
+            for w in sorted(workers):
+                rec = workers[w]
+                if not isinstance(rec, dict):
+                    continue
+                fresh, a = _fresh(rec)
+                if rec.get('divergent') is True and fresh:
+                    add_finding('RESET-PROOF-DIVERGENT', root, f"{sess}\t{w}",
+                                f"{label} · {sess} — {w} read headroom "
+                                f"{rec.get('divergent_headroom')} against a PROVEN reset "
+                                f"(proof kind {rec.get('divergent_proof_kind') or 'none'} "
+                                f"asserts a redraw, not the footer): either the proof is "
+                                f"unreliable or the pane is being used out of band",
+                                policy='daily', session=sess)
+                if _hi(rec) and rec['headroom'] <= ALERT_HEADROOM and fresh:
+                    add_finding('WORKER-LOW-CONTEXT', root, f"{sess}\t{w}",
+                                f"{label} · {sess} — {w} at {rec['headroom']}% headroom "
+                                f"(alert <= {ALERT_HEADROOM}); the bridge resets it at the "
+                                f"next dispatch, or reset it now off the critical path with "
+                                f"`forge-bridge reset-idle --worker {w}`",
+                                policy='never', session=sess)
+                    CONTEXT_ROWS.append({'session': sess, 'root': root, 'label': label,
+                                         'worker': w, 'role': 'worker',
+                                         'headroom': rec['headroom'],
+                                         'confidence': rec.get('confidence'),
+                                         'age_s': (int(a) if a is not None else None)})
+
+        orch = data.get('orchestrator')
+        if isinstance(orch, dict):
+            fresh, a = _fresh(orch)
+            if _hi(orch) and orch['headroom'] <= ORCH_ALERT_HEADROOM and fresh:
+                inc = orch.get('incarnation') or ''
+                # policy='once' keyed on (session, incarnation): pane 1 degrades monotonically
+                # WITHIN a session, so a daily re-ring adds nothing the persistent board row
+                # does not already give; a new session re-arms it.
+                add_finding('ORCHESTRATOR-LOW-CONTEXT', root, f"{sess}\t{inc}",
+                            f"{label} · {sess} — orchestrator (pane 1) at "
+                            f"{orch['headroom']}% headroom (alert <= {ORCH_ALERT_HEADROOM}); "
+                            f"write the handoff note and start a fresh pane-1 session. "
+                            f"Pane 1 is NEVER auto-reset and holds the only un-journaled "
+                            f"state in the system",
+                            policy='once', session=sess)
+                CONTEXT_ROWS.append({'session': sess, 'root': root, 'label': label,
+                                     'worker': 'claude-orchestrator', 'role': 'orchestrator',
+                                     'headroom': orch['headroom'],
+                                     'confidence': orch.get('confidence'),
+                                     'age_s': (int(a) if a is not None else None)})
+
 # ── run the scan ─────────────────────────────────────────────────────────
 for root in discover_roots():
     try:
@@ -1651,6 +1763,10 @@ for root in discover_roots():
         scan_attention(root, root_label(root))
     except Exception as e:
         config_warnings.append(f"attention scan error in {root_label(root)}: {e}")
+    try:
+        scan_usage(root, root_label(root))
+    except Exception as e:
+        config_warnings.append(f"usage scan error in {root_label(root)}: {e}")
 
 # ── delivery audit → DELIVERY-UNVERIFIED (Step 5) ─────────────────────────
 # Read the LAST delivered.log line: a nonzero rc means the ring is unverified. A later
@@ -1852,18 +1968,34 @@ NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
           'RESET-UNAVAILABLE', 'PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED',
           'HYGIENE-CLEANUP']
 order = {c: i for i, c in enumerate(
-    NOTIFY + ['ITEM-PARKED',
+    # NOTE: NOTIFY is used ONLY to build this sort map. The three active-context-management
+    # conditions belong in `order` and in HOT, but NOT in NOTIFY (which would say nothing) and
+    # NOT in ACTIVE (which feeds STATE_OF session-lifecycle glyph logic, where a usage
+    # condition does not belong).
+    NOTIFY + ['RESET-PROOF-DIVERGENT', 'ORCHESTRATOR-LOW-CONTEXT', 'WORKER-LOW-CONTEXT',
+              'ITEM-PARKED',
               'SESSION-QUEUED', 'SESSION-WORKING', 'EPISODE-ACTIVE', 'SESSION-DONE',
               'EPISODE-SETTLED',
               'ZOMBIE-STALE-CONTEXT', 'STALE-PENDING', 'PANE-DONE-RESIDUE',
               'CODEX-EMISSION-OFF', 'LEGACY-CONTEXT'])}
 findings.sort(key=lambda f: (order.get(f['condition'], 99), f['msg']))
 
+# `hot` + policy='never' is the combination that gives a VISIBLE, SILENT board row: _cls
+# returns 'hot' only for members of this set, and swiftbar/forge-board.5s.sh reads ONLY
+# hot/tasks/parked/episodes — an 'active' finding renders NOWHERE in the menubar and would
+# fail In-Scope item 4. The notify loop short-circuits policy=='never' independently of _cls,
+# so the row is recorded and ackable but never rings.
+#
+# A low-context pane therefore appears BOTH in the `N!` unseen count (hot, unacked) and in the
+# `◐N` segment. That is deliberate and matches the shipped DELIVERY-UNVERIFIED precedent:
+# `◐N` says how many panes are low, `N!` says there is something on the board you have not
+# looked at. Acking removes it from `N!` and leaves `◐N`.
 HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH',
        'NEEDS-ASK', 'NEEDS-REPLY', 'NEEDS-DECISION', 'ITEM-BLOCKED', 'NEEDS-PERMISSION',
        'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
-       'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING', 'RESET-UNAVAILABLE'}
+       'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING', 'RESET-UNAVAILABLE',
+       'WORKER-LOW-CONTEXT', 'ORCHESTRATOR-LOW-CONTEXT', 'RESET-PROOF-DIVERGENT'}
 ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE',
           'EPISODE-ACTIVE', 'EPISODE-SETTLED'}
 STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
@@ -2052,7 +2184,12 @@ if BOARD:
              'hot': hot, 'active': active, 'parked': parked_rows,
              'maintenance': {'collapsed': True, 'count': len(maint), 'rows': maint},
              'tasks': task_rows,
-             'episodes': episode_rows}
+             'episodes': episode_rows,
+             # ADDITIVE cc-board/1 key — no version bump, exactly the `parked` precedent.
+             # Older plugins degrade via `b.get("context") or []`.
+             'context': sorted(CONTEXT_ROWS,
+                               key=lambda r: (r.get('headroom') if isinstance(r.get('headroom'), int) else 999,
+                                              r.get('session') or '', r.get('worker') or ''))[:50]}
     print(json.dumps(board, indent=2))
     sys.exit(0)
 
