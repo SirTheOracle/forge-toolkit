@@ -4673,6 +4673,45 @@ for fp in glob.glob(os.path.join(root, ".dev", "attention", "ask-*.json")):
 PY
 }
 
+# S7: one mid-stage sample. DECOUPLED from the poll cadence — cmd_wait's interval defaults to
+# 15s, so a 30-minute stage is 120 ticks; sampling per tick would mean 120 captures, 120
+# python3 spawns and 120 log lines per stage per worker, and forge-watch full-file-scans the
+# events log per slug on every 30s scan (R8).
+#
+# Takes its OWN capture. cmd_stall_check's stdout contract is deliberately NOT touched:
+# cmd_wait parses it positionally and it also writes snapshot caches, so threading usage
+# through it would entangle two state machines. The stated principle: reuse a capture via an
+# ADDITIVE INPUT parameter (S3, S5); never reshape an existing OUTPUT contract.
+#
+# Ledger write only. The one event this may emit is WORKER_LOW_CONTEXT, on the FIRST
+# high-confidence crossing at or below the alert threshold within a generation.
+# Always rc0 — a sampler must never change `wait`'s outcomes.
+#
+# The dedup marker is written BEFORE the event: a crash between the two then costs a MISSED
+# notification rather than a duplicate one on every subsequent tick. This does not cover the
+# _hygiene_write-failure window (the write is advisory), which can still re-notify — that is
+# accepted, because the alternative fails on both windows instead of one.
+_acm_sample_tick() {   # <project_root> <slug> <stage> <worker> <idx>
+    local pr="$1" slug="$2" stage="$3" wk="$4" idx="$5"
+    local _u; _u="$(_observe_usage "$wk" "$slug" "$stage" "$idx" "$pr" "" sample wait 2>/dev/null)"
+    local _hr _cf; read -r _hr _cf <<< "${_u:-unknown none}"
+    # S13.2: pane 1 is observed on the orchestrator's own clock; the sample tick is one of its
+    # three call sites. Never a reset, never a compact, never a keystroke.
+    _observe_pane1 "$pr" "$slug" >/dev/null 2>&1 || true
+    case "$_hr" in ''|unknown|*[!0-9]*) return 0 ;; esac
+    [ "$_cf" = high ] || return 0
+    local _al; _al="$(_context_alert_headroom "$wk" 2>/dev/null)" || return 0
+    case "$_al" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$_hr" -le "$_al" ] || return 0
+    local _g _n
+    _g="$(_hygiene_current_gen "$pr" "$wk" 2>/dev/null)"
+    _n="$(_hygiene_notified_gen "$pr" "$wk" 2>/dev/null)"
+    [ -n "$_g" ] && [ "$_n" = "$_g" ] && return 0
+    _hygiene_write "$pr" notify-low-context "$wk" "generation=${_g:-0}" 2>/dev/null || true
+    _emit_event WORKER_LOW_CONTEXT "$slug" "stage=$stage worker=$wk headroom=$_hr threshold=$_al generation=${_g:-0}"
+    return 0
+}
+
 # wait — block until a callback file appears for <slug>/<stage>, or until
 # stall-check classifies the worker as STALLED/PROMPTING/DEAD.
 #   forge-bridge wait --slug <s> --stage <s> --worker <w>
@@ -4719,6 +4758,13 @@ cmd_wait() {
     local cb_file=""
     local started
     started=$(date +%s)
+
+    # S7.1: the sampler fires on its OWN schedule (default 300s), not on the poll tick. Six
+    # samples per 30-minute stage, not 120. `0` disables it entirely.
+    local _sample_int="${FORGE_USAGE_SAMPLE_INTERVAL_S:-300}"
+    case "$_sample_int" in ''|*[!0-9]*) _sample_int=300 ;; esac
+    local _last_sample; _last_sample="$started"
+    local _sample_idx; _sample_idx="$(pane_index "$worker_canonical")"
 
     # Trap SIGINT: emit ERROR FIRST so it survives even if the printf is
     # interrupted; use :-unknown defaults so a SIGINT during arg-parse still
@@ -4778,6 +4824,11 @@ cmd_wait() {
                 _render_status_file
                 return 0
             fi
+        fi
+
+        if [ "$_sample_int" -gt 0 ] && [ $(( $(date +%s) - _last_sample )) -ge "$_sample_int" ]; then
+            _last_sample=$(date +%s)
+            _acm_sample_tick "$project_root" "$slug" "$stage" "$worker_canonical" "$_sample_idx" || true
         fi
 
         sleep "$interval"
@@ -6073,8 +6124,9 @@ cmd_emit() {
     case "$type" in
         DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE) ;;
         RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY) ;;
+        WORKER_LOW_CONTEXT|ORCHESTRATOR_LOW_CONTEXT) ;;
         *)
-            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY; got '$type'" >&2
+            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY|WORKER_LOW_CONTEXT|ORCHESTRATOR_LOW_CONTEXT; got '$type'" >&2
             return 1
             ;;
     esac

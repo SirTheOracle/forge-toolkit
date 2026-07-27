@@ -2728,9 +2728,19 @@ for et in RESET HYGIENE_DECISION HYGIENE_ABANDON HYGIENE_BYPASSED RESET_UNAVAILA
   fi
 done
 o=$( cd "$MR" && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe "$BRIDGE" emit BOGUS --slug m1 2>&1 ); rc=$?
-[ "$rc" != 0 ] && echo "$o" | grep -q 'OBSERVE_ONLY; got' \
+# Pin MEMBERSHIP plus the message SHAPE, not the tail of the list. The original assertion
+# grepped 'OBSERVE_ONLY; got', which broke the moment the whitelist legitimately grew — it
+# was only ever accidentally correct.
+[ "$rc" != 0 ] && echo "$o" | grep -q 'OBSERVE_ONLY' \
+  && echo "$o" | grep -q 'WORKER_LOW_CONTEXT' && echo "$o" | grep -q 'ORCHESTRATOR_LOW_CONTEXT' \
+  && echo "$o" | grep -q "; got 'BOGUS'" \
   && ok "T-HYG-EMIT BOGUS rejected with the updated whitelist error" \
   || bad "T-HYG-EMIT BOGUS: rc=$rc $o"
+for et in WORKER_LOW_CONTEXT ORCHESTRATOR_LOW_CONTEXT; do
+  ( cd "$MR" && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe "$BRIDGE" emit "$et" --slug m1 worker=codex-a headroom=9 ) >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] && grep -q "^$et: pipeline=m1 " "$MR/.dev/forge-tmp/orchestrator-events.log" \
+    && ok "T-ACM-EMIT $et round-trips cmd_emit" || bad "T-ACM-EMIT $et failed rc=$rc"
+done
 
 echo "── ACM §T: threshold resolution ──"
 [ "$(FORGE_CONTEXT_ALERT_HEADROOM=25 _context_alert_headroom claude-opus)" = 25 ] \
@@ -3203,6 +3213,72 @@ PY
   tmux kill-session -t "$DS" 2>/dev/null
 else
   echo "  (skip: tmux unavailable — ACM §E)"
+fi
+
+echo "── ACM §W: mid-stage sampler (real tmux) ──"
+if command -v tmux >/dev/null 2>&1; then
+  # r1 · BLOCK-LOCAL SESSION (see ACM §D).
+  DS="fbacmw-$$"; DCA="$(mkR acmw)"
+  tmux new-session -d -s "$DS" -x 220 -y 50 -c "$DCA"
+  i=0; while [ "$i" -lt 4 ]; do tmux split-window -d -t "$DS:0" -c "$DCA"; tmux select-layout -t "$DS:0" tiled >/dev/null 2>&1; i=$((i+1)); done
+  DINC="$(tmux display-message -p -t "$DS:0.0" '#{session_created}')"
+  sleep 1
+  EVL="$DCA/.dev/forge-tmp/orchestrator-events.log"
+  mkdir -p "$DCA/.dev/forge-tmp"
+  # r1 · ONE `%%` per literal percent. `%%%%` emits `%%`, and the codex anchor is
+  # `Context (\d+)% left` — a double percent silently never matches, so every reading would
+  # come back `unknown` and the whole block would pass vacuously.
+  for h in 90 60 20 10; do printf '  gpt-5.5 · Context %s%% left · ~/repo\n' "$h" > "$WORK/acm-$h.txt"; done
+  # r1 · The dedup marker is keyed on the generation, and _acm_sample_tick SKIPS the dedup
+  # when _hygiene_current_gen is empty (`[ -n "$_g" ] && ...`). On a fresh root there is no
+  # generation at all, so without this seeding send the notification fires on every low
+  # sample and "exactly one per generation" is untestable. A REAL send, not a synthetic
+  # _hygiene_write — the same reason the re-arm below uses one.
+  run_in_pane "$DS:0.1" acmms-gen0 "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$WORK/acm-90.txt $BRIDGE send --force codex-b seed )"
+  [ "$(rc_of acmms-gen0)" = 0 ] || bad "T-ACM-MIDSTAGE generation seed failed: $(out_of acmms-gen0 | tail -1)"
+  run_in_pane "$DS:0.1" acmsc1 "( cd $DCA && $ENF $BRIDGE stall-check --project-root $DCA codex-b )"
+  sc_before="$(out_of acmsc1 | sed 's/^DONE_.*//' | tr -d '\n')"
+  : > "$EVL"
+  for hf in 90 60 20 10; do
+    run_in_pane "$DS:0.1" "acmms-$hf" "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$WORK/acm-$hf.txt FORGE_CONTEXT_ALERT_HEADROOM=25 FORGE_USAGE_SAMPLE_INTERVAL_S=1 FORGE_WAIT_INTERVAL_S=1 $BRIDGE wait --slug ams --stage coding --worker codex-b --timeout 3 )"
+  done
+  n=$(grep -c '^WORKER_LOW_CONTEXT: ' "$EVL" | tr -d ' ')
+  [ "$n" = 1 ] && ok "T-ACM-MIDSTAGE exactly one WORKER_LOW_CONTEXT per generation (got $n)" \
+    || bad "T-ACM-MIDSTAGE emitted $n WORKER_LOW_CONTEXT lines"
+  # RE-ARM: advance the generation with a REAL send, not a synthetic _hygiene_write. An
+  # implementation that keyed the marker on next_generation instead of latest_generation
+  # would pass the synthetic version and fail this one.
+  run_in_pane "$DS:0.1" acmrearm "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$WORK/acm-90.txt $BRIDGE send --force codex-b bump )"
+  run_in_pane "$DS:0.1" acmms2 "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$WORK/acm-10.txt FORGE_CONTEXT_ALERT_HEADROOM=25 FORGE_USAGE_SAMPLE_INTERVAL_S=1 FORGE_WAIT_INTERVAL_S=1 $BRIDGE wait --slug ams --stage coding --worker codex-b --timeout 3 )"
+  n2=$(grep -c '^WORKER_LOW_CONTEXT: ' "$EVL" | tr -d ' ')
+  [ "$n2" = 2 ] && ok "T-ACM-MIDSTAGE a new generation re-arms the notification (got $n2)" \
+    || bad "T-ACM-MIDSTAGE re-arm failed: $n2"
+  # r1 · cmd_stall_check is deliberately untouched by Step 24, so what is pinned is its
+  # POSITIONAL CONTRACT — `<STATE> pane=<worker> …` — not the state word, which legitimately
+  # changes as work runs. Comparing the state token before/after a wait compares two different
+  # facts (here: UNKNOWN baseline_pending vs ACTIVE elapsed=3s) and can only fail spuriously.
+  run_in_pane "$DS:0.1" acmsc2 "( cd $DCA && $ENF $BRIDGE stall-check --project-root $DCA codex-b )"
+  sc_after="$(out_of acmsc2 | sed 's/^DONE_.*//' | tr -d '\n')"
+  printf '%s' "$sc_before" | grep -qE '^[A-Z_]+ pane=codex-b( |$)' \
+    && printf '%s' "$sc_after" | grep -qE '^[A-Z_]+ pane=codex-b( |$)' \
+    && ok "T-ACM-MIDSTAGE cmd_stall_check's positional contract is unchanged" \
+    || bad "T-ACM-MIDSTAGE stall-check output shape changed: before=[$sc_before] after=[$sc_after]"
+  # r1 · Re-arm again before the interval-0 cell, otherwise the generation is still the one
+  # the re-arm test already notified on and the sampler would be silent even if it ran —
+  # the negative would pass for the wrong reason.
+  : > "$EVL"
+  run_in_pane "$DS:0.1" acmoff-rearm "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$WORK/acm-90.txt $BRIDGE send --force codex-b bump2 )"
+  run_in_pane "$DS:0.1" acmoff "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$WORK/acm-10.txt FORGE_CONTEXT_ALERT_HEADROOM=25 FORGE_USAGE_SAMPLE_INTERVAL_S=0 FORGE_WAIT_INTERVAL_S=1 $BRIDGE wait --slug ams --stage coding --worker codex-b --timeout 3 )"
+  [ "$(grep -c 'WORKER_LOW_CONTEXT\|sampled=1' "$EVL" | tr -d ' ')" = 0 ] \
+    && ok "T-ACM-MIDSTAGE interval 0 disables the sampler entirely" || bad "T-ACM-MIDSTAGE interval 0 still sampled"
+  : > "$EVL"
+  run_in_pane "$DS:0.1" acmflood "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$WORK/acm-90.txt FORGE_USAGE_SAMPLE_INTERVAL_S=1 FORGE_WAIT_INTERVAL_S=1 $BRIDGE wait --slug ams --stage coding --worker codex-b --timeout 5 )"
+  fl=$(grep -c 'USAGE: ' "$EVL" | tr -d ' ')
+  [ "$fl" -le 1 ] && ok "T-ACM-MIDSTAGE healthy sampling adds at most one USAGE line (R8)" \
+    || bad "T-ACM-MIDSTAGE event-log flooding: $fl USAGE lines"
+  tmux kill-session -t "$DS" 2>/dev/null
+else
+  echo "  (skip: tmux unavailable — ACM §W)"
 fi
 
 echo
