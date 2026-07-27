@@ -3033,6 +3033,106 @@ FORGE_PANE1_FIXTURE="$AFIX/claude-lo.txt" _observe_pane1 "$AP" p1 >/dev/null   #
   && ok "T-ACM-PANE1 a second low reading does not re-fire ORCHESTRATOR_LOW_CONTEXT" \
   || bad "T-ACM-PANE1 re-fired on a non-crossing"
 
+echo "── ACM §I: plane isolation (the ledger cannot influence enforcement) ──"
+AI="$WORK/acmIso"; mkdir -p "$AI/.dev"
+_resolve_project_root(){ printf '%s' "$AI"; }
+_session_or_sentinel(){ printf 'hygS'; }
+acm_ledger() {  # acm_ledger <root> <worker> <headroom> <confidence>
+  FORGE_U_FAMILY=claude FORGE_U_STAGE=x FORGE_U_AT="$(timestamp)" FORGE_U_OBSBY=callback \
+    _usage_upsert "$1/$(_usage_file)" "workers/$2" record -1 \
+      "$(printf 'null\tnull\t%s\t%s\tnull\tnull' "$3" "$4")" >/dev/null
+}
+hj_obs "$AI" claude-opus 4 4 90 high
+acm_ledger "$AI" claude-opus 5 high
+[ "$(_hygiene_decide "$AI" claude-opus '' '' | awk '{print $1}')" = KEEP_OBSERVED ] \
+  && ok "T-ACM-ISOLATION-READ journal 90 wins over ledger 5" || bad "T-ACM-ISOLATION-READ ledger leaked into the gate"
+hj_obs "$AI" claude-opus 4 4 5 high
+acm_ledger "$AI" claude-opus 90 high
+[ "$(_hygiene_decide "$AI" claude-opus '' '' | awk '{print $1}')" = RESET_THRESHOLD ] \
+  && ok "T-ACM-ISOLATION-READ journal 5 wins over ledger 90" || bad "T-ACM-ISOLATION-READ inverted case leaked"
+# T-ACM-NO-TTL (regression) — the rejected wall-clock age guard STAYS rejected.
+hj_obs "$AI" claude-opus 4 4 90 high    # measured_at pinned to 2020 in hj_obs
+[ "$(_hygiene_decide "$AI" claude-opus '' '' | awk '{print $1}')" = KEEP_OBSERVED ] \
+  && ok "T-ACM-NO-TTL a 2020 reading that still covers the generation is still KEEP_OBSERVED" \
+  || bad "T-ACM-NO-TTL an age TTL crept into the decision path"
+
+echo "── ACM §D: the live gate, end to end (real tmux) ──"
+if command -v tmux >/dev/null 2>&1; then
+  # r1 · BLOCK-LOCAL SESSION. HYG §Dispatch kills its own session at run.sh:2368, ~700 lines
+  # above this insertion point, so `$DS` is DEAD here and every run_in_pane against it burns
+  # 30s and writes TIMEOUT. Each ACM tmux block therefore builds a fresh session + root and
+  # kills it again at the end; re-binding $DS/$DCA/$DINC is deliberate — the suite's EXIT trap
+  # already covers "${DS:-none}", so an aborted run cannot leak the session.
+  DS="fbacmd-$$"; DCA="$(mkR acmd)"
+  tmux new-session -d -s "$DS" -x 220 -y 50 -c "$DCA"
+  i=0; while [ "$i" -lt 4 ]; do tmux split-window -d -t "$DS:0" -c "$DCA"; tmux select-layout -t "$DS:0" tiled >/dev/null 2>&1; i=$((i+1)); done
+  DINC="$(tmux display-message -p -t "$DS:0.0" '#{session_created}')"
+  sleep 1
+  # Journal helpers bound to THIS session/incarnation (the HYG §Dispatch idiom). The suite's
+  # `session_incarnation_of` is a stub pinned to 42 (run.sh:1983), so the real journal path
+  # must come from $DINC, never from that stub.
+  dwr(){ local r="$1"; shift; ID_target_session="$DS" ID_target_incarnation="$DINC" _hygiene_write "$r" "$@"; }
+  dgen(){ ID_target_session="$DS" ID_target_incarnation="$DINC" _hygiene_current_gen "$1" "$2"; }
+  # ONE fixture that is simultaneously IDLE BY ANCHOR and LOW BY FOOTER — which is F6 made
+  # executable: the idle anchor and the number sit in the same footer region. No shipped
+  # fixture can drive the override (the codex reset fixtures carry no context anchor at all,
+  # and claude-opus-clear-before.txt reads ctx: 32k (3%) = headroom 97).
+  GLOW="$ROOT/tests/forge-bridge/fixtures/claude-opus-idle-low.txt"
+  EVL="$DCA/.dev/forge-tmp/orchestrator-events.log"
+  GUF="$DCA/.dev/forge-usage.$DS.yml"
+  mkdir -p "$DCA/.dev/forge-tmp"
+  # Seed a journal that KEEPs: a covered, high-confidence observation at headroom 90.
+  # `delivery` establishes latest_generation and `delivered` clears the attempting state, so
+  # _hygiene_decide can reach the observation branch at all (the HYG §Reset seeding idiom).
+  dwr "$DCA" delivery claude-opus "id=acm-seed-1" "generation=1" "kind=dispatch" >/dev/null
+  dwr "$DCA" delivered claude-opus >/dev/null
+  dwr "$DCA" observe-known claude-opus "generation=$(dgen "$DCA" claude-opus)" \
+      "callback_id=acmcb1" "pending_timestamp=acmpt1" "usage_record_hash=acmh1" \
+      "headroom=90" "confidence=high" >/dev/null
+  # ---- (1) P20/P21 on a KEEP dispatch: the gate parses the RETAINED capture and writes the
+  # ledger ONCE with dispatch provenance. It has to be asserted here and not on the resetting
+  # dispatch below, because S2.1's post-reset marker legitimately rewrites the same record to
+  # observed_by=reset — so a resetting dispatch can never witness observed_by=dispatch.
+  run_in_pane "$DS:0.1" acmgatek "( cd $DCA && $ENF FORGE_HEALTH_FIXTURE=$CLB $BRIDGE dispatch --slug agate1 --stage adhoc --worker claude-opus )"
+  python3 - "$GUF" <<'PY' && ok "T-ACM-GATE the gate reading is recorded with observed_by: dispatch" \
+    || bad "T-ACM-GATE no dispatch-provenance ledger record"
+import sys,yaml
+r=(yaml.safe_load(open(sys.argv[1])) or {})['workers']['claude-opus']
+# headroom 97 is the LIVE gate capture (ctx: 32k (3%)); the journal said 90 and the ledger
+# has no other writer on this path, so this pins "the 4th _worker_health arg was passed AND
+# its capture reached _usage_parse_capture".
+assert r['observed_by']=='dispatch', r
+assert r['headroom']==97 and r['confidence']=='high' and r['pct']==3, r
+PY
+  grep -q 'HYGIENE_DECISION: .*worker=claude-opus .*action=KEEP_OBSERVED .*source=journal' "$EVL" \
+    || bad "T-ACM-GATE the KEEP seed did not produce a journal-sourced KEEP_OBSERVED: $(grep 'HYGIENE_DECISION' "$EVL" | tail -1)"
+  tmux send-keys -t "$DS:0.0" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$DS:0.0" acmgatek-close "( cd $DCA && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug agate1 --stage adhoc --status DONE --worker claude-opus --message d --quiet )"
+  # ---- (2) the live override: re-seed the SAME covered KEEP at the new generation, then
+  # dispatch against the idle+low fixture. Reset fixtures are supplied so the resulting
+  # RESET_THRESHOLD completes rather than failing the dispatch on an unconfirmable reset.
+  dwr "$DCA" observe-known claude-opus "generation=$(dgen "$DCA" claude-opus)" \
+      "callback_id=acmcb2" "pending_timestamp=acmpt2" "usage_record_hash=acmh2" \
+      "headroom=90" "confidence=high" >/dev/null
+  : > "$EVL"
+  run_in_pane "$DS:0.1" acmgate "( cd $DCA && $ENF FORGE_HEALTH_FIXTURE=$GLOW FORGE_RESET_BASELINE_FIXTURE=$CLB FORGE_RESET_PROOF_FIXTURE=$CLA $BRIDGE dispatch --slug agate2 --stage adhoc --worker claude-opus )"
+  grep -q 'HYGIENE_DECISION: .*worker=claude-opus action=RESET_CONFIRMED .*source=live live_headroom=10' "$EVL" \
+    && ok "T-ACM-GATE the retained capture is parsed and the live override fires (P20/P21/P22/P25)" \
+    || bad "T-ACM-GATE no source=live decision: $(grep 'HYGIENE_DECISION' "$EVL" | tail -1)"
+  # Field ORDER is confidence= … source=, so the two cannot be grepped source-first.
+  grep -q 'HYGIENE_DECISION: .*confidence=none .*source=live' "$EVL" \
+    && ok "T-ACM-GATE a live-driven decision never claims journal confidence" \
+    || bad "T-ACM-GATE confidence=high on a live-driven decision"
+  out_of acmgate | grep -q '^HYGIENE claude-opus: ' \
+    && ok "T-ACM-GATE the dispatch echo reaches stderr (P1)" || bad "T-ACM-GATE no HYGIENE echo"
+  tmux send-keys -t "$DS:0.0" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$DS:0.0" acmgate-close "( cd $DCA && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug agate2 --stage adhoc --status DONE --worker claude-opus --message d --quiet )"
+  unset -f dwr dgen
+  tmux kill-session -t "$DS" 2>/dev/null
+else
+  echo "  (skip: tmux unavailable — ACM §D)"
+fi
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

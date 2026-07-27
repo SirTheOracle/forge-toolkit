@@ -3876,6 +3876,10 @@ PYEOF
     # P2-2: a typo'd mode is a hard error, never a silent observe fall-through, so a run
     # intended as enforce cannot quietly dispatch dirty.
     local _dmode; _dmode="$(_hygiene_mode)" || { _emit_event ERROR "$slug" "stage=$stage reason=hygiene-mode-invalid"; echo "ERROR: FORGE_WORKER_HYGIENE_MODE must be observe|enforce." >&2; return 1; }
+    # S5: holder for the gate capture. Stays EMPTY on the supersede path and in observe mode
+    # (neither calls _worker_health), which is exactly the "no live capture => journal
+    # decision unchanged" cell of the monotone table.
+    local _acm_gate_cap=""
     # P0-4: single cleanup path — every enforcement/supersede return below releases the worker
     # (and lifecycle) lock via the RETURN trap, so no fd 10-13 can leak on an error path.
     trap _hygiene_release_all RETURN
@@ -3898,11 +3902,18 @@ PYEOF
             local _wp _wprc; _wp="$(_worker_open_pending_ts "$project_root" "$worker_canonical" "")"; _wprc=$?
             [ "$_wprc" -eq 0 ] || { _emit_event ERROR "$slug" "stage=$stage reason=pending-scan-failed worker=$worker_canonical"; echo "HOOK BLOCKED: pending scan failed for $worker_canonical." >&2; return 1; }
             [ -z "$_wp" ] || { _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=worker-has-open-pending worker=$worker_canonical"; echo "HOOK BLOCKED: $worker_canonical has an open pending under the lock — refusing to start new work." >&2; return 1; }
-            local _wh; _wh="$(_worker_health "$SESSION" "$worker_pane" "$worker_canonical")"
-            case "$_wh" in idle) ;; *) _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=worker-not-idle state=$_wh worker=$worker_canonical"; echo "HOOK BLOCKED: $worker_canonical not idle (state=$_wh) — refusing to start new work." >&2; return 1 ;; esac
+            # S5.1: retain the capture _worker_health already takes. F6 — the `case` below
+            # refuses dispatch unless health returned `idle`, which means the idle anchor JUST
+            # matched, and those anchors ARE the footer lines carrying the usage number. The
+            # gate reading is therefore high-confidence BY CONSTRUCTION; the mid-turn footer
+            # doubt (R6) applies only to S7's mid-stage sampling, never here.
+            _acm_gate_cap="$(mktemp -t forge-gate-XXXXXX 2>/dev/null)" || _acm_gate_cap=""
+            local _wh; _wh="$(_worker_health "$SESSION" "$worker_pane" "$worker_canonical" "$_acm_gate_cap")"
+            case "$_wh" in idle) ;; *) [ -n "$_acm_gate_cap" ] && rm -f "$_acm_gate_cap" 2>/dev/null; _acm_gate_cap=""; _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=worker-not-idle state=$_wh worker=$worker_canonical"; echo "HOOK BLOCKED: $worker_canonical not idle (state=$_wh) — refusing to start new work." >&2; return 1 ;; esac
         fi
     fi
     local _min; _min="$(_worker_min_headroom "$worker_canonical")" || {
+        [ -n "$_acm_gate_cap" ] && rm -f "$_acm_gate_cap" 2>/dev/null
         _worker_unlock "$worker_canonical"
         _emit_event ERROR "$slug" "stage=$stage reason=config-error worker=$worker_canonical"
         echo "ERROR: invalid FORGE_WORKER_MIN_HEADROOM(_family) — dispatch refused, nothing mutated." >&2
@@ -3914,6 +3925,44 @@ PYEOF
     # high-confidence observation; every other decision has no confident reading.
     local _conf=none; case "$_decision" in KEEP_OBSERVED|RESET_THRESHOLD) _conf=high ;; esac
     [ "$do_clear" = true ] && case "$_decision" in KEEP_*) _decision=RESET_UNPROVEN; _reason=explicit-clear ;; esac
+    # ---- S5: live tightening at the gate ----
+    # MONOTONE-CONSERVATIVE RULE: a new usage input may only move the decision toward RESET,
+    # never toward KEEP. Honestly scoped: this is insurance plus the telemetry
+    # (source=/live_headroom=) that makes family-threshold calibration decidable — it is not
+    # closing an observed failure (F3: coverage retirement fully explains zero KEEP_OBSERVED).
+    #
+    # ORDER MATTERS. `_conf` was resolved above from the JOURNAL decision, and the --clear
+    # coercion runs first so an explicit --clear can never be reinterpreted as source=live.
+    # PARSE ONCE, DECIDE, WRITE ONCE: the divergence flag is only known after the override,
+    # and a write-then-patch sequence would be a read-modify-write racing a concurrent writer.
+    local _live_hr="" _live_conf=none _source=journal _divergent=0 _pkind=""
+    if [ -n "$_acm_gate_cap" ] && [ -s "$_acm_gate_cap" ]; then
+        local _lpct _ltok _lrs _lraw
+        IFS=$'\t' read -r _lpct _ltok _live_hr _live_conf _lrs _lraw <<< "$(_usage_parse_capture "$_acm_gate_cap" "$_fam")"
+        case "$_live_hr" in ''|unknown|*[!0-9]*) _live_hr="" ;; esac
+        # Lazy: the journal read happens ONLY on the branch that can use it, so the common
+        # RESET_UNPROVEN path pays no python3 spawn.
+        case "$_decision" in KEEP_RESET_PROVEN) _pkind="$(_hygiene_reset_proof_kind "$project_root" "$worker_canonical" 2>/dev/null)" ;; esac
+        IFS=$'\t' read -r _decision _reason _source _divergent \
+            <<< "$(_hygiene_live_override "$_decision" "$_reason" "${_live_hr:-}" "$_live_conf" "$_min" "$_pkind")"
+        # S5.5: `confidence=high` must mean "a JOURNAL observation backed this exact decision".
+        # A live-driven decision has no journal backing; source= is what disambiguates the
+        # calibration trail.
+        [ "$_source" = live ] && _conf=none
+        # S5.2: ledger-only, observed_by=dispatch, fresh at exactly the moment a human is most
+        # likely to look. `sample` mode so a bad parse cannot destroy last-known-good. The
+        # divergence fields (S5.4) ride the SAME write as the reading they describe.
+        local _galert; _galert="$(_context_alert_headroom "$worker_canonical" 2>/dev/null)" || _galert=-1
+        case "$_galert" in ''|*[!0-9]*) _galert=-1 ;; esac
+        FORGE_U_FAMILY="$_fam" FORGE_U_STAGE="$stage" FORGE_U_AT="$(timestamp)" \
+        FORGE_U_OBSBY=dispatch FORGE_U_GEN="$(_hygiene_current_gen "$project_root" "$worker_canonical")" \
+        FORGE_U_DIVERGENT="$_divergent" FORGE_U_DIVERGENT_HEADROOM="${_live_hr:-}" \
+        FORGE_U_DIVERGENT_PROOF="${_pkind:-none}" \
+        _usage_upsert "$project_root/$(_usage_file)" "workers/$worker_canonical" sample "$_galert" \
+          "$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$_lpct" "$_ltok" "${_live_hr:-unknown}" "$_live_conf" "$_lrs" "$_lraw")" \
+          >/dev/null 2>&1 || true
+        rm -f "$_acm_gate_cap" 2>/dev/null; _acm_gate_cap=""
+    fi
     local _degraded=0
     case "$_fam" in
         claude) [ "$FORGE_WORKER_HYGIENE_DEGRADED_CLAUDE" = 1 ] && _degraded=1 ;;
@@ -3950,7 +3999,18 @@ PYEOF
             KEEP_OBSERVED|KEEP_RESET_PROVEN) : ;;
         esac
     fi
-    _emit_event HYGIENE_DECISION "$slug" "stage=$stage worker=$worker_canonical action=$_action reason=$_reason threshold=$_min confidence=${_conf:-none} mode=$FORGE_WORKER_HYGIENE_MODE generation=$(_hygiene_current_gen "$project_root" "$worker_canonical")"
+    local _gen_now; _gen_now="$(_hygiene_current_gen "$project_root" "$worker_canonical")"
+    # S5.5: ADDITIVE FIELDS ONLY. No new action= value — the action vocabulary is pinned by
+    # the emit whitelist and consumed by forge-watch's event parsing.
+    _emit_event HYGIENE_DECISION "$slug" "stage=$stage worker=$worker_canonical action=$_action reason=$_reason threshold=$_min confidence=${_conf:-none} mode=$FORGE_WORKER_HYGIENE_MODE generation=$_gen_now source=$_source live_headroom=${_live_hr:-none} divergent=$_divergent"
+    # ACM S1: the decision has always landed only in orchestrator-events.log, so from pane 1
+    # a working hygiene gate and an absent one look identical. One line per boundary, on
+    # STDERR — stdout stays byte-for-byte unchanged because cmd_wait and the orchestrator
+    # parse it.
+    echo "HYGIENE $worker_canonical: $_action — $_reason (source=$_source, live=${_live_hr:-none}, threshold=$_min, gen ${_gen_now:-0})" >&2
+    # S13.2: the orchestrator's own activity is the clock for pane-1 observation. No new
+    # cadence, and NEVER from cmd_status/cmd_context (callers expect those side-effect-free).
+    _observe_pane1 "$project_root" "$slug" >/dev/null 2>&1 || true
 
     local prompt_file="$project_root/.dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
     mkdir -p "$(dirname "$prompt_file")"
@@ -4049,7 +4109,11 @@ PYEOF
             if [ "$_dmode" = enforce ] && _hygiene_worker_ok "$worker_canonical"; then   # P1-2: validated mode
                 if _reset_automation_enabled "$_fam" >/dev/null; then
                     if _reset_worker_locked "$SESSION" "$worker_pane" "$worker_canonical" supersede "$slug" "$_sup_ts"; then
-                        _emit_event HYGIENE_DECISION "$slug" "stage=$_sup_stage worker=$worker_canonical action=RESET_CONFIRMED reason=supersede-abandon threshold=$_min confidence=none mode=enforce generation=$(_hygiene_current_gen "$project_root" "$worker_canonical")"
+                        local _sup_gen; _sup_gen="$(_hygiene_current_gen "$project_root" "$worker_canonical")"
+                        _emit_event HYGIENE_DECISION "$slug" "stage=$_sup_stage worker=$worker_canonical action=RESET_CONFIRMED reason=supersede-abandon threshold=$_min confidence=none mode=enforce generation=$_sup_gen source=journal live_headroom=none divergent=0"
+                        # ACM S1: the supersede-abandon boundary is a reset too, and must be
+                        # as visible as the normal one.
+                        echo "HYGIENE $worker_canonical: RESET_CONFIRMED — supersede-abandon (source=journal, gen ${_sup_gen:-0})" >&2
                     else
                         _lifecycle_unlock; _worker_unlock "$worker_canonical"
                         echo "ERROR: --supersede reset did not confirm for $slug/$_sup_stage — pending/prompt left byte-for-byte unchanged." >&2
