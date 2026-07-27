@@ -3133,6 +3133,78 @@ else
   echo "  (skip: tmux unavailable — ACM §D)"
 fi
 
+echo "── ACM §E: direct-send coverage (real tmux) ──"
+if command -v tmux >/dev/null 2>&1; then
+  # r1 · BLOCK-LOCAL SESSION (see ACM §D): every earlier real-tmux section kills its own
+  # session, so $DS is dead at this insertion point and must be rebuilt per block.
+  DS="fbacme-$$"; DCA="$(mkR acme)"
+  tmux new-session -d -s "$DS" -x 220 -y 50 -c "$DCA"
+  i=0; while [ "$i" -lt 4 ]; do tmux split-window -d -t "$DS:0" -c "$DCA"; tmux select-layout -t "$DS:0" tiled >/dev/null 2>&1; i=$((i+1)); done
+  DINC="$(tmux display-message -p -t "$DS:0.0" '#{session_created}')"
+  sleep 1
+  EVL="$DCA/.dev/forge-tmp/orchestrator-events.log"
+  mkdir -p "$DCA/.dev/forge-tmp"
+  printf '  gpt-5.5 · Context 40%% left · ~/repo\n' > "$WORK/acm-40.txt"
+  run_in_pane "$DS:0.1" acmsend "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$AFIX/codex-9.txt FORGE_CONTEXT_ALERT_HEADROOM=25 $BRIDGE send --force codex-a hello )"
+  [ "$(rc_of acmsend)" = 0 ] \
+    && out_of acmsend | grep -q 'WARNING: codex-a headroom=9 is at or below the alert threshold (25)' \
+    && grep -q 'HYGIENE_DECISION: .*action=SEND_CONTINUATION .*headroom=9 confidence=high' "$EVL" \
+    && ok "T-ACM-SEND warns, records the real headroom, and DELIVERS (rc 0)" \
+    || bad "T-ACM-SEND wrong: rc=$(rc_of acmsend)"
+  # r1 · the floor / boundary / unknown cells must use a PLAIN send (with --force the floor is
+  # bypassed outright and all three cells pass vacuously). A plain send first has to clear the
+  # shipped "no pending log entry targeting <worker>" guard, so seed ONE pending log entry and
+  # reuse it: a send never closes the pending, and a refused send never touches it.
+  run_in_pane "$DS:0.1" acmfloor-seed "( cd $DCA && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug acmf1 --stage adhoc --from claude --to codex-a --prompt p )"
+  [ "$(rc_of acmfloor-seed)" = 0 ] || bad "T-ACM-SEND floor seed failed: $(out_of acmfloor-seed | tail -1)"
+  run_in_pane "$DS:0.1" acmfloor "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$WORK/acm-40.txt FORGE_SEND_MIN_HEADROOM=50 $BRIDGE send codex-a hello )"
+  [ "$(rc_of acmfloor)" != 0 ] && out_of acmfloor | grep -q 'below FORGE_SEND_MIN_HEADROOM=50' \
+    && out_of acmfloor | grep -q 'send --force' \
+    && ok "T-ACM-SEND the floor refuses a plain send at 40 with an explicit --force hint" \
+    || bad "T-ACM-SEND floor did not refuse"
+  # BOUNDARY: the floor is STRICTLY BELOW, so headroom == floor is PERMITTED.
+  printf '  gpt-5.5 · Context 50%% left · ~/repo\n' > "$WORK/acm-50.txt"
+  run_in_pane "$DS:0.1" acmbound "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$WORK/acm-50.txt FORGE_SEND_MIN_HEADROOM=50 $BRIDGE send codex-a hello )"
+  [ "$(rc_of acmbound)" = 0 ] \
+    && ok "T-ACM-SEND headroom == floor is PERMITTED (the floor is strictly-below, unlike the four inclusive knobs)" \
+    || bad "T-ACM-SEND boundary at exactly the floor was refused"
+  run_in_pane "$DS:0.1" acmforce "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$AFIX/codex-9.txt FORGE_SEND_MIN_HEADROOM=50 $BRIDGE send --force codex-a hello )"
+  [ "$(rc_of acmforce)" = 0 ] \
+    && ok "T-ACM-SEND --force at headroom 9 is PERMITTED under a floor of 50 (the BLOCKED path is untouchable)" \
+    || bad "T-ACM-SEND --force was blocked by the floor"
+  run_in_pane "$DS:0.1" acmunk "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$AFIX/no-anchor.txt FORGE_SEND_MIN_HEADROOM=50 $BRIDGE send codex-a hello )"
+  [ "$(rc_of acmunk)" = 0 ] && ok "T-ACM-SEND an unknown reading never triggers the floor" || bad "T-ACM-SEND unknown refused"
+  run_in_pane "$DS:0.1" acmfam "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$AFIX/codex-73.txt FORGE_CONTEXT_ALERT_HEADROOM_CODEX=80 $BRIDGE send --force codex-a hello )"
+  out_of acmfam | grep -q 'WARNING: codex-a headroom=73' \
+    && ok "T-ACM-SEND the family override moves the warning point" || bad "T-ACM-SEND family override ignored"
+  # P13 — the cmd_callback redirect (Step 11). _observe_usage now echoes "<headroom>
+  # <confidence>" on stdout; without the redirect that pair would land in cmd_callback's
+  # stdout, which cmd_wait and the orchestrator parse. Assert the pair is ABSENT.
+  run_in_pane "$DS:0.1" acmcbso "( cd $DCA && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug acmcb --stage adhoc --from claude --to codex-a --prompt p )"
+  run_in_pane "$DS:0.2" acmcbso2 "( cd $DCA && FORGE_WATCH_TRIGGER=0 FORGE_USAGE_FIXTURE=$AFIX/codex-73.txt $BRIDGE callback --slug acmcb --stage adhoc --status DONE --worker codex-a --message m --quiet )"
+  [ "$(rc_of acmcbso2)" = 0 ] \
+    && ! out_of acmcbso2 | sed 's/^DONE_.*//' | grep -qE '^(unknown|[0-9]+) (high|low|none)$' \
+    && ok "T-ACM-CALLBACK-STDOUT the observer's two-field stdout never reaches cmd_callback's stdout (P13)" \
+    || bad "T-ACM-CALLBACK-STDOUT observer stdout leaked into the callback: [$(out_of acmcbso2 | tr '\n' '|')]"
+  # F8: a send NEVER manufactures journal coverage for the new generation. The journal path
+  # comes from $DINC — the suite's session_incarnation_of is a stub pinned to 42 (run.sh:1983).
+  python3 - "$DCA/.dev/forge-hygiene.$DS.$DINC.yml" <<'PY' \
+    && ok "T-ACM-SEND a pre-send measurement is never coverage for the new generation (F8)" \
+    || bad "T-ACM-SEND a send manufactured coverage"
+import sys,yaml
+d=yaml.safe_load(open(sys.argv[1])) or {}
+ws=(d.get("workers") or {})
+assert ws, d          # a vacuous pass is a failure: the sends above must have written here
+for w,r in ws.items():
+    o=(r or {}).get("observation") or {}
+    if o.get("state")=="known" and o.get("covers_generation")==r.get("latest_generation"):
+        assert o.get("callback_id"), (w,o)   # only a callback may establish coverage
+PY
+  tmux kill-session -t "$DS" 2>/dev/null
+else
+  echo "  (skip: tmux unavailable — ACM §E)"
+fi
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

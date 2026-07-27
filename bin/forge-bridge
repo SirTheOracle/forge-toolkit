@@ -2062,6 +2062,44 @@ cmd_send() {
                 esac
             fi
             _worker_lock "$TARGET" || return 1
+            # ---- S6: direct-send coverage ----
+            # Direct sends are the DOMINANT context-mutating path (25 sends vs 10 dispatches
+            # in the live log, 2.5:1) and were entirely unmeasured: every SEND_CONTINUATION
+            # recorded `confidence=none`. Measure BEFORE the next-gen write, under the lock we
+            # already hold (the ledger's fcntl lock is innermost and self-contained, so no new
+            # lock is taken and the shipped deadlock analysis is unchanged).
+            #
+            # F8 NON-GOAL: this reading is written to the LEDGER ONLY. A direct send has no
+            # completion boundary, so coverage cannot legitimately be re-established; writing
+            # it as journal observation for the new generation would manufacture KEEP_OBSERVED
+            # and directly weaken shipped reset semantics.
+            local _shr="" _sconf=none
+            if [ -n "$_pr2" ]; then
+                local _su; _su="$(_observe_usage "$TARGET" "${FORGE_SEND_SLUG:-adhoc}" direct-send "$PANE" "$_pr2" "" sample send 2>/dev/null)"
+                read -r _shr _sconf <<< "${_su:-unknown none}"
+            fi
+            case "$_shr" in ''|unknown|*[!0-9]*) _shr="" ;; esac
+            local _salert; _salert="$(_context_alert_headroom "$TARGET" 2>/dev/null)" || _salert=""
+            if [ -n "$_shr" ] && [ "$_sconf" = high ] && [ -n "$_salert" ] && [ "$_shr" -le "$_salert" ]; then
+                echo "WARNING: $TARGET headroom=$_shr is at or below the alert threshold ($_salert) — sending anyway." >&2
+                echo "         A send is a CONTINUATION: the bridge never resets on send, because a reset here would destroy the very context the send exists to continue." >&2
+            fi
+            # S6.4: opt-in hard floor, default 0 = DISABLED. STRICTLY BELOW (`-lt`), the one
+            # exclusive comparison in this feature — S6.4 says "a hard floor BELOW WHICH ... is
+            # refused", and an inclusive test would refuse at headroom 0 if the `> 0` disable
+            # guard were ever removed. The other four ACM thresholds are inclusive; the
+            # asymmetry is deliberate. Only a HIGH-confidence reading may refuse — `unknown`
+            # never means exhausted.
+            local _sfloor="${FORGE_SEND_MIN_HEADROOM:-0}"
+            case "$_sfloor" in ''|*[!0-9]*) _sfloor=0 ;; esac
+            if [ "$FORCE" != true ] && [ "$_sfloor" -gt 0 ] && [ -n "$_shr" ] && [ "$_sconf" = high ] && [ "$_shr" -lt "$_sfloor" ]; then
+                _worker_unlock "$TARGET"
+                echo "HOOK BLOCKED: $TARGET headroom=$_shr is below FORGE_SEND_MIN_HEADROOM=$_sfloor." >&2
+                echo "  Send anyway:  ~/bin/forge-bridge send --force $TARGET <message>" >&2
+                echo "  (--force is the BLOCKED fix-and-continue path and is NEVER refused by this floor.)" >&2
+                echo "  If this is NOT a continuation, run: ~/bin/forge-bridge reset-idle --worker $TARGET" >&2
+                return 1
+            fi
             # P1-4: FAIL-CLOSED bookkeeping — advance the generation + persist attempting
             # BEFORE typing; any write failure aborts with NO keystroke. send --force is the
             # no-reset continuation but STILL advances the generation so prior observation/
@@ -2071,7 +2109,10 @@ cmd_send() {
                 "id=send-$(date -u +%Y%m%dT%H%M%SZ)-$$" "generation=${_g:-0}" \
                 "kind=$([ "$FORCE" = true ] && echo send-force || echo send)" || { _worker_unlock "$TARGET"; echo "HOOK BLOCKED: send refused — delivery write failed for $TARGET." >&2; return 1; }
             # P2-10: direct worker sends are audited too (a no-reset continuation boundary).
-            _emit_event HYGIENE_DECISION "${FORGE_SEND_SLUG:-adhoc}" "worker=$TARGET action=SEND_CONTINUATION reason=$([ "$FORCE" = true ] && echo force-continuation || echo direct-send) confidence=none mode=$(_hygiene_mode 2>/dev/null) generation=${_g:-0}"
+            # S6.2: the hardcoded `confidence=none` is replaced by the real measurement.
+            _emit_event HYGIENE_DECISION "${FORGE_SEND_SLUG:-adhoc}" "worker=$TARGET action=SEND_CONTINUATION reason=$([ "$FORCE" = true ] && echo force-continuation || echo direct-send) headroom=${_shr:-unknown} confidence=$_sconf mode=$(_hygiene_mode 2>/dev/null) generation=${_g:-0}"
+            # ACM S1: same one-line visibility as the dispatch boundaries.
+            echo "HYGIENE $TARGET: SEND_CONTINUATION — headroom=${_shr:-unknown} confidence=$_sconf (no reset, gen ${_g:-0})" >&2
             _hygiene_crash_at activity
             _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"; local _rc=$?
             _hygiene_crash_at send-enter
