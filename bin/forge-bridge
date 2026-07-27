@@ -1504,6 +1504,62 @@ _usage_mark_post_reset() {   # <project_root> <worker> [generation]
     return 0
 }
 
+# _observe_pane1 <project_root> [slug]   (S13)
+# Pane-1 (orchestrator) observation. THE POLICY IS: OBSERVE AND RECOMMEND, NEVER ACT.
+# No auto-reset, no auto-compact, no keystroke of any kind is ever sent to pane 1.
+# The safety case, in three parts:
+#   1. pane 1 holds the operator conversation — the only state in Forge with no on-disk
+#      reconstruction path;
+#   2. there is no callback boundary in pane 1, so there is no moment the bridge can PROVE
+#      is safe; and
+#   3. the shipped reset proof is a WORKER contract, validated against worker CLIs on
+#      disposable panes.
+#
+# Recorded under a SEPARATE TOP-LEVEL `orchestrator:` ledger key, NEVER under `workers:`.
+# Verified rationale: cmd_finalize (:4713) and cmd_hygiene_abandon (:4885) iterate a
+# hardcoded four-worker order list and never read the ledger, and cmd_hygiene_status never
+# opens it — so nothing would break either way. The top-level key is for
+# FORWARD-COMPATIBILITY and semantic honesty: it keeps the record structurally outside worker
+# space so a future consumer cannot mistake pane 1 for a policy-covered worker, and the four
+# structural pane-1 exclusions stay untouched. The record has the IDENTICAL SHAPE to a worker
+# record, so a future FORGE_ORCHESTRATOR_HYGIENE needs no schema migration (S13.5).
+#
+# `sample` mode, so a mid-turn pane-1 parse miss can never clobber a good reading.
+# Echoes `<headroom> <confidence>`. Always rc0. Test seam: FORGE_PANE1_FIXTURE.
+_observe_pane1() {   # <project_root> [slug]
+    local pr="$1" slug="${2:-orchestrator}"
+    [ -n "$pr" ] || { printf 'unknown none\n'; return 0; }
+    local sess="${ID_target_session:-}"
+    local cap="" fixture=""
+    if [ -n "${FORGE_PANE1_FIXTURE:-}" ] && [ -f "${FORGE_PANE1_FIXTURE}" ]; then
+        cap="$FORGE_PANE1_FIXTURE"; fixture=1
+    else
+        [ -n "$sess" ] || { printf 'unknown none\n'; return 0; }
+        cap=$(mktemp -t forge-p1-XXXXXX 2>/dev/null) || { printf 'unknown none\n'; return 0; }
+        # READ-ONLY capture. This is the only tmux verb this function may ever use.
+        tmux capture-pane -p -t "$sess:$WINDOW.1" -S -12 > "$cap" 2>/dev/null || true
+    fi
+    local _pct _tok _hr _cf _rs _raw
+    IFS=$'\t' read -r _pct _tok _hr _cf _rs _raw <<< "$(_usage_parse_capture "$cap" claude)"
+    [ -z "$fixture" ] && rm -f "$cap" 2>/dev/null
+    local _oal; _oal="$(_orchestrator_alert_headroom 2>/dev/null)" || _oal=-1
+    case "$_oal" in ''|*[!0-9]*) _oal=-1 ;; esac
+    local _ctl
+    _ctl="$(FORGE_U_FAMILY=claude FORGE_U_STAGE=orchestrator FORGE_U_AT="$(timestamp)" \
+            FORGE_U_OBSBY=pane1 FORGE_U_SESSION="${sess:-}" FORGE_U_INCARNATION="${ID_target_incarnation:-}" \
+            _usage_upsert "$pr/$(_usage_file)" orchestrator sample "$_oal" \
+              "$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$_pct" "$_tok" "$_hr" "$_cf" "$_rs" "$_raw")")"
+    local _r_hr _r_conf _r_cross
+    read -r _r_hr _r_conf _r_cross <<< "${_ctl:-unknown none 0}"
+    if [ "${_r_cross:-0}" = 1 ]; then
+        # S13.3: one event per crossing. The BOARD row is state-derived from the ledger, so
+        # this event is telemetry only — it is never what makes the row appear or disappear.
+        _emit_event ORCHESTRATOR_LOW_CONTEXT "$slug" "worker=claude-orchestrator headroom=${_r_hr:-unknown} threshold=$_oal confidence=${_r_conf:-none} session=${sess:-} incarnation=${ID_target_incarnation:-}"
+    fi
+    printf '%s %s\n' "${_r_hr:-unknown}" "${_r_conf:-none}"
+    return 0
+}
+
 # _observe_usage <worker_canonical> <slug> <stage> <worker_idx> <project_root>
 #                [capture_file] [mode] [observed_by]
 # Read-only, family-aware per-task usage observation. Invoked from cmd_callback

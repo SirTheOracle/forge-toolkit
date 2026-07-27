@@ -2991,6 +2991,48 @@ o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
 rmdir "$ARU" 2>/dev/null
 unset -f tmux
 
+echo "── ACM §1: pane-1 observation ──"
+AP="$WORK/acmPane1"; mkdir -p "$AP/.dev"
+_resolve_project_root(){ printf '%s' "$AP"; }
+_session_or_sentinel(){ printf 'acmP'; }
+FORGE_PANE1_FIXTURE="$AFIX/claude-81.txt" _observe_pane1 "$AP" p1slug >/dev/null
+python3 - "$AP/$(_usage_file)" <<'PY' && ok "T-ACM-PANE1 record lands under top-level orchestrator:, never under workers:" || bad "T-ACM-PANE1 placement wrong"
+import sys,yaml
+d=yaml.safe_load(open(sys.argv[1]))
+assert isinstance(d.get('orchestrator'),dict), d
+assert d['orchestrator']['headroom']==19 and d['orchestrator']['observed_by']=='pane1'
+for bad_key in ('claude','claude-orchestrator','pane-1','orchestrator'):
+    assert bad_key not in (d.get('workers') or {}), bad_key
+PY
+_hygiene_worker_ok claude && bad "T-ACM-PANE1 _hygiene_worker_ok accepted pane 1" \
+  || ok "T-ACM-PANE1 _hygiene_worker_ok claude still rejects pane 1"
+o=$(_reset_worker_locked hygS 1 claude idle-proactive p1 2>&1); rc=$?
+[ "$rc" = 2 ] && echo "$o" | grep -q 'non-worker\|pane-not-worker' \
+  && ok "T-ACM-PANE1 _reset_worker_locked on pane 1 still refuses rc2" || bad "T-ACM-PANE1 reset rc=$rc $o"
+grep -q 'local order="claude-opus codex-a codex-b claude-sonnet"' "$BRIDGE" \
+  && ok "T-ACM-PANE1 cmd_finalize's four-worker order list is unaffected" || bad "T-ACM-PANE1 order list changed"
+# Static scan: order-independent and cannot silently degrade.
+sed -n '/^_observe_pane1()/,/^}$/p' "$BRIDGE" | grep -Eq 'send-keys|/clear|/new|/compact' \
+  && bad "T-ACM-PANE1 the pane-1 observer contains a mutation verb" \
+  || ok "T-ACM-PANE1 the pane-1 observer contains no mutation verb"
+# Spy: catches an indirect call the static scan would miss.
+P1SPY="$AP/tmux.spy"; : > "$P1SPY"
+tmux(){ echo "tmux $*" >> "$P1SPY"; return 0; }
+FORGE_PANE1_FIXTURE="$AFIX/claude-81.txt" _observe_pane1 "$AP" p1slug >/dev/null
+unset -f tmux
+grep -q 'send-keys' "$P1SPY" && bad "T-ACM-PANE1 a keystroke reached pane 1" \
+  || ok "T-ACM-PANE1 no keystroke, no reset, no compact reached pane 1"
+# ORCHESTRATOR_LOW_CONTEXT fires once per crossing (ledger-state dedup, no journal marker).
+P1EV="$AP/events.log"; : > "$P1EV"
+_emit_event(){ printf '%s: pipeline=%s %s\n' "$1" "$2" "$3" >> "$P1EV"; }
+printf '  [Opus 4.8] ctx: 190k (95%%)\n' > "$AFIX/claude-lo.txt"
+FORGE_PANE1_FIXTURE="$AFIX/claude-81.txt" _observe_pane1 "$AP" p1 >/dev/null   # 19 -> already low
+: > "$P1EV"
+FORGE_PANE1_FIXTURE="$AFIX/claude-lo.txt" _observe_pane1 "$AP" p1 >/dev/null   # 5, still low
+[ "$(grep -c '^ORCHESTRATOR_LOW_CONTEXT:' "$P1EV" | tr -d ' ')" = 0 ] \
+  && ok "T-ACM-PANE1 a second low reading does not re-fire ORCHESTRATOR_LOW_CONTEXT" \
+  || bad "T-ACM-PANE1 re-fired on a non-crossing"
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
