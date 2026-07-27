@@ -2944,6 +2944,53 @@ h5="$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" _worker_health s
 [ "$h5" = "$h3" ] && ok "T-ACM-HEALTH-COMPAT an unwritable copy-out never changes the verdict" \
   || bad "T-ACM-HEALTH-COMPAT unwritable path leaked: $h5"
 
+echo "── ACM §R: post-reset ledger truth ──"
+# D-2: the shipped HYG §Reset block unsets its tmux stub at run.sh:2132, ~800 lines above
+# this insertion point. _reset_worker_locked issues `tmux send-keys`, so without a stub this
+# block drives REAL tmux against a session that does not exist.
+ACM_RSPY="$WORK/acmR-tmux.spy"; : > "$ACM_RSPY"
+tmux(){ echo "tmux $*" >> "$ACM_RSPY"; return 0; }
+AR2="$WORK/acmReset"; mkdir -p "$AR2/.dev/forge-tmp/hygiene-locks" "$AR2/.dev/proposals"
+export DEV_DIR=".dev"
+_resolve_project_root(){ printf '%s' "$AR2"; }
+_resolve_session(){ printf 'hygS'; }
+_session_or_sentinel(){ printf 'hygS'; }
+ARU="$AR2/$(_usage_file)"
+FORGE_U_FAMILY=claude FORGE_U_STAGE=pre FORGE_U_AT="$(timestamp)" FORGE_U_OBSBY=callback \
+  _usage_upsert "$ARU" workers/claude-opus record -1 "$(printf '91\t42k\t9\thigh\tnull\tctx: 42k (91%%)')" >/dev/null
+_hygiene_write "$AR2" delivery claude-opus "id=seed" "generation=1" "kind=dispatch" >/dev/null
+_hygiene_write "$AR2" delivered claude-opus >/dev/null
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_BASELINE_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_PROOF_FIXTURE="$HFIX/claude-opus-clear-after.txt" \
+    _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+[ "$rc" = 0 ] || bad "T-ACM-RESET-LEDGER reset itself failed: $o"
+python3 - "$ARU" <<'PY' && ok "T-ACM-RESET-LEDGER post-reset record is honestly unknown (never 100)" || bad "T-ACM-RESET-LEDGER wrong"
+import sys,yaml
+r=yaml.safe_load(open(sys.argv[1]))['workers']['claude-opus']
+assert r['headroom']=='unknown', r
+assert r['headroom']!=100 and r['pct'] is None and r['tokens'] is None
+assert r['confidence']=='none' and r['reason']=='post-reset-unmeasured'
+assert r['observed_by']=='reset' and r.get('reset_at')
+PY
+# CASE 2: the LEDGER write fails (usage path is a directory) — the journal write still
+# succeeds, so the reset must remain proven AND usable.
+rm -f "$ARU"; mkdir -p "$ARU"
+_hygiene_write "$AR2" delivery claude-opus "id=seed2" "generation=2" "kind=dispatch" >/dev/null
+_hygiene_write "$AR2" delivered claude-opus >/dev/null
+o=$(FORGE_HEALTH_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_BASELINE_FIXTURE="$HFIX/claude-opus-clear-before.txt" \
+    FORGE_RESET_PROOF_FIXTURE="$HFIX/claude-opus-clear-after.txt" \
+    _reset_worker_locked hygS 0 claude-opus threshold rslug 2>&1); rc=$?
+[ "$rc" = 0 ] && echo "$o" | grep -q '^RESET_OK' \
+  && ok "T-ACM-RESET-LEDGER a ledger-write failure is advisory: the reset still confirms" \
+  || bad "T-ACM-RESET-LEDGER advisory contract broken: rc=$rc $o"
+[ "$(_hygiene_decide "$AR2" claude-opus '' '' | awk '{print $1}')" = KEEP_RESET_PROVEN ] \
+  && ok "T-ACM-RESET-LEDGER the reset is USABLE after a ledger-write failure, not merely non-fatal" \
+  || bad "T-ACM-RESET-LEDGER decide=$(_hygiene_decide "$AR2" claude-opus '' '')"
+rmdir "$ARU" 2>/dev/null
+unset -f tmux
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

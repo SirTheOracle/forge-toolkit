@@ -2379,6 +2379,15 @@ _reset_worker_locked() {   # <session> <idx> <worker> <reason> <slug> [ignore_pe
     _hygiene_write "$pr" reset "$wk" "id=reset-$(date -u +%Y%m%dT%H%M%SZ)-$$" \
         "generation=${_g:-0}" "reason=$reason" "proof_kind=${_pk:-post-baseline-anchor}" "proof_hash=${_ph:-none}" \
         || { echo "RESET_UNPROVEN reason=coverage-write-failed worker=$wk" >&2; return 1; }
+    # 8b. ACM S2.1 — THE LEDGER MUST STOP LYING. Until now _reset_worker_locked wrote reset
+    # coverage to the journal and never touched forge-usage.<session>.yml, so the record kept
+    # its pre-clear headroom (live proof: codex-a reset at 15:33 carrying headroom 9, still
+    # reading 9 at 16:30). Every alert, board glyph and planning snapshot built on the ledger
+    # inherits that defect, so this is a HARD PREREQUISITE for S8's alerting (R1). ADVISORY
+    # and ordered AFTER the coverage write: a ledger failure can never invalidate a proven
+    # reset. This also fires on the cmd_finalize terminal-clear path, which is correct —
+    # after a four-pane terminal clear all four ledger records go honestly `unknown`.
+    _usage_mark_post_reset "$pr" "$wk" "${_g:-}" 2>/dev/null || true
     # 9. clear stale stall snapshots ONLY after semantic confirmation; emit RESET (P2-8:
     # attributed to the dispatching slug, not adhoc).
     rm -f "$FORGE_CACHE_DIR/${sess}-pane${idx}.snapshot" "$FORGE_CACHE_DIR/${sess}-pane${idx}.last-stall-check" 2>/dev/null || true
