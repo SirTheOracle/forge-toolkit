@@ -371,8 +371,8 @@ cmd_dispatch() {
     root="$(cd "$root" 2>/dev/null && pwd -P)" || die "session '$session' root does not exist"
 
     # Billing preflight — silent on pass, loud on fail, BEFORE any write/inject.
-    local bp brc
-    bp="$(billing_preflight "$root" "$allow" 2>&1)"; brc=$?
+    local bp="" brc=0
+    bp="$(billing_preflight "$root" "$allow" 2>&1)" || brc=$?
     if [ "$brc" -ne 0 ]; then
         printf '%s\n' "$bp" >&2
         die "billing preflight failed for $root (use --allow-api-billing to override)"

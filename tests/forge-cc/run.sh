@@ -84,6 +84,12 @@ echo "── billing preflight ──"
 new_root d4
 ANTHROPIC_API_KEY=sk-x FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 "$FORGE" dispatch @forge-x "x" >/dev/null 2>&1 \
   && bad "dispatch proceeded with API key" || ok "dispatch refused with ANTHROPIC_API_KEY set"
+derr="$WORK/dispatch-billing.err"; dout="$WORK/dispatch-billing.out"
+ANTHROPIC_API_KEY=sk-x FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 \
+  "$FORGE" dispatch @forge-x "x" >"$dout" 2>"$derr"
+drc=$?
+{ [ "$drc" -ne 0 ] && [ -s "$derr" ] && grep -q 'billing preflight' "$derr" && grep -q -- '--allow-api-billing' "$derr"; } \
+  && ok "dispatch billing refusal prints diagnostic" || bad "dispatch billing refusal was silent or wrong (rc=$drc)"
 pfout=$(ANTHROPIC_API_KEY=sk-x "$FORGE" preflight --root "$R" 2>&1); pfrc=$?
 { [ "$pfrc" -eq 2 ] && echo "$pfout" | grep -q FAIL; } && ok "preflight reports FAIL (exit 2)" || bad "env key missed (exit=$pfrc)"
 ANTHROPIC_API_KEY=sk-x "$FORGE" preflight --root "$R" --allow-api-billing >/dev/null 2>&1 && ok "--allow-api-billing → exit 0" || bad "override did not exit 0"
