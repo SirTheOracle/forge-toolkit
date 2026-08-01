@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+"""Forge's closed host-operation broker. No shell or raw argv passthrough."""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import unicodedata
+import uuid
+
+SCHEMA = "forge-broker-request/1"
+DELIVERY_SCHEMA = "forge-delivery/1"
+RESULT_SCHEMA = "forge-broker-result/1"
+STOP = False
+
+
+class Refusal(RuntimeError):
+    def __init__(self, code: str, detail: str):
+        super().__init__(detail)
+        self.code, self.detail = code, detail
+
+
+def utc() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def process_stamp(pid: int) -> str:
+    # Hermetic tests run inside a process sandbox that denies ps even though
+    # production's host broker may use it to defend against PID reuse.
+    if os.environ.get("FORGE_BROKER_TEST_ENABLE") == "1":
+        return f"hermetic-pid:{pid}"
+    return subprocess.check_output(["/bin/ps", "-p", str(pid), "-o", "lstart="],
+                                   text=True).strip()
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    with open(tmp, "x", encoding="utf-8") as fh:
+        json.dump(value, fh, sort_keys=True, separators=(",", ":"))
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def load_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise Refusal("INVALID_JSON", f"{path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise Refusal("INVALID_JSON", f"{path}: object required")
+    return value
+
+
+def base_env(state: Path) -> dict[str, str]:
+    home = state / "empty-home"
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home),
+           "LC_ALL": "C", "LANG": "C", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+           "GCM_INTERACTIVE": "never"}
+    return env
+
+
+def resolve_root(raw: str) -> tuple[Path, Path, Path, str]:
+    root = Path(raw).resolve(strict=True)
+    cp = subprocess.run(["/usr/bin/git", "-C", str(root), "rev-parse",
+                         "--show-toplevel", "--absolute-git-dir", "--git-common-dir"],
+                        text=True, capture_output=True, env={"PATH": "/usr/bin:/bin"})
+    if cp.returncode:
+        raise Refusal("NOT_GIT_WORKTREE", cp.stderr.strip())
+    lines = cp.stdout.splitlines()
+    if len(lines) != 3 or Path(lines[0]).resolve() != root:
+        raise Refusal("ROOT_MISMATCH", f"requested={root} top={lines[0] if lines else '?'}")
+    git_dir = Path(lines[1]).resolve()
+    common = Path(lines[2])
+    if not common.is_absolute():
+        common = (root / common).resolve()
+    root_id = sha((str(root) + "\0" + str(git_dir)).encode())
+    return root, git_dir, common, root_id
+
+
+def state_paths(root: Path, git_dir: Path, common: Path, root_id: str) -> tuple[Path, Path, Path, Path]:
+    # Repository-wide coordination/authority lives in the common Git directory.
+    # Index effects and recovery assets remain in this worktree's Git directory.
+    protected = common / "forge" / "broker-v1" / "roots" / root_id
+    transactions = git_dir / "forge" / "broker-v1" / "transactions"
+    untrusted = root / ".dev" / "forge-broker"
+    return protected, transactions, untrusted / "requests", untrusted / "responses"
+
+
+def git(root: Path, state: Path, *args: str, input_text: str | None = None,
+        extra_env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess:
+    env = base_env(state)
+    if extra_env:
+        env.update(extra_env)
+    argv = ["/usr/bin/git", "-C", str(root),
+            "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+            "-c", "core.fsmonitor=false", "-c", "core.pager=cat",
+            "-c", "pager.branch=false", "-c", "credential.helper=", *args]
+    cp = subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env)
+    if check and cp.returncode:
+        raise Refusal("GIT_FAILED", f"{args[0]}: {cp.stderr.strip()}")
+    return cp
+
+
+def safe_paths(root: Path, requested: object) -> list[str]:
+    if not isinstance(requested, list) or not requested:
+        raise Refusal("INVALID_PATHS", "non-empty paths array required")
+    out, aliases = [], set()
+    for raw in requested:
+        if not isinstance(raw, str) or not raw or "\x00" in raw or "\\" in raw:
+            raise Refusal("INVALID_PATH", repr(raw))
+        p = PurePosixPath(raw)
+        if p.is_absolute() or any(x in ("", ".", "..") for x in p.parts):
+            raise Refusal("PATH_ESCAPE", raw)
+        if raw.startswith(":") or p.parts[0] == ".git":
+            raise Refusal("PATH_MAGIC_OR_METADATA", raw)
+        key = unicodedata.normalize("NFC", raw).casefold()
+        if key in aliases:
+            raise Refusal("PATH_ALIAS", raw)
+        aliases.add(key)
+        cur = root
+        for part in p.parts[:-1]:
+            cur /= part
+            if cur.is_symlink():
+                raise Refusal("SYMLINK_ESCAPE", raw)
+        target = root.joinpath(*p.parts)
+        if target.is_symlink() or root not in target.parent.resolve().parents and target.parent.resolve() != root:
+            raise Refusal("SYMLINK_ESCAPE", raw)
+        out.append(raw)
+    return sorted(out)
+
+
+def reject_git_influence(root: Path, state: Path, paths: list[str]) -> None:
+    cfg = git(root, state, "config", "--local", "--null", "--list", check=False).stdout
+    denied = re.compile(r"^(?:alias\.|include(?:if)?\.|filter\.|diff\..*\.(?:command|textconv)|credential\.|core\.(?:attributesfile|hookspath|fsmonitor|sshcommand)|commit\.gpgsign)", re.I)
+    for item in cfg.split("\0"):
+        key = item.split("\n", 1)[0].split("=", 1)[0]
+        if key and denied.search(key):
+            raise Refusal("UNSAFE_GIT_CONFIG", key)
+    attrs = git(root, state, "check-attr", "-z", "--all", "--", *paths, check=False).stdout.split("\0")
+    for i in range(0, len(attrs) - 2, 3):
+        name, value = attrs[i + 1], attrs[i + 2]
+        if name in {"filter", "diff", "working-tree-encoding"} and value not in {"", "unspecified", "unset"}:
+            raise Refusal("UNSAFE_GIT_ATTRIBUTE", f"{attrs[i]}:{name}={value}")
+    staged = git(root, state, "ls-files", "--stage", "-z", "--", *paths).stdout
+    if any(row.startswith("160000 ") for row in staged.split("\0") if row):
+        raise Refusal("GITLINK_DENIED", "requested set contains a gitlink")
+
+
+def status_records(root: Path, state: Path) -> list[str]:
+    return sorted(x for x in git(root, state, "status", "--porcelain=v2", "-z").stdout.split("\0") if x)
+
+
+def unrelated(records: list[str], paths: list[str]) -> list[str]:
+    return [r for r in records if not any(r.endswith(" " + p) or (" " + p + "\t") in r for p in paths)]
+
+
+def active_delivery(protected: Path, delivery_id: str) -> dict:
+    d = load_json(protected / "deliveries" / f"{delivery_id}.json")
+    if d.get("schema") != DELIVERY_SCHEMA or d.get("state") != "open":
+        raise Refusal("DELIVERY_CLOSED", delivery_id)
+    expires = dt.datetime.strptime(d["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    if dt.datetime.now(dt.timezone.utc) >= expires:
+        raise Refusal("DELIVERY_EXPIRED", delivery_id)
+    return d
+
+
+def validate_request(req: dict, delivery: dict, root: Path, root_id: str) -> None:
+    if req.get("schema") != SCHEMA:
+        raise Refusal("SCHEMA_MISMATCH", str(req.get("schema")))
+    for key in ("delivery_id", "session_incarnation", "physical_code_root", "root_identity",
+                "stage", "capability_class", "prompt_sha256"):
+        if req.get(key) != delivery.get(key):
+            raise Refusal("DELIVERY_MISMATCH", key)
+    if Path(req["physical_code_root"]).resolve() != root or req["root_identity"] != root_id:
+        raise Refusal("ROOT_MISMATCH", req["physical_code_root"])
+
+
+def commit(root: Path, git_dir: Path, protected: Path, transactions: Path,
+           req: dict, delivery: dict) -> dict:
+    if delivery.get("capability_class") != "commit":
+        raise Refusal("CAPABILITY_DENIED", str(delivery.get("capability_class")))
+    paths = safe_paths(root, req.get("paths"))
+    reject_git_influence(root, protected, paths)
+    if git(root, protected, "diff", "--cached", "--quiet", check=False).returncode:
+        raise Refusal("INDEX_NOT_CLEAN", "pre-existing staged changes")
+    if git(root, protected, "ls-files", "-u").stdout:
+        raise Refusal("INDEX_UNMERGED", "unmerged index entries")
+    branch = git(root, protected, "symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
+    if not branch or branch != delivery.get("branch_ref"):
+        raise Refusal("BRANCH_CHANGED", branch or "detached")
+    head = git(root, protected, "rev-parse", "HEAD").stdout.strip()
+    if head != delivery.get("expected_head") or head != req.get("expected_head"):
+        raise Refusal("HEAD_MOVED", head)
+    before = status_records(root, protected)
+    index_raw = git(root, protected, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.strip()
+    index = Path(index_raw).resolve(strict=False)
+    if git_dir not in index.parents and index != git_dir / "index":
+        raise Refusal("INDEX_PATH_INVALID", index_raw)
+    txid = req["operation_id"]
+    txdir = transactions / txid
+    txdir.mkdir(parents=True, exist_ok=False)
+    backup = txdir / "index.backup"
+    if index.exists():
+        shutil.copy2(index, backup)
+    tx = {"schema": "forge-broker-transaction/1", "operation_id": txid,
+          "state": "prepared", "head": head, "branch_ref": branch,
+          "git_dir": str(git_dir), "index_path": str(index),
+          "index_existed": index.exists(), "index_before_sha256": sha(index.read_bytes()) if index.exists() else None,
+          "paths": paths, "started_at": utc()}
+    atomic_json(txdir / "journal.json", tx)
+    new_commit = ""
+    try:
+        git(root, protected, "--literal-pathspecs", "add", "--", *paths)
+        tx["index_staged_sha256"] = sha(index.read_bytes()) if index.exists() else None
+        tx["state"] = "index-staged"
+        atomic_json(txdir / "journal.json", tx)
+        staged = sorted(x for x in git(root, protected, "diff", "--cached", "--name-only", "-z").stdout.split("\0") if x)
+        if staged != paths:
+            raise Refusal("STAGED_SET_MISMATCH", repr(staged))
+        modes = git(root, protected, "ls-files", "--stage", "-z", "--", *paths).stdout
+        if any(x.startswith("160000 ") for x in modes.split("\0") if x):
+            raise Refusal("GITLINK_DENIED", "gitlink staged")
+        tree = git(root, protected, "write-tree").stdout.strip()
+        ident = {"GIT_AUTHOR_NAME": delivery.get("git_author_name", "forge worker"),
+                 "GIT_AUTHOR_EMAIL": delivery.get("git_author_email", "forge@local"),
+                 "GIT_COMMITTER_NAME": "forge-broker", "GIT_COMMITTER_EMAIL": "forge-broker@local"}
+        new_commit = git(root, protected, "commit-tree", tree, "-p", head,
+                         input_text=str(req.get("message") or ""), extra_env=ident).stdout.strip()
+        tx.update(state="commit-created", new_commit=new_commit, tree=tree)
+        atomic_json(txdir / "journal.json", tx)
+        if os.environ.get("FORGE_BROKER_CRASH_AT") == "before-cas":
+            os._exit(86)
+        git(root, protected, "update-ref", branch, new_commit, head)
+        tx["state"] = "ref-updated"
+        atomic_json(txdir / "journal.json", tx)
+        if git(root, protected, "rev-parse", branch).stdout.strip() != new_commit:
+            raise Refusal("POST_VERIFY_FAILED", "branch ref mismatch")
+        if os.environ.get("FORGE_BROKER_FAIL_AFTER_CAS") == "1":
+            raise Refusal("INJECTED_POST_CAS_FAILURE", new_commit)
+        if unrelated(status_records(root, protected), paths) != unrelated(before, paths):
+            raise Refusal("UNRELATED_WORKTREE_CHANGED", "porcelain-v2 mismatch")
+        committed = sorted(x for x in git(root, protected, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", new_commit).stdout.split("\0") if x)
+        if committed != paths:
+            raise Refusal("COMMIT_SET_MISMATCH", repr(committed))
+        tx["state"] = "committed"
+        tx["finished_at"] = utc()
+        atomic_json(txdir / "journal.json", tx)
+        return {"commit": new_commit, "paths": paths, "branch_ref": branch}
+    except BaseException:
+        current = git(root, protected, "rev-parse", branch, check=False).stdout.strip()
+        cas_completed = bool(new_commit and current == new_commit)
+        current_index_sha = sha(index.read_bytes()) if index.exists() else None
+        current_tree = git(root, protected, "write-tree", check=False)
+        current_tree_id = current_tree.stdout.strip() if current_tree.returncode == 0 else ""
+        index_is_known = current_index_sha in {tx.get("index_before_sha256"), tx.get("index_staged_sha256")}
+        if tx.get("tree") and current_tree_id == tx.get("tree"):
+            index_is_known = True
+        if not index_is_known:
+            tx["state"] = "manual-recovery-required"
+            tx["finished_at"] = utc()
+            atomic_json(txdir / "journal.json", tx)
+            raise Refusal("INDEX_RECOVERY_CAS_MISMATCH", str(index))
+        # Before CAS, restore the exact prior index. After CAS, the staged index
+        # is the only state aligned with the durable new HEAD; restoring the old
+        # backup would manufacture a stale index against the committed ref.
+        if not cas_completed:
+            if backup.exists():
+                shutil.copy2(backup, index)
+            elif index.exists() and not tx["index_existed"]:
+                index.unlink()
+        # Never roll a ref backward after the CAS succeeded. Recovery restores only
+        # this operation's index and reports the durable commit for host review.
+        tx["state"] = "committed-recovery" if cas_completed else "restored"
+        tx["finished_at"] = utc()
+        atomic_json(txdir / "journal.json", tx)
+        raise
+
+
+def publish_pr(root: Path, protected: Path, req: dict, delivery: dict) -> dict:
+    if delivery.get("capability_class") != "publish-pr-review":
+        raise Refusal("CAPABILITY_DENIED", str(delivery.get("capability_class")))
+    artifact = (root / str(req.get("artifact"))).resolve()
+    reviews = (root / ".dev" / "reviews").resolve()
+    if reviews not in artifact.parents or artifact.is_symlink():
+        raise Refusal("ARTIFACT_ESCAPE", str(artifact))
+    body = artifact.read_bytes()
+    if len(body) > 262144 or sha(body) != req.get("artifact_sha256"):
+        raise Refusal("ARTIFACT_MISMATCH", str(artifact))
+    repo, number = delivery.get("github_repo"), str(delivery.get("pr_number"))
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", str(repo)) or not number.isdigit():
+        raise Refusal("PUBLISH_ENVELOPE_INVALID", f"{repo}#{number}")
+    marker = f"<!-- forge-review:{req['operation_id']} -->"
+    gh = delivery.get("gh_binary", "/opt/homebrew/bin/gh")
+    env = base_env(protected)
+    # gh runs only in this closed broker operation. Give that child the host's
+    # credential store without exposing credentials to the worker or result.
+    env["HOME"] = str(Path.home())
+    env["GH_PROMPT_DISABLED"] = "1"
+    for key in ("GH_TOKEN", "GITHUB_TOKEN", "GH_HOST"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    existing = subprocess.run([gh, "api", "--paginate", f"repos/{repo}/issues/{number}/comments"],
+                              text=True, capture_output=True, env=env)
+    if existing.returncode == 0:
+        for row in json.loads(existing.stdout or "[]"):
+            if marker in str(row.get("body", "")):
+                return {"comment_id": row.get("id"), "comment_url": row.get("html_url"), "replayed": True}
+    payload = protected / "publish" / f"{req['operation_id']}.json"
+    atomic_json(payload, {"body": body.decode("utf-8") + "\n" + marker})
+    cp = subprocess.run([gh, "api", "--method", "POST", f"repos/{repo}/issues/{number}/comments",
+                         "--input", str(payload)], text=True, capture_output=True, env=env)
+    if cp.returncode:
+        raise Refusal("PUBLISH_FAILED", cp.stderr.strip())
+    row = json.loads(cp.stdout)
+    return {"comment_id": row.get("id"), "comment_url": row.get("html_url"), "replayed": False}
+
+
+def process(root_raw: str, request_path: Path, *, trusted_host: bool = False) -> dict:
+    root, git_dir, common, root_id = resolve_root(root_raw)
+    protected, transactions, _, responses = state_paths(root, git_dir, common, root_id)
+    req = load_json(request_path)
+    opid = req.get("operation_id")
+    if not isinstance(opid, str) or not re.fullmatch(r"[A-Za-z0-9._-]{8,128}", opid):
+        raise Refusal("OPERATION_ID_INVALID", repr(opid))
+    result_path = protected / "results" / f"{opid}.json"
+    if result_path.exists():
+        result = load_json(result_path)
+        atomic_json(responses / f"{opid}.json", result)
+        return result
+    try:
+        if not trusted_host:
+            raise Refusal("HOST_CONTROL_REQUIRED", "effectful requests require authenticated host transport")
+        delivery = active_delivery(protected, str(req.get("delivery_id")))
+        validate_request(req, delivery, root, root_id)
+        if req.get("operation") == "commit":
+            detail = commit(root, git_dir, protected, transactions, req, delivery)
+        elif req.get("operation") == "publish-pr-review":
+            detail = publish_pr(root, protected, req, delivery)
+        else:
+            raise Refusal("OPERATION_DENIED", str(req.get("operation")))
+        result = {"schema": RESULT_SCHEMA, "operation_id": opid, "status": "ok",
+                  "delivery_id": req["delivery_id"], "finished_at": utc(), "detail": detail}
+    except Refusal as exc:
+        result = {"schema": RESULT_SCHEMA, "operation_id": opid, "status": "error",
+                  "delivery_id": req.get("delivery_id"), "finished_at": utc(),
+                  "code": exc.code, "detail": exc.detail}
+    atomic_json(result_path, result)
+    atomic_json(responses / f"{opid}.json", result)
+    return result
+
+
+@contextlib.contextmanager
+def locked(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
+def runtime_policy() -> dict:
+    return load_json(Path(__file__).resolve().parent.parent / "config" / "codex-forge-runtime.json")
+
+
+def control_call(protected: Path, request: dict) -> dict:
+    # Control rides authenticated loopback: contained Codex panes have an
+    # attested network-deny sandbox. Authenticate the server before disclosing
+    # the token so a stale endpoint cannot harvest it.
+    info = load_json(protected / "pid.json")
+    host, port = info.get("control_host"), info.get("control_port")
+    if host != "127.0.0.1" or not isinstance(port, int) or not 0 < port < 65536:
+        raise Refusal("CONTROL_ENDPOINT_INVALID", repr((host, port)))
+    token = (protected / "control.token").read_text(encoding="ascii").strip()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(180 if request.get("action") == "submit-operation" else 3)
+    sock.connect((host, port))
+    hello_raw = b""
+    while not hello_raw.endswith(b"\n"):
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        hello_raw += chunk
+    try:
+        hello = json.loads(hello_raw)
+        nonce = bytes.fromhex(str(hello["nonce"]))
+        proof = str(hello["server_proof"])
+    except (ValueError, KeyError, TypeError) as exc:
+        sock.close()
+        raise Refusal("CONTROL_HANDSHAKE_INVALID", str(exc)) from exc
+    expected = hmac.new(token.encode("ascii"), b"forge-server\0" + nonce, hashlib.sha256).hexdigest()
+    if not secrets.compare_digest(proof, expected):
+        sock.close()
+        raise Refusal("CONTROL_SERVER_UNAUTHENTICATED", host)
+    request = dict(request)
+    request["control_token"] = token
+    sock.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    sock.close()
+    value = json.loads(data)
+    if value.get("status") != "ok":
+        raise Refusal(value.get("code", "CONTROL_REFUSED"), value.get("detail", "control refused"))
+    return value
+
+
+def tmux_field(target: str, fmt: str) -> str:
+    cp = subprocess.run(["/opt/homebrew/bin/tmux", "display-message", "-p", "-t", target, fmt],
+                        text=True, capture_output=True, env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin"})
+    if cp.returncode:
+        raise Refusal("TMUX_TARGET_INVALID", target)
+    return cp.stdout.strip()
+
+
+def tmux_session_created(session: str) -> str | None:
+    # Non-raising counterpart to tmux_field(): absence (dead session, dead tmux
+    # server, missing binary) is the expected outcome here, not an error. This
+    # function is called from inside start's identity-check try block, whose
+    # except tuple would swallow an OSError and fall through to a doomed spawn,
+    # so it must never raise. Hermetic tests deny tmux, so it branches on the
+    # same FORGE_BROKER_TEST_ENABLE seam process_stamp() uses.
+    if os.environ.get("FORGE_BROKER_TEST_ENABLE") == "1":
+        fixture = os.environ.get("FORGE_BROKER_TEST_TMUX_SESSIONS", "")
+        live = dict(item.split("=", 1) for item in fixture.split(",") if "=" in item)
+        return live.get(session)
+    try:
+        cp = subprocess.run(["/opt/homebrew/bin/tmux", "display-message", "-p",
+                             "-t", session, "#{session_created}"],
+                            text=True, capture_output=True,
+                            env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin"})
+    except OSError:
+        return None
+    return cp.stdout.strip() if cp.returncode == 0 else None
+
+
+def tmux_incarnation_alive(session: str, incarnation: str) -> bool:
+    return bool(incarnation) and tmux_session_created(session) == incarnation
+
+
+def derive_lane(stage: str, worker: str, rollout: str) -> tuple[str, str]:
+    cfg = runtime_policy()
+    if stage not in cfg["stage_capabilities"] or rollout not in cfg["rollouts"]:
+        raise Refusal("CAPABILITY_UNKNOWN", f"{stage}:{rollout}")
+    cap = cfg["stage_capabilities"][stage]
+    if not worker.startswith("codex"):
+        return cap, ("claude" if cap in cfg["contain_codex_capabilities"] else "reviewed-host")
+    allowed = (cfg["contain_codex_capabilities"] if rollout in {"audit", "contain", "broker-shadow"}
+               else cfg["enforce_codex_capabilities"] if rollout == "enforce"
+               else cfg["publish_codex_capabilities"])
+    return cap, ("codex" if cap in allowed else "reviewed-host")
+
+
+def inspect_live_codex(root: Path, protected: Path, request: dict) -> dict:
+    session, pane = str(request.get("session", "")), str(request.get("pane", ""))
+    target = f"{session}:.{pane}"
+    incarnation = tmux_field(target, "#{session_created}")
+    pane_root = Path(tmux_field(target, "#{pane_current_path}")).resolve(strict=True)
+    if pane_root != root:
+        raise Refusal("PANE_ROOT_MISMATCH", str(pane_root))
+    shell_pid = tmux_field(target, "#{pane_pid}")
+    children = subprocess.run(["/usr/bin/pgrep", "-P", shell_pid, "-x", "codex"], text=True,
+                              capture_output=True, env={"PATH": "/usr/bin:/bin"}).stdout.split()
+    if len(children) != 1:
+        raise Refusal("CODEX_PROCESS_AMBIGUOUS", repr(children))
+    pid = int(children[0])
+    command = subprocess.check_output(["/bin/ps", "-ww", "-p", str(pid), "-o", "command="], text=True).strip()
+    start = subprocess.check_output(["/bin/ps", "-p", str(pid), "-o", "lstart="], text=True).strip()
+    cfg = runtime_policy(); binary = Path(cfg["codex"]["binary"]).resolve(strict=True)
+    if command != str(binary) and not command.startswith(str(binary) + " "):
+        raise Refusal("LIVE_BINARY_MISMATCH", command.split(" ", 1)[0])
+    required = [str(root), "--strict-config", "--sandbox", "workspace-write", "--ask-for-approval", "never",
+                "sandbox_workspace_write.network_access=false", "sandbox_workspace_write.writable_roots=[]"]
+    pos = 0
+    for needle in required:
+        found = command.find(needle, pos)
+        if found < 0:
+            raise Refusal("LIVE_ARGV_MISMATCH", needle)
+        pos = found + len(needle)
+    desired = Path(__file__).resolve().parent.parent / "config" / "codex-forge.config.toml"
+    manifest = {"schema": "forge-codex-launch/1", "session": session, "pane_index": int(pane),
+                "session_incarnation": incarnation, "physical_code_root": str(root),
+                "pid": pid, "process_started": start, "binary": str(binary),
+                "binary_sha256": sha(binary.read_bytes()), "observed_command": command,
+                "desired_policy_sha256": sha(desired.read_bytes()), "policy_file_loaded": False,
+                "private_codex_home": False, "auth_boundary": "ambient-file-store",
+                "contained_ready": True, "unattended_ready": False, "attested_at": utc()}
+    atomic_json(protected / "launch" / f"{session}.p{pane}.json", manifest)
+    return manifest
+
+
+def register_delivery(root: Path, git_dir: Path, common: Path, root_id: str,
+                      protected: Path, request: dict, mode: str) -> dict:
+    allowed = {"slug", "stage", "worker", "requested_worker", "route_reason",
+               "session", "pane", "prompt_file", "prompt_sha256", "github_repo", "pr_number"}
+    supplied = set(request) - {"action", "control_token"}
+    if supplied - allowed:
+        raise Refusal("CONTROL_FIELDS_DENIED", ",".join(sorted(supplied - allowed)))
+    session, pane = str(request.get("session", "")), str(request.get("pane", ""))
+    target = f"{session}:.{pane}"
+    incarnation = tmux_field(target, "#{session_created}")
+    pane_root = Path(tmux_field(target, "#{pane_current_path}")).resolve(strict=True)
+    if pane_root != root:
+        raise Refusal("PANE_ROOT_MISMATCH", str(pane_root))
+    stage, worker = str(request.get("stage", "")), str(request.get("worker", ""))
+    capability, lane = derive_lane(stage, worker, mode)
+    if worker.startswith("codex") and lane != "codex":
+        raise Refusal("LANE_REQUIRED", f"{stage}:{capability}:reviewed-host")
+    if worker.startswith("codex"):
+        # Attest the process at the authority boundary for every delivery. A
+        # pre-launch shell cannot truthfully record the eventual Codex PID, and
+        # a cached manifest alone cannot prove that a pane was not relaunched.
+        live = inspect_live_codex(root, protected, {"session": session, "pane": pane})
+        if live.get("session_incarnation") != incarnation or not live.get("contained_ready"):
+            raise Refusal("LAUNCH_ATTESTATION_INVALID", target)
+        if capability not in {"workspace", "materialized-review"} and not live.get("unattended_ready"):
+            raise Refusal("PRIVATE_RUNTIME_GATE_UNPROVEN", capability)
+    prompt = Path(str(request.get("prompt_file", ""))).resolve(strict=True)
+    prompt_base = (root / ".dev" / "forge-tmp").resolve(strict=True)
+    if prompt_base not in prompt.parents or prompt.is_symlink():
+        raise Refusal("PROMPT_PATH_INVALID", str(prompt))
+    prompt_digest = sha(prompt.read_bytes())
+    if not secrets.compare_digest(prompt_digest, str(request.get("prompt_sha256", ""))):
+        raise Refusal("PROMPT_DIGEST_MISMATCH", str(prompt))
+    branch = git(root, protected, "symbolic-ref", "-q", "HEAD").stdout.strip()
+    head = git(root, protected, "rev-parse", "HEAD").stdout.strip()
+    delivery_id = "delivery-" + uuid.uuid4().hex
+    expires = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=int(runtime_policy()["delivery_ttl_seconds"]))
+    delivery = {"schema": DELIVERY_SCHEMA, "state": "open", "delivery_id": delivery_id,
+                "slug": str(request.get("slug", "")), "session": session,
+                "session_incarnation": incarnation, "pane_index": int(pane), "worker": worker,
+                "requested_worker": str(request.get("requested_worker", worker)),
+                "route_reason": str(request.get("route_reason", "direct")),
+                "physical_code_root": str(root), "git_dir": str(git_dir), "git_common_dir": str(common),
+                "root_identity": root_id, "stage": stage, "capability_class": capability,
+                "lane": lane, "prompt_sha256": prompt_digest, "expected_head": head,
+                "branch_ref": branch, "opened_at": utc(),
+                "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if capability == "publish-pr-review":
+        repo, number = str(request.get("github_repo", "")), str(request.get("pr_number", ""))
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not number.isdigit():
+            raise Refusal("PUBLISH_ENVELOPE_INVALID", f"{repo}#{number}")
+        delivery.update(github_repo=repo, pr_number=int(number), gh_binary="/opt/homebrew/bin/gh")
+    elif request.get("github_repo") or request.get("pr_number"):
+        raise Refusal("PUBLISH_ENVELOPE_UNEXPECTED", capability)
+    active_path = protected / "active" / f"{session}.p{pane}.json"
+    if active_path.exists():
+        old = load_json(active_path)
+        if old.get("state") == "open":
+            raise Refusal("DELIVERY_ALREADY_ACTIVE", old.get("delivery_id", "unknown"))
+    atomic_json(protected / "deliveries" / f"{delivery_id}.json", delivery)
+    atomic_json(active_path, delivery)
+    atomic_json(root / ".dev" / "forge-broker" / "envelopes" / f"{delivery_id}.json", delivery)
+    return delivery
+
+
+def handle_control(root: Path, git_dir: Path, common: Path, root_id: str,
+                   protected: Path, request: dict, mode: str, token: str) -> dict:
+    global STOP
+    if not secrets.compare_digest(str(request.pop("control_token", "")), token):
+        raise Refusal("CONTROL_AUTH_DENIED", "host control token required")
+    action = request.get("action")
+    if action == "stop-broker":
+        info = load_json(protected / "pid.json")
+        info.update(state="draining", drain_requested_at=utc())
+        atomic_json(protected / "pid.json", info)
+        # The current loop completes every request it has already claimed and
+        # makes one final pass over queued requests before observing STOP.
+        STOP = True
+        return {"schema": "forge-broker-stop/1", "state": "draining",
+                "pid": os.getpid(), "root_identity": root_id}
+    if action == "submit-operation":
+        operation = request.get("request")
+        if not isinstance(operation, dict):
+            raise Refusal("CONTROL_OPERATION_INVALID", "request object required")
+        supplied = set(request) - {"action", "request"}
+        if supplied:
+            raise Refusal("CONTROL_FIELDS_DENIED", ",".join(sorted(supplied)))
+        control_request = protected / "control-requests" / f"{uuid.uuid4().hex}.json"
+        atomic_json(control_request, operation)
+        with locked(protected / "effects.lock"):
+            return process(str(root), control_request, trusted_host=True)
+    if action == "register-delivery":
+        return register_delivery(root, git_dir, common, root_id, protected, request, mode)
+    if action == "attest-launch":
+        return inspect_live_codex(root, protected, request)
+    if action == "terminalize-delivery":
+        delivery_id = str(request.get("delivery_id", "")); terminal = str(request.get("terminal", ""))
+        if terminal not in {"completed", "failed", "cancelled", "superseded"}:
+            raise Refusal("TERMINAL_STATE_INVALID", terminal)
+        path = protected / "deliveries" / f"{delivery_id}.json"; d = active_delivery(protected, delivery_id)
+        d.update(state=terminal, terminal_at=utc()); atomic_json(path, d)
+        active = protected / "active" / f"{d['session']}.p{d['pane_index']}.json"
+        if active.exists() and load_json(active).get("delivery_id") == delivery_id:
+            active.unlink()
+        public = root / ".dev" / "forge-broker" / "envelopes" / f"{delivery_id}.json"
+        if public.exists():
+            atomic_json(public, d)
+        return d
+    if action == "active-delivery":
+        path = protected / "active" / f"{request.get('session')}.p{request.get('pane')}.json"
+        return active_delivery(protected, str(load_json(path).get("delivery_id")))
+    if action == "query-result":
+        return load_json(protected / "results" / f"{request.get('operation_id')}.json")
+    if action == "delivery-result":
+        delivery_id = str(request.get("delivery_id", ""))
+        if not re.fullmatch(r"delivery-[0-9a-f]{32}", delivery_id):
+            raise Refusal("DELIVERY_ID_INVALID", delivery_id)
+        rows = [load_json(p) for p in (protected / "results").glob("*.json")]
+        rows = [row for row in rows if row.get("delivery_id") == delivery_id]
+        if not rows:
+            raise Refusal("DELIVERY_RESULT_CARDINALITY", "0")
+        return {"schema": "forge-delivery-results/1", "delivery_id": delivery_id,
+                "status": "ok" if all(row.get("status") == "ok" for row in rows) else "error",
+                "operation_count": len(rows),
+                "operation_ids": sorted(str(row.get("operation_id", "")) for row in rows)}
+    raise Refusal("CONTROL_ACTION_DENIED", str(action))
+
+
+def recover_transactions(root: Path, git_dir: Path, protected: Path, transactions: Path) -> None:
+    if not transactions.exists():
+        return
+    index_raw = git(root, protected, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout.strip()
+    index = Path(index_raw).resolve(strict=False)
+    for journal_path in sorted(transactions.glob("*/journal.json")):
+        tx = load_json(journal_path)
+        if tx.get("state") in {"committed", "restored", "committed-recovery", "manual-recovery-required"}:
+            continue
+        if tx.get("git_dir") != str(git_dir) or tx.get("index_path") != str(index):
+            tx["state"] = "manual-recovery-required"; atomic_json(journal_path, tx); continue
+        branch = str(tx.get("branch_ref", "")); current = git(root, protected, "rev-parse", branch, check=False).stdout.strip()
+        if tx.get("new_commit") and current == tx.get("new_commit"):
+            tx["state"] = "committed-recovery"
+        else:
+            current_sha = sha(index.read_bytes()) if index.exists() else None
+            current_tree = git(root, protected, "write-tree", check=False)
+            current_tree_id = current_tree.stdout.strip() if current_tree.returncode == 0 else ""
+            known = current_sha in {tx.get("index_before_sha256"), tx.get("index_staged_sha256")}
+            if tx.get("tree") and current_tree_id == tx.get("tree"):
+                known = True
+            if not known:
+                tx["state"] = "manual-recovery-required"; atomic_json(journal_path, tx); continue
+            backup = journal_path.parent / "index.backup"
+            if backup.exists(): shutil.copy2(backup, index)
+            elif index.exists() and not tx.get("index_existed"): index.unlink()
+            tx["state"] = "restored"
+        tx["recovered_at"] = utc(); atomic_json(journal_path, tx)
+
+
+def serve(args: argparse.Namespace) -> int:
+    global STOP
+    root, git_dir, common, root_id = resolve_root(args.root)
+    protected, transactions, requests, _ = state_paths(root, git_dir, common, root_id)
+    protected.mkdir(parents=True, exist_ok=True, mode=0o700)
+    requests.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(protected / "broker.lock", "a+")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise Refusal("BROKER_ALREADY_RUNNING", root_id) from exc
+    recover_transactions(root, git_dir, protected, transactions)
+    token_path = protected / "control.token"
+    if token_path.exists():
+        token = token_path.read_text(encoding="ascii").strip()
+    else:
+        token = secrets.token_hex(32); token_path.write_text(token + "\n", encoding="ascii"); os.chmod(token_path, 0o600)
+    control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    control.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    control.bind(("127.0.0.1", 0)); control.listen(8); control.settimeout(0.05)
+    control_host, control_port = control.getsockname()
+    started = process_stamp(os.getpid())
+    atomic_json(protected / "pid.json", {"schema": "forge-broker-pid/1", "pid": os.getpid(),
+                "pid_started": started, "git_dir": str(git_dir), "git_common_dir": str(common),
+                "session": args.session, "session_incarnation": args.incarnation,
+                "physical_code_root": str(root), "root_identity": root_id,
+                "control_host": control_host, "control_port": control_port,
+                "mode": args.mode, "started_at": utc(), "state": "running"})
+    signal.signal(signal.SIGTERM, lambda *_: globals().__setitem__("STOP", True))
+    while not STOP:
+        try:
+            conn, _ = control.accept()
+        except socket.timeout:
+            conn = None
+        if conn is not None:
+            with conn:
+                try:
+                    nonce = secrets.token_bytes(32)
+                    server_proof = hmac.new(token.encode("ascii"), b"forge-server\0" + nonce,
+                                            hashlib.sha256).hexdigest()
+                    conn.sendall(json.dumps({"schema": "forge-broker-hello/1",
+                                             "nonce": nonce.hex(),
+                                             "server_proof": server_proof},
+                                            separators=(",", ":")).encode() + b"\n")
+                    raw = b""
+                    while not raw.endswith(b"\n") and len(raw) <= 131072:
+                        chunk = conn.recv(65536)
+                        if not chunk: break
+                        raw += chunk
+                    request = json.loads(raw)
+                    detail = handle_control(root, git_dir, common, root_id, protected, request, args.mode, token)
+                    reply = {"schema": "forge-broker-control-result/1", "status": "ok", "detail": detail}
+                except (Refusal, OSError, ValueError) as exc:
+                    reply = {"schema": "forge-broker-control-result/1", "status": "error",
+                             "code": getattr(exc, "code", "CONTROL_INVALID"), "detail": str(exc)}
+                conn.sendall(json.dumps(reply, separators=(",", ":")).encode() + b"\n")
+        for path in sorted(requests.glob("*.request.json")):
+            claim = path.with_name(path.name + f".claimed.{os.getpid()}")
+            try:
+                os.replace(path, claim)
+            except OSError:
+                continue
+            try:
+                with locked(protected / "effects.lock"):
+                    process(str(root), claim)
+            except Exception as exc:
+                # A malformed untrusted request must never terminate the host
+                # broker. Keep the rejected claim for diagnosis and continue.
+                atomic_json(claim.with_name(claim.name + ".error.json"), {
+                    "schema": RESULT_SCHEMA, "status": "error",
+                    "code": getattr(exc, "code", "REQUEST_INVALID"),
+                    "detail": str(exc), "finished_at": utc()})
+            claim.rename(claim.with_name(claim.name + ".done"))
+        time.sleep(0.1)
+    info = load_json(protected / "pid.json")
+    info.update(state="stopped", stopped_at=utc())
+    atomic_json(protected / "pid.json", info)
+    control.close()
+    lock_fh.close()
+    return 0
+
+
+REAP_STOP_TIMEOUT = 10.0
+
+
+def broker_pid_live(info: dict) -> bool:
+    # Same PID-reuse defense the start/status paths use: a matching PID alone is
+    # not proof, the process start stamp must match too.
+    try:
+        os.kill(int(info.get("pid", 0)), 0)
+        return process_stamp(int(info["pid"])) == info.get("pid_started")
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+        return False
+
+
+def stop_broker(protected: Path, info: dict, timeout: float) -> dict:
+    try:
+        result = control_call(protected, {"action": "stop-broker"})
+    except (OSError, ValueError) as exc:
+        raise Refusal("BROKER_STOP_FAILED", str(exc)) from exc
+    deadline = time.monotonic() + max(0.1, timeout)
+    while time.monotonic() < deadline:
+        current = load_json(protected / "pid.json")
+        if current.get("state") == "stopped":
+            return result
+        try:
+            os.kill(int(info.get("pid", 0)), 0)
+            actual = process_stamp(int(info["pid"]))
+            if actual != info.get("pid_started"):
+                return result
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            return result
+        time.sleep(0.05)
+    raise Refusal("BROKER_STOP_TIMEOUT", str(info.get("pid", "unknown")))
+
+
+def await_lock_release(protected: Path, timeout: float) -> bool:
+    # serve() writes state=stopped to pid.json a moment BEFORE it closes the
+    # lock fd, so a stop that observed "stopped" can return while the flock is
+    # still held. Grab-and-release proves the old daemon is really gone before
+    # we spawn. Best effort: on timeout we spawn anyway, which is exactly the
+    # pre-reap behavior (the child would refuse with BROKER_ALREADY_RUNNING and
+    # the parent's poll would report BROKER_START_FAILED).
+    deadline = time.monotonic() + max(0.1, timeout)
+    while time.monotonic() < deadline:
+        try:
+            with open(protected / "broker.lock", "a+") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            return True
+        except (BlockingIOError, OSError):
+            time.sleep(0.05)
+    return False
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("serve"); s.add_argument("--root", required=True); s.add_argument("--session", required=True); s.add_argument("--incarnation", required=True); s.add_argument("--mode", required=True)
+    s = sub.add_parser("start"); s.add_argument("--root", required=True); s.add_argument("--session", required=True); s.add_argument("--incarnation", required=True); s.add_argument("--mode", required=True)
+    s = sub.add_parser("stop"); s.add_argument("--root", required=True); s.add_argument("--timeout", type=float, default=10.0)
+    s = sub.add_parser("status"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("control"); s.add_argument("--root", required=True)
+    s = sub.add_parser("once"); s.add_argument("--root", required=True); s.add_argument("--request", required=True)
+    args = p.parse_args()
+    root, git_dir, common, root_id = resolve_root(args.root)
+    protected, _, _, _ = state_paths(root, git_dir, common, root_id)
+    if args.cmd == "serve":
+        return serve(args)
+    if args.cmd == "start":
+        if (protected / "pid.json").exists():
+            info = load_json(protected / "pid.json")
+            try:
+                os.kill(int(info.get("pid", 0)), 0)
+                actual = process_stamp(int(info["pid"]))
+                if actual == info.get("pid_started"):
+                    expected = {"session": args.session, "session_incarnation": args.incarnation,
+                                "mode": args.mode, "physical_code_root": str(root),
+                                "root_identity": root_id}
+                    mismatches = [key for key, value in expected.items() if info.get(key) != value]
+                    if mismatches == ["session_incarnation"] and not tmux_incarnation_alive(
+                            str(info.get("session", "")), str(info.get("session_incarnation", ""))):
+                        # The only difference is the incarnation, and tmux confirms the
+                        # incarnation this daemon claims to serve is gone: it was orphaned
+                        # by a killed/recreated session. Reap it cleanly, then fall through
+                        # to the unchanged spawn block below. Any other mismatched key, or a
+                        # still-live recorded incarnation, still refuses.
+                        try:
+                            stop_broker(protected, info, REAP_STOP_TIMEOUT)
+                        except Refusal:
+                            # The stale daemon dying between the liveness probe and the
+                            # control call surfaces as a transport error, but the reap goal
+                            # is met and the kernel has released its flock. Only a daemon
+                            # that is still live makes this a real failure.
+                            if broker_pid_live(info):
+                                raise
+                        await_lock_release(protected, REAP_STOP_TIMEOUT)
+                    elif mismatches:
+                        raise Refusal("BROKER_IDENTITY_MISMATCH", ",".join(mismatches))
+                    else:
+                        print(json.dumps(info)); return 0
+            except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+                pass
+        log = protected / "broker.log"; log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "ab", buffering=0) as out:
+            cp = subprocess.Popen([str(Path(__file__).resolve()), "serve", "--root", str(root),
+                                   "--session", args.session, "--incarnation", args.incarnation,
+                                   "--mode", args.mode], stdin=subprocess.DEVNULL, stdout=out,
+                                  stderr=out, start_new_session=True, close_fds=True)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if cp.poll() is not None:
+                raise Refusal("BROKER_START_FAILED", f"exit={cp.returncode} log={log}")
+            if (protected / "pid.json").exists():
+                info = load_json(protected / "pid.json")
+                try:
+                    stamp = process_stamp(cp.pid)
+                except (OSError, subprocess.CalledProcessError):
+                    stamp = ""
+                if (info.get("pid") == cp.pid and info.get("state") == "running"
+                        and stamp == info.get("pid_started")):
+                    print(json.dumps(info, sort_keys=True)); return 0
+            time.sleep(0.05)
+        cp.terminate()
+        raise Refusal("BROKER_START_TIMEOUT", f"pid={cp.pid} log={log}")
+    if args.cmd == "stop":
+        info = load_json(protected / "pid.json") if (protected / "pid.json").exists() else {}
+        result = stop_broker(protected, info, args.timeout)
+        print(json.dumps(result, sort_keys=True)); return 0
+    if args.cmd == "status":
+        info = load_json(protected / "pid.json") if (protected / "pid.json").exists() else {"state": "absent"}
+        try:
+            os.kill(int(info.get("pid", 0)), 0)
+            actual = process_stamp(int(info["pid"]))
+            info["live"] = actual == info.get("pid_started")
+        except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+            info["live"] = False
+        print(json.dumps(info, sort_keys=True) if args.json else f"BROKER state={info.get('state')} live={str(info['live']).lower()} mode={info.get('mode','unknown')}")
+        return 0 if info["live"] else 3
+    if args.cmd == "control":
+        request = json.load(sys.stdin)
+        result = control_call(protected, request)
+        print(json.dumps(result["detail"], sort_keys=True)); return 0
+    if args.cmd == "once":
+        if os.environ.get("FORGE_BROKER_TEST_ENABLE") != "1":
+            raise Refusal("TEST_MODE_DENIED", "FORGE_BROKER_TEST_ENABLE=1 required")
+        print(json.dumps(process(str(root), Path(args.request), trusted_host=True), sort_keys=True)); return 0
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Refusal as exc:
+        print(json.dumps({"schema": RESULT_SCHEMA, "status": "error", "code": exc.code, "detail": exc.detail}), file=sys.stderr)
+        raise SystemExit(3)

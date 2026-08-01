@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+case " $* " in
+  *" --method POST "*) printf '{"id":123,"html_url":"https://github.test/comment/123"}\n' ;;
+  *) printf '[]\n' ;;
+esac
