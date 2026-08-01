@@ -14,6 +14,9 @@ bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 
 # Bridge stub (line-84 call is absolute-path; PATH cannot shadow it).
 FB="$WORK/fake-bridge"; printf '#!/bin/bash\nexit 0\n' > "$FB"; chmod +x "$FB"
+FORGE_BROKER_BIN="$WORK/fake-broker"; export FORGE_BROKER_BIN
+BRKLOG="$WORK/broker.log"; : > "$BRKLOG"
+printf '#!/bin/bash\necho "$*" >> "%s"\nexit 0\n' "$BRKLOG" > "$FORGE_BROKER_BIN"; chmod +x "$FORGE_BROKER_BIN"
 
 # PATH-shadow recording tmux. has-session MUST be tunable: plain mode's auto-name
 # loop needs nonzero (else it never picks forge-1); populate validation needs zero.
@@ -37,7 +40,8 @@ SH
 chmod +x "$SHIM/tmux"
 
 echo "── T-START-IDENTITY: plain no-arg path byte-identical (HC4 golden) ──"
-D="$(mktemp -d "${TMPDIR:-/tmp}/fstd.XXXXXX")"; D="$(cd "$D" && pwd)"   # macOS TMPDIR trailing slash → normalize or the sed below misses
+D="$(mktemp -d "${TMPDIR:-/tmp}/fstd.XXXXXX")"; D="$(cd "$D" && pwd -P)"   # normalize /var → /private/var so physical-root launch golden matches
+git -C "$D" init -q
 TMLOG="$WORK/plain.log"; : > "$TMLOG"
 ( cd "$D" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" >/dev/null 2>&1 )
 prc=$?
@@ -49,7 +53,9 @@ else
 fi
 [ "$prc" -eq 0 ] && ok "T-START-PLAIN-EXITS-ZERO: plain run exits 0" || bad "plain run exited $prc"
 grep 'send-keys' "$TMLOG" | grep -q 'FORGE_ROLE' && bad "plain launch strings carry FORGE_ROLE (byte drift)" || ok "plain launch strings unstamped"
-CODEX_STATUS_OVERRIDE="-c 'tui.status_line=[\"model-with-reasoning\",\"context-remaining\",\"current-dir\"]'"
+CODEX_STATUS_OVERRIDE="forge codex-launch"
+grep -q 'forge codex-launch.*--root.*--session.*--pane 2.*--effort xhigh' "$TMLOG" && ok "Codex A uses centralized attested launch" || bad "Codex A launch contract missing"
+grep -q 'forge codex-launch.*--pane 3.*--effort medium' "$TMLOG" && ok "Codex B uses centralized attested launch" || bad "Codex B launch contract missing"
 for _pane in 2 3; do
   _launch_line=$(grep "send-keys -t forge-1:.$_pane " "$TMLOG")
   _override_count=$(printf '%s\n' "$_launch_line" | grep -oF -- "$CODEX_STATUS_OVERRIDE" | wc -l | tr -d ' ')
@@ -57,8 +63,8 @@ for _pane in 2 3; do
     && ok "T-START-CODEX-STATUS-$_pane: override appears exactly once" \
     || bad "T-START-CODEX-STATUS-$_pane: override count=$_override_count line=$_launch_line"
   case "$_launch_line" in
-    *'"context-remaining","current-dir"'*)
-      ok "T-START-CODEX-ORDER-$_pane: context-remaining precedes current-dir" ;;
+    *"--root "*"--session "*"--pane $_pane "*"--effort "*)
+      ok "T-START-CODEX-ORDER-$_pane: root/session/pane/effort order is stable" ;;
     *)
       bad "T-START-CODEX-ORDER-$_pane: routing field order drifted" ;;
   esac
@@ -72,14 +78,27 @@ out=$( TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=2 FORGE_BRIDGE
 grep -q 'new-session' "$TMLOG" && bad "populate created a session" || ok "populate never runs new-session"
 grep -q 'kill-session' "$TMLOG" && bad "populate ran kill-session" || ok "no kill-session on refusal"
 
+echo "── T-START-PLAIN-LAYOUTFAIL: plain layout failure stops broker before kill (R7) ──"
+D2="$(mktemp -d "${TMPDIR:-/tmp}/fstd.XXXXXX")"; D2="$(cd "$D2" && pwd -P)"
+git -C "$D2" init -q
+TMLOG="$WORK/plainfail.log"; : > "$TMLOG"; : > "$BRKLOG"
+( cd "$D2" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_LAYOUT=bad FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" >/dev/null 2>&1 )
+rc=$?
+[ "$rc" -ne 0 ] && ok "plain layout failure exits nonzero" || bad "plain layout failure exited 0"
+sed -n '1p' "$BRKLOG" | grep -q '^start --root ' && ok "broker start recorded before the failure" || bad "broker start missing from log: $(cat "$BRKLOG")"
+sed -n '2p' "$BRKLOG" | grep -q '^stop --root .* --timeout 5$' && ok "layout failure stopped the broker before kill-session" || bad "no broker stop on plain layout failure: $(cat "$BRKLOG")"
+grep -q 'kill-session' "$TMLOG" && ok "plain layout failure still kills the session" || bad "kill-session missing from plain layout failure"
+rm -rf "$D2"
+
 echo "── T-START-POP-TRAP: layout failure → partial-split report, no kill, prior file kept ──"
-POPROOT="$WORK/poproot"; mkdir -p "$POPROOT/.dev"
+POPROOT="$WORK/poproot"; mkdir -p "$POPROOT/.dev"; git -C "$POPROOT" init -q
 echo "prior-session" > "$POPROOT/.dev/.forge-session"
-TMLOG="$WORK/trap.log"; : > "$TMLOG"
+TMLOG="$WORK/trap.log"; : > "$TMLOG"; : > "$BRKLOG"
 out=$( TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_LAYOUT=bad FAKE_DISP="$POPROOT" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --populate-existing scratch 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && ok "layout failure exits nonzero" || bad "layout failure exited 0"
 echo "$out" | grep -q 'partial-split' && ok "trap reports partial-split state" || bad "no partial-split report: $out"
 grep -q 'kill-session' "$TMLOG" && bad "trap ran kill-session" || ok "trap never kills the session"
+grep -q '^stop ' "$BRKLOG" && bad "populate layout failure stopped the broker (session survives — broker must too)" || ok "populate layout failure leaves the broker running (R8)"
 [ "$(grep -v '^#' "$POPROOT/.dev/.forge-session" | grep -m1 .)" = "prior-session" ] && ok "prior .forge-session preserved (first non-comment line)" || bad ".forge-session clobbered"
 
 echo "── T-START-POP-ROLES: per-pane FORGE_ROLE stamps in populate launch strings ──"
@@ -104,7 +123,7 @@ grep -q 'respawn-pane' "$TMLOG" && bad "stamped populate respawned pane 0 (shoul
 
 if command -v tmux >/dev/null 2>&1; then
   echo "── T-START-POP-TRAP-LIVE: real tmux, injected failure, session survives ──"
-  DL="$WORK/livetrap"; mkdir -p "$DL/.dev"
+  DL="$WORK/livetrap"; mkdir -p "$DL/.dev"; git -C "$DL" init -q
   echo "prior-session" > "$DL/.dev/.forge-session"
   tmux new-session -d -s "$RSESS" -c "$DL"
   out=$( cd "$DL" && FORGE_BRIDGE_BIN="$FB" FORGE_START_FAIL_AFTER=3 bash "$START" --populate-existing "$RSESS" 2>&1 ); rc=$?
@@ -116,7 +135,7 @@ if command -v tmux >/dev/null 2>&1; then
   tmux kill-session -t "$RSESS" 2>/dev/null
 
   echo "── T-START-POP-ROLES-LIVE: FORGE_ROLE reaches the launched child process ──"
-  DR="$WORK/liverole"; mkdir -p "$DR/.dev" "$WORK/rolebin" "$WORK/roles"
+  DR="$WORK/liverole"; mkdir -p "$DR/.dev" "$WORK/rolebin" "$WORK/roles"; git -C "$DR" init -q
   for c in claude codex; do
     cat > "$WORK/rolebin/$c" <<SH
 #!/bin/bash
@@ -161,7 +180,7 @@ SH
   tmux kill-session -t "$SSTAMP" 2>/dev/null
 
   echo "── T-START-POP-RELAUNCH-LIVE: unstamped populate stamps + relaunches pane 0 ──"
-  DP="$WORK/liverelaunch"; mkdir -p "$DP/.dev"
+  DP="$WORK/liverelaunch"; mkdir -p "$DP/.dev"; git -C "$DP" init -q
   ( cd "$DP" && tmux new-session -d -s "$PRELSESS" -c "$DP" -e "HOME=$FH2" -e "PATH=$WORK/rolebin:$PATH" )
   ( cd "$DP" && FORGE_BRIDGE_BIN="$FB" bash "$START" --populate-existing "$PRELSESS" >/dev/null 2>&1 ) || true
   _stamp_live="$(tmux show-environment -t "$PRELSESS" TMUX_SESSION 2>/dev/null | sed -n 's/^TMUX_SESSION=//p')"
