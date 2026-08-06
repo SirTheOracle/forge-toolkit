@@ -675,9 +675,15 @@ proposal → review → incorporate → implementation → impl-review → codin
 - If BLOCKING_ITEMS > 0: read impl-review.md for details before advancing.
 - Advance to coding. Apply Change-of-Course Heuristic if BLOCKING_ITEMS > 0.
 
-**coding** — claude-sonnet (on feature branch, no worktree)
-- Template: `~/.config/forge/prompts/coding.txt` (skill: `forge-coder`)
-- Pre-dispatch: ensure feature branch (`git checkout -b {slug}` if not on it). Do NOT use worktrees — they block access to `~/.claude/skills/` and `~/bin/`.
+**coding** — capability-routed in the current physical worktree
+- Template: `~/.config/forge/prompts/coding.txt` (skill: `forge-coder`).
+- Before every mutating dispatch, run `identity`, worktree-aware `preflight`,
+  `health`, and `forge codex-lane --root "$physical_code_root" --stage coding`.
+- The physical worktree root is authoritative. A linked worktree is valid and
+  remains distinct from the main checkout even though both share a Git common dir.
+- In contain/broker-shadow, `commit` capability routes to `reviewed-host`. In
+  enforce, Codex may edit while the exact-path broker owns the commit. Workers
+  never run direct Git mutations.
 - Inputs: `.dev/proposals/{slug}/implementation.md`
 - Output: code changes + `.dev/proposals/{slug}/coder-report.md`
 - **🔒 Infra stage — wrap in the infra lock (Hard Rule 23, Shape A).** Acquire
@@ -1163,11 +1169,11 @@ Background agent failures follow this protocol:
 
 21. **Worker permission-mode and ident contract.**
     Launch flags:
-      Pane 0: `claude --model claude-opus-4-8 --permission-mode acceptEdits`
-      Pane 1: `claude --model claude-opus-4-8` (NO acceptEdits)
+      Pane 0: `claude --model claude-opus-5 --permission-mode acceptEdits`
+      Pane 1: `claude --model claude-opus-5` (NO acceptEdits)
       Pane 2: `codex -m gpt-5.5 -c model_reasoning_effort=xhigh -c service_tier=fast`
       Pane 3: `codex -m gpt-5.5 -c model_reasoning_effort=medium -c service_tier=fast`
-      Pane 4: `claude --model claude-sonnet-4-6 --permission-mode acceptEdits`
+      Pane 4: `claude --model claude-sonnet-5 --permission-mode acceptEdits`
 
     Worker idents are REPO-LOCAL ONLY, set inside the dispatch prompt body:
       `git -C "$PROJECT_ROOT" config user.name  "claude-opus (forge pane 0)"`

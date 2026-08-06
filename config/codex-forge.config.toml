@@ -1,0 +1,16 @@
+# forge-codex-policy/1 — policy only. Never add credentials to this file.
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+cli_auth_credentials_store = "keyring"
+
+[sandbox_workspace_write]
+network_access = false
+writable_roots = []
+exclude_slash_tmp = true
+# Remains false until tests/codex-policy-smoke/run.sh --live proves that a
+# root-local TMPDIR is honored without creating another authority path.
+exclude_tmpdir_env_var = false
+
+[mcp_servers]
+
+[features]

@@ -113,7 +113,10 @@ forge-start           # Auto-names: forge-1, forge-2, etc.
 forge-start myproject  # Custom session name
 ```
 
-This creates a tmux session with 4 panes:
+This creates a tmux session with 5 panes. Codex panes are launched through the
+explicit contain policy; direct Git/network authority is not part of the worker
+contract. Commit and PR publication use the delivery-bound host broker only
+after their rollout gates pass, and unsupported stages use the reviewed lane.
 
 ```
 +------------------+------------------+

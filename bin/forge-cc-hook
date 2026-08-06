@@ -13,7 +13,7 @@
 # (fail-open). EVERY path exits 0. All four events are gated to the orchestrator
 # (pane 1) per the handoff — a worker pane finishing a turn must not mark the
 # initiative done; worker escalation is the Phase B `forge ask` path.
-import sys, os, json, re, hashlib, secrets, datetime, subprocess
+import sys, os, json, re, glob, hashlib, secrets, datetime, subprocess
 
 def done():
     sys.exit(0)
@@ -298,13 +298,28 @@ if role != 'orchestrator':
         tn = data.get('tool_name', '') or ''
         ti = data.get('tool_input') or {}
         cmd = stringify_cmd(ti.get('command') if isinstance(ti, dict) else '')
-        h = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()[:8]
-        atomic(os.path.join(adir, f'wperm.{session}.p{pane_index}.{h}.json'),
-               envelope('worker-permission',
-                        {'agent': agent, 'state': 'needs-input', 'tool_name': tn,
-                         'command': snip(cmd, 300), 'command_hash': h,
-                         'permission_suggestions': data.get('permission_suggestions') or [],
-                         **question_fields(tn, ti)}))
+        digest = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()
+        delivery = None
+        envelopes = os.path.join(root,'.dev','forge-broker','envelopes')
+        matches=[]
+        for path in glob.glob(os.path.join(envelopes,'delivery-*.json')):
+            try: d=json.load(open(path))
+            except Exception: continue
+            if d.get('state')=='open' and d.get('session')==session and str(d.get('pane_index'))==str(pane_index):
+                matches.append(d)
+        if len(matches)==1: delivery=matches[0]
+        if delivery:
+            did = safe_tid(delivery['delivery_id'])
+            body = {'agent': agent, 'state': 'needs-input', 'tool_name': tn,
+                    'tool_summary': tn[:80], 'command_hash': digest,
+                    'delivery_id': delivery['delivery_id'], 'session_incarnation': delivery['session_incarnation'],
+                    'physical_code_root': delivery['physical_code_root'], 'root_identity': delivery['root_identity'],
+                    'slug': delivery.get('slug'), 'stage': delivery['stage'],
+                    'capability_class': delivery['capability_class'], 'source': 'hook',
+                    'prompt_sha256': delivery['prompt_sha256'],
+                    'permission_suggestions': data.get('permission_suggestions') or [], **question_fields(tn, ti)}
+            atomic(os.path.join(adir, f'wperm.{session}.p{pane_index}.{did}.{digest[:12]}.json'),
+                   envelope('worker-permission', body))
     elif event == 'posttooluse':
         # A completed tool RESOLVES its pending permission request: archive the
         # matching perm event so NEEDS-PERMISSION clears within a tick of the
@@ -312,20 +327,28 @@ if role != 'orchestrator':
         tn = data.get('tool_name', '') or ''
         ti = data.get('tool_input') or {}
         cmd = stringify_cmd(ti.get('command') if isinstance(ti, dict) else '')
-        h = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()[:8]
-        pf = os.path.join(adir, f'wperm.{session}.p{pane_index}.{h}.json')
-        try:
-            with open(pf) as f:
-                rec = json.load(f)
-            # empty-command hashes collide across tools (AskUserQuestion vs
-            # Read): only the tool that actually requested may resolve.
-            if (rec.get('tool_name') or '') == tn:
+        digest = hashlib.sha256(cmd.encode('utf-8', 'replace')).hexdigest()
+        matches = []
+        for pf in glob.glob(os.path.join(adir, f'wperm.{session}.p{pane_index}.*.json')):
+            try:
+                with open(pf) as f:
+                    rec = json.load(f)
+            except (OSError, ValueError):
+                continue
+            # Empty-command hashes collide across tools (AskUserQuestion vs
+            # Read), so require both the full digest and the requesting tool.
+            if rec.get('command_hash') == digest and (rec.get('tool_name') or '') == tn:
+                matches.append(pf)
+        # Multiple candidates are ambiguous and therefore remain visible.
+        if len(matches) == 1:
+            pf = matches[0]
+            try:
                 arch = os.path.join(adir, 'archive')
                 os.makedirs(arch, exist_ok=True)
                 ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
                 os.replace(pf, os.path.join(arch, os.path.basename(pf) + '.resolved.' + ts))
-        except (OSError, ValueError):
-            pass
+            except OSError:
+                pass
     # notification: intentionally NO-OP for workers (would collide on notify.<session>.json).
     fire_watch_check(event)
     done()

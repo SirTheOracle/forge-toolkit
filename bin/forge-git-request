@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Submit one closed request to Forge's authenticated host broker."""
+from __future__ import annotations
+import argparse, hashlib, json, os, pathlib, subprocess, sys, uuid
+
+
+def active(root: pathlib.Path) -> dict:
+    session = os.environ.get("TMUX_SESSION", "")
+    pane = os.environ.get("TMUX_PANE", "")
+    if not session or not pane:
+        raise SystemExit("BROKER_REQUEST_REFUSED: TMUX_SESSION and TMUX_PANE are required")
+    idx = subprocess.check_output(["tmux", "display-message", "-p", "-t", pane, "#{pane_index}"], text=True).strip()
+    envelopes = root / ".dev" / "forge-broker" / "envelopes"
+    matches = []
+    for path in envelopes.glob("delivery-*.json"):
+        try: value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError): continue
+        if value.get("state") == "open" and value.get("session") == session and str(value.get("pane_index")) == idx:
+            matches.append(value)
+    if len(matches) != 1:
+        raise SystemExit("BROKER_REQUEST_REFUSED: one public envelope required; broker remains authoritative")
+    return matches[0]
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(); p.add_argument("operation", choices=("commit", "publish-pr-review"))
+    p.add_argument("--root", default=os.getcwd()); p.add_argument("--expected-head")
+    p.add_argument("--message-file"); p.add_argument("--artifact"); p.add_argument("paths", nargs="*")
+    a = p.parse_args(); root = pathlib.Path(a.root).resolve(); d = active(root)
+    opid = f"op-{uuid.uuid4().hex}"
+    req = {k: d[k] for k in ("delivery_id", "session_incarnation", "physical_code_root",
+                              "root_identity", "stage", "capability_class", "prompt_sha256")}
+    req.update(schema="forge-broker-request/1", operation_id=opid, operation=a.operation)
+    if a.operation == "commit":
+        if not a.message_file or not a.expected_head or not a.paths:
+            p.error("commit requires --message-file, --expected-head, and literal paths")
+        req.update(expected_head=a.expected_head,
+                   message=pathlib.Path(a.message_file).read_text(encoding="utf-8"), paths=a.paths)
+    else:
+        if not a.artifact: p.error("publish-pr-review requires --artifact")
+        body=pathlib.Path(a.artifact).read_bytes()
+        req.update(artifact=a.artifact, artifact_sha256=hashlib.sha256(body).hexdigest())
+    broker=os.environ.get("FORGE_BROKER_BIN", "forge-broker")
+    intent=json.dumps({"action":"submit-operation","request":req},separators=(",", ":"))+"\n"
+    cp=subprocess.run([broker,"control","--root",str(root)],input=intent,text=True,capture_output=True)
+    if cp.returncode:
+        print(cp.stderr.strip() or cp.stdout.strip() or "BROKER_REQUEST_REFUSED",file=sys.stderr)
+        return cp.returncode
+    try: result=json.loads(cp.stdout)
+    except ValueError: raise SystemExit("BROKER_REQUEST_REFUSED: invalid broker response")
+    if (result.get("schema") != "forge-broker-result/1" or result.get("operation_id") != opid
+            or result.get("delivery_id") != d.get("delivery_id")):
+        raise SystemExit("BROKER_REQUEST_REFUSED: response correlation mismatch")
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result.get("status")=="ok" else 3
+
+
+if __name__ == "__main__": raise SystemExit(main())

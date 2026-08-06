@@ -18,6 +18,24 @@ bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 
 export FORGE_WATCH_TRIGGER=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fbid.XXXXXX")"; WORK="$(cd "$WORK" && pwd -P)"
+BROKER_STUB="$WORK/forge-broker-stub"
+cat > "$BROKER_STUB" <<'SH'
+#!/bin/bash
+if [ "$1" != control ]; then exit 0; fi
+payload="$(cat)"
+python3 - "$payload" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1]); action=d.get('action')
+if action == 'register-delivery':
+    print(json.dumps({'delivery_id':'delivery-test','session_incarnation':'test-incarnation'}))
+elif action == 'active-delivery':
+    print(json.dumps({'delivery_id':'delivery-test','state':'open','capability_class':'workspace'}))
+else:
+    print(json.dumps({'status':'ok'}))
+PY
+SH
+chmod +x "$BROKER_STUB"
+export FORGE_BROKER_BIN="$BROKER_STUB"
 S1="fbid1-$$"; S2="fbid2-$$"; S3="fbid3-$$"; S4="fbid4-$$"; GS="fbguard-$$"
 trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; tmux kill-session -t "${HS:-none}" 2>/dev/null; tmux kill-session -t "${DS:-none}" 2>/dev/null; tmux kill-session -t "${VS:-none}" 2>/dev/null; tmux kill-session -t "${FS:-none}" 2>/dev/null; rm -rf "$WORK"' EXIT
 
@@ -25,13 +43,13 @@ trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/
 FNS="$WORK/fns.sh"
 {
   grep -m1 '^_valid_session_name()' "$BRIDGE"
-  sed -n '/^ownership_root()/,/^}$/p; /^_same_root_sessions()/,/^}$/p' "$BRIDGE"
+  sed -n '/^ownership_root()/,/^}$/p; /^expected_root_for()/,/^}$/p; /^root_identity()/,/^}$/p; /^_same_root_sessions()/,/^}$/p' "$BRIDGE"
 } > "$FNS"
 # shellcheck disable=SC1090
 . "$FNS"
 
 # mkR <name> — hermetic project root with forge-project.yml + expected_root pin.
-mkR(){ local d="$WORK/$1"; mkdir -p "$d/.claude" "$d/.dev/proposals" "$d/.dev/forge-tmp/callbacks"; printf 'name: %s\nforge:\n  expected_root: %s\n' "$1" "$d" > "$d/.claude/forge-project.yml"; printf '%s' "$d"; }
+mkR(){ local d="$WORK/$1"; mkdir -p "$d/.claude" "$d/.dev/proposals" "$d/.dev/forge-tmp/callbacks"; git -C "$d" init -q; printf 'name: %s\nforge:\n  expected_root: %s\n' "$1" "$d" > "$d/.claude/forge-project.yml"; printf '%s' "$d"; }
 
 echo "== ownership_root / _same_root_sessions (pure helpers) =="
 
@@ -145,7 +163,7 @@ run_in_pane(){
     local pane="$1" name="$2"; shift 2
     local o="$WORK/out.$name"
     : > "$o"
-    tmux send-keys -t "$pane" "{ $* ; } > $o 2>&1; echo DONE_\$? >> $o" Enter
+    tmux send-keys -t "$pane" "{ export FORGE_BROKER_BIN='$BROKER_STUB'; $* ; } > $o 2>&1; echo DONE_\$? >> $o" Enter
     local i=0
     while [ $i -lt 60 ]; do grep -q '^DONE_' "$o" 2>/dev/null && return 0; sleep 0.5; i=$((i+1)); done
     echo "TIMEOUT" >> "$o"; return 1
@@ -551,7 +569,7 @@ if [ "$(rc_of b12-park)" = 0 ] && [ "$(rc_of b12-after-park)" = 0 ] \
    && grep -q 'response: null' "$GROOT/.dev/proposals/b12-next/forge-log.yml" \
    && guard_capture_has 3 'codex-b-adhoc-b12-next.txt'; then
     ok "T-GUARD-B12-AFTER-PARK"
-else bad "T-GUARD-B12-AFTER-PARK"; fi
+else bad "T-GUARD-B12-AFTER-PARK (park=$(rc_of b12-park): $(out_of b12-park | tr '\n' ' ') dispatch=$(rc_of b12-after-park): $(out_of b12-after-park | tr '\n' ' '))"; fi
 guard_done b12-next adhoc codex-b 3 b12-next-clean || bad "B12 close replacement"
 run_in_pane "$GS:0.0" b12-resolve "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE park --resolve --slug b12-block --stage coding --note p0-clean )"
 guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B12-A" || exit 1
@@ -3430,6 +3448,21 @@ else
   bad "T-ACM-STATUS FORGE_USAGE_MAX_AGE_S is inert in the renderer"
 fi
 unset -f cmd_infra_lock acm_vsec
+
+echo "── Codex root/delivery/permission boundary ──"
+RR="$WORK/root-id"; git init -q "$RR"; git -C "$RR" config user.name t; git -C "$RR" config user.email t@x
+touch "$RR/base"; git -C "$RR" add base; git -C "$RR" commit -qm base
+git -C "$RR" worktree add -q "$WORK/wt-a" -b wt-a; git -C "$RR" worktree add -q "$WORK/wt-b" -b wt-b
+ra="$(ownership_root "$WORK/wt-a")"; rb="$(ownership_root "$WORK/wt-b")"
+[ "$ra" != "$rb" ] && [ "$(root_identity "$ra")" != "$(root_identity "$rb")" ] && ok "linked worktrees remain distinct" || bad "linked worktrees collapsed"
+mkdir -p "$WORK/wt-a/.claude"; printf 'forge:\n  expected_root: ../wt-b\n' > "$WORK/wt-a/.claude/forge-project.yml"
+[ "$(ownership_root "$WORK/wt-a")" = "$ra" ] && [ "$(expected_root_for "$ra")" = "$rb" ] && ok "relative expected root validates without owning" || bad "expected root changed ownership"
+# Source pins prove the hook-first attention probe and typed result are in production wait.
+grep -q 'STATUS: needs_permission' "$BRIDGE" \
+  && grep -q 'active-delivery' "$BRIDGE" \
+  && grep -q "d\['emitted_at'\]" "$BRIDGE" \
+  && grep -q 'permission_correlation_ambiguous' "$BRIDGE" \
+  && ok "typed fast permission path installed" || bad "fast permission path absent"
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"

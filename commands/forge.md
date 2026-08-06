@@ -39,8 +39,12 @@ in this pane, in plain English.
    goes to the user in this pane.
    Canonical user intent: <canonical_user_intent>
    Original user request: <verbatim user slash-command line>
-   Project root: <cwd at /forge invocation>
+   physical_code_root: <canonical `git rev-parse --show-toplevel` for this pane>
+   root_identity: <forge-bridge preflight root_identity value>
+   git_common_dir: <forge-bridge preflight git_common_dir value>
    Host session: <the host_session= line from `~/bin/forge-bridge identity`>
+   Before every mutating dispatch, require matching structured delivery fields;
+   a prose-only root is invalid.
    Operational event log: .dev/forge-tmp/orchestrator-events.log
    ```
 

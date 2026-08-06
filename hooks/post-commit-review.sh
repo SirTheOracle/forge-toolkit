@@ -83,17 +83,16 @@ main() {
     local diffstat
     diffstat="$(git diff-tree --stat --no-commit-id --root HEAD 2>/dev/null)"
 
-    # Full diff with deterministic flags
-    local diff_full diff_lines truncated
+    # Materialize the complete immutable review input on the host. Oversized input
+    # becomes a typed non-complete artifact; the worker never repairs it with Git.
+    local diff_full diff_lines truncated diff_bytes max_review_bytes
     diff_full="$(git show --format="" --no-ext-diff --no-color --find-renames -p HEAD 2>/dev/null)"
     diff_lines="$(printf '%s' "$diff_full" | wc -l | tr -d ' ')"
+    diff_bytes="$(printf '%s' "$diff_full" | wc -c | tr -d ' ')"
+    max_review_bytes="${FORGE_MAX_REVIEW_INPUT_BYTES:-8388608}"
     truncated="false"
-
-    # Diff size guard: truncate at 500 lines
-    if [ "$diff_lines" -gt 500 ] 2>/dev/null; then
-        diff_full="$(printf '%s' "$diff_full" | head -500)"
-        diff_full="$diff_full
-[TRUNCATED — full diff: git show $full_hash]"
+    if [ "$diff_bytes" -gt "$max_review_bytes" ] 2>/dev/null; then
+        diff_full="[REVIEW_INPUT_TOO_LARGE commit=$full_hash bytes=$diff_bytes limit=$max_review_bytes]"
         truncated="true"
     fi
 

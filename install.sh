@@ -18,11 +18,13 @@ BIN_DIR="$HOME/bin"
 CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
 CODEX_SKILLS_DIR="$HOME/.codex/skills"
 SETTINGS_FILE="$HOME/.claude/settings.json"
+FORGE_CONFIG_DIR="${FORGE_CONFIG_DIR:-$HOME/.config/forge}"
+MANAGED_POLICY_DIR="$FORGE_CONFIG_DIR/managed/codex-v1"
 
 SKILL_NAMES=(
-    forge-orchestrator forge-coder adversarial-proposal adversarial-lite
-    adversarial-implementation adversarial-qa adversarial-verify docs-refresh
-    proposal-reviewer command-center
+    forge-orchestrator forge-coder forge-fix-runner fix-coder
+    adversarial-proposal adversarial-lite adversarial-implementation
+    adversarial-qa adversarial-verify docs-refresh proposal-reviewer command-center
 )
 # NOTE: proposal-reviewer ships via codex-skills/ ONLY (no skills/ counterpart);
 # the Claude-side uninstall loop no-ops on it by the -d guard. Kept in the list
@@ -37,7 +39,9 @@ OPERATOR_FILES=(
 
 # Single bin manifest (was duplicated across install/uninstall/drift).
 BIN_SCRIPTS=(forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review
-             forge-stall-install-regex forge-watch forge forge-cc-hook)
+             forge-stall-install-regex forge-watch forge forge-cc-hook forge-broker
+             forge-git-request)
+MANAGED_POLICY_FILES=(codex-forge.config.toml codex-forge-runtime.json idle-prompts.yml)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -93,6 +97,24 @@ if [ "${1:-}" = "--check-drift" ]; then
         else err "  ${pair##*:} — not installed"; DRIFT=1; fi
     done
 
+    for managed in "${MANAGED_POLICY_FILES[@]}"; do
+        src="$SCRIPT_DIR/config/$managed"; dst="$MANAGED_POLICY_DIR/$managed"
+        if [ ! -f "$dst" ]; then
+            err "  managed/codex-v1/$managed — not installed"; DRIFT=1
+        elif cmp -s "$src" "$dst"; then
+            ok "  managed/codex-v1/$managed — identical"
+        else
+            err "  managed/codex-v1/$managed — DIFFERS from repository source"; DRIFT=1
+        fi
+    done
+    if [ ! -f "$FORGE_CONFIG_DIR/idle-prompts.yml" ]; then
+        err "  idle-prompts.yml — runtime classifier not installed"; DRIFT=1
+    elif cmp -s "$MANAGED_POLICY_DIR/idle-prompts.yml" "$FORGE_CONFIG_DIR/idle-prompts.yml"; then
+        ok "  idle-prompts.yml — runtime classifier converged"
+    else
+        err "  idle-prompts.yml — operator override differs from managed classifier"; DRIFT=1
+    fi
+
     echo ""
     if [ "$DRIFT" -eq 0 ]; then ok "No drift — repo and installed state converged."; exit 0
     else err "Drift found (see above). Re-run ./install.sh to converge, or reconcile by hand."; exit 1; fi
@@ -129,6 +151,23 @@ if [ "${1:-}" = "--uninstall" ]; then
             ok "  Removed ~/.claude/skills/$skill"
         fi
     done
+
+
+    # Remove only toolkit-owned policy copies. Preserve an operator-modified
+    # runtime classifier instead of treating the config directory as disposable.
+    if [ -f "$FORGE_CONFIG_DIR/idle-prompts.yml" ] \
+       && [ -f "$MANAGED_POLICY_DIR/idle-prompts.yml" ] \
+       && cmp -s "$FORGE_CONFIG_DIR/idle-prompts.yml" "$MANAGED_POLICY_DIR/idle-prompts.yml"; then
+        rm -f "$FORGE_CONFIG_DIR/idle-prompts.yml"
+        ok "  Removed managed runtime idle-prompts.yml"
+    fi
+    for managed in "${MANAGED_POLICY_FILES[@]}"; do
+        [ -f "$MANAGED_POLICY_DIR/$managed" ] || continue
+        rm -f "$MANAGED_POLICY_DIR/$managed"
+        ok "  Removed managed/codex-v1/$managed"
+    done
+    rmdir "$MANAGED_POLICY_DIR" 2>/dev/null || true
+    rmdir "$FORGE_CONFIG_DIR/managed" 2>/dev/null || true
 
     # Remove operator-file symlinks (never a regular file — those are unmanaged)
     for pair in "${OPERATOR_FILES[@]}"; do
@@ -285,6 +324,45 @@ for pair in "${OPERATOR_FILES[@]}"; do
     ln -s "$src" "$dst"
     ok "  ${pair##*:} — linked"
 done
+
+echo ""
+
+# ── Step 3.75: Managed Codex policy and classifier sources ────────────────
+# These files contain policy only, never credentials. The versioned managed
+# directory is refreshed atomically. The runtime classifier follows upgrades
+# only while it still matches the previously managed copy; local operator
+# changes are preserved and surfaced by --check-drift.
+
+info "Step 3.75: Installing managed Codex policy sources"
+
+runtime_classifier="$FORGE_CONFIG_DIR/idle-prompts.yml"
+old_classifier="$MANAGED_POLICY_DIR/idle-prompts.yml"
+refresh_runtime_classifier=0
+if [ ! -e "$runtime_classifier" ]; then
+    refresh_runtime_classifier=1
+elif [ -f "$old_classifier" ] && cmp -s "$runtime_classifier" "$old_classifier"; then
+    refresh_runtime_classifier=1
+fi
+
+mkdir -p "$MANAGED_POLICY_DIR"
+chmod 700 "$FORGE_CONFIG_DIR/managed" "$MANAGED_POLICY_DIR" 2>/dev/null || true
+for managed in "${MANAGED_POLICY_FILES[@]}"; do
+    src="$SCRIPT_DIR/config/$managed"
+    tmp="$(mktemp "$MANAGED_POLICY_DIR/.${managed}.XXXXXX")"
+    cp "$src" "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$MANAGED_POLICY_DIR/$managed"
+    ok "  managed/codex-v1/$managed — installed"
+done
+if [ "$refresh_runtime_classifier" -eq 1 ]; then
+    tmp="$(mktemp "$FORGE_CONFIG_DIR/.idle-prompts.yml.XXXXXX")"
+    cp "$MANAGED_POLICY_DIR/idle-prompts.yml" "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$runtime_classifier"
+    ok "  idle-prompts.yml — runtime classifier installed"
+else
+    warn "  idle-prompts.yml — operator-modified runtime preserved (check drift before rollout)"
+fi
 
 echo ""
 

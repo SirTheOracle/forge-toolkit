@@ -122,19 +122,45 @@ for r in ctx[:4]:
     print(f'◐ {who}/{w} · {r.get("headroom")}% headroom{tail} | color=orange')
 if len(ctx) > 4:
     print(f"+{len(ctx) - 4} more low-context · forge board | color=gray")
+# In-progress panes render as a PARENT line plus a SwiftBar submenu (child rows are
+# '--'-prefixed). The parent answers "who, what stage, still moving?" at a glance; detail
+# that used to crowd the single line moves into the submenu. Every child is optional and
+# omitted when its field is absent — an untagged pane (no resolvable pipeline stage, e.g.
+# pane 1, which dispatches and never receives a pending) degrades to the pre-submenu
+# information, never to "None" or a dangling separator.
 for e in inprog[:8]:
     who = esc(e.get("session") or e.get("label") or "?")
     pane = f" p{e['pane']}" if e.get("pane") not in (None, "") else ""
     act = "streaming" if e.get("mid_turn") else f"quiet {h_age(e.get('quiet_s'))}"
+    slug = esc(e.get("slug") or "")
+    stage = esc(e.get("stage") or "")
     seg = [f"⚙ {who}{pane}"]
-    if e.get("label"):                     # skip the segment when absent — never "·  ·"
-        seg.append(esc(e["label"]))
-    seg += [f"{e.get('turn_count', 0)} turn(s)", act]
-    line = " · ".join(seg)
-    snip = esc(e.get("last_snippet") or "")[:40]
+    if stage:
+        seg.append(stage)
+    seg.append(act)
+    print(" · ".join(seg) + " | color=orange")
+    if slug and stage:
+        print(f"-- pipeline: {slug} / {stage} | color=orange")
+    skill = esc(e.get("skill") or "")
+    if skill:
+        print(f"-- skill: {skill}")
+    disp = []
+    if e.get("stage_since"):
+        disp.append(f"dispatched {h_iso_age(e.get('stage_since'))} ago")
+    if e.get("stage_worker"):
+        disp.append(esc(e["stage_worker"]))
+    if disp:
+        print("-- " + " · ".join(disp))
+    # The snippet is the worker's LAST ASSISTANT MESSAGE, not the prompt — labelled so,
+    # because unlabelled it reads as the dispatch text. Wider here than on the old single
+    # line (80 vs 40) now that it has a row to itself.
+    snip = esc(e.get("last_snippet") or "")[:80]
     if snip:
-        line += f' · "{snip}"'
-    print(f"{line} | color=orange")
+        print(f'-- last: "{snip}"')
+    tail = [f"{e.get('turn_count', 0)} turn(s)"]
+    if e.get("label"):                     # skip the segment when absent — never "·  ·"
+        tail.append(esc(e["label"]))
+    print("-- " + " · ".join(tail) + " | color=gray")
 if len(inprog) > 8:
     print(f"+{len(inprog) - 8} more in progress | color=gray")
 pend = sum(1 for t in tasks if t.get("state") in ("queued", "accepted", "working"))

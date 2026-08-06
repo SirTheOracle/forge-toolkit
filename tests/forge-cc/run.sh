@@ -24,7 +24,20 @@ SH
 chmod +x "$STUB"
 ok(){ PASS=$((PASS+1)); printf '  ok: %s\n' "$1"; }
 bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
-new_root(){ R="$WORK/$1"; mkdir -p "$R/.dev"; git -C "$R" init -q 2>/dev/null; echo '.dev/' > "$R/.gitignore"; TSV="$WORK/$1.tsv"; printf 'forge-x\t%s\n' "$R" > "$TSV"; }
+new_root(){
+  R="$WORK/$1"
+  mkdir -p "$R/.dev/forge-broker/envelopes"
+  git -C "$R" init -q 2>/dev/null
+  echo '.dev/' > "$R/.gitignore"
+  TSV="$WORK/$1.tsv"; printf 'forge-x\t%s\n' "$R" > "$TSV"
+  # Worker permission records are accepted only when they correlate to one
+  # open broker delivery. Seed one delivery per worker pane used by this suite.
+  for pane in 0 2 3; do
+    did="delivery-$1-p$pane"
+    printf '{"schema":"forge-delivery/1","state":"open","delivery_id":"%s","session":"forge-x","pane_index":%s,"session_incarnation":"test-incarnation","physical_code_root":"%s","root_identity":"rid-%s","slug":"test-slug","stage":"review","capability_class":"workspace","prompt_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}\n' \
+      "$did" "$pane" "$R" "$1" > "$R/.dev/forge-broker/envelopes/delivery-$did.json"
+  done
+}
 meta(){ printf '%s\t%s\t%s' "$1" "forge-x" "$2"; }   # pane_index, path
 
 echo "── dispatch: inline schema + marker (hermetic) ──"
@@ -112,9 +125,16 @@ test ! -f "$R/.dev/attention/perm.forge-x.$EH.json" && ok "matching tool resolve
 new_root pt3
 printf '{"tool_name":"Bash","tool_input":{"command":"pytest"}}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" permissionrequest >/dev/null
 WH=$(python3 -c "import hashlib;print(hashlib.sha256(b'pytest').hexdigest()[:8])")
-test -f "$R/.dev/attention/wperm.forge-x.p0.$WH.json" && ok "worker permissionrequest wrote wperm event" || bad "no wperm event"
+wperm="$(find "$R/.dev/attention" -name 'wperm.forge-x.p0.*.json' -print -quit)"
+test -f "$wperm" && python3 - "$wperm" <<'PY' && ok "worker permission is delivery-scoped" || bad "no correlated wperm event"
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert len(d['command_hash'])==64 and d['source']=='hook'
+for k in ('delivery_id','session_incarnation','physical_code_root','root_identity','stage','prompt_sha256'): assert d.get(k)
+PY
 printf '{"tool_name":"Bash","tool_input":{"command":"pytest"}}' | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" posttooluse >/dev/null
-test ! -f "$R/.dev/attention/wperm.forge-x.p0.$WH.json" && ok "worker posttooluse archives the wperm event" || bad "wperm survived posttooluse"
+test ! -f "$wperm" && ls "$R"/.dev/attention/archive/"$(basename "$wperm")".resolved.* >/dev/null 2>&1 \
+  && ok "worker posttooluse archives the wperm event" || bad "wperm survived posttooluse"
 
 echo "── forge-cc-hook: AskUserQuestion content capture (Q1-Q5) ──"
 AQ='{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Deploy to prod?","header":"Deploy","multiSelect":false,"options":[{"label":"yes"},{"label":"no"},{"label":"dry-run"}]}]}}'
@@ -132,7 +152,8 @@ assert e["tool_name"]=="AskUserQuestion" and e["command"]==""
 PY
 new_root aq2
 printf '%s' "$AQ" | FORGE_CC_PANE_META="$(meta 0 "$R")" "$HOOK" permissionrequest >/dev/null
-python3 - "$R/.dev/attention/wperm.forge-x.p0.$EH.json" <<'PY' && ok "Q2 worker wperm carries question fields" || bad "Q2 wperm question fields wrong"
+aq2_wperm="$(find "$R/.dev/attention" -name 'wperm.forge-x.p0.*.json' -print -quit)"
+python3 - "$aq2_wperm" <<'PY' && ok "Q2 worker wperm carries question fields" || bad "Q2 wperm question fields wrong"
 import json,sys
 e=json.load(open(sys.argv[1]))
 assert e["question_snippet"]=="Deploy to prod?" and e["question_options"][0]=="yes"
@@ -273,17 +294,17 @@ python3 -c 'import json,os,sys;e=json.load(open(os.path.join(sys.argv[1],".dev",
 echo "── forge-cc-hook --codex: argv-list command permission (crash fix + writer↔resolver key identity) ──"
 # T1 — argv-list permissionrequest writes a stringified wperm (closes the AttributeError crash).
 new_root cxp1
-LH=$(python3 -c "import hashlib;print(hashlib.sha256(b'bash -lc pytest').hexdigest()[:8])")
 printf '{"tool_name":"shell","tool_input":{"command":["bash","-lc","pytest"]}}' \
   | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
-{ [ "$rc" -eq 0 ] && test -f "$R/.dev/attention/wperm.forge-x.p2.$LH.json"; } \
+CXP1_WPERM="$(find "$R/.dev/attention" -name 'wperm.forge-x.p2.*.json' -print -quit)"
+{ [ "$rc" -eq 0 ] && test -f "$CXP1_WPERM"; } \
   && ok "codex list-command perm → wperm, no crash, stringified hash" || bad "codex perm crash/miskey (rc=$rc)"
-python3 -c 'import json,sys;e=json.load(open(sys.argv[1]));assert e["agent"]=="codex" and e["tool_name"]=="shell" and e["command"]=="bash -lc pytest"' \
-  "$R/.dev/attention/wperm.forge-x.p2.$LH.json" && ok "wperm stringified command + agent=codex" || bad "wperm fields wrong"
+python3 -c 'import hashlib,json,sys;e=json.load(open(sys.argv[1]));assert e["agent"]=="codex" and e["tool_name"]=="shell" and e["command_hash"]==hashlib.sha256(b"bash -lc pytest").hexdigest() and "command" not in e' \
+  "$CXP1_WPERM" && ok "wperm carries full digest without raw command" || bad "wperm fields wrong"
 # T2 — same argv list at posttooluse resolves it (writer↔resolver hash identity).
 printf '{"tool_name":"shell","tool_input":{"command":["bash","-lc","pytest"]}}' \
   | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex posttooluse >/dev/null
-test ! -f "$R/.dev/attention/wperm.forge-x.p2.$LH.json" \
+test ! -f "$CXP1_WPERM" \
   && ok "codex posttooluse archives the matching wperm (hashes match)" || bad "codex wperm survived"
 
 echo "── forge-cc-hook --codex: apply_patch argv list does not crash ──"
@@ -299,14 +320,14 @@ printf '{"tool_name":"apply_patch","tool_input":{"command":["apply_patch","*** B
 echo "── forge-cc-hook --codex: empty/missing command + tool_name resolve-guard on the list path ──"
 # T4 — empty/missing command → empty-hash, no crash; mismatched tool_name does NOT resolve.
 new_root cxp3
-EH=$(python3 -c "import hashlib;print(hashlib.sha256(b'').hexdigest()[:8])")
 printf '{"tool_name":"mcp__x__do","tool_input":{}}' \
   | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
-{ [ "$rc" -eq 0 ] && test -f "$R/.dev/attention/wperm.forge-x.p2.$EH.json"; } \
+CXP3_WPERM="$(find "$R/.dev/attention" -name 'wperm.forge-x.p2.*.json' -print -quit)"
+{ [ "$rc" -eq 0 ] && test -f "$CXP3_WPERM"; } \
   && ok "codex empty command → empty-hash wperm, no crash" || bad "empty command crashed/miskey"
 printf '{"tool_name":"other","tool_input":{}}' \
   | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex posttooluse >/dev/null
-test -f "$R/.dev/attention/wperm.forge-x.p2.$EH.json" \
+test -f "$CXP3_WPERM" \
   && ok "mismatched tool_name does NOT resolve codex wperm (guard survives list path)" || bad "wrong tool resolved codex wperm"
 
 echo "── forge-cc-hook: string command (Claude) byte-identical + zero-stdout invariant ──"

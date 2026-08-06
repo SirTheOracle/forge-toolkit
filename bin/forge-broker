@@ -491,8 +491,17 @@ def inspect_live_codex(root: Path, protected: Path, request: dict) -> dict:
     command = subprocess.check_output(["/bin/ps", "-ww", "-p", str(pid), "-o", "command="], text=True).strip()
     start = subprocess.check_output(["/bin/ps", "-p", str(pid), "-o", "lstart="], text=True).strip()
     cfg = runtime_policy(); binary = Path(cfg["codex"]["binary"]).resolve(strict=True)
-    if command != str(binary) and not command.startswith(str(binary) + " "):
-        raise Refusal("LIVE_BINARY_MISMATCH", command.split(" ", 1)[0])
+    # Compare the live argv[0] to the configured binary in fully-resolved form.
+    # The configured path is a Homebrew symlink (/opt/homebrew/bin/codex), while ps
+    # reports argv[0] verbatim, so resolving only one side rejects a legitimate pane
+    # whenever codex ships as a cask (symlink -> versioned Caskroom path).
+    live_argv0 = command.split(" ", 1)[0]
+    try:
+        live_binary = Path(live_argv0).resolve(strict=True)
+    except OSError:
+        live_binary = None
+    if live_binary != binary:
+        raise Refusal("LIVE_BINARY_MISMATCH", live_argv0)
     required = [str(root), "--strict-config", "--sandbox", "workspace-write", "--ask-for-approval", "never",
                 "sandbox_workspace_write.network_access=false", "sandbox_workspace_write.writable_roots=[]"]
     pos = 0

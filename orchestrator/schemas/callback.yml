@@ -19,6 +19,10 @@ properties:
   parked_at: {type: [string, "null"]}
   parked_reason: {type: [string, "null"]}
   uncommitted: {type: boolean}
+  delivery_id: {type: string, description: Empty for pre-broker compatibility callbacks.}
+  physical_code_root: {type: string}
+  root_identity: {type: string}
+  prompt_sha256: {type: string}
 oneOf:
   - title: exact session and incarnation
     required: [session, incarnation]

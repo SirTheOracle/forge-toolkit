@@ -1,0 +1,56 @@
+{
+ "schema": "forge-codex-prompt-fixtures/1",
+ "cases": [
+  {
+   "name": "plain",
+   "version": "0.145.0",
+   "locale": "en-US",
+   "match": true,
+   "text": "Would you like to run the following command?\n\n  npm test\n\n› 1. Yes, proceed\n  2. No, and tell Codex what to do differently"
+  },
+  {
+   "name": "ansi",
+   "version": "0.145.0",
+   "locale": "en-US",
+   "match": true,
+   "text": "\u001b[1mWould you like to run the following command?\u001b[0m\n\n› 1. Yes, proceed\n  2. No"
+  },
+  {
+   "name": "wrapped-80",
+   "version": "0.145.0",
+   "locale": "en-US",
+   "match": true,
+   "text": "Do you want to allow this command to run?\n\n› 1. Allow, and continue\n  2. No"
+  },
+  {
+   "name": "near-miss-question",
+   "version": "0.145.0",
+   "locale": "en-US",
+   "match": false,
+   "text": "I would like to run the following command in the documentation example."
+  },
+  {
+   "name": "near-miss-numbered",
+   "version": "0.145.0",
+   "locale": "en-US",
+   "match": false,
+   "text": "1. Yes, add the unit test\n2. No, skip it"
+  },
+  {
+   "name": "unknown-version",
+   "version": "0.0.0",
+   "locale": "en-US",
+   "match": false,
+   "blocked": "classifier_unsupported",
+   "text": "Would you like to run the following command?\n\n  npm test\n\n› 1. Yes, proceed\n  2. No, and tell Codex what to do differently"
+  },
+  {
+   "name": "unknown-locale",
+   "version": "0.145.0",
+   "locale": "fr-FR",
+   "match": false,
+   "blocked": "classifier_unsupported",
+   "text": "Would you like to run the following command?\n\n  npm test\n\n› 1. Yes, proceed\n  2. No, and tell Codex what to do differently"
+  }
+ ]
+}

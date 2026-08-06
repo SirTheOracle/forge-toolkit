@@ -174,18 +174,15 @@ After completing a commit group:
      (skip if `{{e2e_command}}` is null)
 
 3. **If tests PASS:**
-   - Stage the changed files for this group: `git add <files>`
-   - Commit with the group's message (from implementation.md) or generate one:
-     ```
-     feat: <brief description of what this group does>
-
-     Applied forge-coder steps N-M from implementation.md
-     Proposal: {slug}
-     ```
-   - Report:
-     ```
-     COMMIT GROUP 1: PASS — committed as abc1234
-     ```
+   - Write the group message to `.dev/forge-tmp/commit-message.txt`.
+   - Capture `expected_head` from the current physical worktree before submitting.
+   - Invoke `forge-git-request commit` with `--root "$PROJECT_ROOT"`,
+     `--expected-head "$expected_head"`, the message file, `--`, and each group
+     path as its own literal argument. Never pass a directory, glob, or inferred path.
+   - Treat `INDEX_NOT_CLEAN`, `INDEX_UNMERGED`, `HEAD_MOVED`, `BRANCH_CHANGED`,
+     `CAPABILITY_DENIED`, and `BROKER_TIMEOUT` as typed `FORGE_BLOCKED` outcomes;
+     leave working files untouched and do not retry with broader authority.
+   - Report the commit ID returned by the broker.
 
 4. **If tests FAIL:**
    - Report the failure with full test output:

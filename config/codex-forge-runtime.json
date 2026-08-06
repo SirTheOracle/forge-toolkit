@@ -1,0 +1,121 @@
+{
+  "schema": "forge-codex-runtime/1",
+  "default_rollout": "contain",
+  "codex": {
+    "binary": "/opt/homebrew/bin/codex",
+    "supported_interactive_versions": [
+      "0.145.0",
+      "0.146.0",
+      "0.146.1"
+    ],
+    "exec_compatibility": "deferred",
+    "private_codex_home_default": false,
+    "required_flags": [
+      "-C",
+      "{physical_code_root}",
+      "--strict-config",
+      "--sandbox",
+      "workspace-write",
+      "--ask-for-approval",
+      "never",
+      "-c",
+      "sandbox_workspace_write.network_access=false",
+      "-c",
+      "sandbox_workspace_write.writable_roots=[]"
+    ]
+  },
+  "classifier": {
+    "schema": "forge-idle-prompts/2",
+    "supported_codex_versions": [
+      "0.145.0",
+      "0.146.0",
+      "0.146.1"
+    ],
+    "supported_locales": [
+      "en-US"
+    ]
+  },
+  "managed_sources": {
+    "policy": "config/codex-forge.config.toml",
+    "idle_prompts": "config/idle-prompts.yml",
+    "hooks": "config/codex-cc-hooks.json"
+  },
+  "protected_state_subdir": "forge/broker-v1",
+  "request_state_subdir": ".dev/forge-broker",
+  "max_review_input_bytes": 8388608,
+  "max_review_output_bytes": 262144,
+  "delivery_ttl_seconds": 7200,
+  "rollouts": {
+    "audit": {
+      "broker_effects": false,
+      "publish_effects": false,
+      "require_live_gates": false
+    },
+    "contain": {
+      "broker_effects": false,
+      "publish_effects": false,
+      "require_live_gates": false
+    },
+    "broker-shadow": {
+      "broker_effects": false,
+      "publish_effects": false,
+      "require_live_gates": true
+    },
+    "enforce": {
+      "broker_effects": true,
+      "publish_effects": false,
+      "require_live_gates": true
+    },
+    "publish-enabled": {
+      "broker_effects": true,
+      "publish_effects": true,
+      "require_live_gates": true
+    }
+  },
+  "stage_capabilities": {
+    "adhoc": "workspace",
+    "fix-scout": "workspace",
+    "review": "workspace",
+    "incorporate": "workspace",
+    "implementation": "workspace",
+    "impl-review": "workspace",
+    "coding": "commit",
+    "qa": "live-qa",
+    "qa-fix": "commit",
+    "fix-code": "commit",
+    "qa-retry": "live-qa",
+    "verify": "live-qa",
+    "commit-review": "materialized-review",
+    "pr-review": "publish-pr-review",
+    "fix-plan": "workspace",
+    "fix-plan-review": "workspace",
+    "fix-plan-revise": "workspace",
+    "fix-investigate": "workspace",
+    "fix-investigate-solo": "workspace",
+    "fix-plan-solo": "workspace",
+    "fix-reproduce": "workspace",
+    "fix-qa": "live-qa",
+    "fix-qa-retry": "live-qa"
+  },
+  "contain_codex_capabilities": [
+    "workspace",
+    "materialized-review"
+  ],
+  "enforce_codex_capabilities": [
+    "workspace",
+    "materialized-review",
+    "commit"
+  ],
+  "publish_codex_capabilities": [
+    "workspace",
+    "materialized-review",
+    "commit",
+    "publish-pr-review"
+  ],
+  "always_reviewed_host_capabilities": [
+    "live-qa",
+    "dependency-install",
+    "browser",
+    "network"
+  ]
+}

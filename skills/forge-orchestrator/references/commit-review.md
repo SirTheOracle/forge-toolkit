@@ -57,7 +57,9 @@ only for the criteria listed below.
 For each commit:
 
 1. Read the .review file (contains full metadata + diff)
-2. If truncated: true, run git show {commit} for full context
+2. The host-materialized diff is the only review input. Never run Git. A
+   non-complete input or digest mismatch is a typed `REVIEW_INPUT_INVALID` result
+   routed to the reviewed host lane.
 3. Review for:
    - Bugs or logic errors
    - Security issues (injection, hardcoded secrets, missing auth checks)

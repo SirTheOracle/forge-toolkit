@@ -9,7 +9,8 @@
 
 set -uo pipefail
 
-WATCH="$(cd "$(dirname "$0")/../.." && pwd)/bin/forge-watch"
+TOOLKIT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+WATCH="$TOOLKIT_ROOT/bin/forge-watch"
 WATCH_SOURCE_BEFORE="$(shasum -a 256 "$WATCH" | awk '{print $1}')"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fw-tests.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -1814,7 +1815,149 @@ else
   echo "  (skip: plugin not found)"; ok "swiftbar plugin present"; ok "swiftbar task count (skipped)"; ok "swiftbar staleness (skipped)"; ok "swiftbar icon decode (skipped)"; ok "swiftbar fallback icon (skipped)"
 fi
 
-echo "── SwiftBar plugin: in-progress episodes SB1-SB12 (hermetic) ──"                     # +16
+echo "── swiftbar-stage-visibility: pane → pipeline-stage join (T-FW-STAGE) ──"           # +8
+new_env tstage
+dispatch_log() {  # <root> <slug> <stage> <to> <ts> <session>   (open, with the ref_msg)
+  local d="$1/.dev/proposals/$2"; mkdir -p "$d"
+  cat > "$d/forge-log.yml" <<EOF
+entries:
+  - timestamp: "$5"
+    stage: $3
+    to: $4
+    session: $6
+    prompt: "Read and follow instructions in .dev/forge-tmp/$4-$3-$2.txt"
+    response: null
+EOF
+}
+ep_tag() {  # <session> <pane> -> "slug|stage|skill|stage_source" for the CURRENT episode
+  run_status --board | python3 -c '
+import json,sys
+b = json.load(sys.stdin)
+s, p = sys.argv[1], sys.argv[2]
+for e in b.get("episodes", []):
+    if e.get("session") == s and str(e.get("pane")) == p and e.get("current"):
+        print("|".join(str(e.get(k)) for k in ("slug", "stage", "skill", "stage_source")))
+        break
+else:
+    print("NO-CURRENT-EPISODE")
+' "$1" "$2"
+}
+
+# T-FW-STAGE-1 — tier 1 (exact brief match). The log's session is deliberately a DIFFERENT
+# session from the pane's, so the tier-2 (session, pane) fallback CANNOT fire: a hit here
+# proves the brief-path match did the work.
+R=$(mk_root sproj); live_session forge-1 "$R"
+dispatch_log "$R" t1slug coding claude-sonnet "$(iso_ago 300)" other-sess
+wpromptf "$R" forge-1 4 30 ptask-s1 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t1slug.txt"
+[ "$(ep_tag forge-1 4)" = "t1slug|coding|forge-coder|brief" ] \
+  && ok "T-FW-STAGE-1 tier 1: brief path match tags slug/stage/skill (cross-session)" \
+  || bad "T-FW-STAGE-1 got: $(ep_tag forge-1 4)"
+
+# T-FW-STAGE-2 — tier 2 (pane fallback) when the live prompt is a follow-up nudge, not the
+# original ref_msg. This is the common live shape (verified 2026-07-29 on feedmint p2).
+new_env tstage2
+R=$(mk_root sproj); live_session forge-1 "$R"
+dispatch_log "$R" t2slug verify codex-a "$(iso_ago 300)" forge-1
+wpromptf "$R" forge-1 2 30 ptask-s2 codex "VERIFY CYCLE 2 context - read this before working"
+[ "$(ep_tag forge-1 2)" = "t2slug|verify|adversarial-verify|pending" ] \
+  && ok "T-FW-STAGE-2 tier 2: nudge prompt falls back to the pane's live pending" \
+  || bad "T-FW-STAGE-2 got: $(ep_tag forge-1 2)"
+
+# T-FW-STAGE-3 — a superseded orphan (open entry with a strictly-newer CLOSED twin at the
+# same stage) must tag NOTHING, under either tier. A stale tag is worse than no tag.
+new_env tstage3
+R=$(mk_root sproj); live_session forge-1 "$R"
+d="$R/.dev/proposals/t3slug"; mkdir -p "$d"
+cat > "$d/forge-log.yml" <<EOF
+entries:
+  - timestamp: "$(iso_ago 900)"
+    stage: coding
+    to: claude-sonnet
+    session: forge-1
+    prompt: "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t3slug.txt"
+    response: null
+  - timestamp: "$(iso_ago 300)"
+    stage: coding
+    to: claude-sonnet
+    session: forge-1
+    prompt: "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t3slug.txt"
+    response: "FORGE_DONE: coding"
+EOF
+wpromptf "$R" forge-1 4 30 ptask-s3 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t3slug.txt"
+[ "$(ep_tag forge-1 4)" = "None|None|None|None" ] \
+  && ok "T-FW-STAGE-3 superseded orphan tags nothing (neither tier)" \
+  || bad "T-FW-STAGE-3 got: $(ep_tag forge-1 4)"
+
+# T-FW-STAGE-4 — a SETTLED episode carries no tag. Settled runs are history and their
+# stage may well be a different one; a confident wrong tag on old work is the failure mode.
+new_env tstage4
+R=$(mk_root sproj); live_session forge-1 "$R"
+dispatch_log "$R" t4slug coding claude-sonnet "$(iso_ago 900)" forge-1
+wstopf "$R" forge-1 4 700 ptask-s4 claude "all done"
+[ "$(ep_tag forge-1 4)" = "None|None|None|None" ] \
+  && ok "T-FW-STAGE-4 settled episode carries no stage tag" \
+  || bad "T-FW-STAGE-4 got: $(ep_tag forge-1 4)"
+
+# T-FW-STAGE-5 — a stage with no mapped skill still tags slug/stage; skill stays null
+# (a missing STAGE_SKILL entry must never render a wrong skill).
+new_env tstage5
+R=$(mk_root sproj); live_session forge-1 "$R"
+dispatch_log "$R" t5slug impl-review claude-opus "$(iso_ago 300)" forge-1
+wpromptf "$R" forge-1 0 30 ptask-s5 claude "Read and follow instructions in .dev/forge-tmp/claude-opus-impl-review-t5slug.txt"
+[ "$(ep_tag forge-1 0)" = "t5slug|impl-review|None|brief" ] \
+  && ok "T-FW-STAGE-5 unmapped stage → slug/stage tagged, skill null" \
+  || bad "T-FW-STAGE-5 got: $(ep_tag forge-1 0)"
+
+# T-FW-STAGE-6 — a pane with no pipeline work at all is untagged (pane 1 / the orchestrator
+# seat dispatches and never receives a pending, so this is its permanent state).
+new_env tstage6
+R=$(mk_root sproj); live_session forge-1 "$R"
+wpromptf "$R" forge-1 1 30 ptask-s6 claude "operator typed something"
+[ "$(ep_tag forge-1 1)" = "None|None|None|None" ] \
+  && ok "T-FW-STAGE-6 pane with no pending is untagged" \
+  || bad "T-FW-STAGE-6 got: $(ep_tag forge-1 1)"
+
+# T-FW-STAGE-7 — the join is read-only and cannot take down a scan: a forge-log.yml that is
+# not parseable at all must still yield a board with episodes, and no scan error.
+new_env tstage7
+R=$(mk_root sproj); live_session forge-1 "$R"
+mkdir -p "$R/.dev/proposals/t7slug"
+printf 'entries: [ this is not: valid: yaml\n  - - -\n' > "$R/.dev/proposals/t7slug/forge-log.yml"
+wpromptf "$R" forge-1 4 30 ptask-s7 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t7slug.txt"
+{ [ "$(ep_tag forge-1 4)" = "None|None|None|None" ] && ! run_status | grep -q "attention scan error"; } \
+  && ok "T-FW-STAGE-7 unparseable log → no tag, no scan error (fail-safe)" \
+  || bad "T-FW-STAGE-7 got: $(ep_tag forge-1 4) / $(run_status | grep 'scan error')"
+
+# T-FW-STAGE-8 — an UNQUOTED YAML timestamp parses as a datetime, not a str. episodes[] is
+# json.dumps'd, so it must be coerced to the canonical ...Z form (the same trap _row already
+# guards for parked_at/blocked_at) — else the board either raises or ships an unparseable
+# age the plugin renders as '?'.
+new_env tstage8
+R=$(mk_root sproj); live_session forge-1 "$R"
+d="$R/.dev/proposals/t8slug"; mkdir -p "$d"
+cat > "$d/forge-log.yml" <<EOF
+entries:
+  - timestamp: $(iso_ago 300)
+    stage: coding
+    to: claude-sonnet
+    session: forge-1
+    prompt: "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t8slug.txt"
+    response: null
+EOF
+wpromptf "$R" forge-1 4 30 ptask-s8 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t8slug.txt"
+since=$(run_status --board | python3 -c '
+import json,sys
+b = json.load(sys.stdin)
+for e in b.get("episodes", []):
+    if e.get("current") and e.get("slug") == "t8slug":
+        print(e.get("stage_since")); break
+else:
+    print("NO-TAG")')
+echo "$since" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' \
+  && ok "T-FW-STAGE-8 unquoted YAML timestamp coerced to canonical ...Z" \
+  || bad "T-FW-STAGE-8 stage_since not canonical: $since"
+
+echo "── SwiftBar plugin: in-progress episodes SB1-SB16 (hermetic) ──"                     # +21
 new_env tsb2
 PLUGIN="$(cd "$(dirname "$WATCH")/.." && pwd)/swiftbar/forge-board.5s.sh"
 if [ -f "$PLUGIN" ]; then
@@ -1845,11 +1988,13 @@ if [ -f "$PLUGIN" ]; then
   [ "${t3%% |*}" = "✓" ] && ok "SB3: legacy board → exact '✓' text" || bad "SB3 title: $t3"
   { echo "$out" | grep -q "1 task(s) in window" && ! grep -q Traceback "$WORK/sb3.err"; } && ok "SB3: legacy task line, no traceback" || bad "SB3 task line/stderr"
 
-  # SB4 — snippet pipe sanitized; exactly one | (the SwiftBar separator) on the row
+  # SB4 — snippet pipe sanitized. The snippet now lives on the '-- last:' submenu row,
+  # which carries no metadata, so a surviving raw '|' would be a SwiftBar-breaking
+  # separator on a line that has no legitimate one: assert ZERO pipes.
   EPP=$(printf '%s' "$EP1" | sed 's/building the parser/a | b/')
   out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EPP]}")
-  line=$(echo "$out" | grep "color=orange")
-  { echo "$line" | grep -q "a ¦ b" && [ "$(printf '%s' "$line" | tr -cd '|' | wc -c | tr -d ' ')" -eq 1 ]; } && ok "SB4: snippet pipe → ¦, one separator" || bad "SB4 row: $line"
+  line=$(echo "$out" | grep -- "-- last:")
+  { echo "$line" | grep -q "a ¦ b" && [ "$(printf '%s' "$line" | tr -cd '|' | wc -c | tr -d ' ')" -eq 0 ]; } && ok "SB4: snippet pipe → ¦ on the submenu row, no stray separator" || bad "SB4 row: $line"
 
   # SB5 — non-current / settled excluded; codex empty pane omits pN token
   EPA='{"episode_id":"a","session":"s-old","pane":"0","root":"/r","label":"L","agent":"claude","state":"in_progress","mid_turn":false,"turn_count":1,"current":false,"quiet_s":5,"last_at":"2026-01-01T00:00:01Z","first_at":"2026-01-01T00:00:00Z","last_snippet":""}'
@@ -1902,9 +2047,46 @@ print(json.dumps(eps))')
   out=$(sbrun "{\"schema\":\"cc-board/1\",\"hot\":[],\"active\":[{\"condition\":\"SESSION-WORKING\",\"state\":\"working\",\"session\":\"forge-1\"}],\"maintenance\":{\"collapsed\":true,\"count\":0,\"rows\":[]},\"tasks\":[],\"stale\":false,\"episodes\":[]}")
   t12=$(echo "$out" | head -1)
   { [ "${t12%% |*}" = "✓" ] && ! echo "$out" | grep -q "⚙"; } && ok "SB12: SESSION-WORKING-only → no gear (pinned exclusion)" || bad "SB12 title: $t12"
+
+  # ── swiftbar-stage-visibility: stage tag + submenu (SB13-SB16) ──
+  EPT=$(printf '%s' "$EP1" | sed 's/"last_snippet":"building the parser"/"last_snippet":"building the parser","slug":"my-slug","stage":"coding","skill":"forge-coder","stage_worker":"claude-sonnet","stage_since":"2026-01-01T00:00:00Z","stage_source":"brief"/')
+
+  # SB13 — tagged pane: stage on the parent, detail in the submenu
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EPT]}")
+  parent=$(echo "$out" | grep "^⚙ ")
+  { echo "$parent" | grep -q "forge-3 p0 · coding · quiet 2m" \
+    && echo "$out" | grep -q -- "-- pipeline: my-slug / coding" \
+    && echo "$out" | grep -q -- "-- skill: forge-coder" \
+    && echo "$out" | grep -q -- "-- last: \"building the parser\"" \
+    && echo "$out" | grep -q -- "-- 3 turn(s) · goparent-ai"; } \
+    && ok "SB13: tagged pane → stage on parent, pipeline/skill/last/turns in submenu" || bad "SB13: $out"
+  echo "$out" | grep -q -- "-- dispatched .* ago · claude-sonnet" \
+    && ok "SB13: submenu carries dispatch age + worker" || bad "SB13 dispatch row: $out"
+
+  # SB14 — untagged pane degrades: no stage segment, no submenu pipeline row, no "None"
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EP1]}")
+  parent=$(echo "$out" | grep "^⚙ ")
+  { [ "${parent%% |*}" = "⚙ forge-3 p0 · quiet 2m" ] \
+    && ! echo "$out" | grep -q -- "-- pipeline:" \
+    && ! echo "$out" | grep -q -- "-- skill:" \
+    && ! echo "$out" | grep -qi "None"; } \
+    && ok "SB14: untagged pane → clean degrade, no stage row, no 'None'" || bad "SB14: $out"
+
+  # SB15 — a stage with no mapped skill emits pipeline but NOT an empty skill row
+  EPU=$(printf '%s' "$EPT" | sed 's/"stage":"coding"/"stage":"impl-review"/; s/"skill":"forge-coder"/"skill":null/')
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EPU]}")
+  { echo "$out" | grep -q -- "-- pipeline: my-slug / impl-review" && ! echo "$out" | grep -q -- "-- skill:"; } \
+    && ok "SB15: unmapped stage → pipeline row, skill row omitted" || bad "SB15: $out"
+
+  # SB16 — slug/stage go through esc(): a pipe in either must not split the line
+  EPV=$(printf '%s' "$EPT" | sed 's/"slug":"my-slug"/"slug":"a|b"/')
+  out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EPV]}")
+  line=$(echo "$out" | grep -- "-- pipeline:")
+  { echo "$line" | grep -q "a¦b" && [ "$(printf '%s' "$line" | tr -cd '|' | wc -c | tr -d ' ')" -eq 1 ]; } \
+    && ok "SB16: slug pipe → ¦, one separator on the pipeline row" || bad "SB16 row: $line"
 else
   echo "  (skip: plugin not found)"
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do ok "swiftbar in-progress (skipped)"; done
+  for i in $(seq 1 21); do ok "swiftbar in-progress (skipped)"; done
 fi
 
 echo "── CODEX-EMISSION-OFF: marker + no codex signal → maintenance; codex fire clears ──"  # +2
@@ -2598,6 +2780,16 @@ after=$(find "$R/.dev" -type f | sort | xargs shasum -a 256 2>/dev/null | shasum
   && ok "T-FW-READONLY the watcher wrote nothing under .dev/ with usage files present" \
   || bad "T-FW-READONLY the watcher mutated project .dev/"
 
+echo "── Codex approval fixture contract ──"
+python3 - "$TOOLKIT_ROOT/config/idle-prompts.yml" "$TOOLKIT_ROOT/tests/forge-watch/fixtures/codex-approval-prompts.json" <<'PY' && ok "all classifier fixtures" || bad "classifier fixture mismatch"
+import json,re,sys,yaml
+cfg=yaml.safe_load(open(sys.argv[1])); cases=json.load(open(sys.argv[2]))['cases']
+ansi=re.compile(r'\x1b\[[0-9;]*[A-Za-z]'); rx=re.compile(cfg['codex-a']['approval_prompt'])
+for c in cases:
+ supported=c['version'] in cfg['supported']['codex_versions'] and c['locale'] in cfg['supported']['locales']
+ got=supported and bool(rx.search(ansi.sub('',c['text'])))
+ assert got is c['match'],(c['name'],got)
+PY
 WATCH_SOURCE_AFTER="$(shasum -a 256 "$WATCH" | awk '{print $1}')"
 [ "$WATCH_SOURCE_BEFORE" = "$WATCH_SOURCE_AFTER" ] \
   && ok "W19 watcher product source hash unchanged during P1-WC compatibility run" \

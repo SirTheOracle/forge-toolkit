@@ -39,8 +39,13 @@ What happens:
    `~/.claude/skills/forge-orchestrator/SKILL.md` into pane 1. You now
    **are** the in-pane orchestrator; there is no hidden background agent
    and no forwarding layer.
-4. The orchestrator seeds itself with the original request, project root,
-   tmux session, and `.dev/forge-tmp/orchestrator-events.log`.
+4. The orchestrator seeds itself with the canonical intent, the verbatim
+   user line, the **physical code root** (`git rev-parse --show-toplevel`
+   for this pane), the `root_identity` and `git_common_dir` values from
+   `preflight`, the `host_session` from `identity`, and
+   `.dev/forge-tmp/orchestrator-events.log`. The seed also states the
+   standing requirement: every mutating dispatch must carry matching
+   structured delivery fields — a prose-only root is invalid.
 5. It runs Hard Rule 0 first (`~/bin/forge-bridge identity` — a live host
    probe, **no** `TMUX_SESSION` export; HALT unless `identity_state=MATCH`),
    then `preflight` + `health` (Hard Rule 18), then enters the requested mode.
@@ -51,7 +56,7 @@ What happens:
 |---|---|
 | `/forge pipeline <slug>` | Load the in-pane orchestrator and enter Pipeline Mode |
 | `/forge start pipeline <slug>` | Same as `/forge pipeline <slug>` |
-| `/forge fix-pipeline <slug> [--reproduce]` | Load the orchestrator and enter Fix Pipeline Mode |
+| `/forge fix-pipeline <slug> [--reproduce]` | Load the orchestrator and enter Fix Pipeline Mode (including the investigate↔fix-plan alternation tracked in `.dev/.forge-fix-alternation`) |
 | `/forge resume <slug>` | Load the in-pane orchestrator with the resume preamble (cd, `identity` (confirm `MATCH`), preflight, context, inspect pending callback, resume `wait` or dispatch next) |
 | `/forge status` | Local: runs `~/bin/forge-bridge status` and prints verbatim |
 | `/forge pause` | In-pane pause: stop dispatching, leave callbacks intact, print bridge status, explain `/forge resume <slug>` |
@@ -125,6 +130,30 @@ never lock and can run in parallel across worktrees.
 For dispatched infra stages, the orchestrator acquires before dispatch
 and releases only after terminal `DONE` or `ERROR`. It intentionally holds
 the lock through `PROMPTING`, `STALLED`, `TIMEOUT`, `DEAD`, and `BLOCKED`.
+
+### Capability routing on `coding`
+
+`coding` is capability-routed in the **current physical worktree**. Before
+every mutating dispatch the orchestrator runs `identity`, a worktree-aware
+`preflight`, `health`, and `forge codex-lane --root <physical-root> --stage
+coding`. A linked worktree is a valid, distinct root even though it shares a
+Git common dir with the main checkout. In `contain` and `broker-shadow` the
+`commit` capability routes to `reviewed-host`; in `enforce` Codex may edit
+while the exact-path broker owns the commit. Workers never run direct Git
+mutations.
+
+### Planning a batch
+
+Before handing out two or more tasks, run `~/bin/forge-bridge usage --refresh`
+once and keep the snapshot with the plan — it live-measures all four workers
+plus pane 1 and prints a per-worker recommendation. A single dispatch does not
+need it; the dispatch-time gate is strictly stronger.
+
+### Batch end
+
+The completion summary runs `forge parked --root <root> --session <session>`.
+Exit 10 means parked or blocked residue remains — report the run **INCOMPLETE**
+and enumerate the items rather than calling it done.
 
 ### Status messages between stages
 
@@ -220,8 +249,11 @@ Core commands for "what's going on right now":
 | `~/bin/forge-bridge health` | Per-pane check: do all 5 panes exist and run the expected worker process? Exits 0 only when every pane is `OK`. Output lines: `OK \| DEAD \| WRONG_PROCESS \| UNKNOWN pane=<name> idx=<n> …` and a `SUMMARY` line |
 | `~/bin/forge-bridge preflight` | Kickoff snapshot: pwd, branch, merge state, halt status code |
 | `~/bin/forge-bridge history [lines]` / `pipeline-log <slug> [lines]` | Recent activity across all pipelines / detail for one pipeline |
-| `~/bin/forge-bridge usage [<worker>]` | Per-worker usage snapshot recorded at each task completion: normalized `headroom` (0-100 = % capacity remaining) + `confidence`. Claude parses `ctx: Nk (P%)`; Codex parses `Context N% left` when rendered. A valid anchor for either provider publishes normalized numeric headroom with `confidence=high`; missing or malformed input remains `unknown` and never means safe or exhausted. Read-only — observation never authorizes clearing or compaction |
+| `~/bin/forge-bridge usage [<worker>] [--refresh] [--json]` | Per-worker usage snapshot recorded at each task completion: normalized `headroom` (0-100 = % capacity remaining) + `confidence`. Claude parses `ctx: Nk (P%)`; Codex parses `Context N% left` when rendered. A valid anchor for either provider publishes normalized numeric headroom with `confidence=high`; missing or malformed input remains `unknown` and never means safe or exhausted. Plain form is read-only — observation never authorizes clearing or compaction. `--refresh` live-measures the four workers and pane 1 first; `--json` adds a per-worker `recommendation`. See "Active context management" below |
+| `~/bin/forge-bridge reset-idle --worker <w>` | Reset an idle worker off the dispatch critical path. Refuses on an open pending, non-idle health, a terminal state, `observe` mode, and pane 1 |
 | `~/bin/forge-bridge infra-lock status` | Whether the global infra lock is free, held live, stale, foreign-host, or corrupt |
+| `~/bin/forge-bridge hygiene-status` | Show hygiene mode, reset capability, thresholds, residue, terminal state, and activation blockers |
+| `~/bin/forge-bridge hygiene-gc [--days N] [--dry-run]` | Conservatively inspect or reap old terminal journals from dead sessions |
 | `~/bin/forge-bridge identity` | Host/target session descriptor — `host_session`, `target_session`, `identity_state`. Exits 0 on `MATCH`/`CROSS_SESSION_DECLARED`, 3 otherwise. Run first when a pane "looks wrong" (Hard Rule 0) |
 | `~/bin/forge-bridge blocked-audit [--root <path>] [--json]` | Read-only census of BLOCKED/PARKED callbacks, half-parked records, duplicate open pendings, and stale state keys. **MUTATES NOTHING** — the diagnostic for "what's still holding this pipeline open" |
 
@@ -574,6 +606,18 @@ legitimately-long stages. Coding and QA typically need more than the
 default 600s. See `references/stall-detection.md` for the per-stage
 timeout table.
 
+Alongside `STATUS` / `STAGE` / `SLUG` / `WORKER` / `CALLBACK`, `wait` also
+prints `CALLBACK_ID` and `PENDING_TIMESTAMP` — pass both to
+`verify-decision` when closing a clean verify.
+
+**Delivery binding on resume.** Every dispatch is registered with the
+root-scoped broker and stamped with a `delivery_id` on both the pending log
+entry and the callback. A callback that does not match the selected pending
+entry is refused as `CALLBACK_IDENTITY_CHANGED` rather than silently
+accepted — inspect the artifact and the current forge log instead of
+replaying the status line. Pre-broker entries carry a blank `delivery_id`
+and remain closable.
+
 For infra stages, `PROMPTING`, `STALLED`, `TIMEOUT`, `DEAD`, and `BLOCKED`
 are all non-terminal; the lock stays held unless the operator explicitly
 aborts and safely force-releases.
@@ -600,6 +644,65 @@ Fix:
    recreate the Forge session at an approved boundary; do not treat the stale
    marker as a routing instruction.
 <!-- docs-refresh:end section=recovery -->
+
+## Codex containment and rollout
+
+The default is `contain`. New panes use the pinned 0.145.0 interactive binary
+and explicit Never/workspace-write/network-off/empty-extra-roots flags. The
+current file credential store means private `CODEX_HOME`, unattended default,
+and authentication isolation remain **unproven**; do not enable them merely
+because aggregate `codex doctor` exits zero or nonzero. Read the named approval,
+filesystem, network, cwd, version, auth, and live-canary fields independently.
+The installed `codex-forge.config.toml` is a desired-policy/hash reference; the
+interactive client does not load it as an isolated home. `codex-doctor` therefore
+also reports the ambient config path and MCP count instead of implying they were
+removed. Explicit launch flags define contain mode, while any unknown or changed
+ambient surface keeps effectful and unattended gates closed.
+
+Lane matrix: workspace and materialized review may use Codex in contain;
+commit and publish require protected broker gates; dependency/browser/network/
+live-QA stay reviewed-host. `broker-shadow` validates without effects,
+`enforce` enables exact-path commit, and `publish-enabled` separately enables
+idempotent review publication. Restart mixed old panes before changing state.
+
+### G-B re-home runbook
+
+1. Freeze deliveries and wait for a terminal callback.
+2. Record both physical roots, Git dirs/common dir, branches, full heads,
+   ahead/behind, porcelain-v2, staged/unmerged state, delivery IDs, callbacks,
+   and locks. Run `forge rehome-audit` and stop on any refusal.
+3. Explicitly enumerate handoff artifacts; never copy arbitrary untracked data.
+4. Start the destination-root session, verify identity/preflight/health/doctor/
+   broker, and run a no-write delivery canary.
+5. Terminalize the source only after the exact canary callback, then resume from
+   the recorded destination envelope.
+
+`STATUS: needs_permission` is non-terminal. Keep the infra lock and answer in
+the pane or explicitly move to the recovery lane; do not widen allowlists.
+Rollback first disables effects/publishing, drains the broker, restores any
+prepared index backup, preserves journals, restarts at a clean boundary in
+contain, and keeps unsupported work on the reviewed host lane.
+
+Inspect the root-scoped broker with `forge codex-broker status --root <worktree>`.
+If `status` or `start` reports an uninitialized broker state (including a
+parseable `pid.json` without `pid`), run `forge codex-broker start --root
+<worktree> --session <live-session> --incarnation <session-created> --mode
+contain` from the destination root. `start` validates the live broker lock and
+recreates the runtime record; do not repair `pid.json` by hand or use a
+`--dry-run` send as a substitute.
+Before changing rollout mode, replacing a session incarnation, or completing a
+rollback, use `forge codex-broker stop --root <worktree>`; stop is authenticated,
+drains claimed work, and prevents a live daemon from being silently reused under
+a different session or mode. Its server-authenticated loopback control channel
+is reachable by the host lane, not by network-denied Codex panes. Files under
+`.dev/forge-broker/requests` cannot authorize a commit or publication; a future
+Codex mutation lane stays closed until it has a separately proven origin-bound
+request transport.
+
+Callbacks are accepted only after their delivery-bound artifact matches the
+selected pipeline entry. A replayed callback ID, an old callback timestamp, or a
+different `delivery_id` is reported as `CALLBACK_IDENTITY_CHANGED`; inspect the
+artifact and current Forge log rather than replaying the status line.
 
 ## Multi-Worktree Concurrency
 

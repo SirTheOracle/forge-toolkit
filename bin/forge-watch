@@ -495,6 +495,7 @@ def _read_log_entries(root, path):
             unc = grab('uncommitted')
             entries.append({'timestamp': ts, 'stage': grab('stage'),
                             'to': grab('to'), 'response': resp,
+                            'prompt': grab('prompt'),
                             'session': grab('session'),
                             'incarnation': grab('incarnation'),
                             'parked_at': grab('parked_at'),
@@ -511,6 +512,9 @@ def _read_log_entries(root, path):
             out.append({'stage': e.get('stage'), 'to': e.get('to'),
                         'timestamp': e.get('timestamp'),
                         'response': e.get('response'),
+                        # swiftbar-stage-visibility: the dispatch ref_msg, carried so the
+                        # pane→stage join can match it against a worker's prompt_snippet.
+                        'prompt': e.get('prompt'),
                         'session': e.get('session'),
                         'incarnation': e.get('incarnation'),
                         'parked_at': e.get('parked_at'),
@@ -568,7 +572,7 @@ def parse_callback(path):
     d['_path'] = path
     d['_filename'] = os.path.basename(path)
     # CALLBACK_SCHEMA_LOCKSTEP forge-watch known
-    known = {'slug','stage','status','worker','session','incarnation','origin','callback_id','timestamp','selected_pending_timestamp','message','parked_at','parked_reason','uncommitted'}
+    known = {'slug','stage','status','worker','session','incarnation','origin','callback_id','timestamp','selected_pending_timestamp','message','parked_at','parked_reason','uncommitted','delivery_id','physical_code_root','root_identity','prompt_sha256'}
     # CALLBACK_SCHEMA_LOCKSTEP forge-watch required
     required = {'slug','stage','status','worker','callback_id','timestamp','message'}
     d['_unknown_headers'] = sorted(k for k in d if not k.startswith('_') and k not in known)
@@ -609,6 +613,11 @@ def parse_callback(path):
 # policy: 'standard' (backoff), 'daily' (>=24h), 'never' (status-only)
 findings = []  # dict: condition, root, key, policy, session, slug, stage, msg
 RESOLVED_STAGES_BY_ROOT = {}  # root -> set of (slug, stage) fully resolved in forge-log
+# swiftbar-stage-visibility: root -> {'brief': {basename: rec}, 'pane': {(sess,pane): rec}}.
+# Built by scan_root, consumed by scan_attention (a SEPARATE top-level function, run after
+# scan_root for the same root). Absent key => no stage tags for that root, which is the
+# correct fail-safe: scan_root raising must never make scan_attention invent a stage.
+STAGE_INDEX_BY_ROOT = {}
                               # (>=1 entry, all closed, cleanly parsed). Published by
                               # scan_root; read by scan_attention (C4 NEEDS-ASK suppress).
 TASKS = []     # cc-board/1 tasks[] projection (Step 3): read-time fold, no ledger
@@ -633,6 +642,79 @@ def root_label(root):
     return os.path.basename(root.rstrip('/')) or root
 
 QA_FAMILY = {'qa', 'qa-fix', 'qa-retry'}
+
+# ── swiftbar-stage-visibility: pane → pipeline-stage join ────────────────────
+# LOCKSTEP: this is the sixth copy of the bridge alias map (see the lockstep note at
+# bin/forge-bridge pane_index()). `forge-bridge alias-self-test --strict` parses THIS
+# file and verifies the table below against the bash source — do not edit one without
+# the other. Canonical names only: the pending log's `to:` is always $worker_canonical
+# (bin/forge-bridge cmd_dispatch → cmd_log), so no alias resolution is needed here.
+NAME_TO_IDX = {'claude-opus': 0, 'claude': 1, 'codex-a': 2, 'codex-b': 3,
+               'claude-sonnet': 4}
+
+# Stage → the skill that stage runs. Derived from ~/.config/forge/prompts/*.txt and the
+# Execution Model Reference in skills/forge-orchestrator/SKILL.md. Stages with no distinct
+# skill (review, incorporate, impl-review, qa-fix, fix-scout, env-fix, *-solo) are
+# deliberately ABSENT — a missing entry renders no skill row, never a wrong one.
+STAGE_SKILL = {
+    'proposal': 'adversarial-proposal',      'proposal-lite': 'adversarial-lite',
+    'implementation': 'adversarial-implementation',
+    'coding': 'forge-coder',                 'coding-fix': 'forge-coder',
+    'qa': 'adversarial-qa',                  'qa-retry': 'adversarial-qa',
+    'qa-live-retry': 'adversarial-qa',       'verify': 'adversarial-verify',
+    'fix-reproduce': 'fix-reproducer',       'fix-investigate': 'adversarial-investigate',
+    'fix-plan': 'adversarial-fix-plan',      'fix-plan-review': 'fix-plan-reviewer',
+    'fix-plan-revise': 'adversarial-fix-plan', 'fix-code': 'fix-coder',
+    'fix-qa': 'adversarial-fix-qa',          'fix-qa-retry': 'adversarial-fix-qa',
+}
+
+# The dispatch ref_msg is "Read and follow [the ]instructions in .dev/forge-tmp/<w>-<stage>-<slug>.txt"
+# (bin/forge-bridge cmd_dispatch). Key on the PATH TOKEN only — the surrounding sentence
+# varies (the amend path says "follow the instructions"), and the basename is the exact
+# string both the pending log and the worker's prompt_snippet carry.
+_BRIEF_RE = re.compile(r'\.dev/forge-tmp/([^\s/"\']+\.txt)')
+
+def _iso(v):
+    """Canonical ...Z string for a log timestamp. An UNQUOTED YAML timestamp parses as a
+    datetime, and episodes[] is json.dumps'd — bare str() would ship '2026-07-29 23:00:00
+    +00:00', which the plugin's h_iso_age cannot parse (renders '?'). Same coercion _row
+    applies to parked_at/blocked_at, for the same reason."""
+    if v is None:
+        return ''
+    if hasattr(v, 'strftime'):
+        return v.strftime('%Y-%m-%dT%H:%M:%SZ')
+    return str(v)
+
+def brief_basename(text):
+    """The forge-tmp brief filename referenced by a dispatch prompt, else None."""
+    if not text or not isinstance(text, str):
+        return None
+    m = _BRIEF_RE.search(text)
+    return m.group(1) if m else None
+
+def episode_stage(root, ep_session, ep_pane, prompts):
+    """Stage record for a pane's CURRENT episode, or None. `prompts` is the episode's
+    candidate dispatch prompts, newest first.
+
+    Tier 1 — an exact match between a prompt's `.dev/forge-tmp/<brief>.txt` token and an
+    OPEN pending's own prompt. This is proof of provenance, not a guess, so it carries no
+    age bound. Tier 2 — the pane's newest live pending, for episodes that split off the
+    dispatch turn. Never raises: a stage tag is decoration, and must not be able to take
+    down a scan."""
+    try:
+        idx = STAGE_INDEX_BY_ROOT.get(root) or {}
+        brief_index = idx.get('brief') or {}
+        for text in prompts:
+            bn = brief_basename(text)
+            if bn and bn in brief_index:
+                r = dict(brief_index[bn]); r['stage_source'] = 'brief'
+                return r
+        r = (idx.get('pane') or {}).get((str(ep_session or ''), str(ep_pane)))
+        if r is not None:
+            r = dict(r); r['stage_source'] = 'pending'
+        return r
+    except Exception:
+        return None
 
 def scan_root(root):
     dev = os.path.join(root, '.dev')
@@ -678,6 +760,45 @@ def scan_root(root):
     # Published AFTER the loop so a mid-loop throw leaves the key absent -> no
     # suppression (fail-safe: keep alerting).
     RESOLVED_STAGES_BY_ROOT[root] = resolved_stages
+
+    # --- swiftbar-stage-visibility: two indexes for the pane → stage join ---
+    # Both are built ONLY from open (response: null) pendings, and both exclude superseded
+    # orphans — an open pending whose (slug, stage) has a strictly-newer CLOSED dispatch,
+    # the same filter has_live_pending uses. A stale tag is worse than no tag.
+    brief_index = {}      # forge-tmp basename -> stage record (tier 1, exact)
+    pane_stage = {}       # (session, str(pane_idx)) -> stage record (tier 2, fallback)
+    for slug, pend in open_by_slug.items():
+        for p in pend:
+            stage = p.get('stage')
+            ts = _iso(p.get('timestamp'))
+            cmax = closed_max_ts.get((slug, stage))
+            if cmax and ts and cmax > ts:
+                continue                       # superseded orphan — not a live stage
+            rec = {'slug': slug, 'stage': stage, 'stage_worker': (p.get('to') or '') or None,
+                   'stage_since': ts or None}
+            bn = brief_basename(p.get('prompt'))
+            if bn:
+                cur = brief_index.get(bn)      # newest wins on the (rare) basename reuse
+                if cur is None or ts > (cur.get('stage_since') or ''):
+                    brief_index[bn] = rec
+            # tier 2 keys on the pane the dispatch targeted. Abandoned residue (>ZOMBIE_AGE_S)
+            # is dropped: tier 1 has no age bound because an exact brief match is proof of
+            # provenance, but a pane-level guess off a week-old pending is not.
+            idx = NAME_TO_IDX.get((p.get('to') or '').strip())
+            sess = (p.get('session') or '').strip()
+            if idx is None or not sess or sess == 'unknown':
+                continue
+            a = age_s(ts)
+            if a is not None and a > ZOMBIE_AGE_S:
+                continue
+            key = (sess, str(idx))
+            cur = pane_stage.get(key)
+            if cur is None or ts > (cur.get('stage_since') or ''):
+                pane_stage[key] = rec
+
+    # Published only after both indexes are fully built (mirrors the RESOLVED_STAGES_BY_ROOT
+    # discipline above): a mid-loop throw leaves the key absent, so nothing gets tagged.
+    STAGE_INDEX_BY_ROOT[root] = {'brief': brief_index, 'pane': pane_stage}
 
     def has_open_pending(slug, stage=None):
         pend = open_by_slug.get(slug, [])
@@ -1306,6 +1427,12 @@ def scan_attention(root, label):
             worker_perms.append(rec); continue
         ev = rec.get('event') or ''
         sess = rec.get('session')
+        if ev in {'BROKER_REGISTRATION_FAILED', 'BROKER_DEAD', 'ATTESTATION_FAILED', 'LANE_REQUIRED'}:
+            add_finding('CONTROL-PLANE', rec.get('physical_code_root') or '',
+                        f"{sess or 'no-session'}\t{rec.get('delivery_id') or rec.get('timestamp')}",
+                        f"{ev} · {sess or 'no-session'} · {rec.get('stage') or 'unknown-stage'}",
+                        session=sess)
+            continue
         if ev == 'ask':
             asks.append(rec)          # session OPTIONAL: an ask stays surfaced
             continue                  # even when fired outside tmux
@@ -1533,7 +1660,26 @@ def scan_attention(root, label):
             quiet = (NOW - last).total_seconds()
             ep_state = 'in_progress' if (cur and (mid or quiet < EPISODE_SETTLE_S)) else 'settled'
             ep_id = f"{sess}|p{pane}|{ep_start.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+            # swiftbar-stage-visibility: tag the CURRENT episode with its pipeline stage.
+            # Settled runs are history — their stage may well be a different one, and a
+            # confident wrong tag on old work is the failure mode to avoid. Candidates are
+            # newest-first: the live wprompt, then each turn's recovered prompt_snippet.
+            # Gate on in_progress, NOT merely on `current`: a pane's newest run can be
+            # current AND settled (quiet past SETTLE with its pending still open, e.g. the
+            # worker finished but the callback is unconsumed). Tagging that reads as "still
+            # running this stage" on the `forge tasks` episode header, which is exactly the
+            # confident-wrong-tag failure this join is supposed to avoid.
+            stg = None
+            if cur and ep_state == 'in_progress':
+                cands = [wp.get('prompt_snippet')] if wp else []
+                cands += [w.get('prompt_snippet') for _, w in run]
+                stg = episode_stage(root, sess, pane, cands)
             episodes.append({'episode_id': ep_id,
+                'slug': (stg or {}).get('slug'), 'stage': (stg or {}).get('stage'),
+                'skill': STAGE_SKILL.get((stg or {}).get('stage')),
+                'stage_worker': (stg or {}).get('stage_worker'),
+                'stage_since': (stg or {}).get('stage_since'),
+                'stage_source': (stg or {}).get('stage_source'),
                 'session': sess, 'pane': pane, 'root': root, 'label': label, 'agent': agent,
                 'state': ep_state, 'mid_turn': mid, 'turn_count': turn_count, 'current': cur,
                 'dispatch_id': (wp.get('dispatch_id') if (cur and wp) else None),  # for Step 4
@@ -1558,8 +1704,13 @@ def scan_attention(root, label):
         wat = parse_iso(ws.get('emitted_at')) if ws else None
         if wat is not None and pat is not None and wat > pat:
             continue
-        add_finding('NEEDS-PERMISSION', root, f"{sess}\tp{pane}\t{pr.get('command_hash','')}",
-                    f"{label} · {sess} p{pane} — {perm_detail(pr)}", session=sess)
+        delivery_id = pr.get('delivery_id') or 'legacy'
+        key = f"{sess}\tp{pane}\t{delivery_id}\t{pr.get('command_hash','')}"
+        f = add_finding('NEEDS-PERMISSION', root, key,
+                        f"{label} · {sess} p{pane} — {perm_detail(pr)}", session=sess)
+        f.update(delivery_id=pr.get('delivery_id'), incarnation=pr.get('session_incarnation'),
+                 slug=pr.get('slug'), stage=pr.get('stage'), source=pr.get('source') or 'hook',
+                 capability_class=pr.get('capability_class'), root_identity=pr.get('root_identity'))
     # ── episode conditions (Step 3): CURRENT run per pane only. Settled history lives in
     # episodes[] and task tags, never as board conditions (emitting it would recreate the
     # per-turn row pile). msgs carry ONLY episode-stable fields (turn_count + snippet) — NO

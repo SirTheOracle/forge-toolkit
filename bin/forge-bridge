@@ -83,6 +83,7 @@ FORGE_HYGIENE_LOCK_WAIT_S="${FORGE_HYGIENE_LOCK_WAIT_S:-5}"
 FORGE_WORKER_MIN_HEADROOM="${FORGE_WORKER_MIN_HEADROOM:-75}"
 # Capability/anchor fixture path (data-driven; never hard-coded).
 FORGE_RESET_CAPABILITY_FILE="${FORGE_RESET_CAPABILITY_FILE:-$HOME/.config/forge/reset-capability.yml}"
+FORGE_BROKER_BIN="${FORGE_BROKER_BIN:-forge-broker}"
 
 # ---- Active-context-management controls (S11) ----
 # FIVE knobs, FIVE different questions. The GATE threshold above is UNTOUCHED; nothing
@@ -134,35 +135,36 @@ EOF
     return 0
 }
 
-# ---- Canonical project-root ownership (session-pin hardening §3.0) ----
-# ownership_root <dir> — THE one root function, applied identically to every operand
-# of every root comparison (fixes the realpath-vs-logical asymmetry; tolerates
-# subdir-created sessions + symlinks). Walks up from realpath(dir) to the nearest
-# .claude/forge-project.yml; anchors on that dir's configured forge.expected_root if
-# non-empty, else the yml dir; else dir itself. Returns pwd -P so BOTH operands
-# canonicalize the same way. bash-3.2-safe. Never applies the name charset guard to a PATH.
+# Physical ownership and configured validation are deliberately separate. Two linked
+# worktrees share a common dir but never share an ownership root or delivery identity.
 ownership_root() {
-    local dir="$1" real anchor y ydir expected
+    local dir="$1" real top
     [ -n "$dir" ] || return 1
-    real="$(cd "$dir" 2>/dev/null && pwd -P)" || real="$dir"
-    ydir="$real"
-    while [ "$ydir" != "/" ] && [ -n "$ydir" ]; do
-        if [ -f "$ydir/.claude/forge-project.yml" ]; then y="$ydir/.claude/forge-project.yml"; break; fi
-        ydir="$(dirname "$ydir")"
-    done
-    if [ -n "${y:-}" ]; then
-        expected="$(python3 -c "
-import yaml
-try:
-    with open('$y') as f: d=yaml.safe_load(f) or {}
-    print((d.get('forge',{}) or {}).get('expected_root','') or '')
-except Exception: pass
-" 2>/dev/null)"
-        if [ -n "$expected" ]; then anchor="$expected"; else anchor="$(dirname "$(dirname "$y")")"; fi
-    else
-        anchor="$real"
-    fi
-    (cd "$anchor" 2>/dev/null && pwd -P) || printf '%s' "$anchor"
+    real="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
+    top="$(git -C "$real" rev-parse --show-toplevel 2>/dev/null)" || top="$real"
+    (cd "$top" 2>/dev/null && pwd -P) || return 1
+}
+
+expected_root_for() {
+    local physical="$1" y="$1/.claude/forge-project.yml"
+    python3 - "$physical" "$y" <<'PY'
+import os,sys,yaml
+physical,y=sys.argv[1:]
+try: raw=str(((yaml.safe_load(open(y)) or {}).get('forge') or {}).get('expected_root') or '')
+except Exception: raw=''
+if not raw: raw=physical
+if not os.path.isabs(raw): raw=os.path.join(physical,raw)
+print(os.path.realpath(raw))
+PY
+}
+
+root_identity() {
+    local root; root="$(ownership_root "$1")" || return 1
+    local gitdir; gitdir="$(git -C "$root" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+    python3 - "$root" "$gitdir" <<'PY'
+import hashlib,sys
+print(hashlib.sha256((sys.argv[1]+'\0'+sys.argv[2]).encode()).hexdigest())
+PY
 }
 
 # _same_root_sessions <dir> — list every LIVE session whose ownership_root equals
@@ -267,7 +269,8 @@ _forge_identity() {
                 ID_target_root="$ID_host_root"
                 if [ -n "$ID_host_root" ] && [ -n "$cwd_root" ] && [ "$ID_host_root" != "$cwd_root" ]; then
                     ID_state="MISMATCH"          # wrong checkout / nested tmux / wandered cwd
-                elif [ -n "$env_stamp" ] && [ "$env_stamp" != "$ID_host_session" ]; then
+                elif [ -n "$env_stamp" ] && [ "$env_stamp" != "$ID_host_session" ] \
+                     && [ "${FORGE_IDENTITY_IGNORE_ENV_STAMP:-0}" != "1" ]; then
                     ID_state="MISMATCH"          # env stamp ≠ probed host (incident replay; MINOR-1)
                 else
                     ID_state="MATCH"
@@ -2315,9 +2318,18 @@ cmd_log() {
     local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
 
     local incarnation="${ID_host_incarnation:-}"
+    local delivery_id="${FORGE_DELIVERY_ID:-}" physical_code_root="${FORGE_PHYSICAL_CODE_ROOT:-}"
+    local root_identity="${FORGE_ROOT_IDENTITY:-}" capability_class="${FORGE_CAPABILITY_CLASS:-}"
+    local delivery_lane="${FORGE_DELIVERY_LANE:-}" prompt_sha256="${FORGE_PROMPT_SHA256:-}"
     cat >> "$pipeline_log" << EOF
 
   - timestamp: "$ts"
+    delivery_id: $delivery_id
+    physical_code_root: $physical_code_root
+    root_identity: $root_identity
+    capability_class: $capability_class
+    lane: $delivery_lane
+    prompt_sha256: $prompt_sha256
     stage: $stage
     from: $from
     to: $to
@@ -2868,6 +2880,32 @@ print(ts)
 PY
 }
 
+# Recover the owning session/incarnation for a callback whose caller could not
+# resolve tmux identity (codex panes / Agent-Teams subagents run without a
+# usable TMUX_PANE). The orchestrator stamped both onto the pending at dispatch
+# time from a pane that DID resolve, so the dispatch record -- not the worker's
+# ambient environment -- is the authority on which session owns this work.
+#
+# Deliberately mirrors _callback_pending_select_exact's cardinality rule: adopt
+# only on exactly one open (stage, worker) pending carrying a complete identity.
+# 0 or >1 exits non-zero and the caller refuses, so two sessions each holding a
+# pending for the same stage+worker can never be silently collapsed.
+_callback_pending_adopt_identity() {   # <log> <stage> <worker>  -> "<session>\t<incarnation>"
+    python3 - "$@" <<'PY'
+import sys, yaml
+path, stage, worker = sys.argv[1:4]
+aliases={'inline':'claude-opus','general':'claude-opus','claude-general':'claude-opus','opus':'claude-opus','codex':'codex-a','orchestrator':'claude','claude-orchestrator':'claude','sonnet':'claude-sonnet'}
+canonical=lambda value: aliases.get(value,value)
+try: entries=(yaml.safe_load(open(path)) or {}).get('entries') or []
+except Exception as exc: print('CALLBACK_PENDING_INVALID:'+str(exc),file=sys.stderr); sys.exit(3)
+c=[e for e in entries if isinstance(e,dict) and e.get('response') is None and e.get('stage')==stage and canonical(str(e.get('to') or ''))==worker and str(e.get('session') or '') and str(e.get('incarnation') or '')]
+if len(c)!=1:
+    print('CALLBACK_IDENTITY_UNADOPTABLE: open pending cardinality='+str(len(c)),file=sys.stderr)
+    sys.exit(2)
+print(str(c[0].get('session'))+'\t'+str(c[0].get('incarnation')))
+PY
+}
+
 _callback_mutation_select() {   # <cb_dir> <slug> <stage> <session> <incarnation> <statuses> <log>
     local cb_dir="$1" slug="$2" stage="$3" session="$4" incarnation="$5" statuses="$6" plog="$7"
     local cb_file scan_rc=0
@@ -2913,6 +2951,8 @@ if len(pending)!=1:
     print('CALLBACK_IDENTITY_AMBIGUOUS: pending cardinality='+str(len(pending)),file=sys.stderr); sys.exit(2)
 selected=str(pending[0].get('timestamp') or '')
 if not selected: print('CALLBACK_IDENTITY_CHANGED: pending timestamp missing',file=sys.stderr); sys.exit(3)
+if str(pending[0].get('delivery_id') or '') != str(cb.get('delivery_id') or ''):
+    print('CALLBACK_IDENTITY_CHANGED: delivery_id mismatch',file=sys.stderr); sys.exit(2)
 fields=[cbf,status,str(cb.get('callback_id') or ''),selected,cb_s,cb_i,str(cb.get('origin') or ''),hashlib.sha256(raw).hexdigest()]
 if not fields[2]: print('CALLBACK_HEADER_INVALID: callback_id missing',file=sys.stderr); sys.exit(3)
 print('|'.join(fields))
@@ -2967,6 +3007,8 @@ bound=[e for e in entries if isinstance(e,dict) and e.get('stage')==stage
        and str(e.get('timestamp') or '')==selected]
 if len(bound)!=1:
     print('CALLBACK_IDENTITY_AMBIGUOUS: bound cardinality='+str(len(bound)),file=sys.stderr); sys.exit(2)
+if str(bound[0].get('delivery_id') or '') != str(cb.get('delivery_id') or ''):
+    print('CALLBACK_IDENTITY_CHANGED: delivery_id mismatch',file=sys.stderr); sys.exit(2)
 fields=[cbf,status,str(cb.get('callback_id') or ''),selected,cb_s,cb_i,str(cb.get('origin') or ''),hashlib.sha256(raw).hexdigest()]
 if not fields[2]: print('CALLBACK_HEADER_INVALID: callback_id missing',file=sys.stderr); sys.exit(3)
 print('|'.join(fields))
@@ -3956,6 +3998,7 @@ PYEOF
 # --dry-run: print rendered prompt to stdout; do NOT write/log/send.
 cmd_dispatch() {
     local slug="" stage="" worker="" do_clear=false dry_run=false supersede=false allow_blocked=""
+    local source_prompt="" requested_worker="" route_reason="direct" github_repo="" pr_number=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --slug)      slug="$2";   shift 2 ;;
@@ -3966,6 +4009,11 @@ cmd_dispatch() {
             --supersede) supersede=true; shift ;;
             --allow-blocked) [ -n "${2:-}" ] || { echo "ERROR: --allow-blocked requires a non-empty reason" >&2; return 1; }
                              allow_blocked="$2"; shift 2 ;;
+            --source-prompt) source_prompt="$2"; shift 2 ;;
+            --requested-worker) requested_worker="$2"; shift 2 ;;
+            --route-reason) route_reason="$2"; shift 2 ;;
+            --github-repo) github_repo="$2"; shift 2 ;;
+            --pr-number) pr_number="$2"; shift 2 ;;
             *)           shift ;;
         esac
     done
@@ -4042,10 +4090,29 @@ cmd_dispatch() {
 
     local tmpl_path="$FORGE_PROMPTS_DIR/$stage.txt"
     local rendered
-    rendered=$(_render_template "$tmpl_path" "$slug" "$stage" "$worker_canonical" "$worker_pane" "$project_root") || {
-        _emit_event ERROR "$slug" "stage=$stage reason=template-render-failed"
-        return 1
-    }
+    if [ -n "$source_prompt" ]; then
+        rendered="$(python3 - "$source_prompt" "$project_root" <<'PY'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1]).resolve(strict=True)
+base=(pathlib.Path(sys.argv[2])/'.dev'/'forge-tmp').resolve(strict=True)
+if base not in p.parents or p.is_symlink(): raise SystemExit('source prompt must be a regular file under .dev/forge-tmp')
+data=p.read_bytes()
+if len(data)>1048576: raise SystemExit('source prompt exceeds 1 MiB')
+sys.stdout.buffer.write(data)
+PY
+)" || { _emit_event ERROR "$slug" "stage=$stage reason=source-prompt-invalid"; return 1; }
+    else
+        rendered=$(_render_template "$tmpl_path" "$slug" "$stage" "$worker_canonical" "$worker_pane" "$project_root") || {
+            _emit_event ERROR "$slug" "stage=$stage reason=template-render-failed"
+            return 1
+        }
+    fi
+    if [ "$stage" = pr-review ]; then
+        [[ "$github_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && [[ "$pr_number" =~ ^[0-9]+$ ]] || {
+            _emit_event ERROR "$slug" "stage=$stage reason=publish-envelope-invalid"; return 1; }
+    elif [ -n "$github_repo$pr_number" ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=publish-envelope-unexpected"; return 1
+    fi
 
     if [ "$dry_run" = true ]; then
         printf '%s' "$rendered"
@@ -4406,10 +4473,42 @@ PYEOF
 
     # P0-4: supersede's replacement prompt is written only now, after its reset+close.
     [ "$supersede" = true ] && printf '%s' "$rendered" > "$prompt_file"
-    local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt"
+    local lane_info capability_class lane rollout
+    lane_info="$(forge codex-lane --root "$project_root" --stage "$stage" --worker "$worker_canonical")" || return 1
+    capability_class="$(printf '%s\n' "$lane_info" | sed -n 's/^capability_class=//p')"
+    lane="$(printf '%s\n' "$lane_info" | sed -n 's/^lane=//p')"
+    rollout="$(printf '%s\n' "$lane_info" | sed -n 's/^rollout=//p')"
+    if [[ "$worker_canonical" == codex-* ]] && [ "$lane" = reviewed-host ]; then
+        _emit_event LANE_REQUIRED "$slug" "stage=$stage worker=$worker_canonical capability=$capability_class rollout=$rollout"
+        echo "LANE_REQUIRED lane=reviewed-host stage=$stage capability=$capability_class rollout=$rollout" >&2
+        _worker_unlock "$worker_canonical"
+        return 4
+    fi
+    local delivery_id delivery_inc physical_code_root root_id prompt_sha
+    physical_code_root="$(ownership_root "$project_root")"; root_id="$(root_identity "$project_root")"
+    prompt_sha="$(printf '%s' "$rendered" | shasum -a 256 | awk '{print $1}')"
+    printf '%s' "$rendered" > "$prompt_file"
+    DELIVERY_INTENT="$(python3 - "$slug" "$stage" "$worker_canonical" "${requested_worker:-$worker_canonical}" "$route_reason" "$ID_target_session" "$worker_pane" "$prompt_file" "$prompt_sha" "$github_repo" "$pr_number" <<'PY'
+import json,sys
+k=('slug','stage','worker','requested_worker','route_reason','session','pane','prompt_file','prompt_sha256','github_repo','pr_number')
+d=dict(zip(k,sys.argv[1:])); d['action']='register-delivery'
+d={k:v for k,v in d.items() if v!=''}
+print(json.dumps(d,separators=(',',':')))
+PY
+)"
+    DELIVERY_JSON="$(printf '%s\n' "$DELIVERY_INTENT" | "$FORGE_BROKER_BIN" control --root "$physical_code_root")" || {
+        _emit_event BROKER_REGISTRATION_FAILED "$slug" "stage=$stage worker=$worker_canonical"
+        _worker_unlock "$worker_canonical"; return 1;
+    }
+    delivery_id="$(printf '%s' "$DELIVERY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["delivery_id"])')"
+    delivery_inc="$(printf '%s' "$DELIVERY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_incarnation"])')"
+    local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt [delivery_id:$delivery_id]"
     # P1-4: pre-send bookkeeping is FAIL-CLOSED — the pending log, the generation, and the
     # attempting delivery must all persist BEFORE any keystroke; any failure aborts and
     # unlocks with NO text sent (no keystroke can occur without durable attempting evidence).
+    FORGE_DELIVERY_ID="$delivery_id" FORGE_PHYSICAL_CODE_ROOT="$physical_code_root" \
+    FORGE_ROOT_IDENTITY="$root_id" FORGE_CAPABILITY_CLASS="$capability_class" \
+    FORGE_DELIVERY_LANE="$lane" FORGE_PROMPT_SHA256="$prompt_sha" \
     cmd_log --slug "$slug" --stage "$stage" --from claude --to "$worker_canonical" --prompt "$ref_msg" >/dev/null || {
         _emit_event ERROR "$slug" "stage=$stage reason=pending-log-failed worker=$worker_canonical"
         _worker_unlock "$worker_canonical"; return 1; }
@@ -4530,13 +4629,56 @@ cmd_callback() {
         return 1
     fi
 
+    local pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
+
     local cb_session="${ID_target_session:-}" cb_incarnation="${ID_target_incarnation:-}"
+    # Identity adoption from the dispatch record. A worker's shell frequently
+    # cannot resolve tmux identity: codex panes and Agent-Teams subagents run
+    # commands in an environment where TMUX is set but TMUX_PANE is absent or
+    # stale, which _forge_identity classifies as `tmux-unavailable` -> no host,
+    # no target, UNAVAILABLE. The `no-tmux` root-candidate fallback does not
+    # apply there, and would not help anyway when several tmux sessions are
+    # rooted at one checkout (that is AMBIGUOUS, not a unique candidate).
+    #
+    # The worker's ambient environment was never the right authority for this.
+    # The PENDING RECORD is: the orchestrator wrote `session`/`incarnation` into
+    # forge-log.yml at dispatch time, from a pane whose identity resolved
+    # cleanly. A callback only reports completion of one specific pending, so
+    # adopt that pending's identity when EXACTLY ONE open pending matches
+    # (stage, worker) -- the same cardinality discipline
+    # _callback_pending_select_exact already enforces. 0 or >1 still refuses, so
+    # this can only convert a hard failure into a correctly-routed publication.
+    #
+    # Without this the delivery is never closed, ages past the broker's 2h
+    # expiry, and wedges the pane permanently: terminalize-delivery refuses it
+    # (DELIVERY_EXPIRED) while dispatch still rejects it
+    # (DELIVERY_ALREADY_ACTIVE).
+    if [ -z "$cb_session" ] || [ -z "$cb_incarnation" ]; then
+        local adopted_identity
+        if adopted_identity="$(_callback_pending_adopt_identity "$pipeline_log" "$stage" "$worker_canonical")"; then
+            IFS=$'\t' read -r cb_session cb_incarnation <<< "$adopted_identity"
+            # Establish the adopted identity for the WHOLE command, not just the
+            # two locals: _context_file/_usage_file/_lifecycle_lock and the
+            # journal writers all derive their paths from ID_target_session via
+            # _resolve_session. Setting only cb_* would publish the callback
+            # correctly but write the context pointer to the __nosession__
+            # sentinel, which §4.1 exists to prevent for a live session.
+            # ID_state is deliberately left as-is: the ambient environment
+            # really was unavailable, and host-degrade only refuses on MISMATCH,
+            # so the diagnostic stays honest without changing the gate.
+            ID_target_session="$cb_session"
+            ID_target_incarnation="$cb_incarnation"
+            ID_target_source="dispatch-record"
+            SESSION="$cb_session"
+            _emit_event IDENTITY_ADOPTED "$slug" \
+                "stage=$stage worker=$worker_canonical session=$cb_session incarnation=$cb_incarnation reason=worker-identity-unavailable"
+        fi
+    fi
     if [ -z "$cb_session" ] || [ -z "$cb_incarnation" ]; then
         _emit_event ERROR "$slug" "stage=$stage reason=callback-identity-unavailable session=${cb_session:-none} incarnation=${cb_incarnation:-none}"
-        echo "ERROR: callback publication requires a live target session and incarnation; no lifecycle state was changed." >&2
+        echo "ERROR: callback publication requires a live target session and incarnation, and no single open pending for stage='$stage' worker='$worker_canonical' was available to adopt one from; no lifecycle state was changed." >&2
         return 1
     fi
-    local pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
     local selected_pending_timestamp
     selected_pending_timestamp="$(_callback_pending_select_exact "$pipeline_log" "$stage" "$worker_canonical" "$cb_session" "$cb_incarnation")" || {
         case "$status" in
@@ -4551,6 +4693,20 @@ cmd_callback() {
     ts=$(timestamp)
     cb_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
 
+    # Resolve the protected delivery hint from the exact pending entry before
+    # constructing the callback document. Blank means a pre-broker delivery.
+    local pending_delivery_id active_json active_delivery_id delivery_capability terminal_intent terminal_state
+    pending_delivery_id="$(python3 - "$pipeline_log" "$selected_pending_timestamp" <<'PY'
+import sys,yaml
+try: entries=(yaml.safe_load(open(sys.argv[1])) or {}).get('entries') or []
+except Exception: entries=[]
+for entry in entries:
+    if str(entry.get('timestamp') or '') == sys.argv[2]:
+        print(entry.get('delivery_id') or '')
+        break
+PY
+)"
+
     local cb_body
     cb_body=$(cat <<EOF
 slug: $slug
@@ -4563,9 +4719,36 @@ origin: ${origin:-}
 callback_id: $cb_id
 timestamp: $ts
 selected_pending_timestamp: "$selected_pending_timestamp"
+delivery_id: ${pending_delivery_id:-}
+physical_code_root: $(ownership_root "$project_root")
+root_identity: $(root_identity "$project_root")
+prompt_sha256: ${FORGE_PROMPT_SHA256:-}
 message: $(yaml_escape "$message")
 EOF
 )
+    # Existing pre-broker deliveries remain closable during rollout. New
+    # delivery-bound work must still reconcile against protected broker state.
+    if [ -n "$pending_delivery_id" ]; then
+        active_json="$(printf '{"action":"active-delivery","session":"%s","pane":"%s"}\n' "$cb_session" "$(pane_index "$worker_canonical")" |
+            "$FORGE_BROKER_BIN" control --root "$project_root")" || return 1
+        active_delivery_id="$(printf '%s' "$active_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["delivery_id"])')"
+        [ "$pending_delivery_id" = "$active_delivery_id" ] || return 1
+        delivery_capability="$(printf '%s' "$active_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["capability_class"])')"
+        case "$status" in
+            DONE) terminal_state=completed ;;
+            ERROR) terminal_state=failed ;;
+            *) terminal_state="" ;;
+        esac
+        # A public worker response is advisory. Mutation-capable DONE callbacks
+        # are accepted only when the host broker has exactly one protected,
+        # successful result for this delivery.
+        if [ "$status" = DONE ] && { [ "$delivery_capability" = commit ] || [ "$delivery_capability" = publish-pr-review ]; }; then
+            local protected_result
+            protected_result="$(printf '{"action":"delivery-result","delivery_id":"%s"}\n' "$active_delivery_id" |
+                "$FORGE_BROKER_BIN" control --root "$project_root")" || return 1
+            printf '%s' "$protected_result" | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("status")=="ok" else 1)' || return 1
+        fi
+    fi
     # Legacy-style response string (for log-response close + the human notify).
     local legacy="FORGE_${status}: ${stage}"
     if [ -n "$message" ]; then
@@ -4671,6 +4854,17 @@ EOF
     esac
     _lifecycle_unlock
 
+    # Terminalize only after the log close and callback publication succeed.
+    # This preserves retryability if either lifecycle write fails.
+    if [ -n "$pending_delivery_id" ] && [ -n "$terminal_state" ]; then
+        terminal_intent="$(printf '{"action":"terminalize-delivery","delivery_id":"%s","terminal":"%s"}\n' \
+            "$active_delivery_id" "$terminal_state")"
+        if ! printf '%s\n' "$terminal_intent" | "$FORGE_BROKER_BIN" control --root "$project_root" >/dev/null; then
+            _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=broker-terminalize-failed delivery_id=$active_delivery_id"
+            return 1
+        fi
+    fi
+
     # Back-compat: still notify the orchestrator pane so humans see the line.
     # Suppressed by --quiet. Only attempts when inside a tmux session.
     #
@@ -4742,7 +4936,7 @@ if sess and inc: spec.append(('exact', os.path.join(d, '%s.%s.%s.callback' % (ba
 if sess: spec.append(('session-only', os.path.join(d, '%s.%s.callback' % (base,sess))))
 spec.append(('unqualified', os.path.join(d, base+'.callback')))
 # CALLBACK_SCHEMA_LOCKSTEP bridge-scanner known
-known={'slug','stage','status','worker','session','incarnation','origin','callback_id','timestamp','selected_pending_timestamp','message','parked_at','parked_reason','uncommitted'}
+known={'slug','stage','status','worker','session','incarnation','origin','callback_id','timestamp','selected_pending_timestamp','message','parked_at','parked_reason','uncommitted','delivery_id','physical_code_root','root_identity','prompt_sha256'}
 # CALLBACK_SCHEMA_LOCKSTEP bridge-scanner required
 required={'slug','stage','status','worker','callback_id','timestamp','message'}
 plausible=[]; invalid=[]
@@ -4789,6 +4983,56 @@ if len(plausible)==1:
 if invalid:
     print('CALLBACK_HEADER_INVALID '+','.join(sorted(invalid)), file=sys.stderr); sys.exit(3)
 sys.exit(1)
+PY
+}
+
+# Validate the selected callback against the pipeline artifact before wait emits
+# it. A callback header is not authority: delivery-bound callbacks must carry
+# the same delivery_id recorded on the selected pending entry, and every
+# callback must be emitted no earlier than that entry. This keeps replayed
+# callback files from being accepted on their status line alone.
+_callback_artifact_matches_pending() {   # <callback> <pipeline-log> <stage>
+    python3 - "$@" <<'PY'
+import datetime, sys, yaml
+cb_path, log_path, stage = sys.argv[1:4]
+try:
+    cb = yaml.load(open(cb_path), Loader=yaml.BaseLoader) or {}
+    data = yaml.load(open(log_path), Loader=yaml.BaseLoader) or {}
+    entries = data.get('entries') or []
+except Exception as exc:
+    print('CALLBACK_ARTIFACT_INVALID:'+str(exc), file=sys.stderr); sys.exit(3)
+if not isinstance(cb, dict) or not isinstance(entries, list):
+    print('CALLBACK_ARTIFACT_INVALID: expected maps', file=sys.stderr); sys.exit(3)
+selected = str(cb.get('selected_pending_timestamp') or '')
+if not selected:
+    print('CALLBACK_ARTIFACT_LEGACY', file=sys.stderr); sys.exit(4)
+callback_delivery = str(cb.get('delivery_id') or '')
+if not callback_delivery:
+    # Pre-broker callbacks have no delivery authority and retain the historical
+    # read-only compatibility path. Only delivery-bound callbacks participate in
+    # the artifact replay check below.
+    print('CALLBACK_ARTIFACT_LEGACY', file=sys.stderr); sys.exit(4)
+if not entries:
+    # Read-only callback fixtures and pre-log legacy sessions have no artifact
+    # to bind. Preserve their historical scanner contract; real dispatches
+    # always write a non-empty pipeline log before publication.
+    print('CALLBACK_ARTIFACT_NO_LOG', file=sys.stderr); sys.exit(4)
+matches = [e for e in entries if isinstance(e, dict)
+           and str(e.get('timestamp') or '') == selected
+           and str(e.get('stage') or '') == stage]
+if len(matches) != 1:
+    print('CALLBACK_IDENTITY_CHANGED: selected pending cardinality='+str(len(matches)), file=sys.stderr); sys.exit(2)
+entry = matches[0]
+def parse(value):
+    return datetime.datetime.strptime(str(value), '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+try:
+    if parse(cb.get('timestamp')) < parse(entry.get('timestamp')):
+        print('CALLBACK_IDENTITY_CHANGED: callback predates pending entry', file=sys.stderr); sys.exit(2)
+except Exception:
+    print('CALLBACK_ARTIFACT_INVALID: timestamp', file=sys.stderr); sys.exit(3)
+if str(entry.get('delivery_id') or '') != callback_delivery:
+    print('CALLBACK_IDENTITY_CHANGED: delivery_id mismatch', file=sys.stderr); sys.exit(2)
+print('OK')
 PY
 }
 
@@ -5001,17 +5245,79 @@ cmd_wait() {
             return 1
         fi
         if [ "$cb_resolve_rc" -eq 0 ] && [ -n "$cb_file" ] && [ -f "$cb_file" ]; then
+            local artifact_rc=0
+            if grep -Eq '^delivery_id: [^[:space:]]' "$cb_file"; then
+                _callback_artifact_matches_pending "$cb_file" "$project_root/.dev/proposals/$slug/forge-log.yml" "$stage" >/dev/null 2>&1 || artifact_rc=$?
+            else
+                artifact_rc=4
+            fi
+            case "$artifact_rc" in
+                0|4) ;; # 4 is an explicitly tolerated pre-delivery legacy callback.
+                2|3)
+                    _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=CALLBACK_IDENTITY_CHANGED"
+                    printf 'STATUS: ERROR\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nDETAIL: CALLBACK_IDENTITY_CHANGED\n' \
+                        "$stage" "$slug" "$worker_canonical"
+                    return 1
+                    ;;
+                *)
+                    _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=CALLBACK_ARTIFACT_INVALID"
+                    printf 'STATUS: ERROR\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nDETAIL: CALLBACK_ARTIFACT_INVALID\n' \
+                        "$stage" "$slug" "$worker_canonical"
+                    return 1
+                    ;;
+            esac
             _wait_emit_callback "$cb_file" "$slug" "$stage" "$worker_canonical" \
                 "$digest_template" "$project_root"
             _render_status_file
             return 0
         fi
 
+        local permission_json="" worker_idx protected_delivery=""
+        worker_idx="$(pane_index "$worker_canonical")"
+        protected_delivery="$(printf '{"action":"active-delivery","session":"%s","pane":"%s"}\n' "$wait_session" "$worker_idx" |
+            "$FORGE_BROKER_BIN" control --root "$project_root" 2>/dev/null)" || protected_delivery=""
+        permission_json="$(FORGE_ACTIVE_DELIVERY="$protected_delivery" python3 - "$project_root/.dev/attention" "$wait_session" "$worker_idx" "$slug" "$stage" <<'PY'
+import datetime,glob,json,os,sys
+adir,sess,pane,slug,stage=sys.argv[1:]
+try: authority=json.loads(os.environ['FORGE_ACTIVE_DELIVERY'])
+except Exception: authority={}
+rows=[]
+for p in glob.glob(os.path.join(adir,f'wperm.{sess}.p{pane}.*.json')):
+ try: d=json.load(open(p))
+ except Exception: continue
+ if d.get('session')!=sess or str(d.get('pane_index'))!=pane: continue
+ exact=('delivery_id','session_incarnation','physical_code_root','root_identity','stage','prompt_sha256')
+ if d.get('slug')!=slug or any(d.get(k)!=authority.get(k) for k in exact): continue
+ try:
+  event=datetime.datetime.fromisoformat(str(d['emitted_at']).replace('Z','+00:00'))
+  opened=datetime.datetime.fromisoformat(str(authority['opened_at']).replace('Z','+00:00'))
+  expires=datetime.datetime.fromisoformat(str(authority['expires_at']).replace('Z','+00:00'))
+ except Exception: continue
+ if opened <= event < expires: rows.append(d)
+if len(rows)==1: print(json.dumps(rows[0],sort_keys=True))
+elif len(rows)>1: print(json.dumps({'ambiguous':True,'count':len(rows)}))
+PY
+)"
+        if [ -n "$permission_json" ]; then
+            if printf '%s' "$permission_json" | grep -q '"ambiguous": true'; then
+                printf 'STATUS: ERROR\nINCIDENT_TYPE: permission_correlation_ambiguous\nSTAGE: %s\nSLUG: %s\nWORKER: %s\n' "$stage" "$slug" "$worker_canonical"
+                return 1
+            fi
+            _emit_event NEEDS_PERMISSION "$slug" "stage=$stage worker=$worker_canonical source=hook"
+            printf 'STATUS: needs_permission\nINCIDENT_TYPE: needs_permission\nSOURCE: hook\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nDETAIL: %s\n' "$stage" "$slug" "$worker_canonical" "$permission_json"
+            return 0
+        fi
         local sc_out sc_state
         sc_out=$(cmd_stall_check --project-root "$project_root" "$worker_canonical" 2>/dev/null)
         sc_state=$(echo "$sc_out" | awk '{print $1}')
         case "$sc_state" in
-            STALLED|PROMPTING|DEAD)
+            PROMPTING)
+                _emit_event NEEDS_PERMISSION "$slug" "stage=$stage worker=$worker_canonical source=pane-classifier"
+                printf 'STATUS: needs_permission\nINCIDENT_TYPE: needs_permission\nSOURCE: pane-classifier\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nDETAIL: %s\n' "$stage" "$slug" "$worker_canonical" "$sc_out"
+                _render_status_file
+                return 0
+                ;;
+            STALLED|DEAD)
                 _emit_event STALL "$slug" "stage=$stage worker=$worker_canonical state=$sc_state"
                 printf 'STATUS: %s\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nDETAIL: %s\n' \
                     "$sc_state" "$stage" "$slug" "$worker_canonical" "$sc_out"
@@ -5037,7 +5343,9 @@ cmd_wait() {
             _acm_sample_tick "$project_root" "$slug" "$stage" "$worker_canonical" "$_sample_idx" || true
         fi
 
-        sleep "$interval"
+        # Permission records and the production pane classifier are latency-sensitive;
+        # the regular stall deadline remains monotonic and is checked on every pass.
+        sleep 1
     done
 }
 
@@ -5742,7 +6050,7 @@ try: import yaml
 except Exception: yaml=None
 root=os.path.realpath(sys.argv[1]); dev=os.path.join(root,'.dev')
 # CALLBACK_SCHEMA_LOCKSTEP bridge-audit known
-known={'slug','stage','status','worker','session','incarnation','origin','callback_id','timestamp','selected_pending_timestamp','message','parked_at','parked_reason','uncommitted'}
+known={'slug','stage','status','worker','session','incarnation','origin','callback_id','timestamp','selected_pending_timestamp','message','parked_at','parked_reason','uncommitted','delivery_id','physical_code_root','root_identity','prompt_sha256'}
 # CALLBACK_SCHEMA_LOCKSTEP bridge-audit required
 required={'slug','stage','status','worker','callback_id','timestamp','message'}
 live={}
@@ -6923,7 +7231,11 @@ cmd_stall_check() {
     fi
     cd "$project_root" || { echo "UNKNOWN cd_failed pane=$target"; return 0; }
 
-    require_identity "stall-check" host-pane || return 1
+    # The targeted TMUX_PANE probe is authoritative for this read-only
+    # classifier. A long-lived pane can retain a stale TMUX_SESSION birth stamp
+    # after a Forge restart; do not turn that harmless environmental residue
+    # into a late-stage stall-check refusal when root/session probing agrees.
+    FORGE_IDENTITY_IGNORE_ENV_STAMP=1 require_identity "stall-check" host-pane || return 1
 
     local canonical idx
     canonical=$(canonical_pane_name "$target")
@@ -7102,10 +7414,17 @@ def make_payload(state, **kv):
         parts.append(f"{k}={v}")
     return " ".join(parts)
 
-# 1. PROMPTING — before any threshold (§2.3).
-if prompting_re and prompting_re.search(raw):
+# 1. PROMPTING — before any threshold. Unknown version/locale is not classified.
+supported = prompts.get('supported') or {}
+runtime_version = os.environ.get('FORGE_CODEX_VERSION', '')
+runtime_locale = os.environ.get('FORGE_CODEX_LOCALE', 'en-US')
+if canonical.startswith('codex-') and (runtime_version not in (supported.get('codex_versions') or []) or
+                                       runtime_locale not in (supported.get('locales') or [])):
+    emit('UNKNOWN', f'reason=classifier_unsupported version={runtime_version or "unknown"} locale={runtime_locale}')
+    sys.exit(0)
+if prompting_re and prompting_re.search(normalized):
     excerpt = ""
-    for line in lines[::-1]:
+    for line in normalized.splitlines()[::-1]:
         if prompting_re.search(line):
             excerpt = line.strip()[:100].replace('"', "'")
             break
@@ -7335,7 +7654,7 @@ cmd_alias_self_test() {
     fi
 
     python3 - "$0" "$STRICT" <<'PYEOF'
-import re, sys
+import os, re, sys
 
 bridge = sys.argv[1]
 strict = (sys.argv[2] == 'true')
@@ -7399,12 +7718,45 @@ else:
         if canonical not in name_to_idx:
             problems.append(f"NAME_TO_IDX missing '{canonical}'")
 
+# swiftbar-stage-visibility: forge-watch carries a SIXTH copy of the map (canonical name ->
+# pane index) for its pane→stage join. Verify it against the bash source here, or the two
+# drift silently. A missing sibling is SKIPPED, not fatal — the bridge must still self-test
+# when it is the only file present (installs, tarballs, tests with a stubbed layout).
+watch_path = os.path.join(os.path.dirname(os.path.abspath(bridge)), 'forge-watch')
+watch_checked = False
+try:
+    with open(watch_path) as f:
+        wsrc = f.read()
+except OSError:
+    wsrc = None
+if wsrc is not None:
+    wm = re.search(r"NAME_TO_IDX\s*=\s*\{([^}]+)\}", wsrc)
+    if not wm:
+        problems.append("forge-watch: NAME_TO_IDX missing")
+    else:
+        widx = {a: int(i) for a, i in re.findall(r"'([^']+)':\s*(\d+)", wm.group(1))}
+        watch_checked = True
+        # every canonical pane name the bash source knows must be present, same index
+        for alias, idx in m_idx.items():
+            canonical = m_name.get(idx)
+            if canonical is None or canonical != alias:
+                continue          # only canonical names are stored in the watcher map
+            if alias not in widx:
+                problems.append(f"forge-watch: NAME_TO_IDX missing '{alias}'")
+            elif widx[alias] != idx:
+                problems.append(
+                    f"forge-watch: '{alias}' bash={idx} watch={widx[alias]}")
+        if strict and len(widx) < len(m_name):
+            problems.append(
+                f"forge-watch: STRICT FAIL — {len(widx)} entries, expected >={len(m_name)}")
+
 if problems:
     for p in problems:
         print(f"alias-self-test: {p}", file=sys.stderr)
     sys.exit(1)
 
-print(f"alias-self-test: OK ({len(expected_canonical)} aliases verified, {len(py_maps)} maps checked)")
+print(f"alias-self-test: OK ({len(expected_canonical)} aliases verified, {len(py_maps)} maps checked"
+      + (", forge-watch NAME_TO_IDX verified)" if watch_checked else ", forge-watch not present)"))
 PYEOF
 }
 

@@ -21,7 +21,7 @@ Watched external worker panes in Phase 2:
 | IDLE                           | no pending log targeting this pane                                   | `wait` keeps polling                  |
 | COMPLETED-PENDING-LOG-RESPONSE | pending log + idle-prompt regex match on normalized tail and no active marker | `wait` confirms via callback file; if no callback yet, keeps polling |
 | STALLED                        | pending log + no idle match + elapsed > threshold + no PROMPTING     | `wait` returns STATUS=STALLED; orchestrator treats as AGENT_FAILED |
-| PROMPTING                      | approval-prompt regex match (regardless of elapsed)                  | `wait` returns STATUS=PROMPTING immediately; orchestrator surfaces to user |
+| needs_permission               | exact correlated hook event, or a supported-version/locale production approval fixture match | `wait` probes now, again within one second, and every wake; the orchestrator keeps infra locked and enters the explicit recovery lane |
 | DEAD                           | tmux pane gone                                                       | `wait` returns STATUS=DEAD; orchestrator halts |
 | UNKNOWN                        | first call after cache wipe / unable to characterize regex           | `wait` keeps polling                  |
 

@@ -43,11 +43,20 @@ if [ -z "$PROJECT_ROOT" ] || [ ! -d "$PROJECT_ROOT" ]; then
     exit 1
 fi
 
-IDLE_FIXTURE="$PROJECT_ROOT/.dev/proposals/forge-sonnet-pane/verification/phase1b-step0/codex-idle/regex.yml"
-PROMPTING_FIXTURE="$PROJECT_ROOT/.dev/proposals/forge-sonnet-pane/verification/phase1b-step0/codex-prompting/regex.yml"
-PHASE2_IDLE_FIXTURE="$PROJECT_ROOT/.dev/proposals/forge-sonnet-pane/verification/phase2-step0/claude-opus-idle/regex.yml"
-PHASE2_PROMPTING_FIXTURE="$PROJECT_ROOT/.dev/proposals/forge-sonnet-pane/verification/phase2-step0/claude-prompting/regex.yml"
+TOOLKIT_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+SOURCE="$TOOLKIT_ROOT/config/idle-prompts.yml"
 RUNTIME_FILE="$HOME/.config/forge/idle-prompts.yml"
+python3 - "$SOURCE" <<'PY'
+import sys,yaml
+d=yaml.safe_load(open(sys.argv[1]))
+assert d.get('schema')=='forge-idle-prompts/2'
+assert d.get('supported',{}).get('codex_versions') and d.get('supported',{}).get('locales')
+assert d['codex-a'].get('approval_prompt') and d['codex-b'].get('approval_prompt')
+PY
+mkdir -p "$(dirname "$RUNTIME_FILE")"
+tmp="$RUNTIME_FILE.tmp.$$"; cp "$SOURCE" "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$RUNTIME_FILE"
+echo "Installed classifier from $SOURCE to $RUNTIME_FILE"
+exit 0
 
 if [ ! -f "$IDLE_FIXTURE" ]; then
     echo "ERROR: idle fixture not found at $IDLE_FIXTURE" >&2

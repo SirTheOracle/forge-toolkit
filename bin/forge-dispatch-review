@@ -98,7 +98,8 @@ only for the criteria listed below.
 For each commit:
 
 1. Read the .review file (contains full metadata + diff)
-2. If truncated: true, run git show {commit} for full context
+2. Treat it as complete immutable input. Never run Git. If `truncated: true`,
+   callback BLOCKED with `reviewed-host` as the required lane.
 3. Review for:
    - Bugs or logic errors
    - Security issues (injection, hardcoded secrets, missing auth checks)
