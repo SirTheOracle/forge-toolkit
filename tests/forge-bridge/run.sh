@@ -150,7 +150,28 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 echo "== real-tmux identity core =="
-tmux new-session -d -s "$S1" -x 200 -y 50 -c "$rootA"
+# These sessions are tiled, not forge-shaped. `FORGE_LAYOUT` and the per-pane
+# `@forge-worker` options are set deliberately — they are receipts for a geometry proof
+# `forge-start` performs; these tests exercise identity resolution, not pane routing. Do
+# NOT "fix" this by rebuilding them with the real split sequence. The only tests that
+# need an unstamped session are the layout-refusal tests, which require a session
+# **without** the stamps.
+mk_session() {
+  local s="$1" x="$2" y="$3" root="$4"
+  tmux new-session -d -s "$s" -x "$x" -y "$y" -c "$root" -e FORGE_LAYOUT=2
+  local i=0
+  while [ "$i" -lt 4 ]; do
+    tmux split-window -d -t "$s:0" -c "$root"
+    tmux select-layout -t "$s:0" tiled >/dev/null 2>&1
+    i=$((i+1))
+  done
+  tmux set-option -p -t "$s:.0" @forge-worker claude
+  tmux set-option -p -t "$s:.1" @forge-worker claude-opus
+  tmux set-option -p -t "$s:.2" @forge-worker claude-sonnet
+  tmux set-option -p -t "$s:.3" @forge-worker codex-a
+  tmux set-option -p -t "$s:.4" @forge-worker codex-b
+}
+mk_session "$S1" 200 50 "$rootA"
 tmux split-window -d -t "$S1:0" -c "$rootA"
 tmux new-session -d -s "$S2" -x 220 -y 50 -c "$rootA"
 i=0; while [ $i -lt 4 ]; do tmux split-window -d -t "$S2:0" -c "$rootA"; tmux select-layout -t "$S2:0" tiled >/dev/null 2>&1; i=$((i+1)); done
@@ -333,7 +354,7 @@ ds="$(cd "$rootA" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_WATCH_TRIGGE
 run_in_pane "$S1:0.0" crossval "FORGE_WATCH_TRIGGER=0 FORGE_IDENTITY_ENFORCE=1 FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE send --target-session $S2 --cross-session claude cross-ok-marker"
 sleep 1
 if [ "$(rc_of crossval)" = "0" ] && tmux capture-pane -p -t "$S2:0.1" | grep -q "cross-ok-marker"; then
-    ok "T-CROSS-VALID declared cross-session send lands in the target's pane 1"
+    ok "T-CROSS-VALID declared cross-session send lands in the target's pane 0"
 else
     bad "T-CROSS-VALID declared cross-session send lands in target (rc=$(rc_of crossval))"
 fi
@@ -3503,6 +3524,55 @@ for _case in orch wl lit; do
     && ok "N-${_case} fails at the named replica" || bad "N-${_case}: $_out"
   rm -rf "$_d"
 done
+echo "── live layout receipt guard ──"
+# Every failure path here kills its own session, and the EXIT trap holds US/SW/RS/HH as a
+# backstop, so an aborted run never leaks a real tmux session onto the operator's server.
+layout_send_refused() {
+  local s="$1" needle="$2" out rc i
+  out=$(cd "$rootA" && FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe \
+    "$BRIDGE" send --target-session "$s" --cross-session claude-opus "guard-marker-$s" 2>&1); rc=$?
+  if [ "$rc" -eq 0 ] || ! printf '%s\n' "$out" | grep -qi "$needle"; then
+    bad "$s did not refuse with $needle: rc=$rc $out"
+    tmux kill-session -t "$s" 2>/dev/null; return
+  fi
+  for i in 0 1 2 3 4; do
+    tmux capture-pane -p -t "$s:0.$i" | grep -q "guard-marker-$s" \
+      && { bad "$s delivered to pane $i despite refusal"; tmux kill-session -t "$s" 2>/dev/null; return; }
+  done
+  ok "$s refused before delivery ($needle)"
+}
+
+US="forge-unstamped-$$"
+tmux new-session -d -s "$US" -x 200 -y 50 -c "$rootA"
+i=0; while [ "$i" -lt 4 ]; do tmux split-window -d -t "$US:0" -c "$rootA"; i=$((i+1)); done
+layout_send_refused "$US" "layout generation"
+tmux kill-session -t "$US" 2>/dev/null
+
+SW="forge-swapped-$$"; mk_session "$SW" 200 50 "$rootA"
+tmux swap-pane -s "$SW:.1" -t "$SW:.3"
+layout_send_refused "$SW" "pane 1"
+tmux kill-session -t "$SW" 2>/dev/null
+
+# T-STAMP-RESPLIT: killing .2 and re-splitting .1 relies on tmux renumbering the survivors
+# and placing the new pane back at index 2 (measured on tmux 3.6a). Derive the index rather
+# than assuming it, so a different tmux renumbering policy fails the assertion, not the setup.
+RS="forge-resplit-$$"; mk_session "$RS" 200 50 "$rootA"
+tmux kill-pane -t "$RS:.2"; tmux split-window -d -t "$RS:.1" -c "$rootA"
+_rs_bare=$(tmux list-panes -t "$RS" -F '#{pane_index} #{@forge-worker}' | awk '$2==""{print $1; exit}')
+[ -n "$_rs_bare" ] && ok "T-STAMP-RESPLIT the replacement pane is unstamped (index $_rs_bare)" \
+  || bad "T-STAMP-RESPLIT setup produced no unstamped pane"
+layout_send_refused "$RS" "unstamped"
+tmux kill-session -t "$RS" 2>/dev/null
+
+HH="forge-health-$$"; mk_session "$HH" 200 50 "$rootA"
+hout=$(cd "$rootA" && TMUX_SESSION="$HH" FORGE_WATCH_TRIGGER=0 "$BRIDGE" health 2>&1 || true)
+for spec in 'claude 0' 'claude-opus 1' 'claude-sonnet 2' 'codex-a 3' 'codex-b 4'; do
+  set -- $spec
+  printf '%s\n' "$hout" | grep -q "pane=$1 idx=$2" || bad "T-HEALTH missing $1/$2: $hout"
+done
+ok "T-HEALTH names all five canonical pane/index pairs"
+tmux kill-session -t "$HH" 2>/dev/null
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

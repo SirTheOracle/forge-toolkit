@@ -60,6 +60,7 @@ SESSION=""   # populated by require_identity() (=$ID_target_session) for session
 
 # Required pane count (Phase 2: 5 panes)
 FORGE_REQUIRED_PANES="${FORGE_REQUIRED_PANES:-5}"
+FORGE_LAYOUT_VERSION="${FORGE_LAYOUT_VERSION:-2}"
 
 # ---- Worker context-hygiene controls (worker-context-hygiene feature) ----
 # enforce = the accepted steady state (DEFAULT since 2026-07-23, after the Step-0 spike +
@@ -119,8 +120,9 @@ FORGE_USAGE_SAMPLE_INTERVAL_S="${FORGE_USAGE_SAMPLE_INTERVAL_S:-300}"
 require_pane_count() {
     local s="$1"
     local required="${2:-$FORGE_REQUIRED_PANES}"
-    local count
-    count=$(tmux list-panes -t "$s" 2>/dev/null | wc -l | tr -d ' ')
+    local geo count
+    geo=$(tmux list-panes -t "$s" -F '#{pane_index} #{@forge-worker}' 2>/dev/null)
+    count=$(printf '%s\n' "$geo" | grep -c .)
     if [ "$count" -lt "$required" ]; then
         cat >&2 <<EOF
 ERROR: Forge session '$s' has $count panes (need $required).
@@ -133,6 +135,37 @@ ERROR: Forge session '$s' has $count panes (need $required).
 EOF
         return 1
     fi
+    [ -n "$FORGE_LAYOUT_VERSION" ] || {
+        echo "CONFIG_ERROR: FORGE_LAYOUT_VERSION is empty — refusing to skip the layout guard" >&2
+        return 1
+    }
+    local stamp
+    stamp=$(tmux show-environment -t "$s" FORGE_LAYOUT 2>/dev/null | sed -n 's/^FORGE_LAYOUT=//p')
+    if [ "$stamp" != "$FORGE_LAYOUT_VERSION" ]; then
+        cat >&2 <<EOF
+ERROR: Forge session '$s' is layout generation '${stamp:-<unstamped>}' (this build needs $FORGE_LAYOUT_VERSION).
+       It predates the orchestrator-banner layout, so its pane indices do NOT match this
+       build. Dispatching would MISROUTE. Restart it:
+         1. Pause or complete the current pipeline stage
+         2. tmux kill-session -t $s
+         3. rm -f ~/.cache/forge/${s}-pane*.snapshot ~/.cache/forge/${s}-pane*.last-stall-check
+         4. forge-start
+EOF
+        return 1
+    fi
+    local _i _w _want
+    while read -r _i _w; do
+        [ -n "$_i" ] || continue
+        _want="$(pane_name "$_i")"
+        if [ "$_w" != "$_want" ]; then
+            echo "ERROR: session '$s' pane $_i is '${_w:-<unstamped>}', expected '$_want'." >&2
+            echo "       A pane was swapped, killed and re-split, or built by an older forge-start." >&2
+            echo "       Dispatch is REFUSED. Restart: tmux kill-session -t $s && forge-start" >&2
+            return 1
+        fi
+    done <<EOF
+$geo
+EOF
     return 0
 }
 
