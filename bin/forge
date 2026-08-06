@@ -635,7 +635,11 @@ if want_stage:
 
 now = datetime.datetime.now(datetime.timezone.utc)
 ask_id = "ask-" + now.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
-role = os.environ.get("FORGE_ROLE") or ("orchestrator" if pane_index == "1" else "worker")
+# LOCKSTEP: bin/forge-bridge pane_index() 'claude'.
+# Verified by `forge-bridge alias-self-test --strict`.
+ORCH_PANE_INDEX = '1'
+role = os.environ.get("FORGE_ROLE") or (
+    "orchestrator" if pane_index == ORCH_PANE_INDEX else "worker")
 rec = {"schema": "cc-attention/1", "event": "ask", "variant": "ask",
        "session": session or None, "root": root,
        "pane_index": pane_index or None, "role": role, "tmux_pane": tmux_pane,

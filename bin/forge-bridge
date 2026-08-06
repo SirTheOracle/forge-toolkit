@@ -464,11 +464,14 @@ require_identity() {
 
 # ---- Helpers ----
 
-# Alias maps must stay in lockstep across:
+# Index-bearing replicas must stay in lockstep across:
 #   - pane_index() / pane_name()
 #   - every inline Python ALIAS_TO_CANONICAL map in this file
-#   - cmd_stall_check_status NAME_TO_IDX
-#   - cmd_send worker allowlist
+#   - bridge/watch NAME_TO_IDX and cmd_health specs
+#   - ORCH_PANE_INDEX in forge-cc-hook and forge
+#   - _reset_worker_locked worker whitelist
+#   - forge-start per-pane @forge-worker receipts
+# Raw numeric tmux targets are forbidden outside forge-start construction.
 # Run `~/bin/forge-bridge alias-self-test --strict` after edits.
 pane_index() {
     case "$1" in
@@ -491,6 +494,12 @@ pane_name() {
         *) echo "pane-$1" ;;
     esac
 }
+
+# The orchestrator seat, resolved through the canonical map — never a literal.
+# Every tmux target in this file MUST be built from pane_index()/$ORCH_IDX;
+# alias-self-test fails on any raw "$WINDOW.<digit>" target outside bin/forge-start.
+ORCH_NAME="claude"
+ORCH_IDX="$(pane_index "$ORCH_NAME")"
 
 # ---- Worker context-hygiene helpers (worker-context-hygiene) ----
 
@@ -1645,7 +1654,10 @@ _observe_pane1() {   # <project_root> [slug]
         [ -n "$sess" ] || { printf 'unknown none\n'; return 0; }
         cap=$(mktemp -t forge-p1-XXXXXX 2>/dev/null) || { printf 'unknown none\n'; return 0; }
         # READ-ONLY capture. This is the only tmux verb this function may ever use.
-        tmux capture-pane -p -t "$sess:$WINDOW.1" -S -12 > "$cap" 2>/dev/null || true
+        # "pane1" here is a historical token meaning "the operator seat", not a live pane
+        # index — the label is persisted in forge-usage.<session>.yml. The seat's index is
+        # $ORCH_IDX.
+        tmux capture-pane -p -t "$sess:$WINDOW.$ORCH_IDX" -S -12 > "$cap" 2>/dev/null || true
     fi
     local _pct _tok _hr _cf _rs _raw
     IFS=$'\t' read -r _pct _tok _hr _cf _rs _raw <<< "$(_usage_parse_capture "$cap" claude)"
@@ -2271,7 +2283,7 @@ cmd_focus() {
 
 cmd_back() {
     require_identity "back" host-pane || return 1
-    tmux select-pane -t "$SESSION:$WINDOW.1"
+    tmux select-pane -t "$SESSION:$WINDOW.$ORCH_IDX"
 }
 
 cmd_log() {
@@ -4875,10 +4887,10 @@ EOF
     if [ "$quiet" != true ] && [ -n "${TMUX:-}" ]; then
         local sess="${ID_target_session:-$ID_host_session}"
         if [ -n "$sess" ]; then
-            _cancel_copy_mode "$sess:$WINDOW.1"
-            tmux send-keys -t "$sess:$WINDOW.1" -l "$legacy" 2>/dev/null || true
+            _cancel_copy_mode "$sess:$WINDOW.$ORCH_IDX"
+            tmux send-keys -t "$sess:$WINDOW.$ORCH_IDX" -l "$legacy" 2>/dev/null || true
             sleep 0.2
-            tmux send-keys -t "$sess:$WINDOW.1" Enter 2>/dev/null || true
+            tmux send-keys -t "$sess:$WINDOW.$ORCH_IDX" Enter 2>/dev/null || true
         fi
     fi
 
@@ -5587,9 +5599,9 @@ PY
     if [ -n "${TMUX:-}" ]; then
         local s; s="${TMUX_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
         if [ -n "$s" ]; then
-            _cancel_copy_mode "$s:$WINDOW.1"
-            tmux send-keys -t "$s:$WINDOW.1" -l "FORGE_PARKED: $slug/$stage — $reason" 2>/dev/null || true
-            sleep 0.2; tmux send-keys -t "$s:$WINDOW.1" Enter 2>/dev/null || true
+            _cancel_copy_mode "$s:$WINDOW.$ORCH_IDX"
+            tmux send-keys -t "$s:$WINDOW.$ORCH_IDX" -l "FORGE_PARKED: $slug/$stage — $reason" 2>/dev/null || true
+            sleep 0.2; tmux send-keys -t "$s:$WINDOW.$ORCH_IDX" Enter 2>/dev/null || true
         fi
     fi
     _render_status_file

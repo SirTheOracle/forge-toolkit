@@ -65,13 +65,17 @@ elif codex:
 else:
     done()
 
-# role: env override wins (future spawned sessions); else pane 1 == orchestrator.
+# LOCKSTEP: bin/forge-bridge pane_index() 'claude'.
+# Verified by `forge-bridge alias-self-test --strict`.
+ORCH_PANE_INDEX = '1'
+# role: env override wins; otherwise the canonical orchestrator index wins.
 # Emission is now OPEN to every pane — the gate that used to DISCARD worker signal is gone.
 # Workers write NAMESPACED per-turn files (the worker branch below); the canonical
 # stop.<session>.json stays the orchestrator's alone, so a worker turn can never mark the
 # initiative done (§5). `agent` rides ONLY on worker records, so the orchestrator envelope —
 # and stop.<session>.json — stays byte-identical. Step 7 makes `agent` codex-aware.
-role = os.environ.get('FORGE_ROLE') or ('orchestrator' if pane_index == '1' else 'worker')
+role = os.environ.get('FORGE_ROLE') or (
+    'orchestrator' if pane_index == ORCH_PANE_INDEX else 'worker')
 agent = 'codex' if codex else 'claude'
 if not session or not os.path.isdir(os.path.join(root, '.dev')):
     done()
