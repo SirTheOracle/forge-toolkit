@@ -3464,6 +3464,32 @@ grep -q 'STATUS: needs_permission' "$BRIDGE" \
   && grep -q 'permission_correlation_ambiguous' "$BRIDGE" \
   && ok "typed fast permission path installed" || bad "fast permission path absent"
 
+echo "── alias-self-test negative fixtures ──"
+alias_negative() {
+  local id="$1" edit="$2" needle="$3" d out rc
+  d="$(mktemp -d)"
+  cp "$ROOT/bin/forge-bridge" "$d/forge-bridge"
+  cp "$ROOT/bin/forge-watch" "$d/forge-watch"
+  chmod +x "$d/forge-bridge" "$d/forge-watch"
+  python3 - "$d/forge-bridge" "$edit" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text(); mode = sys.argv[2]
+if mode == "nti": s = s.replace("'claude-opus': 0, 'claude': 1, 'codex-a': 2, 'codex-b': 3, 'claude-sonnet': 4", "'claude-opus': 9, 'claude': 8, 'codex-a': 7, 'codex-b': 6, 'claude-sonnet': 5", 1)
+elif mode == "bij": s = s.replace('        3) echo "codex-b" ;;\n', '', 1)
+elif mode == "health": s = s.replace('        "codex-a:2:codex-a"', '        "codex-a:9:codex-a"', 1)
+elif mode == "trans": s = s.replace('        codex|codex-a)                                  echo "2" ;;', '        codex|codex-a)                                  echo "3" ;;', 1)
+p.write_text(s)
+PY
+  out=$("$d/forge-bridge" alias-self-test --strict 2>&1); rc=$?
+  { [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q "$needle"; } \
+    && ok "$id fails at the named replica" || bad "$id rc=$rc: $out"
+  rm -rf "$d"
+}
+alias_negative N-NTI nti "NAME_TO_IDX: 'claude-opus'"
+alias_negative N-BIJ bij "has no pane_name() row"
+alias_negative N-HEALTH health "cmd_health specs: 'codex-a'"
+alias_negative N-TRANS trans "map#"
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

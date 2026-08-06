@@ -7689,10 +7689,18 @@ for line in pane_name_block.group(1).splitlines():
     if mm:
         m_name[int(mm.group(1))] = mm.group(2)
 
-expected_canonical = {alias: m_name[idx] for alias, idx in m_idx.items() if idx in m_name}
-if strict and len(expected_canonical) < 7:
-    print(f"alias-self-test: STRICT FAIL — parser found {len(expected_canonical)} aliases, expected >=7", file=sys.stderr)
+expected_canonical = {}
+for alias, idx in m_idx.items():
+    if idx not in m_name:
+        problems.append(f"pane_index alias '{alias}' → index {idx} has no pane_name() row")
+        continue
+    expected_canonical[alias] = m_name[idx]
+if strict and not expected_canonical:
+    print("alias-self-test: STRICT FAIL — parser resolved zero aliases", file=sys.stderr)
     sys.exit(2)
+if strict and len(expected_canonical) < len(m_idx):
+    problems.append(
+        f"alias map incomplete — {len(expected_canonical)} of {len(m_idx)} aliases resolved")
 
 py_maps = re.findall(r"ALIAS_TO_CANONICAL\s*=\s*\{([^}]+)\}", src)
 if strict and len(py_maps) < 4:
@@ -7717,6 +7725,19 @@ else:
     for canonical in set(expected_canonical.values()):
         if canonical not in name_to_idx:
             problems.append(f"NAME_TO_IDX missing '{canonical}'")
+    _nti_checked = 0
+    for alias, idx in m_idx.items():
+        canonical = m_name.get(idx)
+        if canonical is None or canonical != alias:
+            continue
+        if canonical in name_to_idx:
+            _nti_checked += 1
+            if int(name_to_idx[canonical]) != idx:
+                problems.append(
+                    f"NAME_TO_IDX: '{canonical}' bash={idx} python={name_to_idx[canonical]}")
+    if strict and _nti_checked < 5:
+        problems.append(
+            f"NAME_TO_IDX: STRICT FAIL — only {_nti_checked} values compared, expected >=5")
 
 # swiftbar-stage-visibility: forge-watch carries a SIXTH copy of the map (canonical name ->
 # pane index) for its pane→stage join. Verify it against the bash source here, or the two
@@ -7749,6 +7770,25 @@ if wsrc is not None:
         if strict and len(widx) < len(m_name):
             problems.append(
                 f"forge-watch: STRICT FAIL — {len(widx)} entries, expected >={len(m_name)}")
+
+spec_block = re.search(r'local specs=\(\s*(.*?)\n\s*\)', src, re.DOTALL)
+if not spec_block:
+    problems.append("cmd_health specs array missing")
+else:
+    specs = {}
+    for line in spec_block.group(1).splitlines():
+        mm = re.match(r'\s*"([^:"]+):(\d+):([^"]+)"', line)
+        if mm:
+            specs[mm.group(1)] = int(mm.group(2))
+    for idx, canonical in m_name.items():
+        if canonical not in specs:
+            problems.append(f"cmd_health specs missing '{canonical}'")
+        elif specs[canonical] != idx:
+            problems.append(
+                f"cmd_health specs: '{canonical}' bash={idx} specs={specs[canonical]}")
+    if strict and len(specs) < len(m_name):
+        problems.append(
+            f"cmd_health specs: STRICT FAIL — {len(specs)} entries, expected >={len(m_name)}")
 
 if problems:
     for p in problems:
