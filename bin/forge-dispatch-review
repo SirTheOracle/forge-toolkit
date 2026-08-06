@@ -52,16 +52,12 @@ main() {
         # Check committer — route worker commits to a Codex reviewer.
         local ident
         ident=$(sed -n 's/^committer_ident: *"*\([^"]*\)"*/\1/p' "$f" 2>/dev/null | head -1)
+        # Route every worker commit to Codex A. Matching is by worker NAME only:
+        # idents are baked into git history and repo-local config, so an ident written
+        # under either layout matches the same arm. Do NOT reintroduce an index or pane-id.
         case "$ident" in
-            *codex-b*|*codex_b*|*tmux-pane-%3*)
-                reviewer="codex-a"
-                ;;
-            *claude-opus*|*claude_opus*|*forge\ pane\ 0*)
-                reviewer="codex-a"
-                ;;
-            *claude-sonnet*|*claude_sonnet*|*forge\ pane\ 4*)
-                reviewer="codex-a"
-                ;;
+            *codex-b*|*codex_b*|*claude-opus*|*claude_opus*|*claude-sonnet*|*claude_sonnet*)
+                reviewer="codex-a" ;;
         esac
     done
 
@@ -69,7 +65,8 @@ main() {
         return 0
     fi
 
-    # Defensive guard: commit-review side-channel must never consume worker panes 0 or 4.
+    # Defensive guard: the commit-review side-channel must never consume a Claude worker
+    # (claude-opus or claude-sonnet). Reviewers are named, never indexed.
     case "$reviewer" in
         codex-a|codex-b) ;;
         *)

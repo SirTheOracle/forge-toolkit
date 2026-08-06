@@ -7751,11 +7751,79 @@ else:
         problems.append(
             f"NAME_TO_IDX: STRICT FAIL — only {_nti_checked} values compared, expected >=5")
 
-# swiftbar-stage-visibility: forge-watch carries a SIXTH copy of the map (canonical name ->
-# pane index) for its pane→stage join. Verify it against the bash source here, or the two
-# drift silently. A missing sibling is SKIPPED, not fatal — the bridge must still self-test
-# when it is the only file present (installs, tarballs, tests with a stubbed layout).
-watch_path = os.path.join(os.path.dirname(os.path.abspath(bridge)), 'forge-watch')
+# Sibling checks are independent and optional: installed single-file bridges still self-test.
+bindir = os.path.dirname(os.path.abspath(bridge))
+checked = []
+orch_match = re.search(r'^ORCH_NAME="([^"]+)"$', src, re.MULTILINE)
+if not orch_match or orch_match.group(1) not in m_idx:
+    problems.append("ORCH_NAME missing or unknown")
+else:
+    orch_name = orch_match.group(1)
+    orch_idx = m_idx[orch_name]
+    for sibling in ('forge-cc-hook', 'forge'):
+        path = os.path.join(bindir, sibling)
+        try:
+            text = open(path).read()
+        except OSError:
+            continue
+        checked.append(sibling)
+        mm = re.search(r"ORCH_PANE_INDEX\s*=\s*['\"](\d+)['\"]", text)
+        if not mm:
+            problems.append(f"{sibling}: ORCH_PANE_INDEX missing")
+        elif int(mm.group(1)) != orch_idx:
+            problems.append(f"{sibling}: ORCH_PANE_INDEX={mm.group(1)} expected {orch_idx}")
+
+wl = re.search(r'_reset_worker_locked\(\).*?case "\$idx" in ([0-9|\\]+)\)', src, re.DOTALL)
+if not wl:
+    problems.append("_reset_worker_locked worker whitelist missing")
+else:
+    actual_workers = {int(x) for x in re.findall(r'\d+', wl.group(1))}
+    expected_workers = set(m_name) - {m_idx.get(orch_match.group(1))} if orch_match else set()
+    if actual_workers != expected_workers:
+        problems.append(f"worker whitelist={sorted(actual_workers)} expected={sorted(expected_workers)}")
+
+_lit_scanned = ['forge-bridge']
+for sibling in ('forge', 'forge-watch'):
+    path = os.path.join(bindir, sibling)
+    try:
+        text = open(path).read()
+    except OSError:
+        continue
+    if sibling not in checked:
+        checked.append(sibling)
+    _lit_scanned.append(sibling)
+    for mm in re.finditer(r'\$WINDOW\.\d+|:\.\d+', text):
+        problems.append(f"{sibling}: raw pane target {mm.group(0)}")
+for mm in re.finditer(r'\$WINDOW\.\d+|:\.\d+', src):
+    problems.append(f"forge-bridge: raw pane target {mm.group(0)}")
+
+review_path = os.path.join(bindir, 'forge-dispatch-review')
+try:
+    review_src = open(review_path).read()
+except OSError:
+    review_src = None
+if review_src is not None:
+    checked.append('forge-dispatch-review')
+    _lit_scanned.append('forge-dispatch-review')
+    # `panes?` (not `pane`): the guard prose this catches is written in the plural
+    # (a plural "worker panes N or M" form), which a singular-only pattern misses.
+    for mm in re.finditer(r'panes?(?: |\\ )+[0-9]', review_src):
+        problems.append(f"forge-dispatch-review: raw pane prose {mm.group(0)}")
+
+start_path = os.path.join(bindir, 'forge-start')
+try:
+    start_src = open(start_path).read()
+except OSError:
+    start_src = None
+if start_src is not None:
+    checked.append('forge-start')
+    stamps = {int(i): n for i, n in re.findall(
+        r'set-option -p -t "\$SESSION:\.(\d+)" @forge-worker "([^"]+)"', start_src)}
+    if stamps and stamps != m_name:
+        problems.append(f"forge-start pane stamps={stamps} expected={m_name}")
+
+# swiftbar-stage-visibility: forge-watch carries a map for its pane→stage join.
+watch_path = os.path.join(bindir, 'forge-watch')
 watch_checked = False
 try:
     with open(watch_path) as f:
@@ -7808,7 +7876,8 @@ if problems:
     sys.exit(1)
 
 print(f"alias-self-test: OK ({len(expected_canonical)} aliases verified, {len(py_maps)} maps checked"
-      + (", forge-watch NAME_TO_IDX verified)" if watch_checked else ", forge-watch not present)"))
+      + (", forge-watch NAME_TO_IDX verified" if watch_checked else ", forge-watch not present")
+      + f", siblings checked={','.join(sorted(set(checked))) or 'none'})")
 PYEOF
 }
 

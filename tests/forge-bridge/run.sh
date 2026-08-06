@@ -3490,6 +3490,19 @@ alias_negative N-BIJ bij "has no pane_name() row"
 alias_negative N-HEALTH health "cmd_health specs: 'codex-a'"
 alias_negative N-TRANS trans "map#"
 
+# Each extension fixture gets a fresh directory because sibling edits must not leak.
+for _case in orch wl lit; do
+  _d="$(mktemp -d)"; cp "$ROOT/bin/forge-"* "$_d/" 2>/dev/null || true
+  case "$_case" in
+    orch) perl -pi -e "s/ORCH_PANE_INDEX = '1'/ORCH_PANE_INDEX = '9'/" "$_d/forge-cc-hook"; _needle=ORCH_PANE_INDEX ;;
+    wl) perl -pi -e 's/case "\$idx" in 0\|2\|3\|4\)/case "\$idx" in 0\|2\|4\)/' "$_d/forge-bridge"; _needle='worker whitelist' ;;
+    lit) printf '\n# fixture\ntmux select-pane -t "$SESSION:$WINDOW.1"\n' >> "$_d/forge-bridge"; _needle='raw pane target' ;;
+  esac
+  _out=$("$_d/forge-bridge" alias-self-test --strict 2>&1); _rc=$?
+  { [ "$_rc" -ne 0 ] && printf '%s\n' "$_out" | grep -q "$_needle"; } \
+    && ok "N-${_case} fails at the named replica" || bad "N-${_case}: $_out"
+  rm -rf "$_d"
+done
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
