@@ -974,12 +974,12 @@ assert_status_has "question (AskUserQuestion): Deploy to prod?" "QW1 enriched pe
 assert_status_has "options: yes / no / dry-run" "QW1 option labels rendered"
 assert_status_has "(+1 more)" "QW1 additional-question count surfaces"
 assert_status_missing "permission needed: AskUserQuestion" "QW1 contentless fallback not used"
-cat > "$a/wperm.forge-1.p0.e3b0c442.json" <<JSON
+cat > "$a/wperm.forge-1.p1.e3b0c442.json" <<JSON
 {"schema":"cc-attention/1","event":"permissionrequest","variant":"worker-permission","session":"forge-1","root":"$R","pane_index":"1","role":"worker","agent":"claude","tmux_pane":"%1","emitted_at":"$(iso_ago 30)","state":"needs-input","tool_name":"AskUserQuestion","command":"","command_hash":"e3b0c442","permission_suggestions":[],"question_snippet":"Which table?","question_options":["users","orders"],"question_count":1,"multi_select":false}
 JSON
-assert_status_has "forge-1 p0 — question (AskUserQuestion): Which table?" "QW1 worker wperm renders via the same path"
+assert_status_has "forge-1 p1 — question (AskUserQuestion): Which table?" "QW1 worker wperm renders via the same path"
 run_status --pretty | grep -q "answer in the pane" && ok "QW3 pretty hot row carries the go-to-pane hint" || bad "QW3 go-to-pane hint missing"
-rm -f "$a/wperm.forge-1.p0.e3b0c442.json"
+rm -f "$a/wperm.forge-1.p1.e3b0c442.json"
 stopf "$R" forge-1 5 "answered"
 assert_status_missing "Deploy to prod" "QW4 later Stop supersedes the enriched perm row"
 new_env attq2
@@ -1369,13 +1369,13 @@ new_env cpretty1
 R=$(mk_root proj); live_session forge-1 "$R"
 R2=$(mk_root proj2); live_session forge-2 "$R2"
 R3=$(mk_root proj3); live_session forge-3 "$R3"          # live, no events → idle
-askf "$R" forge-1 ask-p1 "" "" 60 "prod or staging config?"
+askf "$R" forge-1 ask-p0 "" "" 60 "prod or staging config?"
 stopf "$R2" forge-2 120 "shipped the widget"             # → done w/ snippet
 pending_log "$R" p-ancient coding codex "$(iso_ago 6000000)"   # STALE-PENDING residue
 run_status --pretty > "$TDIR/pretty.txt" 2>&1
 grep -q "FORGE BOARD" "$TDIR/pretty.txt" && ok "pretty: header renders" || bad "pretty: no header"
 grep -q "NEEDS YOU (1)" "$TDIR/pretty.txt" && ok "pretty: hot section counts the ask" || bad "pretty: hot section wrong: $(cat "$TDIR/pretty.txt")"
-grep -q -- '--answers ask-p1' "$TDIR/pretty.txt" && grep -q "@forge-1" "$TDIR/pretty.txt" \
+grep -q -- '--answers ask-p0' "$TDIR/pretty.txt" && grep -q "@forge-1" "$TDIR/pretty.txt" \
   && ok "pretty: ask row carries a paste-ready answer command" || bad "pretty: answer hint missing"
 grep -q "forge-2.*done.*shipped the widget" "$TDIR/pretty.txt" && ok "pretty: done session shows its snippet" || bad "pretty: done snippet missing"
 grep -q "forge-3.*idle" "$TDIR/pretty.txt" && ok "pretty: eventless live session listed as idle" || bad "pretty: idle session missing"
@@ -1383,7 +1383,7 @@ grep -q "needs you" "$TDIR/pretty.txt" && ok "pretty: asked session flagged in t
 grep -q "1 STALE-PENDING" "$TDIR/pretty.txt" && ! grep -q "\[STALE-PENDING\]" "$TDIR/pretty.txt" \
   && ok "pretty: maintenance summarized, rows hidden" || bad "pretty: maintenance leak/missing"
 run_status --pretty --all | grep -q "\[STALE-PENDING\]" && ok "pretty --all: maintenance rows listed" || bad "pretty --all: rows missing"
-rm -f "$(attn "$R")/ask-p1.json"
+rm -f "$(attn "$R")/ask-p0.json"
 run_status --pretty | grep -q "NEEDS YOU — nothing" && ok "pretty: empty hot reads all-clear" || bad "pretty: all-clear line missing"
 run_status --board > "$TDIR/pb.json"
 python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); assert b["schema"]=="cc-board/1"' "$TDIR/pb.json" \
@@ -1393,27 +1393,27 @@ echo "── worker ingestion: canonical session lifecycle UNTOUCHED (regression
 new_env twork1
 R=$(mk_root proj); live_session forge-1 "$R"
 disp "$R" forge-1 120 cc-a; promptf "$R" forge-1 60 cc-a       # canonical → SESSION-WORKING
-wpromptf "$R" forge-1 0 30 ptask-x; wstopf "$R" forge-1 0 60 ptask-old
+wpromptf "$R" forge-1 1 30 ptask-x; wstopf "$R" forge-1 1 60 ptask-old
 assert_status_has "forge-1 — working" "canonical SESSION-WORKING intact despite worker files"
 assert_status_missing "forge-1 — done" "worker Stop did NOT flip the session to done (P11)"
 
 echo "── EPISODE rows: active/settled; settle ring only with the knob ──"              # +5
 new_env tpd
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 30 ptask-1 claude "finished the widget"
-assert_status_has "p0 — in progress · 1 turn(s)" "sub-settle wstop → EPISODE-ACTIVE row"
+wstopf "$R" forge-1 1 30 ptask-1 claude "finished the widget"
+assert_status_has "p1 — in progress · 1 turn(s)" "sub-settle wstop → EPISODE-ACTIVE row"
 run_status --board | python3 -c 'import json,sys;b=json.load(sys.stdin);r=[x for x in b["active"] if x["condition"]=="EPISODE-ACTIVE"];assert r and r[0]["state"]=="working"' && ok "EPISODE-ACTIVE is active/state=working in cc-board/1" || bad "board EPISODE-ACTIVE wrong"
 : > "$CAP"; run_check >/dev/null
 [ "$(wc -l < "$CAP")" -eq 0 ] && ok "EPISODE-ACTIVE never rings (policy=never)" || bad "EPISODE-ACTIVE rang"
 new_env tpd2
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 700 ptask-2 claude "finished the widget"
-assert_status_has "p0 — done · 1 turn(s)" "quiet past settle → EPISODE-SETTLED row"
+wstopf "$R" forge-1 1 700 ptask-2 claude "finished the widget"
+assert_status_has "p1 — done · 1 turn(s)" "quiet past settle → EPISODE-SETTLED row"
 : > "$CAP"; run_check >/dev/null
 [ "$(wc -l < "$CAP")" -eq 0 ] && ok "EPISODE-SETTLED does not ring by default (dark-first)" || bad "settled rang without opt-in"
 new_env tpd3
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 700 ptask-3 claude "finished the widget"
+wstopf "$R" forge-1 1 700 ptask-3 claude "finished the widget"
 : > "$CAP"; FORGE_WATCH_NOTIFY_EPISODE_DONE=1 "$WATCH" check >/dev/null 2>&1
 notified "done" && ok "EPISODE-SETTLED rings when FORGE_WATCH_NOTIFY_EPISODE_DONE=1" || bad "knob did not arm the settle ring"
 
@@ -1423,8 +1423,8 @@ R=$(mk_root proj); live_session forge-1 "$R"
 disp "$R" forge-1 120 cc-q
 disp "$R" forge-1 120 cc-acc; promptf "$R" forge-1 60 cc-acc
 disp "$R" forge-1 300 cc-ans; printf 'ans' > "$(attn "$R")/payloads/response.cc-ans.txt"
-wpromptf "$R" forge-1 2 30 ptask-w
-wstopf   "$R" forge-1 3 30 ptask-d claude "did the thing"
+wpromptf "$R" forge-1 3 30 ptask-w
+wstopf   "$R" forge-1 4 30 ptask-d claude "did the thing"
 run_status --board > "$TDIR/t.json"
 python3 - "$TDIR/t.json" <<'PY' && ok "tasks[] carries all five states with fields" || bad "tasks[] states wrong"
 import json,sys
@@ -1433,7 +1433,7 @@ assert t["cc-q"]["state"]=="queued", t.get("cc-q")
 assert t["cc-acc"]["state"]=="accepted"
 assert t["cc-ans"]["state"]=="answered" and t["cc-ans"]["response_path"].endswith("response.cc-ans.txt")
 assert t["ptask-w"]["state"]=="working" and t["ptask-w"]["agent"]=="claude"
-assert t["ptask-d"]["state"]=="done" and t["ptask-d"]["pane"]=="3", t["ptask-d"]
+assert t["ptask-d"]["state"]=="done" and t["ptask-d"]["pane"]=="4", t["ptask-d"]
 assert t["cc-q"]["episode_id"] is None, t["cc-q"]            # dispatched rows never tagged
 assert t["ptask-w"]["episode_id"] and t["ptask-d"]["episode_id"]   # worker rows tagged
 PY
@@ -1442,9 +1442,9 @@ echo "── board-noise: old worker-done collapses to maintenance; latest in wi
 new_env twin
 R=$(mk_root proj); live_session forge-1 "$R"
 export FORGE_WATCH_TASK_WINDOW_S=3600
-wstopf "$R" forge-1 0 30   ptask-recent claude "recent turn"
-wstopf "$R" forge-1 0 7200 ptask-old    claude "old turn"
-assert_status_has "p0 — in progress" "recent worker turn surfaces as the live episode"
+wstopf "$R" forge-1 1 30   ptask-recent claude "recent turn"
+wstopf "$R" forge-1 1 7200 ptask-old    claude "old turn"
+assert_status_has "p1 — in progress" "recent worker turn surfaces as the live episode"
 run_status --board | python3 -c 'import json,sys;b=json.load(sys.stdin);ids={x["task_id"] for x in b["tasks"] if x["state"]=="done"};assert "ptask-recent" in ids and "ptask-old" not in ids, ids' && ok "tasks[] bounded to the window (old turn excluded)" || bad "window not applied"
 run_status | grep -q "older worker-done" && ok "old worker-done collapses to a maintenance count" || bad "residue not collapsed"
 unset FORGE_WATCH_TASK_WINDOW_S
@@ -1457,37 +1457,37 @@ export FORGE_WATCH_EPISODE_SETTLE_S=120
 echo "── episodes 1: prompt-only pane opens (stops ∪ prompts union) ──"                 # +2
 new_env tep1
 R=$(mk_root proj); live_session forge-1 "$R"
-wpromptf "$R" forge-1 0 30 t-a
-assert_status_has "p0 — in progress" "wprompt with no wstop opens an episode"
-assert_status_missing "p0 — done" "prompt-only pane is not done"
+wpromptf "$R" forge-1 1 30 t-a
+assert_status_has "p1 — in progress" "wprompt with no wstop opens an episode"
+assert_status_missing "p1 — done" "prompt-only pane is not done"
 
 echo "── episodes 2: sub-settle turns extend ONE episode, not N rows ──"                # +3
 new_env tep2
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 260 t1; wstopf "$R" forge-1 0 160 t2; wstopf "$R" forge-1 0 60 t3
+wstopf "$R" forge-1 1 260 t1; wstopf "$R" forge-1 1 160 t2; wstopf "$R" forge-1 1 60 t3
 assert_status_has "in progress · 3 turn(s)" "3 sub-settle turns → one active episode"
-assert_status_missing "p0 — done" "no settled row while turns keep arriving"
+assert_status_missing "p1 — done" "no settled row while turns keep arriving"
 run_status --board | python3 -c 'import json,sys;e=json.load(sys.stdin)["episodes"];assert len(e)==1 and e[0]["turn_count"]==3 and e[0]["state"]=="in_progress", e' && ok "episodes[] holds one 3-turn in-progress record" || bad "episodes[] wrong"
 
 echo "── episodes 3: mid-turn dominates ──"                                             # +1
 new_env tep3
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 60 t-a; wpromptf "$R" forge-1 0 10 t-b
+wstopf "$R" forge-1 1 60 t-a; wpromptf "$R" forge-1 1 10 t-b
 run_status --board | python3 -c 'import json,sys;e=json.load(sys.stdin)["episodes"];assert e[0]["mid_turn"] is True and e[0]["state"]=="in_progress", e' && ok "newer wprompt → mid_turn episode stays in progress" || bad "mid-turn not dominant"
 
 echo "── episodes 4: settle ──"                                                         # +3
 new_env tep4
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 150 tX
-assert_status_has "p0 — done · 1 turn(s)" "quiet ≥ settle → done"
+wstopf "$R" forge-1 1 150 tX
+assert_status_has "p1 — done · 1 turn(s)" "quiet ≥ settle → done"
 assert_status_missing "in progress" "no active row after settle"
 run_status --board | python3 -c 'import json,sys;e=json.load(sys.stdin)["episodes"];assert e[0]["state"]=="settled", e' && ok "episode settled in episodes[]" || bad "state not settled"
 
 echo "── episodes 5: reopen → two episodes, historical tagging, one condition ──"       # +2
 new_env tep5
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 1000 o1; wstopf "$R" forge-1 0 900 o2   # gap 100 < 120 → one settled run
-wstopf "$R" forge-1 0 30 n1                                    # gap 870 ≥ 120 → NEW run
+wstopf "$R" forge-1 1 1000 o1; wstopf "$R" forge-1 1 900 o2   # gap 100 < 120 → one settled run
+wstopf "$R" forge-1 1 30 n1                                    # gap 870 ≥ 120 → NEW run
 run_status --board > "$TDIR/ep5.json"
 python3 - "$TDIR/ep5.json" <<'PY' && ok "reopen: 2 distinct episodes; history keeps its id; one live condition" || bad "reopen derivation wrong"
 import json,sys
@@ -1509,54 +1509,54 @@ echo "── episodes 6: ring once per episode; reopen re-rings once at a NEW id
 new_env tep6
 R=$(mk_root proj); live_session forge-1 "$R"
 export FORGE_WATCH_NOTIFY_EPISODE_DONE=1
-wstopf "$R" forge-1 0 130 tZ claude "job finished"
+wstopf "$R" forge-1 1 130 tZ claude "job finished"
 run_check >/dev/null
-[ "$(grep -c "p0 — done" "$CAP")" -eq 1 ] && ok "fresh settle rings exactly once" || bad "settle ring count wrong: $(cat "$CAP")"
+[ "$(grep -c "p1 — done" "$CAP")" -eq 1 ] && ok "fresh settle rings exactly once" || bad "settle ring count wrong: $(cat "$CAP")"
 : > "$CAP"; run_check >/dev/null
 [ "$(wc -l < "$CAP")" -eq 0 ] && ok "same settled episode never re-rings (policy=once)" || bad "re-rang"
-wstopf "$R" forge-1 0 800 tZ claude "job finished"    # re-stamp the old episode further back
-wstopf "$R" forge-1 0 300 tN claude "second job done" # new settled run (gap 500 ≥ 120); age
+wstopf "$R" forge-1 1 800 tZ claude "job finished"    # re-stamp the old episode further back
+wstopf "$R" forge-1 1 300 tN claude "second job done" # new settled run (gap 500 ≥ 120); age
                                                       # differs from tZ's original 130 so the
                                                       # new anchor can never collide with the
                                                       # already-rung episode_id
 : > "$CAP"; run_check >/dev/null
-[ "$(grep -c "p0 — done" "$CAP")" -eq 1 ] && ok "re-settle at a NEW episode_id rings exactly once more" || bad "reopen ring wrong: $(cat "$CAP")"
+[ "$(grep -c "p1 — done" "$CAP")" -eq 1 ] && ok "re-settle at a NEW episode_id rings exactly once more" || bad "reopen ring wrong: $(cat "$CAP")"
 unset FORGE_WATCH_NOTIFY_EPISODE_DONE
 
 echo "── episodes 7: dark by default; cold restart cannot ring stale history ──"        # +3
 new_env tep7
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 130 tA
+wstopf "$R" forge-1 1 130 tA
 : > "$CAP"; run_check >/dev/null
 [ "$(wc -l < "$CAP")" -eq 0 ] && ok "fresh settle without the knob is silent" || bad "rang without knob"
 new_env tep7b
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 4120 old1                       # settled far outside the fresh band
+wstopf "$R" forge-1 1 4120 old1                       # settled far outside the fresh band
 rm -f "$FORGE_WATCH_CACHE_DIR/state.json"
 : > "$CAP"; FORGE_WATCH_NOTIFY_EPISODE_DONE=1 "$WATCH" check >/dev/null 2>&1
 [ "$(wc -l < "$CAP")" -eq 0 ] && ok "cold restart: settled history outside EPISODE_RING_FRESH_S never rings" || bad "cold-start storm: $(cat "$CAP")"
-wstopf "$R" forge-1 0 130 new1                        # freshly settled new run (gap ≥ 120)
+wstopf "$R" forge-1 1 130 new1                        # freshly settled new run (gap ≥ 120)
 : > "$CAP"; FORGE_WATCH_NOTIFY_EPISODE_DONE=1 "$WATCH" check >/dev/null 2>&1
-[ "$(grep -c "p0 — done" "$CAP")" -eq 1 ] && ok "freshly-settled stream still rings once after cold start" || bad "fresh ring lost: $(cat "$CAP")"
+[ "$(grep -c "p1 — done" "$CAP")" -eq 1 ] && ok "freshly-settled stream still rings once after cold start" || bad "fresh ring lost: $(cat "$CAP")"
 
 echo "── episodes 8: mid-turn hang → EPISODE-STUCK (hot) ──"                            # +2
 new_env tep8
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 40000 t-old; wpromptf "$R" forge-1 0 39000 t-hang
+wstopf "$R" forge-1 1 40000 t-old; wpromptf "$R" forge-1 1 39000 t-hang
 assert_status_has "EPISODE-STUCK" "prompt with no Stop past TASK_STUCK_S → EPISODE-STUCK"
 run_status --board | python3 -c 'import json,sys;r=[x for x in json.load(sys.stdin)["hot"] if x["condition"]=="EPISODE-STUCK"];assert r and r[0]["state"]=="needs-input"' && ok "EPISODE-STUCK is hot/needs-input" || bad "EPISODE-STUCK not hot"
 
 echo "── episodes 9: first-turn hang, NO wstop at all (T7b) ──"                         # +1
 new_env tep9
 R=$(mk_root proj); live_session forge-1 "$R"
-wpromptf "$R" forge-1 0 40000 t-hang
+wpromptf "$R" forge-1 1 40000 t-hang
 assert_status_has "EPISODE-STUCK" "union derivation reaches a no-wstop hang"
 
 echo "── episodes 10: dispatched hang → TASK-STUCK only (suppression, R1b) ──"          # +6
 new_env tep10
 R=$(mk_root proj); live_session forge-1 "$R"
 disp "$R" forge-1 40000 did-x
-wpromptf "$R" forge-1 0 39000 t-hang claude "working" did-x
+wpromptf "$R" forge-1 1 39000 t-hang claude "working" did-x
 assert_status_has "TASK-STUCK" "dispatched hang fires TASK-STUCK"
 assert_status_missing "EPISODE-STUCK" "EPISODE-STUCK twin suppressed for the same dispatch"
 run_status --board | python3 -c 'import json,sys;h=json.load(sys.stdin)["hot"];assert len(h)==1 and h[0]["condition"]=="TASK-STUCK", h' && ok "exactly one hot row for one hang" || bad "double hot row"
@@ -1564,7 +1564,7 @@ run_status --board | python3 -c 'import json,sys;h=json.load(sys.stdin)["hot"];a
 [ "$(grep -c . "$CAP")" -eq 1 ] && ok "exactly one ring for one hang" || bad "ring count wrong: $(cat "$CAP")"
 new_env tep10b
 R=$(mk_root proj); live_session forge-1 "$R"
-wpromptf "$R" forge-1 0 39000 t-hang claude "working"
+wpromptf "$R" forge-1 1 39000 t-hang claude "working"
 assert_status_has "EPISODE-STUCK" "undispatched twin fires EPISODE-STUCK alone"
 assert_status_missing "TASK-STUCK" "no TASK-STUCK without a dispatch"
 
@@ -1578,22 +1578,22 @@ run_status --board | python3 -c 'import json,sys;e=json.load(sys.stdin)["episode
 echo "── episodes 12: hot outranks and is orthogonal ──"                                # +3
 new_env tep12
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 30 t-w claude "working away"
-wpermf "$R" forge-1 0 beef 10
+wstopf "$R" forge-1 1 30 t-w claude "working away"
+wpermf "$R" forge-1 1 beef 10
 run_check >/dev/null
 assert_notified "permission needed" "worker NEEDS-PERMISSION still rings"
 assert_status_has "permission needed" "hot permission row present"
-assert_status_has "p0 — in progress" "episode row coexists (orthogonal)"
+assert_status_has "p1 — in progress" "episode row coexists (orthogonal)"
 
 echo "── episodes 13: SESSIONS annotation, glyph untouched ──"                          # +3
 new_env tep13
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 30 t-a
+wstopf "$R" forge-1 1 30 t-a
 run_status --pretty > "$TDIR/p.txt"
 grep -q "forge-1.*- idle.*1 pane(s) active" "$TDIR/p.txt" && ok "idle glyph + active-pane annotation (no leak into pane-1 derivation)" || bad "annotation/glyph wrong: $(grep -m2 forge-1 "$TDIR/p.txt")"
 new_env tep13b
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 150 t-a
+wstopf "$R" forge-1 1 150 t-a
 run_status --pretty > "$TDIR/p.txt"
 grep -q "forge-1.*- idle" "$TDIR/p.txt" && ok "settled worker episode → glyph still idle (R8)" || bad "glyph leaked"
 grep -q "pane(s) active" "$TDIR/p.txt" && bad "settled episode wrongly annotated" || ok "no annotation for a settled episode"
@@ -1601,8 +1601,8 @@ grep -q "pane(s) active" "$TDIR/p.txt" && bad "settled episode wrongly annotated
 echo "── episodes 14: cc-board additive — episodes[], row metadata, task tags ──"       # +1
 new_env tep14
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 160 t1; wstopf "$R" forge-1 0 60 t2      # pane 0: active run (gap 100)
-wstopf "$R" forge-1 2 150 t3                                    # pane 2: settled run
+wstopf "$R" forge-1 1 160 t1; wstopf "$R" forge-1 1 60 t2      # pane 1: active run (gap 100)
+wstopf "$R" forge-1 3 150 t3                                    # pane 3: settled run
 disp "$R" forge-1 120 cc-d                                      # dispatched row
 run_status --board > "$TDIR/b14.json"
 python3 - "$TDIR/b14.json" <<'PY' && ok "episodes[] + _row metadata + per-task episode_id + dispatched null" || bad "board additive contract wrong"
@@ -1624,9 +1624,9 @@ PY
 echo "── episodes 15: QUIET — active episode msg is byte-identical across ticks ──"     # +2
 new_env tep15
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 60 tq1 claude "steady work"
+wstopf "$R" forge-1 1 60 tq1 claude "steady work"
 run_status | grep "EPISODE-ACTIVE" > "$TDIR/m1.txt"
-wstopf "$R" forge-1 0 91 tq1 claude "steady work"      # same turn re-stamped 31s older
+wstopf "$R" forge-1 1 91 tq1 claude "steady work"      # same turn re-stamped 31s older
 run_status | grep "EPISODE-ACTIVE" > "$TDIR/m2.txt"
 if [ -s "$TDIR/m1.txt" ] && diff -q "$TDIR/m1.txt" "$TDIR/m2.txt" >/dev/null; then
     ok "EPISODE-ACTIVE msg byte-identical 31s apart (QUIET signature holds)"
@@ -1638,14 +1638,14 @@ grep -q " ago" "$TDIR/m1.txt" && bad "live age leaked into the finding msg" || o
 echo "── episodes 16: clock skew (future emitted_at) is fail-safe ──"                   # +1
 new_env tep16
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 -50 t-fut
-assert_status_has "p0 — in progress" "future timestamp reads in-progress, no crash"
+wstopf "$R" forge-1 1 -50 t-fut
+assert_status_has "p1 — in progress" "future timestamp reads in-progress, no crash"
 
 echo "── episodes 17: fresh prompt after settled gap opens a NEW episode (R2a) ──"      # +2
 new_env tep17
 R=$(mk_root proj); live_session forge-1 "$R"
-wstopf "$R" forge-1 0 1000 old1
-wpromptf "$R" forge-1 0 10 new1
+wstopf "$R" forge-1 1 1000 old1
+wpromptf "$R" forge-1 1 10 new1
 run_status --board > "$TDIR/ep17.json"
 python3 - "$TDIR/ep17.json" <<'PY' && ok "prompt-only current run; old episode not resurrected" || bad "R2a violated"
 import json,sys
@@ -1666,7 +1666,7 @@ echo "── episodes 18: stale settled folds to residue; STUCK exempt (R2b) ─
 new_env tep18
 R=$(mk_root proj); live_session forge-1 "$R"
 export FORGE_WATCH_TASK_WINDOW_S=3600
-wstopf "$R" forge-1 0 7200 old1
+wstopf "$R" forge-1 1 7200 old1
 run_status --board > "$TDIR/ep18.json"
 python3 - "$TDIR/ep18.json" <<'PY' && ok "stale settled: no live condition, no task row; residue only" || bad "R2b guard wrong"
 import json,sys
@@ -1678,7 +1678,7 @@ PY
 new_env tep18b
 R=$(mk_root proj); live_session forge-1 "$R"
 export FORGE_WATCH_TASK_WINDOW_S=3600
-wpromptf "$R" forge-1 0 30000 t-hang
+wpromptf "$R" forge-1 1 30000 t-hang
 assert_status_has "EPISODE-STUCK" "unterminated hang past the window still fires (not residue)"
 unset FORGE_WATCH_TASK_WINDOW_S
 
@@ -1686,7 +1686,7 @@ echo "── episodes 19: multi-root board aggregates every root (R3a) ──"  
 new_env tep19
 R=$(mk_root proj); live_session forge-1 "$R"
 R2=$(mk_root proj2); live_session forge-2 "$R2"
-wstopf "$R" forge-1 0 60 t-a claude "root one"
+wstopf "$R" forge-1 1 60 t-a claude "root one"
 wstopf "$R2" forge-2 0 30 t-b claude "root two"
 run_status --board | python3 -c '
 import json,sys
@@ -1700,7 +1700,7 @@ echo "── episodes 20: cross-root task-id collision keeps root-scoped tags (R
 new_env tep20
 R=$(mk_root proj); live_session forge-1 "$R"
 R2=$(mk_root proj2); live_session forge-2 "$R2"
-wstopf "$R" forge-1 0 30 t-shared
+wstopf "$R" forge-1 1 30 t-shared
 wstopf "$R2" forge-1 0 150 t-shared          # same session name + task_id, other root
 run_status --board | python3 -c '
 import json,sys
@@ -1717,9 +1717,9 @@ unset FORGE_WATCH_EPISODE_SETTLE_S
 echo "── worker NEEDS-PERMISSION: wperm → hot; superseded by a later worker Stop ──"    # +2
 new_env twperm
 R=$(mk_root proj); live_session forge-1 "$R"
-wpermf "$R" forge-1 0 abcd 30
-assert_status_has "forge-1 p0 — permission needed" "wperm → NEEDS-PERMISSION (hot)"
-wstopf "$R" forge-1 0 10 ptask-after
+wpermf "$R" forge-1 1 abcd 30
+assert_status_has "forge-1 p1 — permission needed" "wperm → NEEDS-PERMISSION (hot)"
+wstopf "$R" forge-1 1 10 ptask-after
 assert_status_missing "permission needed" "a later worker Stop supersedes the worker permission"
 
 echo "── graceful degradation: everything empty → valid cc-board/1, no crash ──"        # +2
@@ -1848,20 +1848,20 @@ else:
 # proves the brief-path match did the work.
 R=$(mk_root sproj); live_session forge-1 "$R"
 dispatch_log "$R" t1slug coding claude-sonnet "$(iso_ago 300)" other-sess
-wpromptf "$R" forge-1 4 30 ptask-s1 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t1slug.txt"
-[ "$(ep_tag forge-1 4)" = "t1slug|coding|forge-coder|brief" ] \
+wpromptf "$R" forge-1 2 30 ptask-s1 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t1slug.txt"
+[ "$(ep_tag forge-1 2)" = "t1slug|coding|forge-coder|brief" ] \
   && ok "T-FW-STAGE-1 tier 1: brief path match tags slug/stage/skill (cross-session)" \
-  || bad "T-FW-STAGE-1 got: $(ep_tag forge-1 4)"
+  || bad "T-FW-STAGE-1 got: $(ep_tag forge-1 2)"
 
 # T-FW-STAGE-2 — tier 2 (pane fallback) when the live prompt is a follow-up nudge, not the
-# original ref_msg. This is the common live shape (verified 2026-07-29 on feedmint p2).
+# original ref_msg. This is the common live shape (verified 2026-07-29 on feedmint p3).
 new_env tstage2
 R=$(mk_root sproj); live_session forge-1 "$R"
 dispatch_log "$R" t2slug verify codex-a "$(iso_ago 300)" forge-1
-wpromptf "$R" forge-1 2 30 ptask-s2 codex "VERIFY CYCLE 2 context - read this before working"
-[ "$(ep_tag forge-1 2)" = "t2slug|verify|adversarial-verify|pending" ] \
+wpromptf "$R" forge-1 3 30 ptask-s2 codex "VERIFY CYCLE 2 context - read this before working"
+[ "$(ep_tag forge-1 3)" = "t2slug|verify|adversarial-verify|pending" ] \
   && ok "T-FW-STAGE-2 tier 2: nudge prompt falls back to the pane's live pending" \
-  || bad "T-FW-STAGE-2 got: $(ep_tag forge-1 2)"
+  || bad "T-FW-STAGE-2 got: $(ep_tag forge-1 3)"
 
 # T-FW-STAGE-3 — a superseded orphan (open entry with a strictly-newer CLOSED twin at the
 # same stage) must tag NOTHING, under either tier. A stale tag is worse than no tag.
@@ -1883,39 +1883,39 @@ entries:
     prompt: "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t3slug.txt"
     response: "FORGE_DONE: coding"
 EOF
-wpromptf "$R" forge-1 4 30 ptask-s3 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t3slug.txt"
-[ "$(ep_tag forge-1 4)" = "None|None|None|None" ] \
+wpromptf "$R" forge-1 2 30 ptask-s3 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t3slug.txt"
+[ "$(ep_tag forge-1 2)" = "None|None|None|None" ] \
   && ok "T-FW-STAGE-3 superseded orphan tags nothing (neither tier)" \
-  || bad "T-FW-STAGE-3 got: $(ep_tag forge-1 4)"
+  || bad "T-FW-STAGE-3 got: $(ep_tag forge-1 2)"
 
 # T-FW-STAGE-4 — a SETTLED episode carries no tag. Settled runs are history and their
 # stage may well be a different one; a confident wrong tag on old work is the failure mode.
 new_env tstage4
 R=$(mk_root sproj); live_session forge-1 "$R"
 dispatch_log "$R" t4slug coding claude-sonnet "$(iso_ago 900)" forge-1
-wstopf "$R" forge-1 4 700 ptask-s4 claude "all done"
-[ "$(ep_tag forge-1 4)" = "None|None|None|None" ] \
+wstopf "$R" forge-1 2 700 ptask-s4 claude "all done"
+[ "$(ep_tag forge-1 2)" = "None|None|None|None" ] \
   && ok "T-FW-STAGE-4 settled episode carries no stage tag" \
-  || bad "T-FW-STAGE-4 got: $(ep_tag forge-1 4)"
+  || bad "T-FW-STAGE-4 got: $(ep_tag forge-1 2)"
 
 # T-FW-STAGE-5 — a stage with no mapped skill still tags slug/stage; skill stays null
 # (a missing STAGE_SKILL entry must never render a wrong skill).
 new_env tstage5
 R=$(mk_root sproj); live_session forge-1 "$R"
 dispatch_log "$R" t5slug impl-review claude-opus "$(iso_ago 300)" forge-1
-wpromptf "$R" forge-1 0 30 ptask-s5 claude "Read and follow instructions in .dev/forge-tmp/claude-opus-impl-review-t5slug.txt"
-[ "$(ep_tag forge-1 0)" = "t5slug|impl-review|None|brief" ] \
+wpromptf "$R" forge-1 1 30 ptask-s5 claude "Read and follow instructions in .dev/forge-tmp/claude-opus-impl-review-t5slug.txt"
+[ "$(ep_tag forge-1 1)" = "t5slug|impl-review|None|brief" ] \
   && ok "T-FW-STAGE-5 unmapped stage → slug/stage tagged, skill null" \
-  || bad "T-FW-STAGE-5 got: $(ep_tag forge-1 0)"
+  || bad "T-FW-STAGE-5 got: $(ep_tag forge-1 1)"
 
 # T-FW-STAGE-6 — a pane with no pipeline work at all is untagged (pane 1 / the orchestrator
 # seat dispatches and never receives a pending, so this is its permanent state).
 new_env tstage6
 R=$(mk_root sproj); live_session forge-1 "$R"
-wpromptf "$R" forge-1 1 30 ptask-s6 claude "operator typed something"
-[ "$(ep_tag forge-1 1)" = "None|None|None|None" ] \
+wpromptf "$R" forge-1 0 30 ptask-s6 claude "operator typed something"
+[ "$(ep_tag forge-1 0)" = "None|None|None|None" ] \
   && ok "T-FW-STAGE-6 pane with no pending is untagged" \
-  || bad "T-FW-STAGE-6 got: $(ep_tag forge-1 1)"
+  || bad "T-FW-STAGE-6 got: $(ep_tag forge-1 0)"
 
 # T-FW-STAGE-7 — the join is read-only and cannot take down a scan: a forge-log.yml that is
 # not parseable at all must still yield a board with episodes, and no scan error.
@@ -1923,10 +1923,10 @@ new_env tstage7
 R=$(mk_root sproj); live_session forge-1 "$R"
 mkdir -p "$R/.dev/proposals/t7slug"
 printf 'entries: [ this is not: valid: yaml\n  - - -\n' > "$R/.dev/proposals/t7slug/forge-log.yml"
-wpromptf "$R" forge-1 4 30 ptask-s7 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t7slug.txt"
-{ [ "$(ep_tag forge-1 4)" = "None|None|None|None" ] && ! run_status | grep -q "attention scan error"; } \
+wpromptf "$R" forge-1 2 30 ptask-s7 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t7slug.txt"
+{ [ "$(ep_tag forge-1 2)" = "None|None|None|None" ] && ! run_status | grep -q "attention scan error"; } \
   && ok "T-FW-STAGE-7 unparseable log → no tag, no scan error (fail-safe)" \
-  || bad "T-FW-STAGE-7 got: $(ep_tag forge-1 4) / $(run_status | grep 'scan error')"
+  || bad "T-FW-STAGE-7 got: $(ep_tag forge-1 2) / $(run_status | grep 'scan error')"
 
 # T-FW-STAGE-8 — an UNQUOTED YAML timestamp parses as a datetime, not a str. episodes[] is
 # json.dumps'd, so it must be coerced to the canonical ...Z form (the same trap _row already
@@ -1944,7 +1944,7 @@ entries:
     prompt: "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t8slug.txt"
     response: null
 EOF
-wpromptf "$R" forge-1 4 30 ptask-s8 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t8slug.txt"
+wpromptf "$R" forge-1 2 30 ptask-s8 claude "Read and follow instructions in .dev/forge-tmp/claude-sonnet-coding-t8slug.txt"
 since=$(run_status --board | python3 -c '
 import json,sys
 b = json.load(sys.stdin)
@@ -1967,7 +1967,7 @@ if [ -f "$PLUGIN" ]; then
     printf '%s' "$1" > "$f.json"
     FORGE_BIN="$f" bash "$PLUGIN"
   }
-  EP1='{"episode_id":"e1","session":"forge-3","pane":"0","root":"/r","label":"goparent-ai","agent":"claude","state":"in_progress","mid_turn":false,"turn_count":3,"current":true,"quiet_s":120,"first_at":"2026-01-01T00:00:00Z","last_at":"2026-01-01T00:02:00Z","last_snippet":"building the parser"}'
+  EP1='{"episode_id":"e1","session":"forge-3","pane":"1","root":"/r","label":"goparent-ai","agent":"claude","state":"in_progress","mid_turn":false,"turn_count":3,"current":true,"quiet_s":120,"first_at":"2026-01-01T00:00:00Z","last_at":"2026-01-01T00:02:00Z","last_snippet":"building the parser"}'
   BASE='"schema":"cc-board/1","active":[],"maintenance":{"collapsed":true,"count":0,"rows":[]}'
 
   # SB1 — in-progress title + row (titles carry the icon param; compare the text
@@ -1975,7 +1975,7 @@ if [ -f "$PLUGIN" ]; then
   out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EP1]}")
   t1=$(echo "$out" | head -1)
   { [ "${t1%% |*}" = "⚙1" ] && echo "$t1" | grep -q "templateImage=iVBOR"; } && ok "SB1: title shows ⚙1 + icon, no ✓" || bad "SB1 title: $t1"
-  { echo "$out" | grep -q "forge-3 p0" && echo "$out" | grep -q "quiet 2m"; } && ok "SB1: episode row has session/pane + quiet age" || bad "SB1 row missing"
+  { echo "$out" | grep -q "forge-3 p1" && echo "$out" | grep -q "quiet 2m"; } && ok "SB1: episode row has session/pane + quiet age" || bad "SB1 row missing"
 
   # SB2 — hot leads, order pinned
   out=$(sbrun "{$BASE,\"hot\":[{\"condition\":\"NEEDS-ASK\",\"session\":\"forge-1\",\"acked\":false}],\"tasks\":[],\"stale\":false,\"episodes\":[$EP1]}")
@@ -1997,8 +1997,8 @@ if [ -f "$PLUGIN" ]; then
   { echo "$line" | grep -q "a ¦ b" && [ "$(printf '%s' "$line" | tr -cd '|' | wc -c | tr -d ' ')" -eq 0 ]; } && ok "SB4: snippet pipe → ¦ on the submenu row, no stray separator" || bad "SB4 row: $line"
 
   # SB5 — non-current / settled excluded; codex empty pane omits pN token
-  EPA='{"episode_id":"a","session":"s-old","pane":"0","root":"/r","label":"L","agent":"claude","state":"in_progress","mid_turn":false,"turn_count":1,"current":false,"quiet_s":5,"last_at":"2026-01-01T00:00:01Z","first_at":"2026-01-01T00:00:00Z","last_snippet":""}'
-  EPB='{"episode_id":"b","session":"s-done","pane":"2","root":"/r","label":"L","agent":"claude","state":"settled","mid_turn":false,"turn_count":1,"current":true,"quiet_s":900,"last_at":"2026-01-01T00:00:02Z","first_at":"2026-01-01T00:00:00Z","last_snippet":""}'
+  EPA='{"episode_id":"a","session":"s-old","pane":"1","root":"/r","label":"L","agent":"claude","state":"in_progress","mid_turn":false,"turn_count":1,"current":false,"quiet_s":5,"last_at":"2026-01-01T00:00:01Z","first_at":"2026-01-01T00:00:00Z","last_snippet":""}'
+  EPB='{"episode_id":"b","session":"s-done","pane":"3","root":"/r","label":"L","agent":"claude","state":"settled","mid_turn":false,"turn_count":1,"current":true,"quiet_s":900,"last_at":"2026-01-01T00:00:02Z","first_at":"2026-01-01T00:00:00Z","last_snippet":""}'
   EPC='{"episode_id":"c","session":"codex-x","pane":"","root":"/r","label":"proj","agent":"codex","state":"in_progress","mid_turn":false,"turn_count":1,"current":true,"quiet_s":5,"last_at":"2026-01-01T00:00:03Z","first_at":"2026-01-01T00:00:00Z","last_snippet":""}'
   out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EPA,$EPB,$EPC]}")
   { echo "$out" | head -1 | grep -q "⚙1" && [ "$(echo "$out" | grep -c 'color=orange')" -eq 1 ]; } && ok "SB5: only current+in_progress rendered" || bad "SB5 count wrong"
@@ -2030,7 +2030,7 @@ if [ -f "$PLUGIN" ]; then
   # SB10 — 8-row cap + overflow line
   NINE=$(python3 -c '
 import json
-eps=[{"episode_id":f"e{i}","session":f"s{i}","pane":"0","root":"/r","label":"L","agent":"claude",
+eps=[{"episode_id":f"e{i}","session":f"s{i}","pane":"1","root":"/r","label":"L","agent":"claude",
       "state":"in_progress","mid_turn":False,"turn_count":1,"current":True,"quiet_s":5,
       "first_at":"2026-01-01T00:00:00Z","last_at":f"2026-01-01T00:00:{i:02d}Z","last_snippet":""}
      for i in range(9)]
@@ -2054,7 +2054,7 @@ print(json.dumps(eps))')
   # SB13 — tagged pane: stage on the parent, detail in the submenu
   out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EPT]}")
   parent=$(echo "$out" | grep "^⚙ ")
-  { echo "$parent" | grep -q "forge-3 p0 · coding · quiet 2m" \
+  { echo "$parent" | grep -q "forge-3 p1 · coding · quiet 2m" \
     && echo "$out" | grep -q -- "-- pipeline: my-slug / coding" \
     && echo "$out" | grep -q -- "-- skill: forge-coder" \
     && echo "$out" | grep -q -- "-- last: \"building the parser\"" \
@@ -2066,7 +2066,7 @@ print(json.dumps(eps))')
   # SB14 — untagged pane degrades: no stage segment, no submenu pipeline row, no "None"
   out=$(sbrun "{$BASE,\"hot\":[],\"tasks\":[],\"stale\":false,\"episodes\":[$EP1]}")
   parent=$(echo "$out" | grep "^⚙ ")
-  { [ "${parent%% |*}" = "⚙ forge-3 p0 · quiet 2m" ] \
+  { [ "${parent%% |*}" = "⚙ forge-3 p1 · quiet 2m" ] \
     && ! echo "$out" | grep -q -- "-- pipeline:" \
     && ! echo "$out" | grep -q -- "-- skill:" \
     && ! echo "$out" | grep -qi "None"; } \
@@ -2094,7 +2094,7 @@ new_env tcodex
 R=$(mk_root proj); live_session forge-1 "$R"
 printf '{"schema":"cc-codex-register/1","hook_sha256":"abc","hooks_path":"x"}' > "$(attn "$R")/codex-register.json"
 assert_status_has "CODEX-EMISSION-OFF" "installed codex hooks + no codex emission → CODEX-EMISSION-OFF"
-wstopf "$R" forge-1 2 30 turn-1 codex "codex answered"
+wstopf "$R" forge-1 3 30 turn-1 codex "codex answered"
 assert_status_missing "CODEX-EMISSION-OFF" "a codex-tagged wstop suppresses the row (trust proven observationally)"
 
 
@@ -2149,16 +2149,16 @@ echo "── markdown stripping: snippets render plain on every surface (MD1-MD6
 new_env mdstrip
 R=$(mk_root proj); live_session forge-1 "$R"
 # MD1: worker episode snippet — heading/bold/backticks/link all stripped
-wstopf "$R" forge-1 0 30 ptask-md1 claude '## Done **bold** with `code` and [plan.md](/tmp/plan.md)'
+wstopf "$R" forge-1 1 30 ptask-md1 claude '## Done **bold** with `code` and [plan.md](/tmp/plan.md)'
 assert_status_has "last: Done bold with code and plan.md" "MD1 episode snippet stripped"
 # MD2: session-level done snippet — nested bold+inline-code stripped
 stopf "$R" forge-1 60 'committed **`fix.py`** as `abc123`'
 assert_status_has "done: committed fix.py as abc123" "MD2 session-done snippet stripped"
 # MD3: a snip()-truncated link tail degrades to its link text
-wstopf "$R" forge-1 2 30 ptask-md3 claude 'artifact: [diagnosis.md](/Users/x/sirtheoracle/au'
-assert_status_has "p2 — in progress · 1 turn(s) · last: artifact: diagnosis.md" "MD3 truncated link → text"
+wstopf "$R" forge-1 3 30 ptask-md3 claude 'artifact: [diagnosis.md](/Users/x/sirtheoracle/au'
+assert_status_has "p3 — in progress · 1 turn(s) · last: artifact: diagnosis.md" "MD3 truncated link → text"
 # MD4: non-markdown lookalikes survive (globs, math, #refs, dunders)
-wstopf "$R" forge-1 4 30 ptask-md4 claude 'keep *.json globs, 2 * 3, #192 and __init__.py'
+wstopf "$R" forge-1 2 30 ptask-md4 claude 'keep *.json globs, 2 * 3, #192 and __init__.py'
 assert_status_has 'keep \*\.json globs, 2 \* 3, #192 and __init__\.py' "MD4 lookalikes untouched"
 # MD5: the cc-board JSON itself carries stripped text (the SwiftBar surface)
 run_status --board > "$TDIR/md.json"
@@ -2182,21 +2182,21 @@ new_env htfilter
 R=$(mk_root proj); live_session forge-1 "$R"
 a="$(attn "$R")"
 # HT1: done turn whose prompt was an injected <task-notification> → no task row
-cat > "$a/wstop.forge-1.p0.ptask-ht1.json" <<JSON
+cat > "$a/wstop.forge-1.p1.ptask-ht1.json" <<JSON
 {"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"1","role":"worker","agent":"claude","tmux_pane":"%1","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht1","prompt_snippet":"<task-notification> <task-id>abc123</task-id> <tool-use-id>toolu_x</tool-use-id>","snippet":"noted, moving on","snippet_source":"last_assistant_message","looks_like_question":false}
 JSON
 # HT2: legacy mangled form (record written before the sk- boundary fix) → no task row
-cat > "$a/wstop.forge-1.p2.ptask-ht2.json" <<JSON
+cat > "$a/wstop.forge-1.p3.ptask-ht2.json" <<JSON
 {"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"3","role":"worker","agent":"claude","tmux_pane":"%3","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht2","prompt_snippet":"<ta«redacted»> <task-id>def456</task-id> <tool-use-id>toolu_y</tool-use-id>","snippet":"ack","snippet_source":"last_assistant_message","looks_like_question":false}
 JSON
 # HT3: Agent-Teams <agent-message> turn → no task row
-cat > "$a/wstop.forge-1.p4.ptask-ht3.json" <<JSON
+cat > "$a/wstop.forge-1.p2.ptask-ht3.json" <<JSON
 {"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"2","role":"worker","agent":"claude","tmux_pane":"%2","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht3","prompt_snippet":"<agent-message from=\"regression-hunter-b\"> No corrections","snippet":"ok","snippet_source":"last_assistant_message","looks_like_question":false}
 JSON
 # HT4: live injected wprompt (would render state=working) → no task row
 wpromptf "$R" forge-1 6 30 ptask-ht4 claude "<task-notification> <task-id>xyz</task-id> background agent done"
 # HT5: a normal typed task in the same root still renders (no over-filtering)
-wstopf "$R" forge-1 3 30 ptask-ht5 claude "real work done"
+wstopf "$R" forge-1 4 30 ptask-ht5 claude "real work done"
 run_status --board > "$TDIR/ht.json"
 python3 - "$TDIR/ht.json" <<'PY' && ok "HT1-HT4 injected rows absent from tasks[]; HT5 real task present" || bad "harness-injected filter wrong in tasks[]"
 import json, sys
@@ -2217,7 +2217,7 @@ python3 - "$TDIR/ht.json" <<'PY' && ok "episodes still count injected turns (onl
 import json, sys
 b = json.load(open(sys.argv[1]))
 panes = {e.get('pane') for e in b.get('episodes', [])}
-assert '0' in panes and '2' in panes and '4' in panes, panes
+assert '1' in panes and '3' in panes and '2' in panes, panes
 PY
 
 # ═══════════════════════════════════════════════════════════════════════════

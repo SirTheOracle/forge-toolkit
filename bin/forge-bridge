@@ -7788,6 +7788,7 @@ else:
 # Sibling checks are independent and optional: installed single-file bridges still self-test.
 bindir = os.path.dirname(os.path.abspath(bridge))
 checked = []
+skipped = []
 orch_match = re.search(r'^ORCH_NAME="([^"]+)"$', src, re.MULTILINE)
 if not orch_match or orch_match.group(1) not in m_idx:
     problems.append("ORCH_NAME missing or unknown")
@@ -7799,6 +7800,7 @@ else:
         try:
             text = open(path).read()
         except OSError:
+            skipped.append(sibling)
             continue
         checked.append(sibling)
         mm = re.search(r"ORCH_PANE_INDEX\s*=\s*['\"](\d+)['\"]", text)
@@ -7822,6 +7824,7 @@ for sibling in ('forge', 'forge-watch'):
     try:
         text = open(path).read()
     except OSError:
+        skipped.append(sibling)
         continue
     if sibling not in checked:
         checked.append(sibling)
@@ -7836,6 +7839,7 @@ try:
     review_src = open(review_path).read()
 except OSError:
     review_src = None
+    skipped.append('forge-dispatch-review')
 if review_src is not None:
     checked.append('forge-dispatch-review')
     _lit_scanned.append('forge-dispatch-review')
@@ -7849,12 +7853,16 @@ try:
     start_src = open(start_path).read()
 except OSError:
     start_src = None
+    skipped.append('forge-start')
 if start_src is not None:
     checked.append('forge-start')
     stamps = {int(i): n for i, n in re.findall(
         r'set-option -p -t "\$SESSION:\.(\d+)" @forge-worker "([^"]+)"', start_src)}
-    if stamps and stamps != m_name:
+    stamps_active = bool(re.search(r'^FORGE_LAYOUT_VERSION=', start_src, re.MULTILINE))
+    if stamps_active and stamps != m_name:
         problems.append(f"forge-start pane stamps={stamps} expected={m_name}")
+    elif not stamps_active:
+        skipped.append('forge-start-pane-stamps')
 
 # swiftbar-stage-visibility: forge-watch carries a map for its pane→stage join.
 watch_path = os.path.join(bindir, 'forge-watch')
@@ -7864,6 +7872,7 @@ try:
         wsrc = f.read()
 except OSError:
     wsrc = None
+    skipped.append('forge-watch-NAME_TO_IDX')
 if wsrc is not None:
     wm = re.search(r"NAME_TO_IDX\s*=\s*\{([^}]+)\}", wsrc)
     if not wm:
@@ -7910,8 +7919,13 @@ if problems:
     sys.exit(1)
 
 print(f"alias-self-test: OK ({len(expected_canonical)} aliases verified, {len(py_maps)} maps checked"
+      + f", NAME_TO_IDX by-value={_nti_checked}"
+      + f", cmd_health specs={len(specs)}"
+      + f", worker whitelist={sorted(actual_workers)}"
+      + f", literal scan clean over {len(_lit_scanned)} file(s)"
       + (", forge-watch NAME_TO_IDX verified" if watch_checked else ", forge-watch not present")
-      + f", siblings checked={','.join(sorted(set(checked))) or 'none'})")
+      + f", siblings checked={','.join(sorted(set(checked))) or 'none'}"
+      + f", skipped={','.join(sorted(set(skipped))) or 'none'})")
 PYEOF
 }
 

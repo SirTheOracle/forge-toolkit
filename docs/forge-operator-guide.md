@@ -857,3 +857,12 @@ a missing journal is normal and just means "unproven". Contexts already at
 downgraded bridge needs to reconstruct context, run the older bridge's
 `set-context --slug <slug>` from the owning session. `forge-bridge hygiene-gc` reaps
 dead-incarnation terminal journals conservatively (malformed files are always retained).
+
+### Orchestrator-banner flag day
+
+The pane-renumber release is a flag day: stop and restart every live forge session before
+dispatching with the new toolkit. Historical `.pN.` attention records retain their original
+indices and are not migrated; transient old labels on day-one board rows are expected. Reset
+repo-local git `user.name` values to the new worker indices, or accept one stale-ident cycle.
+The worker grid occupies the lower 60% of the window, so short terminals may leave each worker
+with only three or four visible rows; enlarge the terminal rather than changing the layout.

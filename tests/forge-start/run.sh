@@ -172,15 +172,15 @@ SH
   ( cd "$DR" && tmux new-session -d -s "$ROLESESS" -c "$DR" -e "HOME=$FH2" -e "PATH=$WORK/rolebin:$PATH" -e "TMUX_SESSION=$ROLESESS" )
   ( cd "$DR" && FORGE_BRIDGE_BIN="$FB" bash "$START" --populate-existing "$ROLESESS" >/dev/null 2>&1 ) || true
   for _i in $(seq 1 15); do
-    [ -f "$WORK/roles/0" ] && [ -f "$WORK/roles/1" ] && [ -f "$WORK/roles/4" ] && break
+    [ -f "$WORK/roles/0" ] && [ -f "$WORK/roles/1" ] && [ -f "$WORK/roles/2" ] && break
     sleep 1
   done
   _geo=$(tmux list-panes -t "$ROLESESS" -F '#{pane_index} #{pane_left} #{pane_top} #{pane_width} #{window_width}')
   printf '%s\n' "$_geo" | awk '{L[$1]=$2;T[$1]=$3;W[$1]=$4;WW=$5} END {exit !(L[0]==0 && T[0]==0 && W[0]==WW && L[1]==0 && L[2]==0 && L[3]>0 && L[3]==L[4] && T[1]==T[3] && T[2]==T[4] && T[0]<T[1] && T[1]<T[2])}' \
     && ok "T-GEO real tmux banner over aligned 2x2 grid" || bad "T-GEO wrong: $_geo"
   [ "$(cat "$WORK/roles/0" 2>/dev/null)" = "orchestrator" ] && ok "pane 0 child saw FORGE_ROLE=orchestrator" || bad "pane 0 role: '$(cat "$WORK/roles/0" 2>/dev/null)'"
-  { [ "$(cat "$WORK/roles/0" 2>/dev/null)" = "worker" ] && [ "$(cat "$WORK/roles/4" 2>/dev/null)" = "worker" ]; } \
-    && ok "panes 0/4 children saw FORGE_ROLE=worker" || bad "worker roles: 0='$(cat "$WORK/roles/0" 2>/dev/null)' 4='$(cat "$WORK/roles/4" 2>/dev/null)'"
+  { [ "$(cat "$WORK/roles/1" 2>/dev/null)" = "worker" ] && [ "$(cat "$WORK/roles/2" 2>/dev/null)" = "worker" ]; } \
+    && ok "panes 1/2 children saw FORGE_ROLE=worker" || bad "worker roles: 1='$(cat "$WORK/roles/1" 2>/dev/null)' 2='$(cat "$WORK/roles/2" 2>/dev/null)'"
   tmux kill-session -t "$ROLESESS" 2>/dev/null
 
   echo "── T-START-STAMP-LIVE: -e birth stamp reaches a real pane child (R8) ──"

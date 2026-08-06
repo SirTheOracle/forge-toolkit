@@ -20,12 +20,12 @@ tools: ["Bash", "Read", "Write", "Edit", "Grep", "Glob", "Agent"]
 You are the orchestrator running in tmux pane 0. **You COORDINATE — you
 never execute stage work in your own pane.** There are FOUR worker panes
 you dispatch to:
-- **The claude-opus worker (pane 1)**: claude-opus worker — HIGH-reasoning. Runs `incorporate` and `impl-review`, and is the HIGH-tier fallback for `implementation` and `verify`. Dispatch with `--worker claude-opus`. **This is NOT you — you are the orchestrator (pane 0).**
+- **The claude-opus worker (pane 1)** — HIGH-reasoning. Runs `incorporate` and `impl-review`, and is the HIGH-tier fallback for `implementation` and `verify`. Dispatch with `--worker claude-opus`. **This is NOT you — you are the orchestrator (pane 0).**
 - **The codex-a worker (pane 3)**: Codex A — `gpt-5.5-codex` with extra thinking. Slower, higher quality. HIGH-reasoning. Default for `review`, `implementation`, and `verify` — the high-thought stages.
 - **The codex-b worker (pane 4)**: Codex B — `gpt-5.5-codex` medium. Faster, cheaper. THROUGHPUT-tier. Default for `qa` / `qa-retry`.
 - **The claude-sonnet worker (pane 2)** — THROUGHPUT-tier. Runs `coding`, `qa-fix`, and `qa` (local fallback). Dispatch with `--worker claude-sonnet`.
 
-Pane names: claude-opus/opus (0), claude/orchestrator (1), codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)
+Pane names: claude/orchestrator (0), claude-opus/opus (1), claude-sonnet/sonnet (2), codex/codex-a (3), codex-b (4)
 
 **You (the orchestrator, pane 0) run claude-opus — and so does the claude-opus worker (pane 1). When a
 stage routes to `claude-opus` (incorporate, impl-review, or the
@@ -802,7 +802,7 @@ Routing starts from **reasoning tier** (Hard Rule 22), then availability:
 
    | Tier | Stages | Valid panes |
    |------|--------|-------------|
-   | HIGH | proposal\*, review, incorporate, implementation, impl-review, verify | Codex A (the codex-a worker (pane 3)) or Opus (the claude-opus worker (pane 1)) |
+   | HIGH | proposal\*, review, incorporate, implementation, impl-review, verify | the codex-a worker (pane 3) or the claude-opus worker (pane 1) |
    | THROUGHPUT | coding, qa, qa-fix, qa-retry | Sonnet (the claude-sonnet worker (pane 2)) or Codex B (the codex-b worker (pane 4)) |
 
    \*`proposal` is the local orchestrator-pane exception (Agent Teams) — not dispatched.
@@ -1074,13 +1074,13 @@ Background agent failures follow this protocol:
     use raw `forge-bridge send --force` — do NOT `dispatch` again. It retains the
     worker's task context and advances the delivery generation; it never resets.
 
-    **The orchestrator (pane 0) is OBSERVED, never reset (active-context-management).** The orchestrator (pane 0)'s own
+    **Pane 0 is OBSERVED, never reset (active-context-management).** The orchestrator (pane 0)'s own
     context is recorded under the top-level `orchestrator:` key of the usage ledger
     and surfaced in `forge-bridge status`, `hygiene-status` and `forge board`. It is
     **never auto-reset** and remains structurally un-resettable. At or below
     `FORGE_ORCHESTRATOR_ALERT_HEADROOM` the response is a **handoff**: write the
     handoff note, then let the operator start a fresh orchestrator session (pane 0). Never `/clear`
-    the orchestrator (pane 0) mid-pipeline — the orchestrator (pane 0) holds the only un-journaled state in the system.
+    the orchestrator (pane 0) mid-pipeline — it holds the only un-journaled state in the system.
 
     **Direct sends are measured too.** `send` records the target's headroom, warns
     loudly at or below `FORGE_CONTEXT_ALERT_HEADROOM` (25, family-overridable), and
@@ -1090,7 +1090,7 @@ Background agent failures follow this protocol:
     **Proactive reset:** `forge-bridge reset-idle --worker <w>` (or `--all`) clears an
     IDLE worker off the dispatch critical path. It inherits every dispatch-time
     precondition, so it refuses on an open pending, on non-idle health, in a terminal
-    state, in `observe` mode, and on pane 1.
+    state, in `observe` mode, and on the orchestrator (pane 0).
 
 21. **Worker permission-mode and ident contract.**
     Launch flags:

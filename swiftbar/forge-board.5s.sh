@@ -118,7 +118,7 @@ if len(parked) > 3:
 for r in ctx[:4]:
     who = esc(r.get("session") or r.get("label") or "?")
     w = esc(r.get("worker") or "?")
-    tail = " · the orchestrator (pane 0) — handoff, never a reset" if r.get("role") == "orchestrator" else ""
+    tail = " · pane 0 — handoff, never a reset" if r.get("role") == "orchestrator" else ""
     print(f'◐ {who}/{w} · {r.get("headroom")}% headroom{tail} | color=orange')
 if len(ctx) > 4:
     print(f"+{len(ctx) - 4} more low-context · forge board | color=gray")
