@@ -649,8 +649,14 @@ QA_FAMILY = {'qa', 'qa-fix', 'qa-retry'}
 # file and verifies the table below against the bash source — do not edit one without
 # the other. Canonical names only: the pending log's `to:` is always $worker_canonical
 # (bin/forge-bridge cmd_dispatch → cmd_log), so no alias resolution is needed here.
-NAME_TO_IDX = {'claude-opus': 0, 'claude': 1, 'codex-a': 2, 'codex-b': 3,
-               'claude-sonnet': 4}
+NAME_TO_IDX = {'claude': 0, 'claude-opus': 1, 'claude-sonnet': 2, 'codex-a': 3,
+               'codex-b': 4}
+# Orchestrator index, derived from the map above rather than restated, matching the
+# ORCH_PANE_INDEX constants in bin/forge and bin/forge-cc-hook. Task grouping falls back
+# to it for records that carry no pane (headless codex keeps an empty pane index by
+# contract): the orchestrator is the one seat that never owns an episode, so the
+# current_episodes() lookup must always miss for those records.
+ORCH_PANE_INDEX = str(NAME_TO_IDX['claude'])
 
 # Stage → the skill that stage runs. Derived from ~/.config/forge/prompts/*.txt and the
 # Execution Model Reference in skills/forge-orchestrator/SKILL.md. Stages with no distinct
@@ -1763,7 +1769,7 @@ def scan_attention(root, label):
         if state == 'answered' and (age_s(disp_at) or 0) > TASK_WINDOW_S:
             continue                       # terminal + old → out of the live view
         TASKS.append({'task_id': did, 'session': d.get('session'), 'root': root, 'label': label,
-                      'agent': 'claude', 'pane': d.get('target_pane', 1), 'state': state,
+                      'agent': 'claude', 'pane': d.get('target_pane', 0), 'state': state,
                       'dispatched_at': disp_at, 'started_at': None,
                       'answered_at': (_mtime_iso(resp) if answered else None),
                       'response_path': (os.path.join('.dev', 'attention', 'payloads', f'response.{did}.txt') if answered else None),
@@ -1888,14 +1894,14 @@ def scan_usage(root, label):
             fresh, a = _fresh(orch)
             if _hi(orch) and orch['headroom'] <= ORCH_ALERT_HEADROOM and fresh:
                 inc = orch.get('incarnation') or ''
-                # policy='once' keyed on (session, incarnation): pane 1 degrades monotonically
+                # policy='once' keyed on (session, incarnation): pane 0 degrades monotonically
                 # WITHIN a session, so a daily re-ring adds nothing the persistent board row
                 # does not already give; a new session re-arms it.
                 add_finding('ORCHESTRATOR-LOW-CONTEXT', root, f"{sess}\t{inc}",
-                            f"{label} · {sess} — orchestrator (pane 1) at "
+                            f"{label} · {sess} — orchestrator (pane 0) at "
                             f"{orch['headroom']}% headroom (alert <= {ORCH_ALERT_HEADROOM}); "
-                            f"write the handoff note and start a fresh pane-1 session. "
-                            f"Pane 1 is NEVER auto-reset and holds the only un-journaled "
+                            f"write the handoff note and start a fresh pane-0 session. "
+                            f"Pane 0 is NEVER auto-reset and holds the only un-journaled "
                             f"state in the system",
                             policy='once', session=sess)
                 CONTEXT_ROWS.append({'session': sess, 'root': root, 'label': label,
@@ -2263,13 +2269,13 @@ if os.environ.get('FORGE_WATCH_TASKS') == '1':
     if not tsorted:
         print(paint('2', '  no tasks in the current window'))
     # Grouped per (root, session, pane), recency order preserved; a worker pane's current
-    # episode renders as the group header. Dispatched (pane-1) groups have no episode and
+    # episode renders as the group header. Dispatched (pane-0) groups have no episode and
     # render as before.
     cur_eps = current_episodes()
     groups, gorder = {}, []
     for t in tsorted:
         gk = (t.get('root'), t.get('session') or t.get('label') or '?',
-              str(t.get('pane')) if t.get('pane') is not None else '1')
+              str(t.get('pane')) if t.get('pane') is not None else ORCH_PANE_INDEX)
         if gk not in groups:
             groups[gk] = []
             gorder.append(gk)
@@ -2450,7 +2456,7 @@ if PRETTY:
             if det and room > 10:
                 line += '  ' + paint('2', clip(det, room))
             # Separate ADDITIVE annotation (§5): worker-pane activity never feeds the glyph
-            # (that stays pure pane-1 lifecycle); a busy worker behind an idle pane-1 row
+            # (that stays pure pane-0 lifecycle); a busy worker behind an idle pane-0 row
             # surfaces as a dim pane count instead. Settled episodes contribute nothing.
             n_act = sum(1 for f in fs if f['condition'] == 'EPISODE-ACTIVE')
             if n_act:
@@ -2470,13 +2476,13 @@ if PRETTY:
         print(sect('TASKS', f'({len(trecent)})'))
         # grouped by (session, pane), most recent activity first; a worker pane's current
         # EPISODE is the group header (turn rows beneath are drill-in); dispatched-only
-        # (pane-1) groups render as before. per-group cap keeps one busy pane from
+        # (pane-0) groups render as before. per-group cap keeps one busy pane from
         # drowning the rest
         cur_eps = current_episodes()
         groups = {}
         for t in trecent:
             groups.setdefault((t.get('root'), t.get('session') or t.get('label') or '?',
-                               str(t.get('pane')) if t.get('pane') is not None else '1'),
+                               str(t.get('pane')) if t.get('pane') is not None else ORCH_PANE_INDEX),
                               []).append(t)
         PER_GROUP = 5
         shown = 0

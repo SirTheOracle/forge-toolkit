@@ -66,7 +66,7 @@ parked = b.get("parked") or []             # additive cc-board/1 key (.get or []
 ctx   = b.get("context") or []             # additive cc-board/1 key; ALERTING ROWS ONLY
 eps   = b.get("episodes") or []            # absent on an older forge-watch → today's render
 # In-progress = worker-pane episodes only, by decision (final-plan D5): SESSION-WORKING
-# (pane-1/operator seat) is deliberately NOT counted — the gear means worker progress.
+# (orchestrator pane / operator seat) is deliberately NOT counted — the gear means worker progress.
 inprog = sorted((e for e in eps if e.get("current") and e.get("state") == "in_progress"),
                 key=lambda e: e.get("last_at", ""), reverse=True)
 unseen = sum(1 for r in hot if not r.get("acked"))
@@ -118,7 +118,7 @@ if len(parked) > 3:
 for r in ctx[:4]:
     who = esc(r.get("session") or r.get("label") or "?")
     w = esc(r.get("worker") or "?")
-    tail = " · pane 1 — handoff, never a reset" if r.get("role") == "orchestrator" else ""
+    tail = " · the orchestrator (pane 0) — handoff, never a reset" if r.get("role") == "orchestrator" else ""
     print(f'◐ {who}/{w} · {r.get("headroom")}% headroom{tail} | color=orange')
 if len(ctx) > 4:
     print(f"+{len(ctx) - 4} more low-context · forge board | color=gray")
@@ -126,7 +126,7 @@ if len(ctx) > 4:
 # '--'-prefixed). The parent answers "who, what stage, still moving?" at a glance; detail
 # that used to crowd the single line moves into the submenu. Every child is optional and
 # omitted when its field is absent — an untagged pane (no resolvable pipeline stage, e.g.
-# pane 1, which dispatches and never receives a pending) degrades to the pre-submenu
+# the orchestrator (pane 0), which dispatches and never receives a pending) degrades to the pre-submenu
 # information, never to "None" or a dangling separator.
 for e in inprog[:8]:
     who = esc(e.get("session") or e.get("label") or "?")

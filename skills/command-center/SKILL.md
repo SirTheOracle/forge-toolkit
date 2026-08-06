@@ -45,7 +45,7 @@ forge dispatch @<session> "<answer>" --answers <ask-id>  # reply to a NEEDS-ASK
 ```
 
 `@<session>` is a **live tmux session name** (`@forge-1`), never a repo path. The
-instruction injects into the session's **pane 1** (the orchestrator). A dispatch
+instruction injects into the session's **pane 0** (the orchestrator). A dispatch
 to a busy session queues natively — expected. Billing preflight gates every
 dispatch.
 
@@ -79,7 +79,7 @@ forge dispatch @<session> "<your answer>" --answers <ask-id>
 ```
 
 `--answers` archives the ask and consumes the worker's BLOCKED callback exactly
-once (stage mode), then injects your answer into pane 1; the orchestrator relays
+once (stage mode), then injects your answer into the orchestrator (pane 0); the orchestrator relays
 it to the worker, which resumes.
 
 ### Misrouting guardrails (READ BEFORE EVERY ANSWER)

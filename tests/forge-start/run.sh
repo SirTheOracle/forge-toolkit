@@ -28,8 +28,8 @@ case "$1" in
   has-session) exit "${FAKE_HAS_RC:-1}" ;;
   list-panes)
     case "$*" in
-      *pane_left*) if [ "${FAKE_LAYOUT:-good}" = "bad" ]; then printf '0 0\n1 5\n2 5\n3 5\n4 5\n'
-                   else printf '0 0\n1 0\n2 5\n3 5\n4 5\n'; fi ;;
+      *pane_left*) if [ "${FAKE_LAYOUT:-good}" = "bad" ]; then printf '0 0 0 199 200\n1 0 20 99 200\n2 0 35 99 200\n3 100 20 100 200\n4 100 36 100 200\n'
+                   else printf '0 0 0 200 200\n1 0 20 99 200\n2 0 35 99 200\n3 100 20 100 200\n4 100 35 100 200\n'; fi ;;
       *) n="${FAKE_PANES:-5}"; i=0; while [ "$i" -lt "$n" ]; do echo "$i"; i=$((i+1)); done ;;
     esac ;;
   display-message) echo "${FAKE_DISP:-/tmp}" ;;
@@ -51,12 +51,13 @@ if diff -q "$GOLD" "$WORK/plain.norm" >/dev/null 2>&1; then
 else
   bad "plain path DRIFTED from golden:"; diff "$GOLD" "$WORK/plain.norm" | sed 's/^/    /'
 fi
+if [ "${REGEN:-0}" = 1 ]; then cp "$WORK/plain.norm" "$GOLD"; echo "  (golden REGENERATED)"; fi
 [ "$prc" -eq 0 ] && ok "T-START-PLAIN-EXITS-ZERO: plain run exits 0" || bad "plain run exited $prc"
 grep 'send-keys' "$TMLOG" | grep -q 'FORGE_ROLE' && bad "plain launch strings carry FORGE_ROLE (byte drift)" || ok "plain launch strings unstamped"
 CODEX_STATUS_OVERRIDE="forge codex-launch"
-grep -q 'forge codex-launch.*--root.*--session.*--pane 2.*--effort xhigh' "$TMLOG" && ok "Codex A uses centralized attested launch" || bad "Codex A launch contract missing"
-grep -q 'forge codex-launch.*--pane 3.*--effort medium' "$TMLOG" && ok "Codex B uses centralized attested launch" || bad "Codex B launch contract missing"
-for _pane in 2 3; do
+grep -q 'forge codex-launch.*--root.*--session.*--pane 3.*--effort xhigh' "$TMLOG" && ok "Codex A uses centralized attested launch" || bad "Codex A launch contract missing"
+grep -q 'forge codex-launch.*--pane 4.*--effort medium' "$TMLOG" && ok "Codex B uses centralized attested launch" || bad "Codex B launch contract missing"
+for _pane in 3 4; do
   _launch_line=$(grep "send-keys -t forge-1:.$_pane " "$TMLOG")
   _override_count=$(printf '%s\n' "$_launch_line" | grep -oF -- "$CODEX_STATUS_OVERRIDE" | wc -l | tr -d ' ')
   [ "$_override_count" = 1 ] \
@@ -88,6 +89,11 @@ rc=$?
 sed -n '1p' "$BRKLOG" | grep -q '^start --root ' && ok "broker start recorded before the failure" || bad "broker start missing from log: $(cat "$BRKLOG")"
 sed -n '2p' "$BRKLOG" | grep -q '^stop --root .* --timeout 5$' && ok "layout failure stopped the broker before kill-session" || bad "no broker stop on plain layout failure: $(cat "$BRKLOG")"
 grep -q 'kill-session' "$TMLOG" && ok "plain layout failure still kills the session" || bad "kill-session missing from plain layout failure"
+if grep -qE 'set-environment .* FORGE_LAYOUT|set-option -p .* @forge-worker' "$TMLOG"; then
+  bad "T-STAMP-NONE plain failure wrote layout receipts"
+else
+  ok "T-STAMP-NONE plain failure wrote no layout receipts"
+fi
 rm -rf "$D2"
 
 echo "── T-START-POP-TRAP: layout failure → partial-split report, no kill, prior file kept ──"
@@ -99,16 +105,25 @@ out=$( TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_LAYOUT=
 echo "$out" | grep -q 'partial-split' && ok "trap reports partial-split state" || bad "no partial-split report: $out"
 grep -q 'kill-session' "$TMLOG" && bad "trap ran kill-session" || ok "trap never kills the session"
 grep -q '^stop ' "$BRKLOG" && bad "populate layout failure stopped the broker (session survives — broker must too)" || ok "populate layout failure leaves the broker running (R8)"
+if grep -qE 'set-environment .* FORGE_LAYOUT|set-option -p .* @forge-worker' "$TMLOG"; then
+  bad "T-STAMP-NONE populate failure wrote layout receipts"
+else
+  ok "T-STAMP-NONE populate failure wrote no layout receipts"
+fi
 [ "$(grep -v '^#' "$POPROOT/.dev/.forge-session" | grep -m1 .)" = "prior-session" ] && ok "prior .forge-session preserved (first non-comment line)" || bad ".forge-session clobbered"
 
 echo "── T-START-POP-ROLES: per-pane FORGE_ROLE stamps in populate launch strings ──"
 TMLOG="$WORK/roles.log"; : > "$TMLOG"
 out=$( TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_DISP="$POPROOT" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --populate-existing psess 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && ok "healthy populate exits 0" || bad "populate (rc=$rc): $out"
-grep 'send-keys -t psess:.1' "$TMLOG" | grep -q 'FORGE_ROLE=orchestrator claude' && ok "pane 1 stamped orchestrator" || bad "pane 1 stamp missing"
-grep 'send-keys -t psess:.0' "$TMLOG" | grep -q 'FORGE_ROLE=worker claude' && ok "pane 0 stamped worker" || bad "pane 0 stamp missing"
-grep 'send-keys -t psess:.4' "$TMLOG" | grep -q 'FORGE_ROLE=worker claude' && ok "pane 4 stamped worker" || bad "pane 4 stamp missing"
-grep 'send-keys -t psess:.2\|send-keys -t psess:.3' "$TMLOG" | grep -q 'FORGE_ROLE' && bad "codex panes stamped (should not be)" || ok "codex panes 2/3 unstamped"
+grep 'send-keys -t psess:.0' "$TMLOG" | grep -q 'FORGE_ROLE=orchestrator claude' && ok "pane 0 stamped orchestrator" || bad "pane 0 stamp missing"
+grep 'send-keys -t psess:.1' "$TMLOG" | grep -q 'FORGE_ROLE=worker claude' && ok "pane 1 stamped worker" || bad "pane 1 stamp missing"
+grep 'send-keys -t psess:.2' "$TMLOG" | grep -q 'FORGE_ROLE=worker claude' && ok "pane 2 stamped worker" || bad "pane 2 stamp missing"
+grep 'send-keys -t psess:.3\|send-keys -t psess:.4' "$TMLOG" | grep -q 'FORGE_ROLE' && bad "codex panes stamped (should not be)" || ok "codex panes 3/4 unstamped"
+grep -q 'set-environment -t psess FORGE_LAYOUT 2' "$TMLOG" && ok "T-STAMP-OK session generation receipt written" || bad "T-STAMP-OK session receipt missing"
+for _receipt in ':.0 @forge-worker claude' ':.1 @forge-worker claude-opus' ':.2 @forge-worker claude-sonnet' ':.3 @forge-worker codex-a' ':.4 @forge-worker codex-b'; do
+  grep -q "set-option -p -t psess$_receipt" "$TMLOG" || bad "T-STAMP-OK missing $_receipt"
+done
 [ "$(grep -v '^#' "$POPROOT/.dev/.forge-session" | grep -m1 .)" = "psess" ] && ok "populate wrote .forge-session with the session name" || bad ".forge-session not written"
 grep -q '^# advisory only' "$POPROOT/.dev/.forge-session" && ok "T-LEGACY-HEADER: writer prepends the advisory header" || bad "writer missing advisory header"
 ls "$POPROOT/.dev/".forge-session.tmp.* >/dev/null 2>&1 && bad "atomic-write temp residue left behind" || ok "no .forge-session temp residue (atomic rename)"
@@ -160,7 +175,10 @@ SH
     [ -f "$WORK/roles/0" ] && [ -f "$WORK/roles/1" ] && [ -f "$WORK/roles/4" ] && break
     sleep 1
   done
-  [ "$(cat "$WORK/roles/1" 2>/dev/null)" = "orchestrator" ] && ok "pane 1 child saw FORGE_ROLE=orchestrator" || bad "pane 1 role: '$(cat "$WORK/roles/1" 2>/dev/null)'"
+  _geo=$(tmux list-panes -t "$ROLESESS" -F '#{pane_index} #{pane_left} #{pane_top} #{pane_width} #{window_width}')
+  printf '%s\n' "$_geo" | awk '{L[$1]=$2;T[$1]=$3;W[$1]=$4;WW=$5} END {exit !(L[0]==0 && T[0]==0 && W[0]==WW && L[1]==0 && L[2]==0 && L[3]>0 && L[3]==L[4] && T[1]==T[3] && T[2]==T[4] && T[0]<T[1] && T[1]<T[2])}' \
+    && ok "T-GEO real tmux banner over aligned 2x2 grid" || bad "T-GEO wrong: $_geo"
+  [ "$(cat "$WORK/roles/0" 2>/dev/null)" = "orchestrator" ] && ok "pane 0 child saw FORGE_ROLE=orchestrator" || bad "pane 0 role: '$(cat "$WORK/roles/0" 2>/dev/null)'"
   { [ "$(cat "$WORK/roles/0" 2>/dev/null)" = "worker" ] && [ "$(cat "$WORK/roles/4" 2>/dev/null)" = "worker" ]; } \
     && ok "panes 0/4 children saw FORGE_ROLE=worker" || bad "worker roles: 0='$(cat "$WORK/roles/0" 2>/dev/null)' 4='$(cat "$WORK/roles/4" 2>/dev/null)'"
   tmux kill-session -t "$ROLESESS" 2>/dev/null

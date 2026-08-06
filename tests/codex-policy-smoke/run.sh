@@ -13,7 +13,7 @@ out="$(FORGE_CODEX_ROLLOUT=contain "$ROOT/bin/forge" codex-lane --root "$ROOT" -
 grep -q '^lane=claude$' <<<"$out"
 out="$(FORGE_CODEX_ROLLOUT=enforce "$ROOT/bin/forge" codex-lane --root "$ROOT" --stage coding --worker codex-a)"
 grep -q '^lane=reviewed-host$' <<<"$out" # private runtime/origin gate remains unproven
-"$ROOT/bin/forge" codex-launch --root "$ROOT" --session test --pane 2 --effort xhigh --print 2>/dev/null | grep -F -- '--ask-for-approval never'
+"$ROOT/bin/forge" codex-launch --root "$ROOT" --session test --pane 3 --effort xhigh --print 2>/dev/null | grep -F -- '--ask-for-approval never'
 if [ "${1:-}" != "--live" ]; then echo "policy smoke: hermetic PASS (live gates skipped)"; exit 0; fi
 doctor="$($ROOT/bin/forge codex-doctor "$ROOT" || true)"
 for field in approval_never filesystem_restricted network_restricted cwd_exact version_supported; do grep -q "^$field=true$" <<<"$doctor"; done

@@ -22,7 +22,7 @@ A forge project needs:
 
 ### Starting a pipeline
 
-From pane 1 of your forge session, type:
+From the orchestrator (pane 0) of your forge session, type:
 
 ```
 /forge pipeline <slug>
@@ -36,7 +36,7 @@ What happens:
    `forge-pipeline <slug>`, `forge-fix-pipeline <slug>`, resume mode,
    local status/pause, or an ad-hoc request.
 3. For pipeline/fix/ad-hoc orchestration, it loads
-   `~/.claude/skills/forge-orchestrator/SKILL.md` into pane 1. You now
+   `~/.claude/skills/forge-orchestrator/SKILL.md` into the orchestrator (pane 0). You now
    **are** the in-pane orchestrator; there is no hidden background agent
    and no forwarding layer.
 4. The orchestrator seeds itself with the canonical intent, the verbatim
@@ -64,7 +64,7 @@ What happens:
 
 ### Subsequent messages
 
-Once `/forge` has loaded the orchestrator, the user speaks to pane 1
+Once `/forge` has loaded the orchestrator, the user speaks to the orchestrator (pane 0)
 directly. There is no active-agent forwarding grammar. Two literal
 exceptions are handled specially:
 
@@ -146,7 +146,7 @@ mutations.
 
 Before handing out two or more tasks, run `~/bin/forge-bridge usage --refresh`
 once and keep the snapshot with the plan — it live-measures all four workers
-plus pane 1 and prints a per-worker recommendation. A single dispatch does not
+plus the orchestrator (pane 0) and prints a per-worker recommendation. A single dispatch does not
 need it; the dispatch-time gate is strictly stronger.
 
 ### Batch end
@@ -249,8 +249,8 @@ Core commands for "what's going on right now":
 | `~/bin/forge-bridge health` | Per-pane check: do all 5 panes exist and run the expected worker process? Exits 0 only when every pane is `OK`. Output lines: `OK \| DEAD \| WRONG_PROCESS \| UNKNOWN pane=<name> idx=<n> …` and a `SUMMARY` line |
 | `~/bin/forge-bridge preflight` | Kickoff snapshot: pwd, branch, merge state, halt status code |
 | `~/bin/forge-bridge history [lines]` / `pipeline-log <slug> [lines]` | Recent activity across all pipelines / detail for one pipeline |
-| `~/bin/forge-bridge usage [<worker>] [--refresh] [--json]` | Per-worker usage snapshot recorded at each task completion: normalized `headroom` (0-100 = % capacity remaining) + `confidence`. Claude parses `ctx: Nk (P%)`; Codex parses `Context N% left` when rendered. A valid anchor for either provider publishes normalized numeric headroom with `confidence=high`; missing or malformed input remains `unknown` and never means safe or exhausted. Plain form is read-only — observation never authorizes clearing or compaction. `--refresh` live-measures the four workers and pane 1 first; `--json` adds a per-worker `recommendation`. See "Active context management" below |
-| `~/bin/forge-bridge reset-idle --worker <w>` | Reset an idle worker off the dispatch critical path. Refuses on an open pending, non-idle health, a terminal state, `observe` mode, and pane 1 |
+| `~/bin/forge-bridge usage [<worker>] [--refresh] [--json]` | Per-worker usage snapshot recorded at each task completion: normalized `headroom` (0-100 = % capacity remaining) + `confidence`. Claude parses `ctx: Nk (P%)`; Codex parses `Context N% left` when rendered. A valid anchor for either provider publishes normalized numeric headroom with `confidence=high`; missing or malformed input remains `unknown` and never means safe or exhausted. Plain form is read-only — observation never authorizes clearing or compaction. `--refresh` live-measures the four workers and the orchestrator (pane 0) first; `--json` adds a per-worker `recommendation`. See "Active context management" below |
+| `~/bin/forge-bridge reset-idle --worker <w>` | Reset an idle worker off the dispatch critical path. Refuses on an open pending, non-idle health, a terminal state, `observe` mode, and the orchestrator (pane 0) |
 | `~/bin/forge-bridge infra-lock status` | Whether the global infra lock is free, held live, stale, foreign-host, or corrupt |
 | `~/bin/forge-bridge hygiene-status` | Show hygiene mode, reset capability, thresholds, residue, terminal state, and activation blockers |
 | `~/bin/forge-bridge hygiene-gc [--days N] [--dry-run]` | Conservatively inspect or reap old terminal journals from dead sessions |
@@ -332,9 +332,9 @@ moment a pane's context actually changes.
 | Command | What it does |
 |---|---|
 | `~/bin/forge-bridge usage` | Read-only snapshot. Freshness is **per-record** `measured_at`, so a row that has not been re-measured shows `STALE` even when another worker's callback just refreshed the file |
-| `~/bin/forge-bridge usage --refresh` | Live-measures all four workers **and pane 1**, then renders. The batch-planning snapshot — run it once before distributing two or more tasks. In-flight panes are sampled, not skipped; their number is a **floor** |
+| `~/bin/forge-bridge usage --refresh` | Live-measures all four workers **and the orchestrator (pane 0)**, then renders. The batch-planning snapshot — run it once before distributing two or more tasks. In-flight panes are sampled, not skipped; their number is a **floor** |
 | `~/bin/forge-bridge usage --json` | Same data, stable keys, plus a tier-free `recommendation` per worker: `reset-first` \| `ok` \| `busy` \| `unknown` |
-| `~/bin/forge-bridge reset-idle --worker <w>` | Reset an **idle** worker off the dispatch critical path. Refuses on an open pending, non-idle health, a terminal state, `observe` mode, and pane 1 |
+| `~/bin/forge-bridge reset-idle --worker <w>` | Reset an **idle** worker off the dispatch critical path. Refuses on an open pending, non-idle health, a terminal state, `observe` mode, and the orchestrator (pane 0) |
 | `~/bin/forge-bridge hygiene-status` | Now also prints every **effective** threshold and the last ten hygiene decisions |
 
 Five thresholds, five different questions:
@@ -343,7 +343,7 @@ Five thresholds, five different questions:
 |---|---|---|
 | `FORGE_WORKER_MIN_HEADROOM` (+`_CLAUDE`/`_CODEX`) | 75 | Should a new stage start in this conversation? **This is the gate — unchanged.** |
 | `FORGE_CONTEXT_ALERT_HEADROOM` (+`_CLAUDE`/`_CODEX`) | 25 | Is this worker in trouble? (board finding + send warning) |
-| `FORGE_ORCHESTRATOR_ALERT_HEADROOM` | 30 | Does pane 1 need a handoff? |
+| `FORGE_ORCHESTRATOR_ALERT_HEADROOM` | 30 | Does the orchestrator (pane 0) need a handoff? |
 | `FORGE_USAGE_MAX_AGE_S` | 900 | **Display only** — is this reading too old to show as current? It is *never* a gate input; hygiene evidence has no wall-clock expiry |
 | `FORGE_SEND_MIN_HEADROOM` | 0 (off) | Opt-in hard floor on non-`--force` sends. This one is **strictly below** the floor; the other four are inclusive |
 
@@ -351,7 +351,7 @@ Plus `FORGE_USAGE_SAMPLE_INTERVAL_S` (300, `0` disables the mid-stage sampler) a
 watcher-side mirror `FORGE_WATCH_ALERT_HEADROOM` (25, set in `~/.config/forge/watch.env`).
 
 **What you will see.** Every dispatch and every direct send now prints one
-`HYGIENE <worker>: <ACTION> — <reason>` line to stderr, so the check is visible from pane 1
+`HYGIENE <worker>: <ACTION> — <reason>` line to stderr, so the check is visible from the orchestrator (pane 0)
 instead of only in the events log. `forge-bridge status` gains a **Worker context** table and
 a **Recent hygiene decisions** tail. When a worker crosses the alert threshold the menubar
 grows a `◐N` segment (after `⏸N`, before `✓`) and `forge board` shows a `WORKER-LOW-CONTEXT`
@@ -370,10 +370,10 @@ prints a loud warning and delivers anyway. Set `FORGE_SEND_MIN_HEADROOM` if you 
 floor; `--force` is never refused by it, because `--force` is the BLOCKED fix-and-continue
 path.
 
-**Pane 1 is observed, never touched.** Its reading lands under the ledger's top-level
+**The orchestrator (pane 0) is observed, never touched.** Its reading lands under the ledger's top-level
 `orchestrator:` key. At or below its threshold you get a board row and one notification; the
-response is to write a handoff note and start a fresh pane-1 session. Forge sends no reset,
-no compact, and no keystroke of any kind to pane 1.
+response is to write a handoff note and start a fresh orchestrator session (pane 0). Forge sends no reset,
+no compact, and no keystroke of any kind to the orchestrator (pane 0).
 
 ## Blocked-on-You Notifications (`forge-watch`)
 
@@ -544,7 +544,7 @@ Command Center ask exception: if the BLOCKED state came from a worker
 running `forge ask --slug {slug} --stage {stage} --worker {worker}
 "<question>"`, and the operator answers with `forge dispatch @<session>
 "<answer>" --answers <ask-id>`, that answer dispatch has already archived
-the BLOCKED callback before injecting the answer into pane 1. In that case,
+the BLOCKED callback before injecting the answer into the orchestrator (pane 0). In that case,
 relay the answer to the worker with `send --force` and do **not** run a
 second `callback-consume`.
 

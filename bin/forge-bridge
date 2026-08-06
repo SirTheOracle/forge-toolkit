@@ -7,17 +7,18 @@
 # Falls back to .dev/.forge-session file, then scans for forge sessions.
 #
 # Pane layout:
-#   0 = claude-opus worker      TOP-LEFT
-#   1 = claude orchestrator     BOTTOM-LEFT
-#   2 = codex A                 TOP-RIGHT
-#   3 = codex B                 MIDDLE-RIGHT
-#   4 = claude-sonnet worker    BOTTOM-RIGHT
+#   0 = claude orchestrator     TOP, FULL WIDTH (banner)
+#   1 = claude-opus worker      MIDDLE-LEFT
+#   2 = claude-sonnet worker    BOTTOM-LEFT
+#   3 = codex A                 MIDDLE-RIGHT
+#   4 = codex B                 BOTTOM-RIGHT
 #
 # Hooks (enforced by the script, not by skills):
 #   1. send refuses to dispatch unless a pending log entry targets the same pane
 #      (per-target log-before-send; alias-normalized so historical `to: inline`
-#      entries resolve to the canonical `claude-opus` pane-0 worker name and
-#      historical `to: claude` entries match the canonical `claude` orchestrator name)
+#      entries resolve to the canonical `claude-opus` worker name (pane 1) and
+#      historical `to: claude` entries match the canonical `claude` orchestrator
+#      name (pane 0))
 #   2. log-response auto-updates .dev/forge-context.yml on completion
 #      (qa, qa-fix, qa-retry do NOT auto-advance — orchestrator decides)
 #   3. context command loads pipeline state for session start
@@ -45,8 +46,8 @@
 #   add-note <text>             — annotate context (persists across sessions)
 #   alias-self-test [--strict]  — verify pane alias maps stay in lockstep
 #
-# Pane names: inline/general/claude-opus/opus (0), claude/orchestrator/claude-orchestrator (1),
-#             codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)
+# Pane names: claude/orchestrator/claude-orchestrator (0), inline/general/claude-opus/opus (1),
+#             claude-sonnet/sonnet (2), codex/codex-a (3), codex-b (4)
 # ============================================================
 
 # --- Session-independent globals (no tmux required) ---
@@ -90,7 +91,7 @@ FORGE_BROKER_BIN="${FORGE_BROKER_BIN:-forge-broker}"
 # below may move a hygiene decision (MONOTONE-CONSERVATIVE RULE).
 #   MIN_HEADROOM        should a new stage start in this conversation?   (gate, 75)
 #   CONTEXT_ALERT       is this worker in trouble?                       (alerting, 25)
-#   ORCHESTRATOR_ALERT  does pane 1 need a handoff?                      (30)
+#   ORCHESTRATOR_ALERT  does the orchestrator (pane 0) need a handoff?                      (30)
 #   USAGE_MAX_AGE_S     is this reading too old to SHOW as current?      (DISPLAY ONLY)
 #   SEND_MIN_HEADROOM   opt-in hard floor on non---force sends           (0 = disabled)
 # USAGE_MAX_AGE_S is display-only BY DESIGN: a wall-clock TTL at the gate was explicitly
@@ -475,22 +476,22 @@ require_identity() {
 # Run `~/bin/forge-bridge alias-self-test --strict` after edits.
 pane_index() {
     case "$1" in
-        inline|general|claude-general|claude-opus|opus) echo "0" ;;
-        claude|orchestrator|claude-orchestrator)        echo "1" ;;
-        codex|codex-a)                                  echo "2" ;;
-        codex-b)                                        echo "3" ;;
-        claude-sonnet|sonnet)                           echo "4" ;;
+        claude|orchestrator|claude-orchestrator)        echo "0" ;;
+        inline|general|claude-general|claude-opus|opus) echo "1" ;;
+        claude-sonnet|sonnet)                           echo "2" ;;
+        codex|codex-a)                                  echo "3" ;;
+        codex-b)                                        echo "4" ;;
         *)                                              echo "$1" ;;
     esac
 }
 
 pane_name() {
     case "$1" in
-        0) echo "claude-opus" ;;
-        1) echo "claude" ;;
-        2) echo "codex-a" ;;
-        3) echo "codex-b" ;;
-        4) echo "claude-sonnet" ;;
+        0) echo "claude" ;;
+        1) echo "claude-opus" ;;
+        2) echo "claude-sonnet" ;;
+        3) echo "codex-a" ;;
+        4) echo "codex-b" ;;
         *) echo "pane-$1" ;;
     esac
 }
@@ -510,7 +511,7 @@ _worker_family() {
         *)                         printf '' ;;
     esac
 }
-_hygiene_worker_ok() {   # rc0 iff a policy-covered worker pane (never pane 1)
+_hygiene_worker_ok() {   # rc0 iff a policy-covered worker pane (never the orchestrator (pane 0))
     case "$1" in claude-opus|codex-a|codex-b|claude-sonnet) return 0 ;; *) return 1 ;; esac
 }
 _hygiene_valid_pct() {   # <val> rc0 iff integer 0..100
@@ -588,9 +589,9 @@ _context_alert_headroom() {   # <worker_canonical>
     printf '%s' "$shared"
 }
 
-# Effective pane-1 alert headroom (S11/S13.3). No family dimension — pane 1 is always Claude.
+# Effective orchestrator-pane alert headroom (S11/S13.3). No family dimension — the orchestrator (pane 0) is always Claude.
 # Deliberately NOT named *_MIN_HEADROOM: it is not gate vocabulary and never authorizes an
-# action against pane 1.
+# action against the orchestrator (pane 0).
 _orchestrator_alert_headroom() {
     local v="$FORGE_ORCHESTRATOR_ALERT_HEADROOM"
     if ! _hygiene_valid_pct "$v"; then
@@ -1049,7 +1050,7 @@ PY
 # from this, NEVER from the file-level `updated:` key — one worker's callback refreshes
 # `updated:` for every record in the file, which is exactly how a 22-hour-old reading
 # rendered as current. Empty output = no record / unparseable timestamp.
-_usage_record_age_s() {   # <usage_file> <worker>   ('orchestrator' selects the pane-1 record)
+_usage_record_age_s() {   # <usage_file> <worker>   ('orchestrator' selects the orchestrator-pane record)
     [ -f "$1" ] || { printf ''; return 0; }
     python3 - "$1" "$2" <<'PY'
 import sys,yaml,datetime
@@ -1173,7 +1174,7 @@ cmd_hygiene_status() {
     echo "  thresholds (effective):"
     echo "    gate   min_headroom          claude=$(_worker_min_headroom claude-opus 2>/dev/null) codex=$(_worker_min_headroom codex-a 2>/dev/null)   (should a new stage start here?)"
     echo "    alert  context_alert         claude=$(_context_alert_headroom claude-opus 2>/dev/null) codex=$(_context_alert_headroom codex-a 2>/dev/null)   (is this worker in trouble?)"
-    echo "    alert  orchestrator_alert    $(_orchestrator_alert_headroom 2>/dev/null)              (does pane 1 need a handoff?)"
+    echo "    alert  orchestrator_alert    $(_orchestrator_alert_headroom 2>/dev/null)              (does the orchestrator (pane 0) need a handoff?)"
     echo "    show   usage_max_age_s       $(_usage_max_age_s)             (DISPLAY ONLY — never a gate input)"
     echo "    send   send_min_headroom     $FORGE_SEND_MIN_HEADROOM               (0 = disabled; opt-in floor, strictly-below)"
     echo "    wait   usage_sample_interval $FORGE_USAGE_SAMPLE_INTERVAL_S             (0 = sampler off)"
@@ -1211,7 +1212,7 @@ cmd_hygiene_status() {
 # refusal and pane-index cross-check, the family capability gate (reason is `idle-proactive`,
 # NOT `operator`, so the gate applies), incarnation match, journal identity preflight,
 # fail-closed pending scan, idle health before AND after the clear, and semantic proof. It
-# therefore cannot touch pane 1 and cannot touch a pane with an open pending — the mid-stage
+# therefore cannot touch the orchestrator (pane 0) and cannot touch a pane with an open pending — the mid-stage
 # and BLOCKED fix-and-continue invariants hold BY CONSTRUCTION, not by a new check.
 #
 # Payoff: the next dispatch decides KEEP_RESET_PROVEN because reset.covers_generation still
@@ -1254,7 +1255,7 @@ cmd_reset_idle() {
     if [ "$all" = 1 ]; then
         targets="$order"
     else
-        _hygiene_worker_ok "$want" || { echo "reset-idle: '$want' is not a policy-covered worker pane (pane 1 is structurally un-resettable)." >&2; return 1; }
+        _hygiene_worker_ok "$want" || { echo "reset-idle: '$want' is not a policy-covered worker pane (the orchestrator (pane 0) is structurally un-resettable)." >&2; return 1; }
         targets="$want"
     fi
     # P0-4 single cleanup path: every return below releases any held fd.
@@ -1361,7 +1362,7 @@ yaml_escape() {
     fi
 }
 
-# ---- Heartbeat event log helpers (passive pane-1 event stream) ----
+# ---- Heartbeat event log helpers (passive orchestrator-pane event stream) ----
 #
 # Caller-visible behavior: any value passed through _sanitize_event_value
 # is mutated for the log line:
@@ -1486,7 +1487,7 @@ PYEOF
 # cmd_dispatch's gate all route through it. Two implementations of one lock protocol over one
 # file is a correctness hazard, not a style question.
 #
-#   slot   workers/<canonical> | orchestrator     (pane 1 is NEVER under workers:)
+#   slot   workers/<canonical> | orchestrator     (the orchestrator (pane 0) is NEVER under workers:)
 #   mode   record  today's behavior; a failed parse overwrites the record to unknown
 #          sample  NON-DESTRUCTIVE — a parse that did not reach confidence:high never
 #                  replaces an existing record, so a mid-turn parse miss cannot destroy
@@ -1622,12 +1623,12 @@ _usage_mark_post_reset() {   # <project_root> <worker> [generation]
 }
 
 # _observe_pane1 <project_root> [slug]   (S13)
-# Pane-1 (orchestrator) observation. THE POLICY IS: OBSERVE AND RECOMMEND, NEVER ACT.
-# No auto-reset, no auto-compact, no keystroke of any kind is ever sent to pane 1.
+# Orchestrator-seat (pane 0) observation. THE POLICY IS: OBSERVE AND RECOMMEND, NEVER ACT.
+# No auto-reset, no auto-compact, no keystroke of any kind is ever sent to the orchestrator (pane 0).
 # The safety case, in three parts:
-#   1. pane 1 holds the operator conversation — the only state in Forge with no on-disk
+#   1. the orchestrator (pane 0) holds the operator conversation — the only state in Forge with no on-disk
 #      reconstruction path;
-#   2. there is no callback boundary in pane 1, so there is no moment the bridge can PROVE
+#   2. there is no callback boundary in the orchestrator (pane 0), so there is no moment the bridge can PROVE
 #      is safe; and
 #   3. the shipped reset proof is a WORKER contract, validated against worker CLIs on
 #      disposable panes.
@@ -1637,11 +1638,11 @@ _usage_mark_post_reset() {   # <project_root> <worker> [generation]
 # hardcoded four-worker order list and never read the ledger, and cmd_hygiene_status never
 # opens it — so nothing would break either way. The top-level key is for
 # FORWARD-COMPATIBILITY and semantic honesty: it keeps the record structurally outside worker
-# space so a future consumer cannot mistake pane 1 for a policy-covered worker, and the four
-# structural pane-1 exclusions stay untouched. The record has the IDENTICAL SHAPE to a worker
+# space so a future consumer cannot mistake the orchestrator (pane 0) for a policy-covered worker, and the four
+# structural orchestrator-pane exclusions stay untouched. The record has the IDENTICAL SHAPE to a worker
 # record, so a future FORGE_ORCHESTRATOR_HYGIENE needs no schema migration (S13.5).
 #
-# `sample` mode, so a mid-turn pane-1 parse miss can never clobber a good reading.
+# `sample` mode, so a mid-turn orchestrator-pane parse miss can never clobber a good reading.
 # Echoes `<headroom> <confidence>`. Always rc0. Test seam: FORGE_PANE1_FIXTURE.
 _observe_pane1() {   # <project_root> [slug]
     local pr="$1" slug="${2:-orchestrator}"
@@ -1957,7 +1958,7 @@ EOF
     # Heartbeat: stage RESULT recorded (not necessarily an advance).
     # commit-review is a side-channel, not a pipeline stage transition — skip.
     # Fires from both cmd_log_response (normal callback path) and cmd_set_context
-    # (manual operator recovery); the second source is intentional so pane 1 sees
+    # (manual operator recovery); the second source is intentional so the orchestrator (pane 0) sees
     # interventions.
     if [ "$stage" != "commit-review" ]; then
         _emit_event STAGE "$slug" "result_stage=$stage status=$status next=${next_stage:-pending-orchestrator-decision} worker=$worker"
@@ -2242,7 +2243,7 @@ cmd_send() {
             return $_rc
             ;;
     esac
-    # Non-worker target (pane-1 / orchestrator relay) — unchanged path.
+    # Non-worker target (orchestrator pane / relay) — unchanged path.
     _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"
 }
 
@@ -2476,7 +2477,7 @@ _worker_lock_fd() {   # <worker_canonical> -> fd or empty
 }
 _worker_lock() {   # <worker_canonical> ; rc 0 held, 1 busy/error, 2 non-worker
     local wk="$1" fd; fd="$(_worker_lock_fd "$wk")"
-    [ -n "$fd" ] || { echo "ERROR: worker-lock: pane 1 / non-worker '$wk' is unlockable" >&2; return 2; }
+    [ -n "$fd" ] || { echo "ERROR: worker-lock: the orchestrator (pane 0) / non-worker '$wk' is unlockable" >&2; return 2; }
     local pr; pr="$(_resolve_project_root "" 2>/dev/null)"
     [ -n "$pr" ] || { echo "ERROR: worker-lock: no project root" >&2; return 1; }
     local ld="$pr/.dev/forge-tmp/hygiene-locks"; mkdir -p "$ld" 2>/dev/null
@@ -2550,7 +2551,7 @@ _reset_worker_locked() {   # <session> <idx> <worker> <reason> <slug> [ignore_pe
     local sess="$1" idx="$2" wk="$3" reason="$4" slug="${5:-adhoc}" ignore_pt="${6:-}"
     local fam; fam="$(_worker_family "$wk")"
     [ -n "$fam" ] || { echo "RESET_REFUSED reason=non-worker" >&2; return 2; }
-    case "$idx" in 0|2|3|4) ;; *) echo "RESET_REFUSED reason=pane-not-worker idx=$idx" >&2; return 2 ;; esac
+    case "$idx" in 1|2|3|4) ;; *) echo "RESET_REFUSED reason=pane-not-worker idx=$idx" >&2; return 2 ;; esac
     # P2-5: the supplied index MUST be the canonical pane index for this worker, else a
     # caller bug would clear one pane while recording reset evidence for another.
     local _wantidx; _wantidx="$(pane_index "$wk")"
@@ -3826,7 +3827,7 @@ if usage_file and os.path.exists(usage_file):
             _a = _u_age(_o)
             _tag = '  STALE' if (_a is None or _a > usage_max_age) else ''
             ctx_rows.append(
-                f"  {'pane-1 (orch)':<15} headroom={str(_o.get('headroom')):<8} "
+                f"  {'pane-0 (orch)':<15} headroom={str(_o.get('headroom')):<8} "
                 f"confidence={str(_o.get('confidence')):<5} age={_u_hage(_a):<5} "
                 f"by={str(_o.get('observed_by') or '?'):<9}{_tag}  OBSERVE-ONLY")
 L.append("## Worker context")
@@ -3835,7 +3836,7 @@ L.extend(ctx_rows or ["  (no usage recorded yet)"])
 L.append("")
 
 # ── S4.1: Recent hygiene decisions ──────────────────────────────────────────
-# From pane 1 a working feature and an absent feature looked IDENTICAL, because every
+# From the orchestrator (pane 0) a working feature and an absent feature looked IDENTICAL, because every
 # HYGIENE_DECISION landed only in the events log. BYTE-BOUNDED tail — never a full scan.
 # forge-watch already full-file-scans this log per slug per 30s tick, and this renderer runs
 # from twelve call sites (R8).
@@ -4087,7 +4088,7 @@ cmd_dispatch() {
             ;;
         proposal)
             _emit_event ERROR "$slug" "stage=$stage reason=proposal-not-dispatchable worker=$worker_canonical"
-            echo "ERROR: stage 'proposal' runs locally in pane 1 via Agent Teams; it is not dispatchable to a worker. Run it inline, then close with 'forge-bridge log-response --to claude --stage proposal'." >&2
+            echo "ERROR: stage 'proposal' runs locally in the orchestrator (pane 0) via Agent Teams; it is not dispatchable to a worker. Run it inline, then close with 'forge-bridge log-response --to claude --stage proposal'." >&2
             return 1
             ;;
     esac
@@ -4329,12 +4330,12 @@ PYEOF
     # S5.5: ADDITIVE FIELDS ONLY. No new action= value — the action vocabulary is pinned by
     # the emit whitelist and consumed by forge-watch's event parsing.
     _emit_event HYGIENE_DECISION "$slug" "stage=$stage worker=$worker_canonical action=$_action reason=$_reason threshold=$_min confidence=${_conf:-none} mode=$FORGE_WORKER_HYGIENE_MODE generation=$_gen_now source=$_source live_headroom=${_live_hr:-none} divergent=$_divergent"
-    # ACM S1: the decision has always landed only in orchestrator-events.log, so from pane 1
+    # ACM S1: the decision has always landed only in orchestrator-events.log, so from the orchestrator (pane 0)
     # a working hygiene gate and an absent one look identical. One line per boundary, on
     # STDERR — stdout stays byte-for-byte unchanged because cmd_wait and the orchestrator
     # parse it.
     echo "HYGIENE $worker_canonical: $_action — $_reason (source=$_source, live=${_live_hr:-none}, threshold=$_min, gen ${_gen_now:-0})" >&2
-    # S13.2: the orchestrator's own activity is the clock for pane-1 observation. No new
+    # S13.2: the orchestrator's own activity is the clock for orchestrator-pane observation. No new
     # cadence, and NEVER from cmd_status/cmd_context (callers expect those side-effect-free).
     _observe_pane1 "$project_root" "$slug" >/dev/null 2>&1 || true
 
@@ -5157,7 +5158,7 @@ _acm_sample_tick() {   # <project_root> <slug> <stage> <worker> <idx>
     local pr="$1" slug="$2" stage="$3" wk="$4" idx="$5"
     local _u; _u="$(_observe_usage "$wk" "$slug" "$stage" "$idx" "$pr" "" sample wait 2>/dev/null)"
     local _hr _cf; read -r _hr _cf <<< "${_u:-unknown none}"
-    # S13.2: pane 1 is observed on the orchestrator's own clock; the sample tick is one of its
+    # S13.2: the orchestrator (pane 0) is observed on the orchestrator's own clock; the sample tick is one of its
     # three call sites. Never a reset, never a compact, never a keystroke.
     _observe_pane1 "$pr" "$slug" >/dev/null 2>&1 || true
     case "$_hr" in ''|unknown|*[!0-9]*) return 0 ;; esac
@@ -6738,7 +6739,7 @@ cmd_emit() {
 #
 # Default: a read-only FILE read (forge-usage.<session>.yml); it never scrapes a pane, so a
 # status query cannot perturb a worker. --refresh DOES measure: it live-samples the four
-# workers and pane 1, upserts, then renders — that is the batch-planning snapshot.
+# workers and the orchestrator (pane 0), upserts, then renders — that is the batch-planning snapshot.
 #
 # FRESHNESS COMES FROM PER-RECORD `measured_at`, NEVER from the file-level `updated:` key.
 # That key is refreshed by ANY worker's callback, which is exactly how a 22-hour-old codex-b
@@ -6770,7 +6771,7 @@ cmd_usage() {
     local usage_file="$project_root/$(_usage_file)"
     local _uw
     if [ "$refresh" = 1 ]; then
-        # S10: live-measure the four workers and pane 1. Panes with an OPEN PENDING are
+        # S10: live-measure the four workers and the orchestrator (pane 0). Panes with an OPEN PENDING are
         # SAMPLED, NOT SKIPPED — a mid-stage reading is the most decision-relevant number in a
         # planning snapshot; it renders as `in-flight` and is worded as a FLOOR (the worker
         # will consume more before its stage ends). S3.2's non-destructive sample rule is what
@@ -6945,9 +6946,9 @@ for r in rows:
 if orow is not None:
     hr = orow["headroom"] if orow["headroom"] is not None else "?"
     print("  %-13s role=orchestrator headroom=%-7s confidence=%-5s age=%-5s %s" % (
-        "pane-1", hr, orow.get("confidence") or "?", h_age(orow["age_s"]),
+        "pane-0", hr, orow.get("confidence") or "?", h_age(orow["age_s"]),
         "STALE" if orow["stale"] else ""))
-    print("      -> observe-only (pane 1 is NEVER auto-reset; at or below the orchestrator")
+    print("      -> observe-only (the orchestrator (pane 0) is NEVER auto-reset; at or below the orchestrator")
     print("         threshold the response is a HANDOFF NOTE, not a /clear)")
 if flt and not rows:
     print("  (no record for worker '%s')" % flt)
@@ -7613,7 +7614,7 @@ ALIAS_TO_CANONICAL = {
 }
 def canonical(name): return ALIAS_TO_CANONICAL.get(name, name)
 
-NAME_TO_IDX = {'claude-opus': 0, 'claude': 1, 'codex-a': 2, 'codex-b': 3, 'claude-sonnet': 4}
+NAME_TO_IDX = {'claude': 0, 'claude-opus': 1, 'claude-sonnet': 2, 'codex-a': 3, 'codex-b': 4}
 
 try:
     with open(summary_log) as f:
@@ -7904,11 +7905,11 @@ cmd_health() {
     # Expected (canonical_name, idx, kind) tuples.
     # kind is 'claude' or 'codex' — matched against idle-prompts.yml regex tables.
     local specs=(
-        "claude-opus:0:claude-opus"
-        "claude:1:claude-opus"
-        "codex-a:2:codex-a"
-        "codex-b:3:codex-b"
-        "claude-sonnet:4:claude-sonnet"
+        "claude:0:claude-opus"
+        "claude-opus:1:claude-opus"
+        "claude-sonnet:2:claude-sonnet"
+        "codex-a:3:codex-a"
+        "codex-b:4:codex-b"
     )
 
     local existing_idxs
@@ -8181,12 +8182,12 @@ case "${1:-help}" in
         echo "  set-context --slug <s>        Set active pipeline (auto-derives state)"
         echo "  add-note <text>               Add a note to context (persists across sessions)"
         echo "  usage [<worker>] [--refresh] [--json]"
-        echo "                                Per-worker usage snapshot (+ pane 1). --refresh live-measures first;"
+        echo "                                Per-worker usage snapshot (+ the orchestrator (pane 0)). --refresh live-measures first;"
         echo "                                --json emits stable keys with a tier-free recommendation (reset-first|ok|busy|unknown)"
         echo "  reset-idle [--worker <w> | --all] [--dry-run]"
         echo "                                Proactively reset an IDLE worker off the dispatch critical path. Inherits every"
         echo "                                dispatch-time safety precondition; refuses on an open pending, non-idle health,"
-        echo "                                a terminal state, in observe mode, and on pane 1"
+        echo "                                a terminal state, in observe mode, and on the orchestrator (pane 0)"
         echo "  identity                      Print host/target identity descriptor; exit 0 (MATCH/CROSS) or 3 (MISMATCH/AMBIGUOUS/UNAVAILABLE)"
         echo "  stall-check-status [--project-root <p>]"
         echo "                                List panes with pending dispatch and stale stall-check coverage"
@@ -8215,7 +8216,7 @@ case "${1:-help}" in
         echo "  hygiene-gc [--days N] [--dry-run]  Reap dead-incarnation terminal journals + locks (conservative)"
         echo "  hygiene-abandon --slug <s> --reason <text>  Audited cleanup non-completion escape from a stuck terminal state"
         echo ""
-        echo "Panes: claude-opus/opus/inline/general (0), claude/orchestrator/claude-orchestrator (1), codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)"
+        echo "Panes: claude/orchestrator/claude-orchestrator (0), claude-opus/opus/inline/general (1), claude-sonnet/sonnet (2), codex/codex-a (3), codex-b (4)"
         echo ""
         echo "Hooks (automatic):"
         echo "  - send blocks unless a pending log entry targets the same pane (per-target check)"

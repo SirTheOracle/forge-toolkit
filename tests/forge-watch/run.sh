@@ -865,11 +865,11 @@ if "$WATCH" status >/dev/null 2>&1; then ok "empty session map exits 0 cleanly";
 attn(){ mkdir -p "$1/.dev/attention/payloads"; echo "$1/.dev/attention"; }
 disp(){  # disp <root> <session> <ageSec> <id> [snippet] [sender]
   local a; a="$(attn "$1")"; cat > "$a/dispatch-$4.json" <<JSON
-{"schema":"cc-dispatch/1","event":"dispatch","dispatch_id":"$4","session":"$2","root":"$1","target_pane":1,"mode":"inline","instruction_snippet":"${5:-do the thing}","instruction_sha256":"abc","dispatched_at":"$(iso_ago "$3")","sender":"${6:-seat}","state":"queued-input","answers_ask_id":null}
+{"schema":"cc-dispatch/1","event":"dispatch","dispatch_id":"$4","session":"$2","root":"$1","target_pane":0,"mode":"inline","instruction_snippet":"${5:-do the thing}","instruction_sha256":"abc","dispatched_at":"$(iso_ago "$3")","sender":"${6:-seat}","state":"queued-input","answers_ask_id":null}
 JSON
 }
 promptf(){ local a; a="$(attn "$1")"; cat > "$a/prompt.$2.json" <<JSON
-{"schema":"cc-attention/1","event":"userpromptsubmit","variant":"dispatch-accept","session":"$2","root":"$1","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago "$3")","dispatch_id":"${4:-null}","prompt_snippet":"x"}
+{"schema":"cc-attention/1","event":"userpromptsubmit","variant":"dispatch-accept","session":"$2","root":"$1","pane_index":"0","role":"orchestrator","tmux_pane":"%0","emitted_at":"$(iso_ago "$3")","dispatch_id":"${4:-null}","prompt_snippet":"x"}
 JSON
 }
 stopf(){ # stopf <root> <session> <ageSec> [snippet] [is_q] [question_snippet] [response_did]
@@ -880,11 +880,11 @@ stopf(){ # stopf <root> <session> <ageSec> [snippet] [is_q] [question_snippet] [
     extra=",\"question_snippet\":\"$6\""
   fi
   cat > "$a/stop.$2.json" <<JSON
-{"schema":"cc-attention/1","event":"stop","variant":"snippet","session":"$2","root":"$1","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago "$3")","snippet":"${4:-all done}","snippet_source":"last_assistant_message","looks_like_question":$isq$extra}
+{"schema":"cc-attention/1","event":"stop","variant":"snippet","session":"$2","root":"$1","pane_index":"0","role":"orchestrator","tmux_pane":"%0","emitted_at":"$(iso_ago "$3")","snippet":"${4:-all done}","snippet_source":"last_assistant_message","looks_like_question":$isq$extra}
 JSON
 }
 permf(){ local a; a="$(attn "$1")"; cat > "$a/perm.$2.$3.json" <<JSON
-{"schema":"cc-attention/1","event":"permissionrequest","variant":"permission","session":"$2","root":"$1","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago "${5:-30}")","state":"needs-input","tool_name":"${4:-Bash}","command":"run something","command_hash":"$3","permission_suggestions":[]}
+{"schema":"cc-attention/1","event":"permissionrequest","variant":"permission","session":"$2","root":"$1","pane_index":"0","role":"orchestrator","tmux_pane":"%0","emitted_at":"$(iso_ago "${5:-30}")","state":"needs-input","tool_name":"${4:-Bash}","command":"run something","command_hash":"$3","permission_suggestions":[]}
 JSON
 }
 askf(){  # askf <root> <session> <ask_id> <slug> <stage> [ageSec] [question]
@@ -893,7 +893,7 @@ askf(){  # askf <root> <session> <ask_id> <slug> <stage> [ageSec] [question]
 import json,sys
 p,sess,root,aid,slug,stage,ts,q=sys.argv[1:9]
 json.dump({"schema":"cc-attention/1","event":"ask","variant":"ask","session":sess,"root":root,
-  "pane_index":"4","role":"worker","tmux_pane":"%4","emitted_at":ts,"ask_id":aid,
+  "pane_index":"2","role":"worker","tmux_pane":"%2","emitted_at":ts,"ask_id":aid,
   "mode":"stage" if slug else "session-scope","slug":slug or None,"stage":stage or None,
   "worker":"codex-a","question_snippet":q,"question_sha256":"deadbeef"},open(p,"w"),indent=2)
 PY
@@ -968,14 +968,14 @@ echo "── attention: AskUserQuestion perm rows carry the question (QW1-QW4) �
 new_env attq1
 R=$(mk_root proj); live_session forge-1 "$R"
 a="$(attn "$R")"; cat > "$a/perm.forge-1.e3b0c442.json" <<JSON
-{"schema":"cc-attention/1","event":"permissionrequest","variant":"permission","session":"forge-1","root":"$R","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago 30)","state":"needs-input","tool_name":"AskUserQuestion","command":"","command_hash":"e3b0c442","permission_suggestions":[],"question_snippet":"Deploy to prod?","question_options":["yes","no","dry-run"],"question_count":2,"multi_select":false}
+{"schema":"cc-attention/1","event":"permissionrequest","variant":"permission","session":"forge-1","root":"$R","pane_index":"0","role":"orchestrator","tmux_pane":"%0","emitted_at":"$(iso_ago 30)","state":"needs-input","tool_name":"AskUserQuestion","command":"","command_hash":"e3b0c442","permission_suggestions":[],"question_snippet":"Deploy to prod?","question_options":["yes","no","dry-run"],"question_count":2,"multi_select":false}
 JSON
 assert_status_has "question (AskUserQuestion): Deploy to prod?" "QW1 enriched perm row shows the question"
 assert_status_has "options: yes / no / dry-run" "QW1 option labels rendered"
 assert_status_has "(+1 more)" "QW1 additional-question count surfaces"
 assert_status_missing "permission needed: AskUserQuestion" "QW1 contentless fallback not used"
 cat > "$a/wperm.forge-1.p0.e3b0c442.json" <<JSON
-{"schema":"cc-attention/1","event":"permissionrequest","variant":"worker-permission","session":"forge-1","root":"$R","pane_index":"0","role":"worker","agent":"claude","tmux_pane":"%0","emitted_at":"$(iso_ago 30)","state":"needs-input","tool_name":"AskUserQuestion","command":"","command_hash":"e3b0c442","permission_suggestions":[],"question_snippet":"Which table?","question_options":["users","orders"],"question_count":1,"multi_select":false}
+{"schema":"cc-attention/1","event":"permissionrequest","variant":"worker-permission","session":"forge-1","root":"$R","pane_index":"1","role":"worker","agent":"claude","tmux_pane":"%1","emitted_at":"$(iso_ago 30)","state":"needs-input","tool_name":"AskUserQuestion","command":"","command_hash":"e3b0c442","permission_suggestions":[],"question_snippet":"Which table?","question_options":["users","orders"],"question_count":1,"multi_select":false}
 JSON
 assert_status_has "forge-1 p0 — question (AskUserQuestion): Which table?" "QW1 worker wperm renders via the same path"
 run_status --pretty | grep -q "answer in the pane" && ok "QW3 pretty hot row carries the go-to-pane hint" || bad "QW3 go-to-pane hint missing"
@@ -2172,7 +2172,7 @@ assert not any('**' in t or '](' in t or '`' in t for t in texts), texts
 PY
 # MD6: AskUserQuestion perm question + option labels stripped
 a="$(attn "$R")"; cat > "$a/perm.forge-1.mdq.json" <<JSON
-{"schema":"cc-attention/1","event":"permissionrequest","variant":"permission","session":"forge-1","root":"$R","pane_index":"1","role":"orchestrator","tmux_pane":"%1","emitted_at":"$(iso_ago 30)","state":"needs-input","tool_name":"AskUserQuestion","command":"","command_hash":"mdq","permission_suggestions":[],"question_snippet":"Deploy **now** to \`prod\`?","question_options":["**yes**","\`no\`"],"question_count":1,"multi_select":false}
+{"schema":"cc-attention/1","event":"permissionrequest","variant":"permission","session":"forge-1","root":"$R","pane_index":"0","role":"orchestrator","tmux_pane":"%0","emitted_at":"$(iso_ago 30)","state":"needs-input","tool_name":"AskUserQuestion","command":"","command_hash":"mdq","permission_suggestions":[],"question_snippet":"Deploy **now** to \`prod\`?","question_options":["**yes**","\`no\`"],"question_count":1,"multi_select":false}
 JSON
 assert_status_has "question (AskUserQuestion): Deploy now to prod?" "MD6 perm question stripped"
 assert_status_has "options: yes / no" "MD6 option labels stripped"
@@ -2183,15 +2183,15 @@ R=$(mk_root proj); live_session forge-1 "$R"
 a="$(attn "$R")"
 # HT1: done turn whose prompt was an injected <task-notification> → no task row
 cat > "$a/wstop.forge-1.p0.ptask-ht1.json" <<JSON
-{"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"0","role":"worker","agent":"claude","tmux_pane":"%0","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht1","prompt_snippet":"<task-notification> <task-id>abc123</task-id> <tool-use-id>toolu_x</tool-use-id>","snippet":"noted, moving on","snippet_source":"last_assistant_message","looks_like_question":false}
+{"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"1","role":"worker","agent":"claude","tmux_pane":"%1","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht1","prompt_snippet":"<task-notification> <task-id>abc123</task-id> <tool-use-id>toolu_x</tool-use-id>","snippet":"noted, moving on","snippet_source":"last_assistant_message","looks_like_question":false}
 JSON
 # HT2: legacy mangled form (record written before the sk- boundary fix) → no task row
 cat > "$a/wstop.forge-1.p2.ptask-ht2.json" <<JSON
-{"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"2","role":"worker","agent":"claude","tmux_pane":"%2","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht2","prompt_snippet":"<ta«redacted»> <task-id>def456</task-id> <tool-use-id>toolu_y</tool-use-id>","snippet":"ack","snippet_source":"last_assistant_message","looks_like_question":false}
+{"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"3","role":"worker","agent":"claude","tmux_pane":"%3","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht2","prompt_snippet":"<ta«redacted»> <task-id>def456</task-id> <tool-use-id>toolu_y</tool-use-id>","snippet":"ack","snippet_source":"last_assistant_message","looks_like_question":false}
 JSON
 # HT3: Agent-Teams <agent-message> turn → no task row
 cat > "$a/wstop.forge-1.p4.ptask-ht3.json" <<JSON
-{"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"4","role":"worker","agent":"claude","tmux_pane":"%4","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht3","prompt_snippet":"<agent-message from=\"regression-hunter-b\"> No corrections","snippet":"ok","snippet_source":"last_assistant_message","looks_like_question":false}
+{"schema":"cc-attention/1","event":"stop","variant":"worker-snippet","session":"forge-1","root":"$R","pane_index":"2","role":"worker","agent":"claude","tmux_pane":"%2","emitted_at":"$(iso_ago 30)","task_id":"ptask-ht3","prompt_snippet":"<agent-message from=\"regression-hunter-b\"> No corrections","snippet":"ok","snippet_source":"last_assistant_message","looks_like_question":false}
 JSON
 # HT4: live injected wprompt (would render state=working) → no task row
 wpromptf "$R" forge-1 6 30 ptask-ht4 claude "<task-notification> <task-id>xyz</task-id> background agent done"
@@ -2751,12 +2751,12 @@ run_status --board | python3 -c 'import json,sys; assert json.load(sys.stdin).ge
 # ORCHESTRATOR-LOW-CONTEXT notifies ONCE and re-arms on a new incarnation.
 new_env lowctx6; R=$(mk_root proj); live_session forge-1 "$R"
 orch_ledger "$R" forge-1 12 high 30 1; run_check >/dev/null
-assert_notified "orchestrator (pane 1) at 12% headroom" "T-FW-ORCH notifies on the crossing"
+assert_notified "orchestrator (pane 0) at 12% headroom" "T-FW-ORCH notifies on the crossing"
 : > "$CAP"; run_check >/dev/null
-assert_not_notified "orchestrator (pane 1)" "T-FW-ORCH policy=once does not re-notify while it persists"
+assert_not_notified "orchestrator (pane 0)" "T-FW-ORCH policy=once does not re-notify while it persists"
 assert_status_has "ORCHESTRATOR-LOW-CONTEXT" "T-FW-ORCH the board row stays ambient"
 orch_ledger "$R" forge-1 12 high 30 2; run_check >/dev/null
-assert_notified "orchestrator (pane 1) at 12% headroom" "T-FW-ORCH re-arms on a new incarnation"
+assert_notified "orchestrator (pane 0) at 12% headroom" "T-FW-ORCH re-arms on a new incarnation"
 
 # RESET-PROOF-DIVERGENT.
 new_env lowctx7; R=$(mk_root proj); live_session forge-1 "$R"

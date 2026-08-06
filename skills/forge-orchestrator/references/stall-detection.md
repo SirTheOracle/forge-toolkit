@@ -10,10 +10,10 @@ pane, (b) whether the pane's normalized content changed since last check,
 and (c) per-pane regex matches against `~/.config/forge/idle-prompts.yml`.
 
 Watched external worker panes in Phase 2:
-- `claude-opus` / pane 0 — incorporate, impl-review
-- `codex-a` / pane 2 — review and eligible implementation/review work
-- `codex-b` / pane 3 — implementation and QA work
-- `claude-sonnet` / pane 4 — coding, qa-fix, verify local fallback
+- `claude-opus` / the claude-opus worker (pane 1) — incorporate, impl-review
+- `codex-a` / the codex-a worker (pane 3) — review and eligible implementation/review work
+- `codex-b` / the codex-b worker (pane 4) — implementation and QA work
+- `claude-sonnet` / the claude-sonnet worker (pane 2) — coding, qa-fix, verify local fallback
 
 | state                          | trigger                                                              | bridge action / orchestrator response |
 |--------------------------------|----------------------------------------------------------------------|---------------------------------------|

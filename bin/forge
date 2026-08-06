@@ -453,7 +453,7 @@ def redact(s):
 adir = os.path.join(root, ".dev", "attention"); os.makedirs(adir, exist_ok=True)
 pointer = force_pointer or ("\n" in instr) or (len(instr.encode("utf-8")) > inline_max)
 rec = {"schema": "cc-dispatch/1", "event": "dispatch", "dispatch_id": did,
-       "session": session, "root": root, "target_pane": 1,
+       "session": session, "root": root, "target_pane": 0,
        "mode": "pointer" if pointer else "inline",
        "instruction_snippet": redact(instr[:200]).replace("\n", " "),
        "instruction_sha256": sha, "dispatched_at": ts, "sender": sender,
@@ -483,15 +483,15 @@ PY
     gc_root "$root"
 
     # Inject via the bridge's cmd_send 3-step split. TMUX_SESSION is the bridge's
-    # resolution step 1 (trusted unconditionally), so this targets <session>:0.1
-    # from any cwd; pane 1 (claude) is outside cmd_send's worker guard (no --force).
+    # resolution step 1 (trusted unconditionally), so this targets <session>:0.0
+    # from any cwd; pane 0 (claude) is outside cmd_send's worker guard (no --force).
     if [ "$dry" = true ]; then
-        printf 'DRY-RUN inject → %s:0.1: %s\n' "$session" "$oneliner"
+        printf 'DRY-RUN inject → %s:0.0: %s\n' "$session" "$oneliner"
     else
         if ! ( cd "$root" && "$FORGE_BRIDGE_BIN" send --target-session "$session" --cross-session claude "$oneliner" ); then
             _dispatch_fail "injection failed (forge-bridge send)"
         fi
-        printf 'DISPATCHED @%s pane=1 sender=%s%s\n' "$session" "$sender" \
+        printf 'DISPATCHED @%s pane=0 sender=%s%s\n' "$session" "$sender" \
             "$([ -n "$answers" ] && printf ' answers=%s' "$answers")"
         fire_watch_check    # Step 6: surface the new queued/accepted task at ~1s (real inject only)
         # --wait (opt-in): block until THIS dispatch's answer lands, then print it.
@@ -559,19 +559,20 @@ q = os.environ.get("FORGE_ASK_Q", "")
 # walk-up to .claude/forge-project.yml (out-of-tmux ask).
 meta = None
 tmux_pane = os.environ.get("TMUX_PANE", "")
-pane_index = ""; session = ""; root = ""
+pane_index = ""; session = ""; root = ""; window_panes = ""
 if not root_override and tmux_pane:
     try:
         meta = subprocess.run(
             ["tmux", "display-message", "-p", "-t", tmux_pane,
-             "#{pane_index}\t#{session_name}\t#{session_path}"],
+             "#{pane_index}\t#{session_name}\t#{session_path}\t#{window_panes}"],
             capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         meta = None
 if meta:
     p = meta.split("\t")
-    if len(p) == 3:
+    if len(p) in (3, 4):
         pane_index, session, root = p[0], p[1], os.path.realpath(p[2])
+        window_panes = p[3] if len(p) == 4 else ""
 if root_override:
     root = os.path.realpath(root_override)
 if not root:
@@ -637,9 +638,10 @@ now = datetime.datetime.now(datetime.timezone.utc)
 ask_id = "ask-" + now.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
 # LOCKSTEP: bin/forge-bridge pane_index() 'claude'.
 # Verified by `forge-bridge alias-self-test --strict`.
-ORCH_PANE_INDEX = '1'
+ORCH_PANE_INDEX = '0'
+_multi = (window_panes or "").isdigit() and int(window_panes) > 1
 role = os.environ.get("FORGE_ROLE") or (
-    "orchestrator" if pane_index == ORCH_PANE_INDEX else "worker")
+    "orchestrator" if (pane_index == ORCH_PANE_INDEX and _multi) else "worker")
 rec = {"schema": "cc-attention/1", "event": "ask", "variant": "ask",
        "session": session or None, "root": root,
        "pane_index": pane_index or None, "role": role, "tmux_pane": tmux_pane,
@@ -666,7 +668,7 @@ PY
     rm -f "$outf"
 
     # Stage mode → ALSO raise a quiet BLOCKED callback. --quiet: the attention path
-    # notifies the human; don't double-notify pane 1. --message is the REDACTED
+    # notifies the human; don't double-notify pane 0. --message is the REDACTED
     # snippet (one redaction pass feeds both the event and the callback file). A
     # bridge failure NEVER fails the worker — the attention event already carries it.
     if [ "$a_mode" = "stage" ]; then

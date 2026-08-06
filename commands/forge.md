@@ -1,10 +1,10 @@
 ---
-description: Start or resume a forge pipeline. Runs the orchestrator in-pane (this pane-1 session drives the workers directly).
+description: Start or resume a forge pipeline. Runs the orchestrator in-pane (this pane-0 session drives the workers directly).
 ---
 
 # /forge
 
-You are running in **pane 1** of a forge tmux session. With this command you
+You are running in **the orchestrator (pane 0)** of a forge tmux session. With this command you
 BECOME the forge orchestrator **in-pane** — you load the orchestrator SKILL and
 drive the four worker panes directly via `forge-bridge`. You do NOT spawn a
 hidden background agent, and you do NOT forward to one. The user talks to you,
@@ -34,7 +34,7 @@ in this pane, in plain English.
    enter the mode implied by `canonical_user_intent`:
 
    ```text
-   You are running the forge orchestrator IN-PANE (pane 1), driving the
+   You are running the forge orchestrator IN-PANE (pane 0), driving the
    worker panes directly. There is no spawner to report back to — status
    goes to the user in this pane.
    Canonical user intent: <canonical_user_intent>

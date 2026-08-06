@@ -32,24 +32,24 @@ new_root(){
   TSV="$WORK/$1.tsv"; printf 'forge-x\t%s\n' "$R" > "$TSV"
   # Worker permission records are accepted only when they correlate to one
   # open broker delivery. Seed one delivery per worker pane used by this suite.
-  for pane in 0 2 3; do
+  for pane in 1 3 4; do
     did="delivery-$1-p$pane"
     printf '{"schema":"forge-delivery/1","state":"open","delivery_id":"%s","session":"forge-x","pane_index":%s,"session_incarnation":"test-incarnation","physical_code_root":"%s","root_identity":"rid-%s","slug":"test-slug","stage":"review","capability_class":"workspace","prompt_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}\n' \
       "$did" "$pane" "$R" "$1" > "$R/.dev/forge-broker/envelopes/delivery-$did.json"
   done
 }
-meta(){ printf '%s\t%s\t%s' "$1" "forge-x" "$2"; }   # pane_index, path
+meta(){ printf '%s\t%s\t%s\t%s' "$1" "forge-x" "$2" "${3:-5}"; }   # pane_index, path, window_panes
 
 echo "── dispatch: inline schema + marker (hermetic) ──"
 new_root d1
 out=$(FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 "$FORGE" dispatch @forge-x "short instruction" --allow-api-billing --sender seat 2>&1)
 ev=$(ls "$R"/.dev/attention/dispatch-*.json 2>/dev/null | head -1)
 [ -n "$ev" ] && ok "inline dispatch wrote an event" || bad "no event: $out"
-python3 - "$ev" <<'PY' && ok "inline event fields correct" || bad "inline schema wrong"
+python3 - "$ev" <<'PY' && ok "T-TARGET-PANE inline cc-dispatch/1 fields correct (target_pane=0)" || bad "T-TARGET-PANE inline schema wrong"
 import json,sys,hashlib
 e=json.load(open(sys.argv[1]))
 assert e["schema"]=="cc-dispatch/1" and e["event"]=="dispatch"
-assert e["session"]=="forge-x" and e["target_pane"]==1 and e["mode"]=="inline"
+assert e["session"]=="forge-x" and e["target_pane"]==0 and e["mode"]=="inline"
 assert e["state"]=="queued-input" and e["sender"]=="seat" and e["answers_ask_id"] is None
 assert e["instruction_sha256"]==hashlib.sha256(b"short instruction").hexdigest()
 PY
@@ -198,19 +198,35 @@ N="$WORK/notforge"; mkdir -p "$N"
 printf '{"prompt":"hi"}' | FORGE_CC_PANE_META="$(meta 1 "$N")" "$HOOK" userpromptsubmit
 test ! -d "$N/.dev" && ok "hook inert in non-forge root (no .dev)" || bad "hook wrote into non-forge root"
 
-echo "── forge-cc-hook: STRUCTURAL path on a real tmux session (NO FORGE_ROLE) ──"
+echo "── forge-cc-hook: STRUCTURAL role path on real tmux (NO FORGE_ROLE) ──"
 if command -v tmux >/dev/null 2>&1; then
   new_root h2
-  tmux new-session -d -s "$SESS" -c "$R"; tmux split-window -t "$SESS" -c "$R"   # pane 0 + 1
-  p1=$(tmux list-panes -t "$SESS" -F '#{pane_index} #{pane_id}' | awk '$1==1{print $2}')
+  tmux new-session -d -s "$SESS" -c "$R"; tmux split-window -t "$SESS" -c "$R"
   p0=$(tmux list-panes -t "$SESS" -F '#{pane_index} #{pane_id}' | awk '$1==0{print $2}')
-  printf '{"last_assistant_message":"done here"}' | env -u FORGE_ROLE -u TMUX_SESSION TMUX_PANE="$p1" "$HOOK" stop
-  test -f "$R/.dev/attention/stop.$SESS.json" && ok "pane-1 structural fire wrote event (no FORGE_ROLE)" || bad "structural pane-1 silent"
+  p1=$(tmux list-panes -t "$SESS" -F '#{pane_index} #{pane_id}' | awk '$1==1{print $2}')
+  printf '{"last_assistant_message":"done here"}' | env -u FORGE_ROLE -u TMUX_SESSION TMUX_PANE="$p0" "$HOOK" stop
+  test -f "$R/.dev/attention/stop.$SESS.json" && ok "T-ROLE pane 0 wrote canonical stop" || bad "T-ROLE pane 0 silent"
   rm -f "$R/.dev/attention/"stop.*.json "$R/.dev/attention/"wstop.*.json 2>/dev/null
-  printf '{"last_assistant_message":"worker done"}' | env -u FORGE_ROLE -u TMUX_SESSION TMUX_PANE="$p0" "$HOOK" stop
-  { ls "$R/.dev/attention/"wstop."$SESS".p0.*.json >/dev/null 2>&1 && test ! -f "$R/.dev/attention/stop.$SESS.json"; } \
-    && ok "pane-0 structural → namespaced wstop; canonical untouched" || bad "pane-0 structural wrong"
+  printf '{"last_assistant_message":"worker done"}' | env -u FORGE_ROLE -u TMUX_SESSION TMUX_PANE="$p1" "$HOOK" stop
+  { ls "$R/.dev/attention/"wstop."$SESS".p1.*.json >/dev/null 2>&1 && test ! -f "$R/.dev/attention/stop.$SESS.json"; } \
+    && ok "T-ROLE pane 1 wrote namespaced wstop" || bad "T-ROLE pane 1 classification wrong"
+  (cd "$R" && env -u FORGE_ROLE TMUX_PANE="$p0" FORGE_BRIDGE_BIN="$STUB" "$FORGE" ask --session-scope "role zero" >/dev/null 2>&1)
+  _ask0=$(ls -t "$R"/.dev/attention/ask-*.json | head -1)
+  python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["role"] == "orchestrator"' "$_ask0" \
+    && ok "T-ROLE forge ask pane 0 is orchestrator" || bad "T-ROLE forge ask pane 0 wrong"
+  (cd "$R" && env -u FORGE_ROLE TMUX_PANE="$p1" FORGE_BRIDGE_BIN="$STUB" "$FORGE" ask --session-scope "role one" >/dev/null 2>&1)
+  _ask1=$(ls -t "$R"/.dev/attention/ask-*.json | head -1)
+  python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["role"] == "worker"' "$_ask1" \
+    && ok "T-ROLE forge ask pane 1 is worker" || bad "T-ROLE forge ask pane 1 wrong"
   tmux kill-session -t "$SESS" 2>/dev/null
+
+  SOLO="forge-cc-solo-$$"
+  tmux new-session -d -s "$SOLO" -c "$R"
+  solo0=$(tmux list-panes -t "$SOLO" -F '#{pane_id}')
+  printf '{"last_assistant_message":"solo done"}' | env -u FORGE_ROLE -u TMUX_SESSION TMUX_PANE="$solo0" "$HOOK" stop
+  { ls "$R/.dev/attention/"wstop."$SOLO".p0.*.json >/dev/null 2>&1 && test ! -f "$R/.dev/attention/stop.$SOLO.json"; } \
+    && ok "T-ROLE-SOLO pane 0 degrades to worker" || bad "T-ROLE-SOLO false orchestrator"
+  tmux kill-session -t "$SOLO" 2>/dev/null
 else
   echo "  (skip: no tmux)"
 fi
@@ -257,7 +273,7 @@ done
 n=$(ls "$R"/.dev/attention/wstop.forge-x.p0.*.json 2>/dev/null | wc -l | tr -d ' ')
 [ "$n" -eq 2 ] && ok "two worker Stops in one pane → two distinct wstop files (no LWW collapse)" || bad "got $n wstop (LWW collapse!)"
 new_root w3
-out=$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"permission_suggestions":["allow-once"]}' | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" permissionrequest)
+out=$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"permission_suggestions":["allow-once"]}' | FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" permissionrequest)
 [ -z "$out" ] && ok "worker PermissionRequest: zero stdout (fail-open)" || bad "worker perm printed: $out"
 wpm=$(ls "$R"/.dev/attention/wperm.forge-x.p2.*.json 2>/dev/null | head -1)
 python3 -c 'import json,sys;e=json.load(open(sys.argv[1]));assert e["role"]=="worker" and e["tool_name"]=="Bash" and e["state"]=="needs-input"' "$wpm" && ok "wperm row structured (role=worker)" || bad "wperm wrong"
@@ -276,18 +292,18 @@ import json,os,sys
 adir=os.path.join(sys.argv[1],".dev","attention"); os.makedirs(adir,exist_ok=True)
 json.dump({"schema":"cc-dispatch/1","dispatch_id":"cc-relay-1","session":"forge-x"},open(os.path.join(adir,"dispatch-cc-relay-1.json"),"w"))
 PY
-printf '{"prompt":"do X [dispatch_id:cc-fake] then subtask [dispatch_id:cc-relay-1]"}' | FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" userpromptsubmit
+printf '{"prompt":"do X [dispatch_id:cc-fake] then subtask [dispatch_id:cc-relay-1]"}' | FORGE_CC_PANE_META="$(meta 3 "$R")" "$HOOK" userpromptsubmit
 python3 -c 'import json;assert json.load(open("'"$R"'/.dev/attention/wprompt.forge-x.p4.json"))["task_id"]=="cc-relay-1"' \
   && ok "backed relayed dispatch_id is the task_id (unbacked cc-fake filtered)" || bad "task_id not the relayed id"
 
 echo "── forge-cc-hook --codex: adapter maps codex payload → worker emission ──"
 new_root cx1
 printf '{"prompt":"codex task","turn_id":"turn-abc","session_id":"sid","cwd":"%s"}' "$R" \
-  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex userpromptsubmit
+  | FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" --codex userpromptsubmit
 python3 -c 'import json,os,sys;e=json.load(open(os.path.join(sys.argv[1],".dev","attention","wprompt.forge-x.p2.json")));assert e["agent"]=="codex" and e["role"]=="worker" and e["task_id"]=="turn-abc"' "$R" \
   && ok "codex UserPromptSubmit → agent=codex, task_id=turn_id (native correlation)" || bad "codex prompt wrong"
 printf '{"last_assistant_message":"codex done, ok?","turn_id":"turn-abc","stop_hook_active":false}' \
-  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex stop
+  | FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" --codex stop
 python3 -c 'import json,os,sys;e=json.load(open(os.path.join(sys.argv[1],".dev","attention","wstop.forge-x.p2.turn-abc.json")));assert e["agent"]=="codex" and e["task_id"]=="turn-abc" and e["looks_like_question"] is True' "$R" \
   && ok "codex Stop → wstop keyed on turn_id, agent=codex, question detected" || bad "codex stop wrong"
 
@@ -295,7 +311,7 @@ echo "── forge-cc-hook --codex: argv-list command permission (crash fix + wr
 # T1 — argv-list permissionrequest writes a stringified wperm (closes the AttributeError crash).
 new_root cxp1
 printf '{"tool_name":"shell","tool_input":{"command":["bash","-lc","pytest"]}}' \
-  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
+  | FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
 CXP1_WPERM="$(find "$R/.dev/attention" -name 'wperm.forge-x.p2.*.json' -print -quit)"
 { [ "$rc" -eq 0 ] && test -f "$CXP1_WPERM"; } \
   && ok "codex list-command perm → wperm, no crash, stringified hash" || bad "codex perm crash/miskey (rc=$rc)"
@@ -303,7 +319,7 @@ python3 -c 'import hashlib,json,sys;e=json.load(open(sys.argv[1]));assert e["age
   "$CXP1_WPERM" && ok "wperm carries full digest without raw command" || bad "wperm fields wrong"
 # T2 — same argv list at posttooluse resolves it (writer↔resolver hash identity).
 printf '{"tool_name":"shell","tool_input":{"command":["bash","-lc","pytest"]}}' \
-  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex posttooluse >/dev/null
+  | FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" --codex posttooluse >/dev/null
 test ! -f "$CXP1_WPERM" \
   && ok "codex posttooluse archives the matching wperm (hashes match)" || bad "codex wperm survived"
 
@@ -313,7 +329,7 @@ echo "── forge-cc-hook --codex: apply_patch argv list does not crash ──"
 # (no file written); this exercises the identical list.encode() crash path without that trap.
 new_root cxp2
 printf '{"tool_name":"apply_patch","tool_input":{"command":["apply_patch","*** Begin Patch pytest *** End Patch"]}}' \
-  | FORGE_CC_PANE_META="$(meta 3 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
+  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
 { [ "$rc" -eq 0 ] && ls "$R"/.dev/attention/wperm.forge-x.p3.*.json >/dev/null 2>&1; } \
   && ok "codex apply_patch list → wperm, no crash" || bad "apply_patch crashed (rc=$rc)"
 
@@ -321,12 +337,12 @@ echo "── forge-cc-hook --codex: empty/missing command + tool_name resolve-gu
 # T4 — empty/missing command → empty-hash, no crash; mismatched tool_name does NOT resolve.
 new_root cxp3
 printf '{"tool_name":"mcp__x__do","tool_input":{}}' \
-  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
+  | FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" --codex permissionrequest >/dev/null; rc=$?
 CXP3_WPERM="$(find "$R/.dev/attention" -name 'wperm.forge-x.p2.*.json' -print -quit)"
 { [ "$rc" -eq 0 ] && test -f "$CXP3_WPERM"; } \
   && ok "codex empty command → empty-hash wperm, no crash" || bad "empty command crashed/miskey"
 printf '{"tool_name":"other","tool_input":{}}' \
-  | FORGE_CC_PANE_META="$(meta 2 "$R")" "$HOOK" --codex posttooluse >/dev/null
+  | FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" --codex posttooluse >/dev/null
 test -f "$CXP3_WPERM" \
   && ok "mismatched tool_name does NOT resolve codex wperm (guard survives list path)" || bad "wrong tool resolved codex wperm"
 
@@ -357,7 +373,7 @@ new_root tg1
 SENT="$WORK/fired.$$"; rm -f "$SENT"
 STUBFW="$WORK/slowwatch"; printf '#!/bin/bash\ntouch %q\nsleep 30\n' "$SENT" > "$STUBFW"; chmod +x "$STUBFW"
 start=$(date +%s)
-printf '{"last_assistant_message":"done"}' | FORGE_WATCH_TRIGGER=1 FORGE_WATCH_BIN="$STUBFW" FORGE_CC_PANE_META="$(meta 4 "$R")" "$HOOK" stop
+printf '{"last_assistant_message":"done"}' | FORGE_WATCH_TRIGGER=1 FORGE_WATCH_BIN="$STUBFW" FORGE_CC_PANE_META="$(meta 3 "$R")" "$HOOK" stop
 elapsed=$(( $(date +%s) - start ))
 for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$SENT" ] && break; sleep 0.3; done
 { [ "$elapsed" -lt 5 ] && [ -f "$SENT" ]; } && ok "worker Stop trigger detaches (<5s) AND fires (sentinel touched)" || bad "trigger blocked ${elapsed}s or never fired"
@@ -980,7 +996,7 @@ for f in "$ROOT/skills/forge-orchestrator/SKILL.md" "$ROOT/agents/forge-orchestr
     "tie-break **within**" \
     "stale generation coverage" \
     "reset-idle --worker" \
-    "Pane 1 is OBSERVED, never reset" \
+    "Pane 0 is OBSERVED, never reset" \
     "Batch planning (two or more tasks)" \
     "FORGE_ORCHESTRATOR_ALERT_HEADROOM"; do
     grep -qF "$needle" "$f" && ok "T-ACM-LOCKSTEP has '$needle': $(basename "$f")" \

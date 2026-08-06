@@ -20,8 +20,8 @@ Read the `committer_ident` field from each `.review` file:
 
 | Committer | Route to |
 |-----------|----------|
-| Codex B / codex-b / tmux-pane-%3 | **Codex A** (pane 2) |
-| All others (Codex A, Claude, manual) | **Codex B** (pane 3) |
+| Codex B / codex-b | **Codex A** (the codex-a worker, pane 3) |
+| All others (Codex A, Claude, manual) | **Codex B** (the codex-b worker, pane 4) |
 | Only one Codex available | Route to it regardless (self-review > no review) |
 
 ## Dispatch Protocol

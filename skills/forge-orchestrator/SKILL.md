@@ -9,7 +9,7 @@ description: >
 
 
 > **Invocation mode:** both `/forge` and `/forge-orchestrator` now load this
-> body **in-pane** — you ARE the orchestrator in pane 1, driven directly by the
+> body **in-pane** — you ARE the orchestrator in the orchestrator (pane 0), driven directly by the
 > user, with NO spawner to report status back to (status goes to the user in
 > this pane). `/forge` adds the argument grammar (pipeline / fix-pipeline /
 > resume / status / pause) and seeds the run; `/forge-orchestrator` is the
@@ -21,34 +21,34 @@ description: >
 
 ## Your Role
 
-You are the orchestrator running in tmux pane 1. **You COORDINATE — you
+You are the orchestrator running in tmux pane 0. **You COORDINATE — you
 never execute stage work in your own pane.** There are FOUR worker panes
 you dispatch to:
-- **Pane 0**: claude-opus worker — HIGH-reasoning. Runs `incorporate` and `impl-review`, and is the HIGH-tier fallback for `implementation` and `verify`. Dispatch with `--worker claude-opus`. **This is NOT you — you are pane 1.**
-- **Pane 2**: Codex A — `gpt-5.5-codex` with extra thinking. Slower, higher quality. HIGH-reasoning. Default for `review`, `implementation`, and `verify` — the high-thought stages.
-- **Pane 3**: Codex B — `gpt-5.5-codex` medium. Faster, cheaper. THROUGHPUT-tier. Default for `qa` / `qa-retry`.
-- **Pane 4**: claude-sonnet worker — THROUGHPUT-tier. Runs `coding`, `qa-fix`, and `qa` (local fallback). Dispatch with `--worker claude-sonnet`.
+- **The claude-opus worker (pane 1)**: claude-opus worker — HIGH-reasoning. Runs `incorporate` and `impl-review`, and is the HIGH-tier fallback for `implementation` and `verify`. Dispatch with `--worker claude-opus`. **This is NOT you — you are the orchestrator (pane 0).**
+- **The codex-a worker (pane 3)**: Codex A — `gpt-5.5-codex` with extra thinking. Slower, higher quality. HIGH-reasoning. Default for `review`, `implementation`, and `verify` — the high-thought stages.
+- **The codex-b worker (pane 4)**: Codex B — `gpt-5.5-codex` medium. Faster, cheaper. THROUGHPUT-tier. Default for `qa` / `qa-retry`.
+- **The claude-sonnet worker (pane 2)** — THROUGHPUT-tier. Runs `coding`, `qa-fix`, and `qa` (local fallback). Dispatch with `--worker claude-sonnet`.
 
 Pane names: claude-opus/opus (0), claude/orchestrator (1), codex/codex-a (2), codex-b (3), claude-sonnet/sonnet (4)
 
-**You (pane 1) run claude-opus — and so does the pane-0 worker. When a
+**You (the orchestrator, pane 0) run claude-opus — and so does the claude-opus worker (pane 1). When a
 stage routes to `claude-opus` (incorporate, impl-review, or the
-implementation/verify HIGH-tier fallback) it goes to the pane-0 WORKER
+implementation/verify HIGH-tier fallback) it goes to the claude-opus WORKER (pane 1)
 via `dispatch`, never to yourself — you dispatch it and consume only the
 digest. Likewise `claude-sonnet` stages (coding, qa-fix, qa fallback) go
-to pane 4. The bridge refuses `--worker claude` (pane 1) on dispatch by
+to the claude-sonnet worker (pane 2). The bridge refuses `--worker claude` (the orchestrator, pane 0) on dispatch by
 design, and (Hard Rule 22) now also refuses any HIGH-tier stage sent to a
-throughput pane — you have NO path to "do the agent work in pane 1." If
-you ever feel the urge to ask the user "can pane 1 do the agent work?",
-the answer is always no: dispatch to pane 0 or pane 2 (high) / pane 4 or
-pane 3 (throughput) instead.**
+throughput pane — you have NO path to "do the agent work in the orchestrator (pane 0)." If
+you ever feel the urge to ask the user "can the orchestrator (pane 0) do the agent work?",
+the answer is always no: dispatch to the claude-opus worker (pane 1) or the codex-a worker (pane 3) (high) / the claude-sonnet worker (pane 2) or
+the codex-b worker (pane 4) (throughput) instead.**
 
 When stage routing offers a choice, default to **A (Codex A)** for
 `review`, `implementation`, and `verify`; the HIGH-tier fallback for
-`implementation`/`verify` is **claude-opus (pane 0)**, never a throughput
+`implementation`/`verify` is **claude-opus (the claude-opus worker (pane 1))**, never a throughput
 pane. Default to **B (Codex B)** for `qa` / `qa-retry`. The Worker
 Selection section and Hard Rule 22 formalize this. `proposal` is the lone
-HIGH-reasoning stage that runs locally in pane 1 (Agent Teams idiom) — it
+HIGH-reasoning stage that runs locally in the orchestrator (pane 0) (Agent Teams idiom) — it
 is the only sanctioned local execution; every other stage is dispatched.
 
 The user talks to you in plain English. You decide what to do, who does
@@ -259,7 +259,7 @@ self-service repair path for the runtime regex tables.
 
 | Stage | Worker | Notes |
 |-------|--------|-------|
-| proposal | local (Agent Teams) | HIGH-tier, local pane-1 exception. Spawns A, B, C teammates in foreground — NOT dispatched via the bridge |
+| proposal | local (Agent Teams) | HIGH-tier, local orchestrator-pane exception. Spawns A, B, C teammates in foreground — NOT dispatched via the bridge |
 | review | codex-a | HIGH. Adversarial proposal review (codex-a only) |
 | incorporate | claude-opus | HIGH. Merge review feedback into final-plan.md |
 | implementation | codex-a (**claude-opus fallback**) | HIGH. Adversarial implementation doc. Fallback is the other HIGH pane, never throughput |
@@ -335,7 +335,7 @@ The bridge enforces two automatic hooks:
 **Required (see Hard Rule 0):** the orchestrator does NOT export `TMUX_SESSION` and
 does NOT `cat .dev/.forge-session`. Identity is the HOST PANE, resolved live by
 `forge-bridge` on every call via a `TMUX_PANE`-targeted probe. Background agents you
-spawn inherit `TMUX_PANE` and resolve your pane-1 host automatically; a detached
+spawn inherit `TMUX_PANE` and resolve your orchestrator-pane host automatically; a detached
 agent under two same-root sessions is refused unless it passes `--target-session
 <name> --cross-session`. Run `~/bin/forge-bridge identity` to read the resolved
 `host_session=` / `identity_state=`; never `export` or `eval` a session variable.
@@ -644,7 +644,7 @@ proposal → review → incorporate → implementation → impl-review → codin
   Then spawn the digest agent against the returned `DIGEST_PROMPT` path.
 - Advance to implementation. Apply Change-of-Course Heuristic if digest is not HIGH/0.
 
-**implementation** — codex-a preferred, **claude-opus (pane 0) fallback**
+**implementation** — codex-a preferred, **claude-opus (the claude-opus worker (pane 1)) fallback**
 - Template: `~/.config/forge/prompts/implementation.txt` (skill: `adversarial-implementation`)
 - HIGH-tier stage (Hard Rule 22): the only valid workers are `codex-a` and `claude-opus`; the bridge rejects `codex-b`/`claude-sonnet` here. Fallback to the other HIGH pane is an availability decision (Hard Rule 9), not a usage-threshold decision; the bridge owns context hygiene.
 - Output: `.dev/proposals/{slug}/implementation.md`
@@ -653,7 +653,7 @@ proposal → review → incorporate → implementation → impl-review → codin
   ~/bin/forge-bridge dispatch --slug {slug} --stage implementation --worker codex-a
   ~/bin/forge-bridge wait --slug {slug} --stage implementation --worker codex-a --digest-template implementation
   ```
-  Fallback (claude-opus) — pass `--clear` because pane 0 already ran `incorporate` in this pipeline (Hard Rule 20):
+  Fallback (claude-opus) — pass `--clear` because the claude-opus worker (pane 1) already ran `incorporate` in this pipeline (Hard Rule 20):
   ```bash
   ~/bin/forge-bridge dispatch --slug {slug} --stage implementation --worker claude-opus --clear
   ~/bin/forge-bridge wait --slug {slug} --stage implementation --worker claude-opus --digest-template implementation
@@ -719,8 +719,8 @@ proposal → review → incorporate → implementation → impl-review → codin
   # on DONE/ERROR: ~/bin/forge-bridge infra-lock release --slug {slug} --stage qa
   ```
 - **Path B: local fallback (qa local fallback)** — adversarial-qa needs Agent
-  Teams, so run it inline (foreground) in pane 1 when codex-b is unavailable
-  (Hard Rule 22 second pane-1 exception). Use **Shape B** — acquire, `log` (open
+  Teams, so run it inline (foreground) in the orchestrator (pane 0) when codex-b is unavailable
+  (Hard Rule 22 second orchestrator-pane exception). Use **Shape B** — acquire, `log` (open
   pending), restart-on-entry, run inline, `log-response` (close on EVERY exit),
   **release**, then digest:
   ```bash
@@ -738,7 +738,7 @@ proposal → review → incorporate → implementation → impl-review → codin
 - If the loop is entered, see "QA Fix Loop" below.
 - If clean (advisory-only or no findings) → emit `✓ qa complete — advancing to verify`.
 
-**verify** — HIGH-tier: **codex-a default, claude-opus (pane 0) fallback**
+**verify** — HIGH-tier: **codex-a default, claude-opus (the claude-opus worker (pane 1)) fallback**
 - Template: `~/.config/forge/prompts/verify.txt` (skill: `adversarial-verify`)
 - **Worker selection:** verify is a HIGH-reasoning stage (Hard Rule 22) — the only valid workers are `codex-a` and `claude-opus`; the bridge rejects `codex-b`/`claude-sonnet`. Default to **codex-a**; fall back to **claude-opus** only if Codex A is unavailable or already high-fill (surfaced, per Hard Rule 9).
 - **Exclusion guard:** verify MUST NOT use the worker that ran the most recent `qa`/`qa-retry` stage. Under current QA routing (codex-b, or claude-sonnet local fallback) the high-tier verify workers are always disjoint from the QA workers, so the guard is normally satisfied automatically. Still read the latest `qa`/`qa-retry` log entry and confirm before dispatch — the guard protects against future QA-routing changes; it is no longer the primary selection algorithm.
@@ -755,7 +755,7 @@ proposal → review → incorporate → implementation → impl-review → codin
   ~/bin/forge-bridge wait --slug {slug} --stage verify --worker codex-a --digest-template verify
   # on DONE/ERROR: ~/bin/forge-bridge infra-lock release --slug {slug} --stage verify
   ```
-  Fallback (claude-opus) — pass `--clear` if pane 0 already ran a stage (incorporate / impl-review / implementation fallback) in this pipeline (Hard Rule 20):
+  Fallback (claude-opus) — pass `--clear` if the claude-opus worker (pane 1) already ran a stage (incorporate / impl-review / implementation fallback) in this pipeline (Hard Rule 20):
   ```bash
   ~/bin/forge-bridge infra-lock acquire --slug {slug} --stage verify
   ~/bin/forge-bridge dispatch --slug {slug} --stage verify --worker claude-opus --clear \
@@ -839,7 +839,7 @@ When the `qa` digest reports findings of severity `minor` or above:
    Then spawn the digest agent against the returned `DIGEST_PROMPT` path.
 3. **Re-run QA once** as stage `qa-retry` — **🔒 wrap in the infra lock (Hard
    Rule 23)**, same shape as `qa`: Shape A for codex-b dispatch, Shape B for the
-   pane-1 local fallback (codex-b external preferred, claude-sonnet/pane-1 local
+   orchestrator-pane local fallback (codex-b external preferred, claude-sonnet/orchestrator-pane local
    fallback). `qa-retry` also does restart-on-entry (installed adversarial-qa).
 4. **If qa-retry digest is clean** → advance to verify.
 5. **If qa-retry still has findings** → escalate to user with the remaining
@@ -865,7 +865,7 @@ Routing starts from **reasoning tier** (Hard Rule 22), then availability:
 
 0. **Batch planning (two or more tasks).** Before distributing a batch, run
    `~/bin/forge-bridge usage --refresh` **once** and record the snapshot in the
-   plan. It live-measures all four workers plus pane 1 and prints a tier-free
+   plan. It live-measures all four workers plus the orchestrator (pane 0) and prints a tier-free
    `recommendation` per worker (`reset-first` | `ok` | `busy` | `unknown`) — the
    bridge reporting its own gate's verdict, so you never re-derive the
    inclusive-boundary arithmetic yourself. Not required for a single dispatch:
@@ -877,14 +877,14 @@ Routing starts from **reasoning tier** (Hard Rule 22), then availability:
 
    | Tier | Stages | Valid panes |
    |------|--------|-------------|
-   | HIGH | proposal\*, review, incorporate, implementation, impl-review, verify | Codex A (pane 2) or Opus (pane 0) |
-   | THROUGHPUT | coding, qa, qa-fix, qa-retry | Sonnet (pane 4) or Codex B (pane 3) |
+   | HIGH | proposal\*, review, incorporate, implementation, impl-review, verify | Codex A (the codex-a worker (pane 3)) or Opus (the claude-opus worker (pane 1)) |
+   | THROUGHPUT | coding, qa, qa-fix, qa-retry | Sonnet (the claude-sonnet worker (pane 2)) or Codex B (the codex-b worker (pane 4)) |
 
-   \*`proposal` is the local pane-1 exception (Agent Teams) — not dispatched.
+   \*`proposal` is the local orchestrator-pane exception (Agent Teams) — not dispatched.
 
    Per-stage defaults / fallbacks:
    - `review` → codex-a **only** (no fallback; wait if busy)
-   - `incorporate`, `impl-review` → claude-opus (pane 0)
+   - `incorporate`, `impl-review` → claude-opus (the claude-opus worker (pane 1))
    - `implementation` → codex-a default, **claude-opus** fallback
    - `verify` → codex-a default, **claude-opus** fallback (≠ latest QA worker)
    - `coding`, `qa-fix` → claude-sonnet
@@ -897,8 +897,8 @@ Routing starts from **reasoning tier** (Hard Rule 22), then availability:
    is **not** a QA fallback — QA falls back to claude-sonnet, not codex-a.)
 
 2. **Check availability** — read whichever worker pane the stage routes to:
-   - Codex workers: `~/bin/forge-bridge read codex-a 5` (pane 2) / `read codex-b 5` (pane 3)
-   - Claude workers: `~/bin/forge-bridge read claude-opus 5` (pane 0) / `read claude-sonnet 5` (pane 4)
+   - Codex workers: `~/bin/forge-bridge read codex-a 5` (the codex-a worker (pane 3)) / `read codex-b 5` (the codex-b worker (pane 4))
+   - Claude workers: `~/bin/forge-bridge read claude-opus 5` (the claude-opus worker (pane 1)) / `read claude-sonnet 5` (the claude-sonnet worker (pane 2))
    - If you see an idle prompt, the worker is available
    - If you see active output, the worker is busy
 3. **Respect constraints**:
@@ -926,10 +926,10 @@ Routing starts from **reasoning tier** (Hard Rule 22), then availability:
    critical path. Never `/clear` a worker yourself.
    Usage **never** authorizes a mid-stage reset and **never**
    changes the reasoning tier (Hard Rule 22); BLOCKED fix-and-continue retains context but
-   advances the delivery generation. All four worker panes share the policy; pane 1 is
+   advances the delivery generation. All four worker panes share the policy; the orchestrator (pane 0) is
    observed but never reset. Every boundary emits a `HYGIENE_DECISION` audit record, and
    every dispatch and send now echoes one `HYGIENE …` line to stderr so the check is
-   visible from pane 1. `observe` mode is the
+   visible from the orchestrator (pane 0). `observe` mode is the
    rollout kill switch (legacy behavior + a loud `HYGIENE_BYPASSED`); `enforce` is the
    accepted feature mode. A clean verify is closed with `verify-decision` then `finalize`;
    a bare `COMPLETE` means the finalization outbox published after all four workers were
@@ -1149,13 +1149,13 @@ Background agent failures follow this protocol:
     use raw `forge-bridge send --force` — do NOT `dispatch` again. It retains the
     worker's task context and advances the delivery generation; it never resets.
 
-    **Pane 1 is OBSERVED, never reset (active-context-management).** Pane 1's own
+    **The orchestrator (pane 0) is OBSERVED, never reset (active-context-management).** The orchestrator (pane 0)'s own
     context is recorded under the top-level `orchestrator:` key of the usage ledger
     and surfaced in `forge-bridge status`, `hygiene-status` and `forge board`. It is
     **never auto-reset** and remains structurally un-resettable. At or below
     `FORGE_ORCHESTRATOR_ALERT_HEADROOM` the response is a **handoff**: write the
-    handoff note, then let the operator start a fresh pane-1 session. Never `/clear`
-    pane 1 mid-pipeline — pane 1 holds the only un-journaled state in the system.
+    handoff note, then let the operator start a fresh orchestrator session (pane 0). Never `/clear`
+    the orchestrator (pane 0) mid-pipeline — the orchestrator (pane 0) holds the only un-journaled state in the system.
 
     **Direct sends are measured too.** `send` records the target's headroom, warns
     loudly at or below `FORGE_CONTEXT_ALERT_HEADROOM` (25, family-overridable), and
@@ -1169,16 +1169,16 @@ Background agent failures follow this protocol:
 
 21. **Worker permission-mode and ident contract.**
     Launch flags:
-      Pane 0: `claude --model claude-opus-5 --permission-mode acceptEdits`
-      Pane 1: `claude --model claude-opus-5` (NO acceptEdits)
-      Pane 2: `codex -m gpt-5.5 -c model_reasoning_effort=xhigh -c service_tier=fast`
-      Pane 3: `codex -m gpt-5.5 -c model_reasoning_effort=medium -c service_tier=fast`
-      Pane 4: `claude --model claude-sonnet-5 --permission-mode acceptEdits`
+      Pane 0: `claude --model claude-opus-5` (NO acceptEdits — operator seat)
+      Pane 1: `claude --model claude-opus-5 --permission-mode acceptEdits`
+      Pane 2: `claude --model claude-sonnet-5 --permission-mode acceptEdits`
+      Pane 3: `codex -m gpt-5.5 -c model_reasoning_effort=xhigh -c service_tier=fast`
+      Pane 4: `codex -m gpt-5.5 -c model_reasoning_effort=medium -c service_tier=fast`
 
     Worker idents are REPO-LOCAL ONLY, set inside the dispatch prompt body:
-      `git -C "$PROJECT_ROOT" config user.name  "claude-opus (forge pane 0)"`
+      `git -C "$PROJECT_ROOT" config user.name  "claude-opus (forge pane 1)"`
       `git -C "$PROJECT_ROOT" config user.email "claude-opus@forge.local"`
-    or the equivalent `claude-sonnet` values for pane 4.
+    or the equivalent `claude-sonnet` values for pane 2.
 
     NEVER `git config --global`. NEVER `git config --add`.
 
@@ -1187,9 +1187,9 @@ Background agent failures follow this protocol:
     operator removes that wildcard, the bare workstation-wide Bash entries
     needed are `pytest`, `node`, and `compare`.
 
-    `forge-dispatch-review` routes commits made by `claude-opus (forge pane 0)`
-    or `claude-sonnet (forge pane 4)` to Codex A. The reviewer guard prevents
-    routing reviews to worker panes 0 or 4.
+    `forge-dispatch-review` routes commits made by the `claude-opus` worker
+    or the `claude-sonnet` worker to Codex A. The reviewer guard refuses to
+    route reviews back to the Claude worker panes.
 
     PROMPTING regex (`^ ❯ \d+\. `) for Claude panes is active in Phase 2.
     Surface prompts to the user; do not auto-edit allowlists.
@@ -1199,34 +1199,34 @@ Background agent failures follow this protocol:
     bridge enforces this on `dispatch` — an illegal stage/worker pair is
     rejected, not silently run.
 
-    - **`proposal` — local HIGH-reasoning exception.** It runs in pane 1
+    - **`proposal` — local HIGH-reasoning exception.** It runs in the orchestrator (pane 0)
       via Agent Teams (the orchestrator's own Opus context) because the
       Agent Teams idiom is orchestrator-local. It is the **primary** stage
-      that executes locally in pane 1, and it is NOT dispatchable (the
+      that executes locally in the orchestrator (pane 0), and it is NOT dispatchable (the
       bridge refuses `dispatch --stage proposal`). It is no longer the
-      *only* pane-1-local execution — the gated `qa`/`qa-retry` fallback
+      *only* orchestrator-local execution — the gated `qa`/`qa-retry` fallback
       below is the second (D2).
     - **Dispatched HIGH-tier stages — `review`, `incorporate`,
       `implementation`, `impl-review`, `verify`** — run ONLY on Codex A
-      (pane 2) or Opus pane 0. They NEVER run in pane 1, and NEVER fall
+      (the codex-a worker (pane 3)) or the claude-opus worker (pane 1). They NEVER run in the orchestrator pane, and NEVER fall
       back to a throughput pane (Sonnet/Codex B). If both HIGH panes are
       unavailable, halt and surface (Hard Rule 9); do not downgrade.
     - **THROUGHPUT-tier stages — `coding`, `qa`, `qa-fix`, `qa-retry`** —
-      run on Sonnet (pane 4) or Codex B (pane 3). (`qa` is medium-
+      run on Sonnet (the claude-sonnet worker (pane 2)) or Codex B (the codex-b worker (pane 4)). (`qa` is medium-
       reasoning but throughput-routed by design — there is no third tier.)
-    - **Local `qa`/`qa-retry` fallback — second pane-1 exception (D2).**
+    - **Local `qa`/`qa-retry` fallback — second orchestrator-pane exception (D2).**
       When **codex-b is unavailable**, `qa`/`qa-retry` may run inline in
-      pane 1 via Agent Teams (adversarial-qa needs the Agent Teams idiom,
+      the orchestrator (pane 0) via Agent Teams (adversarial-qa needs the Agent Teams idiom,
       which is orchestrator-local — the same reason `proposal` is local).
-      This pane-1 exception is gated on **both** conditions:
+      This orchestrator-pane exception is gated on **both** conditions:
       `(codex-b unavailable) AND (the infra lock is HELD for this slug/stage)`.
       It is the **qa local fallback** (Hard Rule 23, Shape B). claude-sonnet
-      (pane 4) dispatch is still preferred over pane-1-local when sonnet is
-      free; pane-1-local is the last resort when no throughput pane is
+      (the claude-sonnet worker (pane 2)) dispatch is still preferred over orchestrator-local when sonnet is
+      free; orchestrator-local is the last resort when no throughput pane is
       available. The infra lock MUST be held around the inline run (Shape B).
-    - **All other stage work is forbidden in pane 1**, with exactly two
+    - **All other stage work is forbidden in the orchestrator (pane 0)**, with exactly two
       named exceptions: `proposal`, and the gated local `qa`/`qa-retry`
-      fallback above (Hard Rule 23 Shape B). Pane 1 otherwise only
+      fallback above (Hard Rule 23 Shape B). The orchestrator (pane 0) otherwise only
       dispatches and consumes digests; it does not execute stages.
 
     The bridge guard enforces tier only; the verify "≠ latest QA worker"
@@ -1296,7 +1296,7 @@ Background agent failures follow this protocol:
 
     ### Shape B — local fallback infra stage (`qa` Path B / `qa-retry` inline)
 
-    When codex-b is unavailable and `qa`/`qa-retry` runs **inline in pane 1**
+    When codex-b is unavailable and `qa`/`qa-retry` runs **inline in the orchestrator (pane 0)**
     (Agent Teams), there is no `dispatch`/`wait` to key off — so the lock brackets
     the inline run, and per Rule 5 the local stage must also be logged AND closed:
 
@@ -1304,7 +1304,7 @@ Background agent failures follow this protocol:
     ~/bin/forge-bridge infra-lock acquire --slug {slug} --stage {stage}
     ~/bin/forge-bridge log --slug {slug} --stage {stage} --from claude --to claude --prompt "<local qa run>"   # open the pending (Rule 5)
     # restart-on-entry (qa/qa-retry): bring up THIS worktree's services before testing (installed adversarial-qa SKILL) — under the held lock
-    # run adversarial-qa inline (pane 1)                                                                        # lock HELD
+    # run adversarial-qa inline (the orchestrator, pane 0)                                                                        # lock HELD
     #   success  -> ~/bin/forge-bridge log-response --slug {slug} --to claude --stage {stage} --response "FORGE_DONE: {stage} — <artifact>"
     #   FAIL/ABORT -> ~/bin/forge-bridge log-response --slug {slug} --to claude --stage {stage} --response "FORGE_ERROR: {stage} — <reason>"   # close anyway (R3-6)
     ~/bin/forge-bridge infra-lock release --slug {slug} --stage {stage}   # release as soon as artifacts written + pending CLOSED (failure path: only after confirming no unsafe service proc)
@@ -1405,5 +1405,5 @@ Hash input: the body ABOVE this comment block, i.e.
 Regenerate: see move2-plan-2026-05-14.md §10 step 6(a) or hash-drift check.
 Tools amendment: 'Agent' added per CP-4 sub-test (f) finding (2026-05-14) — required so the orchestrator can spawn digest children (SKILL.md Hard Rule 17 mandates this).
 2026-06-28: Reasoning-tier routing (Hard Rule 22) — verify re-tiered HIGH (codex-a/claude-opus), implementation fallback codex-b→claude-opus, bridge dispatch tier guard. See handoffs/handoff-2026-06-28-stage-pane-routing-plan.md.
-2026-06-29: Cross-worktree infra lock (Hard Rule 23) — acquire-before-dispatch / release-on-terminality wrapping for the five infra stages (coding/qa/qa-fix/qa-retry/verify), Shapes A/B, Hard Rule 22 amended for the gated local qa/qa-retry pane-1 fallback (D2). See handoffs/handoff-2026-06-29-infra-lock-plan.md.
+2026-06-29: Cross-worktree infra lock (Hard Rule 23) — acquire-before-dispatch / release-on-terminality wrapping for the five infra stages (coding/qa/qa-fix/qa-retry/verify), Shapes A/B, Hard Rule 22 amended for the gated local qa/qa-retry orchestrator-pane fallback (D2). See handoffs/handoff-2026-06-29-infra-lock-plan.md.
 -->

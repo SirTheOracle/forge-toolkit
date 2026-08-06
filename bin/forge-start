@@ -4,18 +4,14 @@
 # ============================================================
 #
 # Layout:
-#   ┌──────────────────┬──────────────────┐
-#   │ Pane 0           │ Pane 2           │
+#   ┌─────────────────────────────────────┐
+#   │ Pane 0 — Claude Opus orchestrator   │
+#   ├──────────────────┬──────────────────┤
+#   │ Pane 1           │ Pane 3           │
 #   │ Claude Opus      │ Codex A          │
-#   │ worker           │                  │
-#   ├──────────────────┤                  │
-#   │ Pane 1           ├──────────────────┤
-#   │ Claude Opus      │ Pane 3           │
-#   │ orchestrator     │ Codex B          │
-#   │                  ├──────────────────┤
-#   │                  │ Pane 4           │
-#   │                  │ Claude Sonnet    │
-#   │                  │ worker           │
+#   ├──────────────────┼──────────────────┤
+#   │ Pane 2           │ Pane 4           │
+#   │ Claude Sonnet    │ Codex B          │
 #   └──────────────────┴──────────────────┘
 #
 # Usage:
@@ -32,6 +28,7 @@ BRIDGE_BIN="${FORGE_BRIDGE_BIN:-$HOME/bin/forge-bridge}"
 
 DIR="$(pwd)"
 POPULATE=0
+FORGE_LAYOUT_VERSION="${FORGE_LAYOUT_VERSION:-2}"
 
 # Test hook (addendum 4): force a mid-layout failure ONLY in populate mode so the
 # error-trap's partial-split contract is exercisable. No-op in manual mode.
@@ -91,9 +88,9 @@ fi
 # Per-pane role stamps (P1d) — ONLY in populate mode; plain mode keeps the
 # byte-identical launch strings (HC4/HC5: forge-1..4 stay stamp-free, structural).
 if [ "$POPULATE" = 1 ]; then
-    _RP0="FORGE_ROLE=worker "; _RP1="FORGE_ROLE=orchestrator "; _RP4="FORGE_ROLE=worker "
+    _RP0="FORGE_ROLE=orchestrator "; _RP1="FORGE_ROLE=worker "; _RP2="FORGE_ROLE=worker "
 else
-    _RP0=""; _RP1=""; _RP4=""
+    _RP0=""; _RP1=""; _RP2=""
 fi
 
 # R8 populate: a spawn-created session carries -e TMUX_SESSION by construction; an
@@ -120,19 +117,20 @@ if [ "$POPULATE" = 0 ]; then
     tmux new-session -d -s "$SESSION" -c "$DIR" \
         -e "TMUX_SESSION=$SESSION" -e "FORGE_ROOT=$DIR"
 fi
-tmux split-window -h -t "$SESSION:.0" -c "$DIR" -p 50; _maybe_fail 1
-tmux split-window -v -t "$SESSION:.0" -c "$DIR" -p 50; _maybe_fail 2
-tmux split-window -v -t "$SESSION:.2" -c "$DIR" -p 66; _maybe_fail 3
-tmux split-window -v -t "$SESSION:.3" -c "$DIR" -p 50; _maybe_fail 4
+tmux split-window -v -t "$SESSION:.0" -c "$DIR" -p 60; _maybe_fail 1   # 0 = top 40%, 1 = bottom 60%
+tmux split-window -h -t "$SESSION:.1" -c "$DIR" -p 50; _maybe_fail 2   # 1 = bottom-left, 2 = bottom-right
+tmux split-window -v -t "$SESSION:.1" -c "$DIR" -p 50; _maybe_fail 3   # 1 = L-top, 2 = L-bottom, right → 3
+tmux split-window -v -t "$SESSION:.3" -c "$DIR" -p 50; _maybe_fail 4   # 3 = R-top, 4 = R-bottom
 
 # Enable mouse
 tmux set -g mouse on
 
 # Launch CLIs in each pane (verified by Phase 2 Step 0 V7). ${_RP*} are EMPTY in
 # plain mode (byte-identical to the historical strings); populate mode prepends the
-# per-pane FORGE_ROLE stamp (P1d). Codex panes 2/3 are hook-invisible → no role.
-tmux send-keys -t "$SESSION:.0" "${_RP0}claude --model claude-opus-5 --permission-mode acceptEdits" Enter
-tmux send-keys -t "$SESSION:.1" "${_RP1}claude --model claude-opus-5" Enter
+# per-pane FORGE_ROLE stamp (P1d). Codex panes 3/4 are hook-invisible → no role.
+tmux send-keys -t "$SESSION:.0" "${_RP0}claude --model claude-opus-5" Enter
+tmux send-keys -t "$SESSION:.1" "${_RP1}claude --model claude-opus-5 --permission-mode acceptEdits" Enter
+tmux send-keys -t "$SESSION:.2" "${_RP2}claude --model claude-sonnet-5 --permission-mode acceptEdits" Enter
 PHYSICAL_ROOT="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null)" || { echo "forge-start: physical Git worktree required" >&2; exit 2; }
 PHYSICAL_ROOT="$(cd "$PHYSICAL_ROOT" && pwd -P)"
 INCARNATION="$(tmux display-message -p -t "$SESSION" '#{session_created}')"
@@ -140,17 +138,25 @@ FORGE_BROKER_BIN="${FORGE_BROKER_BIN:-$HOME/bin/forge-broker}"
 "$FORGE_BROKER_BIN" start --root "$PHYSICAL_ROOT" --session "$SESSION" --incarnation "$INCARNATION" --mode "${FORGE_CODEX_ROLLOUT:-contain}" >/dev/null || {
     echo "forge-start: broker failed to start; Codex panes not launched" >&2; exit 3;
 }
-tmux send-keys -t "$SESSION:.2" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 2 --effort xhigh" Enter
-tmux send-keys -t "$SESSION:.3" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 3 --effort medium" Enter
-tmux send-keys -t "$SESSION:.4" "${_RP4}claude --model claude-sonnet-5 --permission-mode acceptEdits" Enter
+tmux send-keys -t "$SESSION:.3" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 3 --effort xhigh" Enter
+tmux send-keys -t "$SESSION:.4" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 4 --effort medium" Enter
 
-# Layout invariant assertion: panes 0/1 left, panes 2/3/4 right.
-_actual=$(tmux list-panes -t "$SESSION" -F '#{pane_index} #{pane_left}' | sort -n)
-_left_idx=$(echo "$_actual" | awk '$2==0 {print $1}' | tr '\n' ',' | sed 's/,$//')
-_right_idx=$(echo "$_actual" | awk '$2!=0 {print $1}' | tr '\n' ',' | sed 's/,$//')
-if [ "$_left_idx" != "0,1" ] || [ "$_right_idx" != "2,3,4" ]; then
-    echo "ERROR: forge-start layout invariant failed (left={$_left_idx} right={$_right_idx})" >&2
-    tmux list-panes -t "$SESSION" -F '#{pane_index} L=#{pane_left} T=#{pane_top}' >&2
+# Construction-only geometry proof. Runtime guards use identity receipts, not geometry.
+_geo=$(tmux list-panes -t "$SESSION" -F '#{pane_index} #{pane_left} #{pane_top} #{pane_width} #{window_width}')
+_bad=$(printf '%s\n' "$_geo" | awk '
+  {L[$1]=$2; T[$1]=$3; W[$1]=$4; WW=$5; seen[$1]=1; n++}
+  END {
+    if (n != 5)                            { print "pane-count=" n; exit }
+    for (i=0; i<5; i++) if (!(i in seen)) { print "missing-index=" i; exit }
+    if (L[0]!=0 || T[0]!=0 || W[0]!=WW)   { print "pane0-not-full-width-top" }
+    if (L[1]!=0 || L[2]!=0)               { print "left-column-must-be-1,2" }
+    if (L[3]<=0 || L[3]!=L[4])            { print "right-column-must-be-3,4" }
+    if (T[1]!=T[3] || T[2]!=T[4])         { print "grid-rows-misaligned" }
+    if (!(T[0]<T[1] && T[1]<T[2]))        { print "row-order-wrong" }
+  }')
+if [ -n "$_bad" ]; then
+    echo "ERROR: forge-start layout invariant failed ($_bad)" >&2
+    printf '%s\n' "$_geo" >&2
     if [ "$POPULATE" = 1 ]; then
         exit 1          # EXIT trap reports partial-split + tears down; never kill/rm
     fi
@@ -162,8 +168,17 @@ if [ "$_left_idx" != "0,1" ] || [ "$_right_idx" != "2,3,4" ]; then
     exit 1
 fi
 
-# Focus on pane 1 (orchestrator)
-tmux select-pane -t "$SESSION:.1"
+# Per-pane identity receipts. Written ONLY after the geometry invariant above passed.
+# They attach to pane objects, survive respawn, follow swaps, and are absent on new panes.
+tmux set-option -p -t "$SESSION:.0" @forge-worker "claude"
+tmux set-option -p -t "$SESSION:.1" @forge-worker "claude-opus"
+tmux set-option -p -t "$SESSION:.2" @forge-worker "claude-sonnet"
+tmux set-option -p -t "$SESSION:.3" @forge-worker "codex-a"
+tmux set-option -p -t "$SESSION:.4" @forge-worker "codex-b"
+tmux set-environment -t "$SESSION" FORGE_LAYOUT "$FORGE_LAYOUT_VERSION"
+
+# Focus on pane 0 (orchestrator)
+tmux select-pane -t "$SESSION:.0"
 
 # Phase 1b §2.7: wipe stall-check cache for any prior session reusing this name.
 # (forge-1 etc. get reused after kill-session; without this, the new session
@@ -186,11 +201,11 @@ if [ "$POPULATE" = 1 ]; then _POPULATE_OK=1; fi   # populate succeeded — disar
 echo ""
 echo "Session '$SESSION' ready."
 echo ""
-echo "  Pane 0 (top-left):      Claude Opus worker"
-echo "  Pane 1 (bottom-left):   Claude Opus orchestrator"
-echo "  Pane 2 (top-right):     Codex A"
-echo "  Pane 3 (middle-right):  Codex B"
-echo "  Pane 4 (bottom-right):  Claude Sonnet worker"
+echo "  Pane 0 (top, full width): Claude Opus orchestrator"
+echo "  Pane 1 (middle-left):     Claude Opus worker"
+echo "  Pane 2 (bottom-left):     Claude Sonnet worker"
+echo "  Pane 3 (middle-right):    Codex A"
+echo "  Pane 4 (bottom-right):    Codex B"
 echo ""
 echo "Attach with:  tmux attach -t $SESSION"
 echo ""
