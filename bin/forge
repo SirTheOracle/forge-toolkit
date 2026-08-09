@@ -14,6 +14,9 @@
 #   forge ask  --slug S --stage T --worker W "<question>"
 #   forge preflight [--root PATH] [--allow-api-billing]
 #   forge register <root> [--force]
+#   forge worktree ensure --session S [--from DIR] [--print-path]
+#                  [--allow-dirty-base] [--dry-run]
+#   forge worktree path --session S [--from DIR]
 #   forge board [--all]             human board (--all lists maintenance residue)
 #   forge board --json              machine cc-board/1 JSON
 #   forge status [--board]          alias for board (--board = the JSON)
@@ -683,18 +686,12 @@ PY
     return 0
 }
 
-# ── register: gitignore gate + hook merge (1.4) + watch-roots ─────────────
-cmd_register() {
-    local root="" force=0 alias="" seed=0
-    while [ $# -gt 0 ]; do case "$1" in
-        --force) force=1; shift ;;
-        --alias) alias="$(sanitize_name "$2")"; shift 2 ;;
-        --seed)  seed=1; shift ;;
-        *) root="$1"; shift ;;
-    esac; done
-    if [ "$seed" = 1 ]; then registry_seed; return; fi
-    [ -n "$root" ] || die "register requires <root>"
-    root="$(cd "$root" 2>/dev/null && pwd -P)" || die "no such root '$root'"
+# ── root bootstrap + register ─────────────────────────────────────────────
+# Worktree provisioning calls only this helper. Keep watch-roots and registry
+# writes in cmd_register: registry identity is common-dir keyed, and dead
+# worktrees are discovered read-only by recover_roots.
+bootstrap_root_assets() { # bootstrap_root_assets <root> [force]
+    local root="$1" force="${2:-0}"
 
     # A `.dev/` (trailing-slash) gitignore pattern can only match an EXISTING
     # directory — create it first or a brand-new root fails the gate below
@@ -798,6 +795,20 @@ print(f"registered codex CC hooks in {hpath} (trust: one-time /hooks review per 
 PY
         echo "  codex: run /hooks in each codex pane at $root to trust the hook (one-time per hash)."
     fi
+}
+
+cmd_register() {
+    local root="" force=0 alias="" seed=0
+    while [ $# -gt 0 ]; do case "$1" in
+        --force) force=1; shift ;;
+        --alias) alias="$(sanitize_name "$2")"; shift 2 ;;
+        --seed)  seed=1; shift ;;
+        *) root="$1"; shift ;;
+    esac; done
+    if [ "$seed" = 1 ]; then registry_seed; return; fi
+    [ -n "$root" ] || die "register requires <root>"
+    root="$(cd "$root" 2>/dev/null && pwd -P)" || die "no such root '$root'"
+    bootstrap_root_assets "$root" "$force"
 
     local wr="$HOME/.config/forge/watch-roots"
     mkdir -p "$(dirname "$wr")"; touch "$wr"
@@ -809,6 +820,499 @@ PY
         || die "register: '$root' is not a git repo (repo identity requires git)"
     [ -n "$alias" ] || alias="$(sanitize_name "$(basename "$root")")"
     registry_write "$rid" "$alias" "$root"
+}
+
+# _worktree_cfg <source-root> <field> — scalar config reader, loud on malformed YAML.
+_worktree_cfg() {
+    FORGE_WT_SOURCE="$1" FORGE_WT_FIELD="$2" python3 - <<'PY'
+import os, sys
+try:
+    import yaml
+    with open(os.path.join(os.environ["FORGE_WT_SOURCE"], ".claude", "forge-project.yml")) as f:
+        data = yaml.safe_load(f) or {}
+except Exception as e:
+    sys.exit(f"forge worktree: malformed forge-project.yml ({e})")
+if not isinstance(data, dict): sys.exit("forge worktree: forge-project.yml must contain a mapping")
+forge = data.get("forge", {})
+if forge is None: forge = {}
+if not isinstance(forge, dict): sys.exit("forge worktree: forge must be a mapping")
+wt = forge.get("worktree", {})
+if wt is None: wt = {}
+if not isinstance(wt, dict): sys.exit("forge worktree: forge.worktree must be a mapping")
+field = os.environ["FORGE_WT_FIELD"]
+if field == "parent": value = wt.get("parent", "")
+elif field == "prefix": value = wt.get("prefix", "")
+elif field == "branch_prefix": value = wt.get("branch_prefix", "forge/")
+elif field == "worktree_base_ref": value = wt.get("base_ref", "")
+elif field == "base_ref": value = forge.get("base_ref", "")
+elif field == "fetch": value = wt.get("fetch", True)
+elif field == "expected_root": value = forge.get("expected_root", "")
+else: sys.exit("forge worktree: internal unknown config field")
+if field == "fetch":
+    if not isinstance(value, bool): sys.exit("forge worktree: forge.worktree.fetch must be true or false")
+    print("1" if value else "0")
+elif value is None:
+    print("")
+elif not isinstance(value, str):
+    key = "forge.base_ref" if field == "base_ref" else ("forge.expected_root" if field == "expected_root" else "forge.worktree." + field.replace("worktree_", ""))
+    sys.exit(f"forge worktree: {key} must be a string")
+else:
+    if field == "parent" and "parent" in wt and not value:
+        sys.exit("forge worktree: forge.worktree.parent must be a non-empty path string")
+    if field == "prefix" and "prefix" in wt and (not value or value in (".", "..") or "/" in value or "\\" in value or "\0" in value):
+        sys.exit("forge worktree: forge.worktree.prefix must be one safe path component")
+    print(os.path.expanduser(value))
+PY
+}
+
+# Validate declared seed paths before git worktree add so every refusal is
+# zero-mutation. Unknown worktree keys remain intentionally ignored.
+_worktree_validate_seed_config() {
+    FORGE_WT_SOURCE="$1" python3 - <<'PY'
+import os, pathlib, sys, yaml
+fp = os.path.join(os.environ["FORGE_WT_SOURCE"], ".claude", "forge-project.yml")
+try:
+    with open(fp) as f: data = yaml.safe_load(f) or {}
+except Exception as e:
+    sys.exit(f"forge worktree: malformed forge-project.yml ({e})")
+if not isinstance(data, dict): sys.exit("forge worktree: forge-project.yml must contain a mapping")
+forge=data.get("forge", {})
+if forge is None: forge={}
+if not isinstance(forge, dict): sys.exit("forge worktree: forge must be a mapping")
+worktree=forge.get("worktree", {})
+if worktree is None: worktree={}
+if not isinstance(worktree, dict): sys.exit("forge worktree: forge.worktree must be a mapping")
+seed = worktree.get("seed", [])
+if seed is None: seed = []
+if not isinstance(seed, list): sys.exit("forge worktree: forge.worktree.seed must be a list")
+for i, item in enumerate(seed):
+    if not isinstance(item, dict): sys.exit(f"forge worktree: seed[{i}] must be a mapping")
+    path = item.get("path"); mode = item.get("mode", "copy"); required = item.get("required", False)
+    if not isinstance(path, str) or not path: sys.exit(f"forge worktree: seed[{i}].path must be a non-empty string")
+    p = pathlib.PurePosixPath(path)
+    if p.is_absolute() or not p.parts or "\\" in path or "\0" in path or ".." in p.parts or p.parts[0] in (".git", ".dev"):
+        sys.exit(f"forge worktree: unsafe seed path refused: {path}")
+    if not isinstance(mode, str) or mode not in ("copy", "symlink"): sys.exit(f"forge worktree: seed[{i}].mode must be copy or symlink")
+    if not isinstance(required, bool): sys.exit(f"forge worktree: seed[{i}].required must be true or false")
+PY
+}
+
+# _worktree_seed <src> <wt> <manifest> <dry-run>. The manifest feeds the
+# provenance writer and never lives under .dev/attention.
+_worktree_seed() {
+    FORGE_WT_SOURCE="$1" FORGE_WT_DEST="$2" FORGE_WT_MANIFEST="$3" FORGE_WT_DRY="$4" python3 - <<'PY'
+import collections, json, os, pathlib, re, shutil, subprocess, sys, yaml
+src = os.environ["FORGE_WT_SOURCE"]; dst = os.environ["FORGE_WT_DEST"]
+manifest = os.environ["FORGE_WT_MANIFEST"]; dry = os.environ["FORGE_WT_DRY"] == "1"
+with open(os.path.join(src, ".claude", "forge-project.yml")) as f: data = yaml.safe_load(f) or {}
+items = collections.OrderedDict()
+def add(path, mode="copy", required=False, implicit=True):
+    items[path] = {"path": path, "mode": mode, "required": required, "implicit": implicit}
+add(".envrc")
+for top in (".claude", ".codex"):
+    base = os.path.join(src, top)
+    if os.path.isdir(base):
+        for name in sorted(os.listdir(base)):
+            rel = top + "/" + name
+            add(rel, "symlink" if rel == ".codex/hooks.json" else "copy")
+for item in (((data.get("forge") or {}).get("worktree") or {}).get("seed") or []):
+    add(item["path"], item.get("mode", "copy"), item.get("required", False), False)
+seeded=[]; skipped=[]
+for rel, item in items.items():
+    source = os.path.join(src, rel); target = os.path.join(dst, rel)
+    if dry:
+        if os.path.lexists(target): action="skip-present"
+        elif os.path.lexists(source): action=item["mode"]
+        elif item["required"]: action="missing-required"
+        else: action="missing-optional"
+        print(f"seed {rel}: {action}")
+        continue
+    if os.path.lexists(target):
+        skipped.append({"path": rel, "reason": "present"}); continue
+    if not os.path.lexists(source):
+        if item["required"]:
+            sys.stderr.write(f"forge worktree: required seed source is missing: {source}\n")
+            raise SystemExit(4)
+        if not item["implicit"]:
+            sys.stderr.write(f"forge worktree: optional seed source is missing: {source}\n")
+        skipped.append({"path": rel, "reason": "source-absent"}); continue
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if item["mode"] == "symlink": os.symlink(source, target)
+    elif os.path.isdir(source): shutil.copytree(source, target, symlinks=True)
+    else: shutil.copy2(source, target, follow_symlinks=False)
+    action = item["mode"]
+    seeded.append({"path": rel, "mode": item["mode"], "action": action})
+    # Only a newly-seeded, untracked project file may receive this narrow rewrite.
+    if rel == ".claude/forge-project.yml":
+        tracked = subprocess.run(["git", "-C", src, "ls-files", "--error-unmatch", rel],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        expected = ((data.get("forge") or {}).get("expected_root"))
+        if not tracked and isinstance(expected, str) and os.path.isabs(os.path.expanduser(expected)):
+            text = open(target).read()
+            pattern = re.compile(r'^(?P<head>\s*expected_root:\s*)(?P<q>["\x27]?)(?P<value>.*?)(?P=q)(?P<tail>\s*(?:#.*)?)$', re.M)
+            def repl(m):
+                q = m.group("q") or '"'
+                return m.group("head") + q + dst + q + m.group("tail")
+            text2, count = pattern.subn(repl, text, count=1)
+            if count != 1: raise SystemExit("forge worktree: expected_root was parsed but its source line was not found")
+            with open(target, "w") as f: f.write(text2)
+with open(manifest, "w") as f: json.dump({"seeded": seeded, "skipped": skipped}, f)
+PY
+}
+
+# Verbose (arg 4 = 1, used by --dry-run) prints one line per unseeded gitignored
+# path. A real provision prints ONE grouped summary line instead: enumerating
+# every path floods the start banner (74 lines in goparent-ai) and buries the two
+# or three that matter — backend/.venv, backend/.env — under .tmpDocs, caches,
+# node_modules and test-results. An advisory that fires 74 times per start is
+# noise the operator learns to scroll past, which defeats its purpose.
+_worktree_advisory_scan() {
+    FORGE_WT_SOURCE="$1" FORGE_WT_DEST="$2" FORGE_WT_MANIFEST="$3" FORGE_WT_VERBOSE="${4:-0}" python3 - <<'PY'
+import json, os, pathlib, subprocess, sys
+src=os.environ["FORGE_WT_SOURCE"]; dst=os.environ["FORGE_WT_DEST"]
+verbose=os.environ.get("FORGE_WT_VERBOSE")=="1"
+with open(os.environ["FORGE_WT_MANIFEST"]) as f: m=json.load(f)
+known={x["path"] for x in m["seeded"]} | {x["path"] for x in m["skipped"]}
+seen=set(); hits=[]
+for root, dirs, files in os.walk(src):
+    relroot=os.path.relpath(root, src); depth=0 if relroot=="." else len(relroot.split(os.sep))
+    dirs[:] = [d for d in dirs if d not in (".git", ".dev") and depth < 2]
+    for name in dirs + files:
+        rel=os.path.relpath(os.path.join(root, name), src)
+        if len(pathlib.PurePath(rel).parts) > 2 or rel in known or rel in seen: continue
+        if os.path.lexists(os.path.join(dst, rel)): continue
+        if subprocess.run(["git", "-C", src, "check-ignore", "-q", "--", rel]).returncode == 0:
+            seen.add(rel); hits.append(rel)
+if not hits: sys.exit(0)
+if verbose:
+    for rel in sorted(hits):
+        print(f"forge worktree: {rel} is present in the source root but not seeded — declare under forge.worktree.seed if the panes need it.", file=sys.stderr)
+    sys.exit(0)
+from collections import Counter
+# Order by hit count, not alphabetically: the operator wants the biggest
+# contributors named, not whichever directory happens to sort first (.DS_Store).
+counts=Counter(pathlib.PurePath(rel).parts[0] for rel in hits)
+tops=[t for t,_ in counts.most_common()]
+head=", ".join(tops[:5]); more=f", +{len(tops)-5} more" if len(tops) > 5 else ""
+print(f"forge worktree: {len(hits)} gitignored path(s) not seeded ({head}{more}) — re-run with --dry-run to list them, or declare under forge.worktree.seed if the panes need them.", file=sys.stderr)
+PY
+}
+
+# _worktree_resolve_base <src> <configured> <forge-base>
+# Prints: base<TAB>sha<TAB>fallback(0|1)<TAB>tried-list.
+_worktree_resolve_base() {
+    local src="$1" configured="$2" forge_base="$3" origin_head candidate base="" tried="" fallback=0 sha
+    origin_head="$(git -C "$src" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's#^refs/remotes/##' || true)"
+    for candidate in "$configured" "$forge_base" "$origin_head" origin/main main; do
+        [ -n "$candidate" ] || continue
+        case " $tried " in *" $candidate "*) continue ;; esac
+        tried="${tried:+$tried }$candidate"
+        if git -C "$src" rev-parse --verify "$candidate^{commit}" >/dev/null 2>&1; then
+            base="$candidate"; break
+        fi
+    done
+    if [ -z "$base" ]; then
+        git -C "$src" rev-parse --verify 'HEAD^{commit}' >/dev/null 2>&1 || return 2
+        base=HEAD; fallback=1
+    fi
+    sha="$(git -C "$src" rev-parse "$base^{commit}")" || return 2
+    printf '%s\t%s\t%s\t%s\n' "$base" "$sha" "$fallback" "$tried"
+}
+
+cmd_worktree() {
+    local action="${1:-}" session="" from="$PWD" print_path=0 allow_dirty=0 dry=0
+    [ -n "$action" ] || { echo "forge worktree: expected ensure or path" >&2; return 2; }
+    shift || true
+    while [ $# -gt 0 ]; do case "$1" in
+        --session) [ $# -ge 2 ] || { echo "forge worktree: --session requires a value" >&2; return 2; }; session="$2"; shift 2 ;;
+        --from) [ $# -ge 2 ] || { echo "forge worktree: --from requires a value" >&2; return 2; }; from="$2"; shift 2 ;;
+        --print-path) print_path=1; shift ;;
+        --allow-dirty-base) allow_dirty=1; shift ;;
+        --dry-run) dry=1; shift ;;
+        --*) echo "forge worktree: unknown flag $1" >&2; return 2 ;;
+        *) echo "forge worktree: unexpected argument '$1'" >&2; return 2 ;;
+    esac; done
+    case "$action" in ensure|path) ;; *) echo "forge worktree: expected ensure or path" >&2; return 2 ;; esac
+    [ -n "$session" ] || { echo "forge worktree: --session is required" >&2; return 2; }
+    case "$session" in .|..|-*|*[!A-Za-z0-9_.-]*) echo "forge worktree: invalid session name '$session'" >&2; return 2 ;; esac
+    if [ "$dry" = 1 ] && [ "$print_path" = 1 ]; then
+        echo "forge worktree: --dry-run and --print-path are mutually exclusive" >&2; return 2
+    fi
+    if [ "$action" = path ] && { [ "$dry" = 1 ] || [ "$allow_dirty" = 1 ] || [ "$print_path" = 1 ]; }; then
+        echo "forge worktree: path accepts only --session and --from" >&2; return 2
+    fi
+
+    local src
+    src="$(git -C "$from" rev-parse --show-toplevel 2>/dev/null)" \
+        || { echo "forge worktree: --from is not a Git worktree: $from" >&2; return 2; }
+    src="$(cd "$src" && pwd -P)"
+    [ -f "$src/.claude/forge-project.yml" ] || {
+        echo "forge worktree: forge-bridge requires .claude/forge-project.yml; the source root does not have one. Run 'forge register' there first, or use 'forge-start --here'." >&2
+        return 2
+    }
+    git -C "$src" check-ignore -q --no-index .dev/probe 2>/dev/null || {
+        echo "forge worktree: .dev/ is not gitignored in $src — refusing before worktree creation" >&2; return 2;
+    }
+    _worktree_validate_seed_config "$src" || return 2
+
+    local parent prefix branch_prefix wt branch fetch expected tracked_project=0
+    parent="${FORGE_WORKTREE_PARENT:-$(_worktree_cfg "$src" parent)}" || return 2
+    [ -n "$parent" ] || parent="$(dirname "$src")"
+    prefix="$(_worktree_cfg "$src" prefix)" || return 2
+    [ -n "$prefix" ] || prefix="$(basename "$src")"
+    case "$prefix" in .|..|*/*|*\\*) echo "forge worktree: forge.worktree.prefix must be one safe path component" >&2; return 2 ;; esac
+    branch_prefix="$(_worktree_cfg "$src" branch_prefix)" || return 2
+    fetch="$(_worktree_cfg "$src" fetch)" || return 2
+    expected="$(_worktree_cfg "$src" expected_root)" || return 2
+    # Resolve symlinks in the nearest existing ancestor, then append any
+    # not-yet-created suffix. This makes collision checks and printed paths use
+    # the same physical spelling even when parent traverses a symlink.
+    parent="$(FORGE_WT_PARENT="$parent" python3 - <<'PY'
+import os
+p=os.path.abspath(os.path.expanduser(os.environ["FORGE_WT_PARENT"]))
+suffix=[]
+while not os.path.lexists(p):
+    parent, leaf=os.path.split(p)
+    if not leaf: raise SystemExit("forge worktree: cannot resolve worktree parent")
+    suffix.append(leaf); p=parent
+p=os.path.realpath(p)
+for leaf in reversed(suffix): p=os.path.join(p,leaf)
+print(p)
+PY
+)" || return 2
+    wt="$parent/$prefix-$session"; branch="$branch_prefix$session"
+    git check-ref-format --branch "$branch" >/dev/null 2>&1 || { echo "forge worktree: invalid resulting branch '$branch'" >&2; return 2; }
+    if git -C "$src" ls-files --error-unmatch .claude/forge-project.yml >/dev/null 2>&1; then tracked_project=1; fi
+    if [ "$tracked_project" = 1 ] && [ -n "$expected" ] && [ "${expected#/}" != "$expected" ] && [ "$expected" != "$wt" ]; then
+        echo "forge worktree: $src tracks .claude/forge-project.yml with an absolute forge.expected_root ($expected). A worktree cannot use that value and this tool will not rewrite a tracked file. Fix in the repo: delete the forge.expected_root key, or set it to '.' — both resolve correctly at every root. Then re-run." >&2
+        return 2
+    fi
+    if [ "$action" = path ]; then printf '%s\n' "$wt"; return 0; fi
+
+    local registered_path=0 registered_branch="" record branch_owner="" is_reattach=0
+    record="$(git -C "$src" worktree list --porcelain 2>/dev/null || true)"
+    registered_branch="$(printf '%s\n' "$record" | awk -v w="$wt" '
+        $1=="worktree" {p=substr($0,10)}
+        $1=="branch" && p==w {sub(/^refs\/heads\//,"",$2); print $2; exit}')"
+    printf '%s\n' "$record" | awk -v w="$wt" '$1=="worktree" && substr($0,10)==w {f=1} END{exit !f}' && registered_path=1 || true
+    if [ "$registered_path" = 1 ]; then
+        if [ "$registered_branch" != "$branch" ]; then
+            echo "forge worktree: target is registered on '$registered_branch', expected '$branch': $wt" >&2; return 4
+        fi
+        is_reattach=1
+    elif [ -e "$wt" ] || [ -L "$wt" ]; then
+        echo "forge worktree: target exists but is not a registered worktree of this repository: $wt" >&2; return 4
+    fi
+
+    local configured forge_base base="" base_sha="" tried="" fallback=0 resolved
+    configured="$(_worktree_cfg "$src" worktree_base_ref)" || return 2
+    forge_base="$(_worktree_cfg "$src" base_ref)" || return 2
+    # Resolve once without mutation so an unusable repository still refuses
+    # before a fetch. The final resolution is repeated after the dirty gate.
+    resolved="$(_worktree_resolve_base "$src" "$configured" "$forge_base")" \
+        || { echo "forge worktree: no usable base ref and HEAD has no commit" >&2; return 2; }
+    IFS=$'\t' read -r base base_sha fallback tried <<< "$resolved"
+    if [ "$dry" = 1 ] && [ "$fallback" = 1 ]; then
+        echo "forge worktree: WARNING: base ladder tried:${tried:- none}; falling back to HEAD at ${base_sha:0:12}" >&2
+    elif [ "$dry" = 1 ] && [ -n "$configured" ] && [ "$base" != "$configured" ]; then
+        echo "forge worktree: WARNING: configured base '$configured' did not verify; tried:${tried:- none}; selected $base" >&2
+    fi
+    local dirty_porcelain dirty_paths untracked ahead owner=""
+    dirty_porcelain="$(git -C "$src" status --porcelain -uno 2>/dev/null || true)"
+    dirty_paths="$(printf '%s\n' "$dirty_porcelain" | sed '/^$/d; s/^...//')"
+    untracked="$(git -C "$src" status --porcelain 2>/dev/null | grep -c '^??' || true)"
+    ahead="$(git -C "$src" rev-list --count "$base..HEAD" 2>/dev/null || echo 0)"
+    owner="$(_spawn_session_at_root "$src" 2>/dev/null || true)"
+    [ "$untracked" -eq 0 ] || echo "forge worktree: NOTICE: source has $untracked untracked path(s); they are not carried automatically" >&2
+    if [ -n "$dirty_paths" ]; then
+        echo "forge worktree: source has tracked modifications that will not appear in the new worktree:" >&2
+        printf '  %s\n' "$dirty_paths" >&2
+        printf '%s\n' "$dirty_paths" | grep -q '\.wp-blog-cache\.json$' && echo "forge worktree: a tracked file your build rewrites should be gitignored in the repo." >&2 || true
+        if [ "$is_reattach" = 0 ] && [ "$allow_dirty" = 0 ]; then
+            if [ -n "$owner" ]; then
+                echo "forge worktree: Session '$owner' is live in this root. Do not commit and do not stash — both mutate the working tree its five panes are editing, and a commit moves HEAD. Your option here is: forge-start --allow-dirty-base $session" >&2
+            else
+                echo "forge worktree: Options: commit the work, or re-run with --allow-dirty-base." >&2
+            fi
+            return 2
+        fi
+        [ "$is_reattach" = 0 ] || echo "forge worktree: WARNING: reattaching despite current source dirtiness" >&2
+        [ "$allow_dirty" = 0 ] || echo "forge worktree: WARNING: --allow-dirty-base accepted the listed tracked paths" >&2
+    fi
+
+    # All exit-2 validation and the create-only dirty refusal are complete.
+    # Fetch may now mutate refs; resolve the ladder again so the cut uses them.
+    local fetch_failed=0
+    if [ "$dry" = 0 ] && [ "$fetch" = 1 ] && git -C "$src" remote get-url origin >/dev/null 2>&1; then
+        git -C "$src" fetch --quiet origin || fetch_failed=1
+    fi
+    if [ "$dry" = 0 ]; then
+        resolved="$(_worktree_resolve_base "$src" "$configured" "$forge_base")" \
+            || { echo "forge worktree: no usable base ref after fetch" >&2; return 4; }
+        IFS=$'\t' read -r base base_sha fallback tried <<< "$resolved"
+        if [ "$fallback" = 1 ]; then
+            echo "forge worktree: WARNING: base ladder tried:${tried:- none}; falling back to HEAD at ${base_sha:0:12}" >&2
+        elif [ -n "$configured" ] && [ "$base" != "$configured" ]; then
+            echo "forge worktree: WARNING: configured base '$configured' did not verify; tried:${tried:- none}; selected $base" >&2
+        fi
+        ahead="$(git -C "$src" rev-list --count "$base..HEAD" 2>/dev/null || echo 0)"
+        if [ "$fetch_failed" = 1 ]; then
+            echo "forge worktree: WARNING: fetch origin failed; using local $base @ $base_sha (committer date $(git -C "$src" show -s --format=%cI "$base_sha"))" >&2
+        elif [ "$fetch" = 1 ] && git -C "$src" remote get-url origin >/dev/null 2>&1; then
+            echo "forge worktree: base $base @ $base_sha ($(git -C "$src" show -s --format=%cI "$base_sha"))" >&2
+        fi
+    fi
+    if [ "$ahead" -gt 0 ]; then
+        echo "forge worktree: NOTICE: source HEAD is $ahead commit(s) ahead of $base; new worktree starts at $base_sha" >&2
+        echo "forge worktree: carry unstaged changes manually: git -C '$src' diff HEAD > /tmp/carry.patch && git -C '$wt' apply --3way /tmp/carry.patch" >&2
+    fi
+
+    local manifest; manifest="$(mktemp "${TMPDIR:-/tmp}/forge-worktree-seed.XXXXXX")"
+    if [ "$dry" = 1 ]; then
+        printf 'PLAN worktree=%s\nPLAN branch=%s\nPLAN base_ref=%s\nPLAN base_sha=%s\n' "$wt" "$branch" "$base" "$base_sha"
+        printf 'PLAN divergence tracked_dirty=%s untracked=%s ahead=%s\n' "$([ -n "$dirty_paths" ] && echo yes || echo no)" "$untracked" "$ahead"
+        _worktree_seed "$src" "$wt" "$manifest" 1 || { local rc=$?; rm -f "$manifest"; return "$rc"; }
+        # Verbose advisory belongs here, not on the real run: --dry-run is exactly
+        # where the operator wants the full unseeded list. $wt does not exist yet,
+        # so every candidate is reported.
+        _worktree_advisory_scan "$src" "$wt" "$manifest" 1 || true
+        printf 'direnv %s\n' "$([ -f "$src/.envrc" ] && echo evaluate || echo absent)"
+        local codex_plan
+        codex_plan="$(FORGE_WT_SOURCE="$src" python3 - <<'PY'
+import os,yaml
+root=os.environ["FORGE_WT_SOURCE"]
+with open(os.path.join(root,".claude","forge-project.yml")) as f: data=yaml.safe_load(f) or {}
+mode=None
+for item in (((data.get("forge") or {}).get("worktree") or {}).get("seed") or []):
+    if item.get("path")==".codex/hooks.json": mode=item.get("mode","copy")
+print("unverified" if mode=="copy" or not os.path.isfile(os.path.join(root,".codex","hooks.json")) else "symlinked")
+PY
+)"
+        printf 'codex-trust %s\n' "$codex_plan"
+        rm -f "$manifest"; return 0
+    fi
+
+    if [ "$is_reattach" = 1 ]; then
+        echo "ENSURE worktree @$wt (branch $branch) — reusing, not re-cutting" >&2
+    else
+        if ! mkdir -p "$parent"; then
+            echo "forge worktree: could not create worktree parent: $parent" >&2
+            rm -f "$manifest"; return 4
+        fi
+        if git -C "$src" show-ref --verify --quiet "refs/heads/$branch"; then
+            branch_owner="$(printf '%s\n' "$record" | awk -v b="refs/heads/$branch" '
+                $1=="worktree" {p=substr($0,10)} $1=="branch" && $2==b {print p; exit}')"
+            if [ -n "$branch_owner" ]; then
+                echo "forge worktree: branch '$branch' is already checked out at $branch_owner" >&2; rm -f "$manifest"; return 4
+            fi
+            echo "forge worktree: WARNING: adopting existing free branch '$branch'; the cut is its tip, not $base" >&2
+            git -C "$src" worktree add "$wt" "$branch" >&2 || { rm -f "$manifest"; return 4; }
+        else
+            git -C "$src" worktree add -b "$branch" "$wt" "$base" >&2 || { rm -f "$manifest"; return 4; }
+        fi
+    fi
+
+    _worktree_seed "$src" "$wt" "$manifest" 0 || { local rc=$?; rm -f "$manifest"; [ "$rc" -eq 4 ] && return 4 || return 4; }
+    local tracked_after
+    tracked_after="$(git -C "$wt" status --porcelain -uno 2>/dev/null || true)"
+    if [ -n "$tracked_after" ]; then
+        echo "forge worktree: tracked modifications appeared after seeding:" >&2
+        printf '%s\n' "$tracked_after" >&2; rm -f "$manifest"; return 4
+    fi
+    ( bootstrap_root_assets "$wt" 0 ) >&2 || { rm -f "$manifest"; return 4; }
+    # bootstrap_root_assets writes canonically via os.replace, so an implicit
+    # hooks symlink becomes a regular file. Restore the symlink only when the
+    # canonical merge is semantically identical to the source; otherwise keep
+    # the fresher worktree file and report it as unverified.
+    FORGE_WT_SOURCE="$src" FORGE_WT_DEST="$wt" python3 - <<'PY'
+import json, os, sys, yaml
+root=os.environ["FORGE_WT_SOURCE"]
+source=os.path.join(root, ".codex", "hooks.json")
+target=os.path.join(os.environ["FORGE_WT_DEST"], ".codex", "hooks.json")
+explicit_mode=None
+try:
+    with open(os.path.join(root, ".claude", "forge-project.yml")) as f:
+        data=yaml.safe_load(f) or {}
+    for item in (((data.get("forge") or {}).get("worktree") or {}).get("seed") or []):
+        if item.get("path") == ".codex/hooks.json": explicit_mode=item.get("mode", "copy")
+except Exception:
+    pass  # structural validation already succeeded before mutation
+if explicit_mode == "copy":
+    print("forge worktree: WARNING: declared copy mode keeps .codex/hooks.json worktree-local and unverified; run /hooks in panes 3/4", file=sys.stderr)
+elif os.path.isfile(source) and os.path.isfile(target):
+    try:
+        with open(source) as f: left=json.load(f)
+        with open(target) as f: right=json.load(f)
+        same=left == right
+    except (OSError, ValueError) as e:
+        same=False
+        print("forge worktree: WARNING: Codex hook JSON comparison failed (%s); retaining the worktree-local regular file as unverified" % e, file=sys.stderr)
+    if same:
+        os.unlink(target)
+        os.symlink(source, target)
+    else:
+        print("forge worktree: WARNING: canonical bootstrap made .codex/hooks.json fresher than the source; retaining the worktree-local regular file as unverified", file=sys.stderr)
+elif os.path.isfile(target):
+    print("forge worktree: WARNING: no source Codex hooks file; retaining the bootstrapped worktree file as unverified", file=sys.stderr)
+PY
+    tracked_after="$(git -C "$wt" status --porcelain -uno 2>/dev/null || true)"
+    if [ -n "$tracked_after" ]; then
+        echo "forge worktree: tracked modifications appeared after canonical bootstrap:" >&2
+        printf '%s\n' "$tracked_after" >&2; rm -f "$manifest"; return 4
+    fi
+    _worktree_advisory_scan "$src" "$wt" "$manifest" || true
+
+    local direnv_state=absent direnv_bin="${FORGE_DIRENV_BIN:-direnv}" direnv_status="" codex_trust=absent
+    if [ -f "$wt/.envrc" ]; then
+        direnv_state=deferred
+        if command -v "$direnv_bin" >/dev/null 2>&1; then
+            direnv_status="$("$direnv_bin" status "$src" 2>&1 || true)"
+            if printf '%s\n' "$direnv_status" | grep -q 'Found RC allowed 0'; then
+                if "$direnv_bin" allow "$wt" >/dev/null 2>&1; then direnv_state=allowed
+                else direnv_state=failed; echo "forge worktree: WARNING: direnv allow failed for '$wt'" >&2; fi
+            else
+                echo "forge worktree: run: direnv allow '$wt'" >&2
+            fi
+        else
+            echo "forge worktree: run: direnv allow '$wt'" >&2
+        fi
+    fi
+    if [ -L "$wt/.codex/hooks.json" ] && [ "$(cd "$(dirname "$wt/.codex/hooks.json")" && cd "$(dirname "$(readlink "$wt/.codex/hooks.json")")" 2>/dev/null && pwd -P)/$(basename "$(readlink "$wt/.codex/hooks.json")")" = "$src/.codex/hooks.json" ]; then
+        codex_trust=symlinked
+    elif [ -e "$wt/.codex/hooks.json" ]; then codex_trust=unverified; fi
+
+    local source_branch
+    source_branch="$(git -C "$src" symbolic-ref --short HEAD 2>/dev/null || printf HEAD)"
+    FORGE_WT_SOURCE="$src" FORGE_WT_DEST="$wt" FORGE_WT_SESSION="$session" \
+    FORGE_WT_BRANCH="$branch" FORGE_WT_BASE="$base" FORGE_WT_SHA="$base_sha" \
+    FORGE_WT_SOURCE_BRANCH="$source_branch" \
+    FORGE_WT_AHEAD="$ahead" FORGE_WT_DIRTY="$dirty_paths" FORGE_WT_UNTRACKED="$untracked" \
+    FORGE_WT_ALLOW="$allow_dirty" FORGE_WT_MANIFEST="$manifest" FORGE_WT_DIRENV="$direnv_state" \
+    FORGE_WT_CODEX="$codex_trust" python3 - <<'PY' || { rm -f "$manifest"; return 4; }
+import datetime, json, os
+with open(os.environ["FORGE_WT_MANIFEST"]) as f: seed=json.load(f)
+rec={"schema":"cc-worktree/1", "session":os.environ["FORGE_WT_SESSION"],
+     "source_root":os.environ["FORGE_WT_SOURCE"],
+     "source_branch":os.environ["FORGE_WT_SOURCE_BRANCH"],
+     "base_ref":os.environ["FORGE_WT_BASE"], "base_sha":os.environ["FORGE_WT_SHA"],
+     "source_ahead":int(os.environ["FORGE_WT_AHEAD"]),
+     "tracked_dirty":[x for x in os.environ["FORGE_WT_DIRTY"].splitlines() if x],
+     "untracked_count":int(os.environ["FORGE_WT_UNTRACKED"]),
+     "allow_dirty_base":os.environ["FORGE_WT_ALLOW"]=="1",
+     "seeded":seed["seeded"], "skipped":seed["skipped"],
+     "direnv":os.environ["FORGE_WT_DIRENV"], "codex_trust":os.environ["FORGE_WT_CODEX"],
+     "created_at":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+fp=os.path.join(os.environ["FORGE_WT_DEST"], ".dev", "forge-worktree.json")
+tmp=fp+".tmp.%d"%os.getpid()
+with open(tmp,"w") as f: json.dump(rec,f,indent=2); f.write("\n")
+os.replace(tmp,fp)
+PY
+    if [ -n "$dirty_paths" ] && [ "$allow_dirty" = 1 ]; then
+        spawn_state_event "$wt" "$session" "worktree-dirty-source" "source tracked paths omitted: $(printf '%s' "$dirty_paths" | tr '\n' ',')"
+    fi
+    rm -f "$manifest"
+    if [ "$print_path" = 1 ]; then printf '%s\n' "$(cd "$wt" && pwd -P)"
+    else echo "ENSURED worktree $wt (branch $branch @ ${base_sha:0:12})"; fi
 }
 
 # _spawn_session_at_root <root> → first live session NAME whose session_path==root
@@ -1082,8 +1586,9 @@ gc_launchd_uninstall() {
 # Every ambiguity fails closed to "report, don't touch". Detection-only boot
 # service via com.forge.recover (RunAtLoad + StartInterval; boot-id dedup).
 
-# P1 — shared root discovery: watch-roots ∪ live tmux session paths. cmd_gc's
-# backstop sweep consumes the same union (factored from its former inline pipe).
+# Shared root discovery: watch-roots ∪ live tmux session paths ∪ every linked
+# worktree of each registered primary. cmd_gc and cmd_recover consume the same
+# read-only union; provisioning never appends worktrees to watch-roots.
 recover_roots() {
     local wr="${FORGE_WATCH_ROOTS_FILE:-$HOME/.config/forge/watch-roots}"
     {
@@ -1093,6 +1598,21 @@ recover_roots() {
         else
             tmux list-sessions -F '#{session_path}' 2>/dev/null || true
         fi
+        FORGE_REG_FILE="$REGISTRY_FILE" python3 - <<'PY' 2>/dev/null | while IFS= read -r _registered; do
+import os
+try:
+    import yaml
+    with open(os.environ["FORGE_REG_FILE"]) as f:
+        data = yaml.safe_load(f) or {}
+except Exception:
+    data = {}
+for entry in (data.get("repos") or {}).values():
+    if isinstance(entry, dict) and entry.get("path"):
+        print(entry["path"])
+PY
+            git -C "$_registered" worktree list --porcelain 2>/dev/null \
+                | sed -n 's/^worktree //p' || true
+        done
     } | sed '/^[[:space:]]*$/d' | sort -u
 }
 
@@ -1240,6 +1760,12 @@ REGISTRY = [
    "filename_re": r"^recover-[A-Za-z0-9._-]+\.json$", "session_field": None,
    "timestamp_field": "emitted_at", "payload_refs": []},
   {"schema": "cc-registry/1", "event": None, "scope": "root", "filename_re": None,
+   "session_field": None, "timestamp_field": None, "payload_refs": []},
+  # Per-worktree provenance written by `forge worktree ensure` to
+  # <wt>/.dev/forge-worktree.json — deliberately NOT under .dev/attention, so it
+  # is never swept as attention residue. Declared here because the writer-schema
+  # lockstep requires every cc-*/N literal in this file to be registered.
+  {"schema": "cc-worktree/1", "event": None, "scope": "root", "filename_re": None,
    "session_field": None, "timestamp_field": None, "payload_refs": []},
 ]
 CONTEXT_RE = re.compile(r"^forge-context\.(.+)\.yml$")   # bare forge-context.yml never matches
@@ -2193,6 +2719,8 @@ checks={'approval_never':sandbox.get('approval policy')=='Never',
 version=str(d.get('codexVersion') or '')
 checks['version_supported']=version in cfg['codex']['supported_interactive_versions']
 checks['binary_exact']=os.path.realpath(str(install.get('current executable','')))==os.path.realpath(bin)
+print(f"codex_version={version or 'unknown'}")
+print('supported_interactive_versions=' + ','.join(cfg['codex']['supported_interactive_versions']))
 for k,v in checks.items(): print(f'{k}={str(v).lower()}')
 print('private_codex_home=false')
 print(f"auth_storage_mode={auth.get('auth storage mode','unknown')}")
@@ -2222,7 +2750,11 @@ cmd_codex_launch() {
         printf '%s -C %s --strict-config --sandbox workspace-write --ask-for-approval never -c sandbox_workspace_write.network_access=false -c sandbox_workspace_write.writable_roots=[] -m gpt-5.5 -c model_reasoning_effort=%s -c service_tier=fast\n' "$bin" "$root" "$effort"
         return 0
     fi
-    local ready; ready="$(cmd_codex_doctor "$root")"; echo "$ready" | grep -q '^launch_ready=true$' || { echo "$ready" >&2; return 3; }
+    local ready; ready="$(cmd_codex_doctor "$root")"; echo "$ready" | grep -q '^launch_ready=true$' || {
+        echo "forge: codex-launch: readiness preflight failed; Codex was not started" >&2
+        echo "$ready" >&2
+        return 3
+    }
     # The broker records the real Codex PID/argv immediately before it opens a
     # delivery. A pre-exec shell manifest would attest the wrong process.
     exec "$bin" -C "$root" --strict-config --sandbox workspace-write --ask-for-approval never \
@@ -2277,6 +2809,7 @@ case "${1:-help}" in
     ask)       shift; cmd_ask "$@" ;;
     preflight) shift; cmd_preflight "$@" ;;
     register)  shift; cmd_register "$@" ;;
+    worktree)  shift; cmd_worktree "$@" ;;
     spawn)     shift; cmd_spawn "$@" ;;
     # Human board by default; --json (or legacy status --board) = cc-board/1
     # JSON for machines. Raw findings remain at `forge-watch status`.
@@ -2288,5 +2821,5 @@ case "${1:-help}" in
     recover)   shift; cmd_recover "$@" ;;
     parked)    shift; cmd_parked "$@" ;;
     -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register status board tasks gc recover parked codex-broker)" ;;
+    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register worktree status board tasks gc recover parked codex-broker)" ;;
 esac

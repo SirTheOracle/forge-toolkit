@@ -1,11 +1,14 @@
 #!/bin/bash
-# Harness for bin/forge-start (Phase C): manual-path byte-identity (HC4 golden),
-# --populate-existing validation/trap/roles, plus two real-tmux liveness proofs.
+# Harness for bin/forge-start: --here compatibility and auto-worktree goldens,
+# provisioning/broker atomicity, populate validation/trap/roles, and live proofs.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 START="$ROOT/bin/forge-start"
 GOLD="$ROOT/tests/forge-start/golden-plain.log"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/fst.XXXXXX")"
+# Physicalize immediately: macOS $TMPDIR is /var/folders/... symlinked to
+# /private/var/folders/.... forge-start resolves PHYSICAL_ROOT with `pwd -P`, so
+# an unresolved WORK makes the --root arguments un-normalizable by sed.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/fst.XXXXXX")"; WORK="$(cd "$WORK" && pwd -P)"
 RSESS="fstrap-$$"; ROLESESS="fsrole-$$"; SSTAMP="fsstamp-$$"; PRELSESS="fsprel-$$"
 trap 'tmux kill-session -t "$RSESS" 2>/dev/null; tmux kill-session -t "$ROLESESS" 2>/dev/null; tmux kill-session -t "$SSTAMP" 2>/dev/null; tmux kill-session -t "$PRELSESS" 2>/dev/null; rm -rf "$WORK"' EXIT
 PASS=0; FAIL=0
@@ -14,6 +17,14 @@ bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 
 # Bridge stub (line-84 call is absolute-path; PATH cannot shadow it).
 FB="$WORK/fake-bridge"; printf '#!/bin/bash\nexit 0\n' > "$FB"; chmod +x "$FB"
+DOCTORCALLS="$WORK/codex-doctor.calls"; : > "$DOCTORCALLS"
+FORGE_CODEX_DOCTOR_BIN="$WORK/fake-codex-doctor"; export FORGE_CODEX_DOCTOR_BIN DOCTORCALLS
+cat > "$FORGE_CODEX_DOCTOR_BIN" <<'SH'
+#!/bin/bash
+echo "$*" >> "${DOCTORCALLS:?}"
+echo 'launch_ready=true'
+SH
+chmod +x "$FORGE_CODEX_DOCTOR_BIN"
 FORGE_BROKER_BIN="$WORK/fake-broker"; export FORGE_BROKER_BIN
 BRKLOG="$WORK/broker.log"; : > "$BRKLOG"
 printf '#!/bin/bash\necho "$*" >> "%s"\nexit 0\n' "$BRKLOG" > "$FORGE_BROKER_BIN"; chmod +x "$FORGE_BROKER_BIN"
@@ -43,11 +54,11 @@ echo "── T-START-IDENTITY: plain no-arg path byte-identical (HC4 golden) ─
 D="$(mktemp -d "${TMPDIR:-/tmp}/fstd.XXXXXX")"; D="$(cd "$D" && pwd -P)"   # normalize /var → /private/var so physical-root launch golden matches
 git -C "$D" init -q
 TMLOG="$WORK/plain.log"; : > "$TMLOG"
-( cd "$D" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" >/dev/null 2>&1 )
+( cd "$D" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_BRIDGE_BIN="$FB" FORGE_BIN="$WORK/never-forge" HOME="$WORK/h" bash "$START" --here >/dev/null 2>&1 )
 prc=$?
 sed "s|$D|__DIR__|g" "$TMLOG" > "$WORK/plain.norm"
 if diff -q "$GOLD" "$WORK/plain.norm" >/dev/null 2>&1; then
-  ok "plain tmux call sequence identical to the pre-Phase-C golden"
+  ok "T-START-HERE-GOLDEN: --here matches the post-hoist compatibility golden"
 else
   bad "plain path DRIFTED from golden:"; diff "$GOLD" "$WORK/plain.norm" | sed 's/^/    /'
 fi
@@ -70,7 +81,87 @@ for _pane in 3 4; do
       bad "T-START-CODEX-ORDER-$_pane: routing field order drifted" ;;
   esac
 done
+[ ! -e "$WORK/never-forge" ] && ok "T-START-HERE-GOLDEN: FORGE_BIN never invoked" || bad "--here invoked FORGE_BIN"
 rm -rf "$D"
+
+echo "── provisioning and broker atomicity ──"
+STARTSRC="$WORK/start-source"; WTD="$WORK/fixed-worktree"; mkdir -p "$STARTSRC/.dev" "$WTD/.dev"; git -C "$STARTSRC" init -q; git -C "$WTD" init -q
+FORGECALLS="$WORK/forge.calls"; : > "$FORGECALLS"; WF="$WORK/fake-forge"; printf '#!/bin/bash\necho "$*" >> "%s"\necho "%s"\n' "$FORGECALLS" "$WTD" > "$WF"; chmod +x "$WF"
+TMLOG="$WORK/wt.log"; : > "$TMLOG"; : > "$DOCTORCALLS"
+( cd "$STARTSRC" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_BIN="$WF" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" worktree >/dev/null 2>&1 ); rc=$?
+sed "s|$WTD|__WT__|g" "$TMLOG" > "$WORK/wt.norm"
+[ "$rc" = 0 ] && diff -q "$ROOT/tests/forge-start/golden-worktree.log" "$WORK/wt.norm" >/dev/null \
+  && ok "T-START-WT-GOLDEN: all cwd/root args use provisioned path" || bad "worktree golden drift"
+grep -qF "worktree ensure --session worktree --from $STARTSRC --print-path" "$FORGECALLS" && ! grep -qF "$STARTSRC" "$TMLOG" && grep -qF -- "--root $WTD" "$BRKLOG" && ! grep -qF "$STARTSRC" "$BRKLOG" \
+  && ok "T-START-WT-ROOT-COLLAPSE" || bad "source root leaked past provisioning"
+grep -qxF "codex-doctor $WTD" "$DOCTORCALLS" \
+  && ok "T-START-CODEX-PREFLIGHT-ROOT: doctor checks the provisioned root" \
+  || bad "Codex doctor did not check provisioned root: $(cat "$DOCTORCALLS")"
+
+# A fail-closed Codex version/readiness refusal must occur before new-session,
+# broker start, any split, or any CLI launch. The read-only explicit-name
+# has-session probe is allowed and creates no tmux state.
+BADDOCTOR="$WORK/bad-codex-doctor"
+cat > "$BADDOCTOR" <<'SH'
+#!/bin/bash
+cat <<'EOF'
+codex_version=9.9.9
+supported_interactive_versions=0.147.0
+version_supported=false
+launch_ready=false
+EOF
+SH
+chmod +x "$BADDOCTOR"
+TMLOG="$WORK/codex-preflight-fail.log"; : > "$TMLOG"; : > "$BRKLOG"
+out=$(cd "$WTD" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_CODEX_DOCTOR_BIN="$BADDOCTOR" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --here unsupported 2>&1); rc=$?
+[ "$rc" = 3 ] && echo "$out" | grep -q 'Codex readiness preflight failed before tmux layout' \
+  && echo "$out" | grep -q '^codex_version=9.9.9$' \
+  && ! grep -qE '^(new-session|split-window|send-keys|kill-session) ' "$TMLOG" \
+  && [ ! -s "$BRKLOG" ] \
+  && ok "T-START-CODEX-PREFLIGHT-ATOMIC: unsupported Codex leaves zero tmux/broker state" \
+  || bad "Codex preflight was not atomic (rc=$rc tmux=$(cat "$TMLOG") broker=$(cat "$BRKLOG") out=$out)"
+
+# One chronological stream proves broker ownership is established after the
+# incarnation read and before the first split; separate logs cannot prove this.
+ORDERBROKER="$WORK/order-broker"; printf '#!/bin/bash\necho "BROKER $*" >> "$TMLOG"\n' > "$ORDERBROKER"; chmod +x "$ORDERBROKER"
+TMLOG="$WORK/order.log"; : > "$TMLOG"
+( cd "$STARTSRC" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_BIN="$WF" FORGE_BROKER_BIN="$ORDERBROKER" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" ordered >/dev/null 2>&1 ); rc=$?
+python3 - "$TMLOG" <<'PY' && ok "T-START-BROKER-ORDER" || bad "broker ordering"
+import sys
+lines=open(sys.argv[1]).read().splitlines()
+pos=lambda needle: next(i for i,x in enumerate(lines) if needle in x)
+assert pos("new-session") < pos("display-message") < pos("BROKER start") < pos("split-window")
+PY
+
+TMLOG="$WORK/provfail.log"; : > "$TMLOG"
+( cd "$STARTSRC" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_START_PROVISION_FAIL=1 FORGE_BIN="$WF" HOME="$WORK/h" bash "$START" pf >/dev/null 2>&1 ); rc=$?
+# The contract is "zero tmux STATE", not "zero tmux calls": for an explicit name
+# forge-start probes `has-session` BEFORE provisioning (by design — it is line 1
+# of golden-worktree.log, and it replaces the auto-name loop's probe rather than
+# adding a second HC4 call). A read-only probe creates nothing; assert that no
+# state-creating call was made instead of asserting an empty log.
+[ "$rc" != 0 ] && ! grep -q '^new-session' "$TMLOG" && ok "T-START-PROVISION-FAIL-ATOMIC" || bad "provision failure touched tmux"
+group_ok=1; for erc in 2 4; do
+  EF="$WORK/forge-$erc"; printf '#!/bin/bash\nexit %s\n' "$erc" > "$EF"; chmod +x "$EF"; TMLOG="$WORK/pass-$erc.log"; : > "$TMLOG"
+  ( cd "$STARTSRC" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_BIN="$EF" HOME="$WORK/h" bash "$START" "p$erc" >/dev/null 2>&1 ); rc=$?
+  [ "$rc" = "$erc" ] && ! grep -q '^new-session' "$TMLOG" || group_ok=0
+done
+[ "$group_ok" = 1 ] && ok "T-START-EXIT-PASSTHROUGH" || bad "exit passthrough"
+TMLOG="$WORK/dup.log"; : > "$TMLOG"; out=$(cd "$STARTSRC" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FORGE_BIN="$WORK/never-forge" bash "$START" dupe 2>&1); rc=$?
+[ "$rc" = 2 ] && echo "$out" | grep -q 'attach with' && ! grep -q 'new-session' "$TMLOG" && ok "T-START-DUP-SESSION" || bad "duplicate session"
+
+BF="$WORK/fail-broker"; printf '#!/bin/bash\nexit 1\n' > "$BF"; chmod +x "$BF"
+echo prior > "$WTD/.dev/.forge-session"; TMLOG="$WORK/bfplain.log"; : > "$TMLOG"
+out=$(cd "$WTD" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_PANES=1 FORGE_BROKER_BIN="$BF" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --here broken 2>&1); rc=$?
+[ "$rc" = 3 ] && [ "$(grep -c '^new-session ' "$TMLOG")" = 1 ] && [ "$(grep -c '^kill-session ' "$TMLOG")" = 1 ] && grep -q 'kill-session' "$TMLOG" && ! grep -q 'split-window\|send-keys' "$TMLOG" && [ "$(cat "$WTD/.dev/.forge-session")" = prior ] \
+  && ok "T-START-BROKERFAIL-PLAIN" || bad "plain broker failure"
+TMLOG="$WORK/bfpop.log"; : > "$TMLOG"
+out=$(TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_DISP="$WTD" FORGE_BROKER_BIN="$BF" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --populate-existing popfail 2>&1); rc=$?
+[ "$rc" != 0 ] && ! grep -q 'kill-session\|split-window' "$TMLOG" && echo "$out" | grep -q 'broker start failed' && ! echo "$out" | grep -q 'failed mid-layout' \
+  && ok "T-START-BROKERFAIL-POP" || bad "populate broker failure"
+TMLOG="$WORK/noprov.log"; : > "$TMLOG"
+TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_DISP="$WTD" FORGE_BIN="$WORK/never-forge" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --populate-existing noprov >/dev/null 2>&1
+[ $? = 0 ] && ok "T-START-POPULATE-NO-PROVISION" || bad "populate invoked provisioning"
 
 echo "── T-START-POP-VALIDATE: populate refuses a non-1-pane session ──"
 TMLOG="$WORK/val.log"; : > "$TMLOG"
@@ -83,7 +174,7 @@ echo "── T-START-PLAIN-LAYOUTFAIL: plain layout failure stops broker before 
 D2="$(mktemp -d "${TMPDIR:-/tmp}/fstd.XXXXXX")"; D2="$(cd "$D2" && pwd -P)"
 git -C "$D2" init -q
 TMLOG="$WORK/plainfail.log"; : > "$TMLOG"; : > "$BRKLOG"
-( cd "$D2" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_LAYOUT=bad FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" >/dev/null 2>&1 )
+( cd "$D2" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_LAYOUT=bad FORGE_BRIDGE_BIN="$FB" FORGE_BIN="$WORK/never-forge" HOME="$WORK/h" bash "$START" --here >/dev/null 2>&1 )
 rc=$?
 [ "$rc" -ne 0 ] && ok "plain layout failure exits nonzero" || bad "plain layout failure exited 0"
 sed -n '1p' "$BRKLOG" | grep -q '^start --root ' && ok "broker start recorded before the failure" || bad "broker start missing from log: $(cat "$BRKLOG")"

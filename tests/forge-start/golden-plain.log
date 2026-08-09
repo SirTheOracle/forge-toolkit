@@ -1,5 +1,6 @@
 has-session -t forge-1
 new-session -d -s forge-1 -c __DIR__ -e TMUX_SESSION=forge-1 -e FORGE_ROOT=__DIR__
+display-message -p -t forge-1 #{session_created}
 split-window -v -t forge-1:.0 -c __DIR__ -p 60
 split-window -h -t forge-1:.1 -c __DIR__ -p 50
 split-window -v -t forge-1:.1 -c __DIR__ -p 50
@@ -8,7 +9,6 @@ set -g mouse on
 send-keys -t forge-1:.0 claude --model claude-opus-5 Enter
 send-keys -t forge-1:.1 claude --model claude-opus-5 --permission-mode acceptEdits Enter
 send-keys -t forge-1:.2 claude --model claude-sonnet-5 --permission-mode acceptEdits Enter
-display-message -p -t forge-1 #{session_created}
 send-keys -t forge-1:.3 forge codex-launch --root '__DIR__' --session 'forge-1' --pane 3 --effort xhigh Enter
 send-keys -t forge-1:.4 forge codex-launch --root '__DIR__' --session 'forge-1' --pane 4 --effort medium Enter
 list-panes -t forge-1 -F #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{window_width}

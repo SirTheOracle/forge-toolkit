@@ -17,8 +17,19 @@ A forge project needs:
    service/test/qa sections that workers read for their environment
    preamble. (See the project-config section of `technical-reference.md`
    for the schema.)
-2. **`forge-start`** to create the 5-pane tmux session and write
-   `.dev/.forge-session` with the session name.
+2. **`forge-start`** to provision a session-named sibling Git worktree, seed
+   its root-local Forge assets, create the 5-pane tmux session there, and write
+   `.dev/.forge-session` with the session name. Worktrees are deliberately
+   never auto-removed.
+
+`forge-start --here [name]` is the escape hatch: it starts in the current
+physical Git root and does not provision. Use `forge-start --here` when working
+on `forge-toolkit` itself because the installed `~/bin/forge*` launchers point
+at the primary toolkit checkout. Under `--here`, a subdirectory invocation is
+collapsed to the Git toplevel, so `.dev/.forge-session` is no longer written in
+the subdirectory. Re-run `forge register` at a primary root after the canonical
+hook block changes; provisioning refreshes the worktree copy but intentionally
+does not mutate the primary as a side effect.
 
 ### Starting a pipeline
 
@@ -647,7 +658,8 @@ Fix:
 
 ## Codex containment and rollout
 
-The default is `contain`. New panes use the pinned 0.145.0 interactive binary
+The default is `contain`. New panes use the exact-version-gated interactive
+binary, currently validated through 0.147.0,
 and explicit Never/workspace-write/network-off/empty-extra-roots flags. The
 current file credential store means private `CODEX_HOME`, unattended default,
 and authentication isolation remain **unproven**; do not enable them merely

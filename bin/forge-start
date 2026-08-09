@@ -15,20 +15,33 @@
 #   └──────────────────┴──────────────────┘
 #
 # Usage:
-#   forge-start              — auto-names (forge-1, forge-2, etc.)
-#   forge-start myname       — names session "myname"
+#   forge-start [--here] [--allow-dirty-base] [name]
+#   forge-start --populate-existing <name>
+#
+# Plain starts provision a sibling Git worktree by default. --here (or
+# FORGE_START_WORKTREE=0) keeps the current physical root; use it while working
+# on forge-toolkit itself because the installed launchers point at this checkout.
 # ============================================================
 
 set -e
 
-# One behavior-preserving seam: the bridge binary (default = the real one) so
-# hermetic tests can stub the alias self-test. tmux calls stay bare — the manual
-# path's call sites are byte-identical (proven by the golden identity test).
 BRIDGE_BIN="${FORGE_BRIDGE_BIN:-$HOME/bin/forge-bridge}"
+FORGE_BIN="${FORGE_BIN:-$HOME/bin/forge}"
+FORGE_CODEX_DOCTOR_BIN="${FORGE_CODEX_DOCTOR_BIN:-$HOME/bin/forge}"
+FORGE_START_WORKTREE="${FORGE_START_WORKTREE:-1}"
+FORGE_START_CODEX_PREFLIGHT="${FORGE_START_CODEX_PREFLIGHT:-1}"
 
 DIR="$(pwd)"
 POPULATE=0
+ALLOW_DIRTY=""
 FORGE_LAYOUT_VERSION="${FORGE_LAYOUT_VERSION:-2}"
+
+# Plain-mode flags are shifted before the existing positional-name branch.
+while [ $# -gt 0 ]; do case "$1" in
+    --here) FORGE_START_WORKTREE=0; shift ;;
+    --allow-dirty-base) ALLOW_DIRTY=1; shift ;;
+    *) break ;;
+esac; done
 
 # Test hook (addendum 4): force a mid-layout failure ONLY in populate mode so the
 # error-trap's partial-split contract is exercisable. No-op in manual mode.
@@ -54,11 +67,12 @@ _populate_teardown() {
 # `exit 1` branches (an ERR trap would not fire on those). Reports the partial
 # split, tears down added panes, exits nonzero.
 _POPULATE_OK=0
+_FAIL_REASON="mid-layout"
 _populate_trap() {
     if [ "$_POPULATE_OK" = 1 ]; then return 0; fi
     local now
     now="$(tmux list-panes -t "$SESSION" -F '#{pane_index}' 2>/dev/null | grep -c . || echo '?')"
-    echo "ERROR: forge-start --populate-existing failed mid-layout for '$SESSION' — partial-split state: $now pane(s)." >&2
+    echo "ERROR: forge-start --populate-existing failed: $_FAIL_REASON — partial-split state: $now pane(s)." >&2
     echo "       Session left ALIVE (never killed); tearing down only the panes this run added." >&2
     _populate_teardown
     exit 1
@@ -83,6 +97,44 @@ else
         COUNT=$((COUNT + 1))
     done
     SESSION="forge-$COUNT"
+fi
+
+if [ "$POPULATE" = 0 ]; then
+    # Auto-naming's loop already proved its selected name absent; explicit names
+    # need the same pre-provision check without adding a second HC4 tmux call.
+    if [ -n "${1:-}" ] && tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "forge-start: session '$SESSION' already exists — attach with: tmux attach -t $SESSION" >&2
+        exit 2
+    fi
+    SOURCE_ROOT="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null)" \
+        || { echo "forge-start: physical Git worktree required" >&2; exit 2; }
+    SOURCE_ROOT="$(cd "$SOURCE_ROOT" && pwd -P)"
+    if [ "${FORGE_START_PROVISION_FAIL:-0}" = 1 ]; then
+        echo "forge-start: INJECTED provisioning failure (FORGE_START_PROVISION_FAIL)" >&2
+        exit 4
+    fi
+    if [ "$FORGE_START_WORKTREE" = 1 ]; then
+        DIR="$("$FORGE_BIN" worktree ensure --session "$SESSION" --from "$SOURCE_ROOT" \
+                 ${ALLOW_DIRTY:+--allow-dirty-base} --print-path)" || exit $?
+    else
+        DIR="$SOURCE_ROOT"
+    fi
+fi
+
+# Fail before plain mode creates any tmux state when a Codex upgrade has not
+# passed Forge's exact-version containment gate. Populate mode already owns one
+# pane; its EXIT trap preserves that pane and reports this distinct reason.
+if [ "$FORGE_START_CODEX_PREFLIGHT" = 1 ]; then
+    _codex_ready="$("$FORGE_CODEX_DOCTOR_BIN" codex-doctor "$DIR" 2>&1)" || true
+    if ! printf '%s\n' "$_codex_ready" | grep -qx 'launch_ready=true'; then
+        echo "forge-start: Codex readiness preflight failed before tmux layout; no Codex panes were launched" >&2
+        printf '%s\n' "$_codex_ready" >&2
+        if [ "$POPULATE" = 1 ]; then
+            _FAIL_REASON="Codex readiness preflight failed"
+            exit 1
+        fi
+        exit 3
+    fi
 fi
 
 # Per-pane role stamps (P1d) — ONLY in populate mode; plain mode keeps the
@@ -111,12 +163,20 @@ fi
 # the existing detached 1-pane session (spawn created it with -c <root>); plain
 # mode creates it. Everything from the first split on is identical.
 if [ "$POPULATE" = 0 ]; then
-    # R8: stamp session env BEFORE any pane child launches so every pane inherits
-    # TMUX_SESSION by construction. Defensive under the new model (host detection is
-    # authoritative); a missing stamp degrades to host-derived identity, never a misroute.
+    # Stamp session env before any pane child launches.
     tmux new-session -d -s "$SESSION" -c "$DIR" \
         -e "TMUX_SESSION=$SESSION" -e "FORGE_ROOT=$DIR"
 fi
+PHYSICAL_ROOT="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null)" || { echo "forge-start: physical Git worktree required" >&2; exit 2; }
+PHYSICAL_ROOT="$(cd "$PHYSICAL_ROOT" && pwd -P)"
+INCARNATION="$(tmux display-message -p -t "$SESSION" '#{session_created}')"
+FORGE_BROKER_BIN="${FORGE_BROKER_BIN:-$HOME/bin/forge-broker}"
+"$FORGE_BROKER_BIN" start --root "$PHYSICAL_ROOT" --session "$SESSION" --incarnation "$INCARNATION" --mode "${FORGE_CODEX_ROLLOUT:-contain}" >/dev/null || {
+    echo "forge-start: broker failed to start; tearing down the session just created" >&2
+    if [ "$POPULATE" = 1 ]; then _FAIL_REASON="broker start failed"; exit 1; fi
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    exit 3
+}
 tmux split-window -v -t "$SESSION:.0" -c "$DIR" -p 60; _maybe_fail 1   # 0 = top 40%, 1 = bottom 60%
 tmux split-window -h -t "$SESSION:.1" -c "$DIR" -p 50; _maybe_fail 2   # 1 = bottom-left, 2 = bottom-right
 tmux split-window -v -t "$SESSION:.1" -c "$DIR" -p 50; _maybe_fail 3   # 1 = L-top, 2 = L-bottom, right → 3
@@ -131,13 +191,6 @@ tmux set -g mouse on
 tmux send-keys -t "$SESSION:.0" "${_RP0}claude --model claude-opus-5" Enter
 tmux send-keys -t "$SESSION:.1" "${_RP1}claude --model claude-opus-5 --permission-mode acceptEdits" Enter
 tmux send-keys -t "$SESSION:.2" "${_RP2}claude --model claude-sonnet-5 --permission-mode acceptEdits" Enter
-PHYSICAL_ROOT="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null)" || { echo "forge-start: physical Git worktree required" >&2; exit 2; }
-PHYSICAL_ROOT="$(cd "$PHYSICAL_ROOT" && pwd -P)"
-INCARNATION="$(tmux display-message -p -t "$SESSION" '#{session_created}')"
-FORGE_BROKER_BIN="${FORGE_BROKER_BIN:-$HOME/bin/forge-broker}"
-"$FORGE_BROKER_BIN" start --root "$PHYSICAL_ROOT" --session "$SESSION" --incarnation "$INCARNATION" --mode "${FORGE_CODEX_ROLLOUT:-contain}" >/dev/null || {
-    echo "forge-start: broker failed to start; Codex panes not launched" >&2; exit 3;
-}
 tmux send-keys -t "$SESSION:.3" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 3 --effort xhigh" Enter
 tmux send-keys -t "$SESSION:.4" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 4 --effort medium" Enter
 
@@ -200,6 +253,19 @@ if [ "$POPULATE" = 1 ]; then _POPULATE_OK=1; fi   # populate succeeded — disar
 
 echo ""
 echo "Session '$SESSION' ready."
+if [ -f "$DIR/.dev/forge-worktree.json" ]; then
+    IFS=$'\t' read -r _wt_branch _wt_base _wt_sha _wt_ahead _wt_trust < <(python3 - "$DIR/.dev/forge-worktree.json" <<'PY'
+import json,sys
+with open(sys.argv[1]) as f: d=json.load(f)
+print("\t".join([d.get("source_branch", ""), d.get("base_ref", ""), d.get("base_sha", ""), str(d.get("source_ahead", 0)), d.get("codex_trust", "absent")]))
+PY
+)
+    echo "  Worktree: $DIR"
+    echo "  Branch: $(git -C "$DIR" symbolic-ref --short HEAD 2>/dev/null || echo detached)"
+    echo "  Base: $_wt_base @ ${_wt_sha:0:12}"
+    [ "${_wt_ahead:-0}" -eq 0 ] || echo "  Source ahead: $_wt_ahead commit(s)"
+    echo "  Codex hook trust: $_wt_trust — panes 3/4: run /hooks if prompted"
+fi
 echo ""
 echo "  Pane 0 (top, full width): Claude Opus orchestrator"
 echo "  Pane 1 (middle-left):     Claude Opus worker"

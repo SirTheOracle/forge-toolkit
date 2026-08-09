@@ -10,6 +10,19 @@ project:
 # name as the final argv); it splits panes and launches CLIs but never creates,
 # renames, or kills the session. Default if omitted: forge-start --populate-existing.
 forge:
+  # Optional automatic-worktree policy. Defaults are dirname(source),
+  # basename(source), branch prefix "forge/", automatic base-ref resolution,
+  # and best-effort origin fetch.
+  worktree:
+    parent: "~/sirtheoracle/automation"
+    prefix: "my-project"
+    branch_prefix: "forge/"
+    base_ref: ""
+    fetch: true
+    seed:
+      - { path: "backend/.venv", mode: symlink, required: false }
+      - { path: "frontend/node_modules", mode: symlink, required: false }
+      - { path: "backend/.env", mode: copy, required: false }
   control_center:
     on_spawn: ["forge-start", "--populate-existing"]
 

@@ -1353,6 +1353,22 @@ assert_notified "first launch" "first-launch notifies"
 : > "$CAP"; FORGE_WATCH_RENOTIFY_S=1 run_check >/dev/null; sleep 2; FORGE_WATCH_RENOTIFY_S=1 run_check >/dev/null
 grep -q "first launch" "$CAP" && bad "first-launch re-notified (policy once violated)" || ok "first-launch never re-notifies"
 
+echo "── spawn-state: dirty worktree source is hot and notifies once ──"
+new_env cspawn_dirty
+R=$(mk_root proj); live_session forge-1 "$R"
+spawnf "$R" forge-1 worktree-dirty-source 30 "source tracked paths omitted: README.md"
+DIRTY_EVENT="$(attn "$R")/spawn-forge-1-worktree-dirty-source.json"; cp "$DIRTY_EVENT" "$TDIR/event.before"
+assert_status_has "worktree cut from dirty source" "dirty-source renders"
+run_status --board | python3 -c '
+import json,sys
+b=json.load(sys.stdin); row={r["condition"]:r for r in b["hot"]}["WORKTREE-DIRTY-SOURCE"]
+assert row["state"]=="needs-input" and row["session"]=="forge-1"
+' && ok "dirty-source is hot/needs-input" || bad "dirty-source board mapping"
+run_check >/dev/null; assert_notified "worktree cut from dirty source" "dirty-source notifies"
+: > "$CAP"; FORGE_WATCH_RENOTIFY_S=1 run_check >/dev/null; sleep 2; FORGE_WATCH_RENOTIFY_S=1 run_check >/dev/null
+grep -q "worktree cut from dirty source" "$CAP" && bad "dirty-source re-notified" || ok "dirty-source policy once"
+cmp -s "$DIRTY_EVENT" "$TDIR/event.before" && ok "dirty-source producer record remains read-only" || bad "watcher mutated dirty-source record"
+
 echo "── spawn-state: ancient event is residue; removed file clears (T-WATCH-SPAWN-CLEAR) ──"
 new_env cspawn4
 R=$(mk_root proj); live_session forge-1 "$R"

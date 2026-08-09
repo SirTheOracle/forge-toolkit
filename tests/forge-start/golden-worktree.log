@@ -1,0 +1,21 @@
+has-session -t worktree
+new-session -d -s worktree -c __WT__ -e TMUX_SESSION=worktree -e FORGE_ROOT=__WT__
+display-message -p -t worktree #{session_created}
+split-window -v -t worktree:.0 -c __WT__ -p 60
+split-window -h -t worktree:.1 -c __WT__ -p 50
+split-window -v -t worktree:.1 -c __WT__ -p 50
+split-window -v -t worktree:.3 -c __WT__ -p 50
+set -g mouse on
+send-keys -t worktree:.0 claude --model claude-opus-5 Enter
+send-keys -t worktree:.1 claude --model claude-opus-5 --permission-mode acceptEdits Enter
+send-keys -t worktree:.2 claude --model claude-sonnet-5 --permission-mode acceptEdits Enter
+send-keys -t worktree:.3 forge codex-launch --root '__WT__' --session 'worktree' --pane 3 --effort xhigh Enter
+send-keys -t worktree:.4 forge codex-launch --root '__WT__' --session 'worktree' --pane 4 --effort medium Enter
+list-panes -t worktree -F #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{window_width}
+set-option -p -t worktree:.0 @forge-worker claude
+set-option -p -t worktree:.1 @forge-worker claude-opus
+set-option -p -t worktree:.2 @forge-worker claude-sonnet
+set-option -p -t worktree:.3 @forge-worker codex-a
+set-option -p -t worktree:.4 @forge-worker codex-b
+set-environment -t worktree FORGE_LAYOUT 2
+select-pane -t worktree:.0
