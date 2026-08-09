@@ -6,7 +6,8 @@
     "supported_interactive_versions": [
       "0.145.0",
       "0.146.0",
-      "0.146.1"
+      "0.146.1",
+      "0.147.0"
     ],
     "exec_compatibility": "deferred",
     "private_codex_home_default": false,
@@ -29,7 +30,8 @@
     "supported_codex_versions": [
       "0.145.0",
       "0.146.0",
-      "0.146.1"
+      "0.146.1",
+      "0.147.0"
     ],
     "supported_locales": [
       "en-US"
