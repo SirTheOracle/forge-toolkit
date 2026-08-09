@@ -373,4 +373,14 @@ FORGE_SOURCE_AFTER="$(shasum -a 256 "$FORGE" | awk '{print $1}')"
 [ "$FORGE_SOURCE_BEFORE" = "$FORGE_SOURCE_AFTER" ] \
   && ok "T24 recovery product source hash unchanged during P1-WC compatibility run" \
   || bad "T24 recovery product source hash changed"
+
+echo "── T25: rehome blocks every lifecycle request residue shape ──"
+new_root t25src; SRC="$R"; new_root t25dst; DST="$R"
+LQR="$SRC/.dev/forge-broker/lifecycle/requests"; mkdir -p "$LQR"
+for name in lci-1.intent.json lci-2.intent.json.claimed.123 lci-3.orphan.20260807T000000Z; do
+  rm -f "$LQR"/*; printf '{}\n' > "$LQR/$name"
+  audit_rc=0; audit_out="$("$FORGE" rehome-audit "$SRC" "$DST" 2>&1)" || audit_rc=$?
+  [ "$audit_rc" -eq 3 ] && printf '%s\n' "$audit_out" | grep -q '.dev/forge-broker/lifecycle/requests:inflight' \
+    && ok "T25 rehome blocks $name" || bad "T25 rehome accepted $name: rc=$audit_rc $audit_out"
+done
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]

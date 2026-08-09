@@ -2811,6 +2811,54 @@ WATCH_SOURCE_AFTER="$(shasum -a 256 "$WATCH" | awk '{print $1}')"
   && ok "W19 watcher product source hash unchanged during P1-WC compatibility run" \
   || bad "W19 watcher product source hash changed"
 
+echo "── lifecycle terminalization findings ──"
+new_env lifecycle1; R=$(mk_root proj)
+mkdir -p "$R/.dev/forge-broker/lifecycle/requests" "$R/.dev/forge-broker/lifecycle/responses" "$TDIR/protected/deliveries"
+cat > "$TDIR/broker-paths" <<'SH'
+#!/bin/bash
+printf '{"schema":"forge-broker-paths/1","protected":"%s"}\n' "$FORGE_WATCH_TEST_PROTECTED"
+SH
+chmod +x "$TDIR/broker-paths"
+export FORGE_BROKER_BIN="$TDIR/broker-paths" FORGE_WATCH_TEST_PROTECTED="$TDIR/protected"
+printf '{"delivery_id":"delivery-11111111111111111111111111111111","state":"open","slug":"life","stage":"coding","session":"forge-1"}\n' > "$TDIR/protected/deliveries/delivery-11111111111111111111111111111111.json"
+printf '{"action":"reconcile-delivery","delivery_id":"delivery-11111111111111111111111111111111"}\n' > "$R/.dev/forge-broker/lifecycle/requests/lci-1.intent.json"
+run_check >/dev/null
+assert_status_missing "TERMINALIZE-PENDING" "fresh lifecycle intent is suppressed"
+
+touch -t 202001010000 "$R/.dev/forge-broker/lifecycle/requests/lci-1.intent.json"
+run_check >/dev/null
+assert_status_has "TERMINALIZE-PENDING" "aged lifecycle intent is visible"
+python3 - "$TDIR/protected/deliveries/delivery-11111111111111111111111111111111.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['state']='completed'; json.dump(d,open(p,'w'))
+PY
+run_check >/dev/null
+assert_status_missing "TERMINALIZE-PENDING" "completed protected delivery clears finding"
+# Worker-writable responses have no authority without a matching protected audit.
+printf '{"status":"error","intent_id":"lci-forged","delivery_id":"delivery-11111111111111111111111111111111"}\n' > "$R/.dev/forge-broker/lifecycle/responses/lci-forged.json"
+run_check >/dev/null
+assert_status_missing "TERMINALIZE-REFUSED" "forged refused response has no independent authority"
+python3 - "$TDIR/protected/deliveries/delivery-11111111111111111111111111111111.json" "$TDIR/protected/audit" <<'PY'
+import json,os,sys
+p,a=sys.argv[1:]; d=json.load(open(p)); d['state']='open'; json.dump(d,open(p,'w'))
+os.makedirs(a,exist_ok=True)
+json.dump({'event':'LIFECYCLE_REFUSED','intent_id':'lci-forged',
+           'delivery_id':d['delivery_id'],'code':'LIFECYCLE_PENDING_OPEN'},open(a+'/refused.json','w'))
+PY
+run_check >/dev/null
+assert_status_has "TERMINALIZE-REFUSED" "host-audited refusal on an open delivery is visible"
+
+# N-3: the finding is derived from the protected audit, so a pane cannot
+# suppress it by deleting or rewriting its own worker-writable response. This is
+# the discriminating case: with the old response-driven scan the finding
+# disappears here, because there is no response file left to iterate.
+rm -f "$R/.dev/forge-broker/lifecycle/responses/lci-forged.json"
+run_check >/dev/null
+assert_status_has "TERMINALIZE-REFUSED" "deleting the response cannot suppress an audited refusal"
+printf '{"status":"ok","intent_id":"lci-forged","delivery_id":"delivery-11111111111111111111111111111111"}\n' > "$R/.dev/forge-broker/lifecycle/responses/lci-forged.json"
+run_check >/dev/null
+assert_status_has "TERMINALIZE-REFUSED" "rewriting the response to ok cannot suppress it either"
+
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"
 [ "$FAIL" -gt 0 ] && red "FAIL: $FAIL" || green "FAIL: 0"

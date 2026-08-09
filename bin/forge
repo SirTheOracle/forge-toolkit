@@ -2765,14 +2765,34 @@ cmd_codex_launch() {
 
 cmd_codex_broker() {
     local action="${1:-}" root="$PWD"
-    [ -n "$action" ] || die "codex-broker requires status or stop"
+    [ -n "$action" ] || die "codex-broker requires status, stop, or reap"
     shift || true
+    local pane="" force=0
     while [ $# -gt 0 ]; do case "$1" in
         --root) root="$2"; shift 2 ;;
+        --pane) pane="$2"; shift 2 ;;
+        --force) force=1; shift ;;
         *) die "codex-broker: unknown flag $1" ;;
     esac; done
-    case "$action" in status|stop) ;; *) die "codex-broker requires status or stop" ;; esac
+    case "$action" in status|stop|reap) ;; *) die "codex-broker requires status, stop, or reap" ;; esac
     root="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" || die "codex-broker: not a worktree"
+    if [ "$action" = reap ]; then
+        [ -n "${pane:-}" ] || die "codex-broker reap requires --pane <n>"
+        local session
+        session="${TMUX_SESSION:-$(tmux display-message -p '#S' 2>/dev/null)}"
+        # N-7: reap defaults to expired-only. --force cancels a live stage and
+        # is recorded as forced in the protected audit.
+        python3 - "$session" "$pane" "$force" <<'PY' | "$(_toolkit_root)/bin/forge-broker" control --root "$root"
+import json,sys
+request={'action':'reap-delivery','session':sys.argv[1],'pane':sys.argv[2],
+         'operator_command':'forge codex-broker reap'}
+if sys.argv[3]=='1':
+    request['force']=True
+    request['operator_command']='forge codex-broker reap --force'
+print(json.dumps(request,separators=(',',':')))
+PY
+        return
+    fi
     exec "$(_toolkit_root)/bin/forge-broker" "$action" --root "$root"
 }
 
@@ -2793,6 +2813,11 @@ for name,root in [('source',sys.argv[1]),('destination',sys.argv[2])]:
 for r in rows.values():
  for p in ('.dev/forge-broker/requests','.dev/forge-tmp/callbacks'):
   if os.path.isdir(os.path.join(r['physical_code_root'],p)) and os.listdir(os.path.join(r['physical_code_root'],p)): reasons.append(p+':inflight')
+ lifecycle=os.path.join(r['physical_code_root'],'.dev/forge-broker/lifecycle/requests')
+ if os.path.isdir(lifecycle):
+  names=os.listdir(lifecycle)
+  if any(n.endswith('.intent.json') or '.claimed.' in n or '.orphan.' in n for n in names):
+   reasons.append('.dev/forge-broker/lifecycle/requests:inflight')
 print(json.dumps({'schema':'forge-rehome-audit/1','safe':not reasons,'reasons':sorted(set(reasons)),'roots':rows},sort_keys=True))
 raise SystemExit(0 if not reasons else 3)
 PY

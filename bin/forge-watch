@@ -119,6 +119,7 @@ fw_notify() {
 # Human-readable findings go to stdout. When notify_out is a file, one
 # "title<TAB>body" line per notification-to-deliver is appended to it.
 run_engine() {
+    FORGE_BROKER_BIN="${FORGE_BROKER_BIN:-$(dirname "$SELF")/forge-broker}" \
     python3 - "$1" "$2" "${3:-}" <<'PYEOF'
 import sys, os, re, glob, json, time, fcntl, datetime, subprocess
 
@@ -156,7 +157,7 @@ ALLOWED_KEYS = {
     'FORGE_WATCH_EPISODE_SETTLE_S', 'FORGE_WATCH_NOTIFY_EPISODE_DONE',
     'FORGE_WATCH_TASK_WINDOW_S',
     'FORGE_WATCH_TASK_STUCK_S', 'FORGE_WATCH_CHECK_TIMEOUT_S',
-    'FORGE_WATCH_QUIET_UNCHANGED',
+    'FORGE_WATCH_QUIET_UNCHANGED', 'FORGE_TERMINALIZE_PENDING_S',
     # active-context-management (S8/S11). All three are ALERTING/DISPLAY knobs; none can move
     # a hygiene decision — the gate threshold lives in the bridge and is not readable here by
     # design. Unknown keys are warned-and-ignored, so watch.env would reject them otherwise.
@@ -726,6 +727,58 @@ def scan_root(root):
     dev = os.path.join(root, '.dev')
     tmp = os.path.join(dev, 'forge-tmp')
     label = root_label(root)
+
+    lifecycle_base = os.path.join(dev, 'forge-broker', 'lifecycle')
+    pending_s = cfg_int('FORGE_TERMINALIZE_PENDING_S', 60)
+    broker = os.environ['FORGE_BROKER_BIN']
+    protected = ''
+    try:
+        path_result = subprocess.run([broker, 'paths', '--root', root, '--json'], text=True,
+                                     capture_output=True, timeout=3)
+        if path_result.returncode == 0:
+            protected = str(json.loads(path_result.stdout).get('protected') or '')
+    except Exception:
+        protected = ''
+    for intent_path in glob.glob(os.path.join(lifecycle_base, 'requests', '*.intent.json')):
+        try:
+            intent = json.load(open(intent_path))
+            delivery_id = str(intent.get('delivery_id') or '')
+            delivery = json.load(open(os.path.join(protected, 'deliveries', delivery_id + '.json')))
+            if delivery.get('state') != 'open':
+                continue
+            age = max(0, int(time.time() - os.path.getmtime(intent_path)))
+            if age >= pending_s:
+                add_finding('TERMINALIZE-PENDING', root, delivery_id,
+                            f'{label} · {delivery.get("slug") or "unknown"} — terminalization pending',
+                            slug=delivery.get('slug'), stage=delivery.get('stage'), session=delivery.get('session'))
+        except Exception:
+            continue
+    # N-3: this scan used to iterate RESPONSE files and require
+    # response.status != 'ok' before emitting. Responses are worker-writable, so
+    # a pane could suppress a real host-recorded refusal just by deleting or
+    # rewriting its own response while its delivery stayed open and unreconciled.
+    # Drive the scan from protected LIFECYCLE_REFUSED audits joined to protected
+    # open deliveries; response files are display metadata, never a precondition.
+    seen_refusals = set()
+    for audit_path in glob.glob(os.path.join(protected, 'audit', '*.json')):
+        try:
+            row = json.load(open(audit_path))
+            if row.get('event') != 'LIFECYCLE_REFUSED':
+                continue
+            delivery_id = str(row.get('delivery_id') or '')
+            intent_id = str(row.get('intent_id') or '')
+            if (intent_id, delivery_id) in seen_refusals:
+                continue
+            delivery = json.load(open(os.path.join(protected, 'deliveries', delivery_id + '.json')))
+            if delivery.get('state') != 'open':
+                continue
+            seen_refusals.add((intent_id, delivery_id))
+            add_finding('TERMINALIZE-REFUSED', root, intent_id or delivery_id,
+                        f'{label} · {delivery.get("slug") or "unknown"} — lifecycle terminalization refused',
+                        policy='never', slug=delivery.get('slug'), stage=delivery.get('stage'),
+                        session=delivery.get('session'))
+        except Exception:
+            continue
 
     # --- pipeline logs: open + stale pendings, indexed by slug ---
     open_by_slug = {}     # slug -> [pending,...]

@@ -443,6 +443,9 @@ def control_call(protected: Path, request: dict) -> dict:
             if not chunk:
                 break
             data += chunk
+        if (os.environ.get("FORGE_BROKER_TEST_ENABLE") == "1"
+                and os.environ.get("FORGE_BROKER_TEST_REPLY_TRUNCATE") == "1"):
+            data = b'{"partial'
         try:
             value = json.loads(data)
         except ValueError as exc:
@@ -839,7 +842,7 @@ def handle_control(root: Path, git_dir: Path, common: Path, root_id: str,
     if action == "attest-launch":
         return inspect_live_codex(root, protected, request)
     if action == "reap-delivery":
-        supplied = set(request) - {"action", "session", "pane", "operator_command"}
+        supplied = set(request) - {"action", "session", "pane", "operator_command", "force"}
         if supplied:
             raise Refusal("CONTROL_FIELDS_DENIED", ",".join(sorted(supplied)))
         session, pane = str(request.get("session", "")), str(request.get("pane", ""))
@@ -851,9 +854,20 @@ def handle_control(root: Path, git_dir: Path, common: Path, root_id: str,
             raise Refusal("DELIVERY_CLOSED", delivery_id)
         opened = dt.datetime.strptime(delivery["opened_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
         age_s = max(0, int((dt.datetime.now(dt.timezone.utc) - opened).total_seconds()))
+        # N-7: reap used to require only state == "open", so a mistyped pane
+        # cancelled a healthy running stage instantly and irreversibly. Cancelling
+        # live work is a separate, louder operation than clearing an abandoned
+        # one: expiry is the default precondition, and early cancellation must be
+        # asked for explicitly and is recorded as such in the audit.
+        expires = dt.datetime.strptime(delivery["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        expired = dt.datetime.now(dt.timezone.utc) >= expires
+        forced = request.get("force") is True
+        if not expired and not forced:
+            raise Refusal("DELIVERY_NOT_EXPIRED", f"{delivery_id} expires_at={delivery['expires_at']}")
         result = transition_delivery(root, protected, delivery, "cancelled")
         atomic_json(protected / "audit" / f"{utc().replace(':', '')}-{uuid.uuid4().hex}.json",
                     {"event": "DELIVERY_REAPED", "delivery_id": delivery_id, "age_seconds": age_s,
+                     "expired": expired, "forced": forced,
                      "operator_command": str(request.get("operator_command", "forge codex-broker reap")),
                      "at": utc()})
         return result
@@ -1164,6 +1178,14 @@ def sweep_terminal_callbacks(root: Path, git_dir: Path, common: Path, root_id: s
 
 
 def lifecycle_pass(root: Path, git_dir: Path, common: Path, root_id: str, protected: Path) -> None:
+    # Test hook: keep the daemon fully alive — pid live, lifecycle_queue
+    # advertised — but stop servicing the queue. Reaching CONTROL_QUEUED any
+    # other way is impossible: broker_pid_live() is a PRECONDITION of the
+    # fallback, so simply stopping the daemon short-circuits to exit 4 and can
+    # never produce exit 5.
+    if (os.environ.get("FORGE_BROKER_TEST_ENABLE") == "1"
+            and os.environ.get("FORGE_BROKER_TEST_QUEUE_PAUSE") == "1"):
+        return
     request_fd = queue_directory(root, LIFECYCLE_REQUESTS_AT)
     try:
         response_fd = queue_directory(root, LIFECYCLE_RESPONSES_AT)
