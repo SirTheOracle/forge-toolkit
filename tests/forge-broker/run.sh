@@ -194,4 +194,82 @@ FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$WR" --session forge-linked --inca
 git -C "$WR" diff --cached --quiet
 grep -q '"state":"restored"' "$WG/forge/broker-v1/transactions/op-crash001/journal.json"
 FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$WR" >/dev/null
+
+# Lifecycle queue tests are load-bearing: this is structural non-effect authority,
+# not pane authentication. The worker-writable callback can only support accidental-
+# divergence checks; dangerous actions must remain absent from the handler itself.
+LQ="$R/.dev/forge-broker/lifecycle"; mkdir -p "$LQ/requests" "$LQ/responses"
+FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$R" --session life --incarnation 1 --mode contain >/dev/null
+FORGE_BROKER_TEST_ENABLE=1 "$B" status --root "$R" --json | grep -q '"lifecycle_queue": 1'
+lq_head_before="$(git -C "$R" rev-parse HEAD)"
+for action in submit-operation register-delivery attest-launch stop-broker query-result; do
+  id="lci-$(printf '%032d' ${#action})"
+  printf '{"schema":"forge-lifecycle-intent/1","intent_id":"%s","action":"%s","emitted_at":"2026-08-07T00:00:00Z"}\n' "$id" "$action" > "$LQ/requests/$id.intent.json"
+  for _ in $(seq 1 100); do [ -f "$LQ/responses/$id.json" ] && break; sleep 0.05; done
+  grep -q LIFECYCLE_ACTION_DENIED "$LQ/responses/$id.json"
+done
+test "$lq_head_before" = "$(git -C "$R" rev-parse HEAD)"
+rm -f "$LQ/requests"/* "$LQ/responses"/*
+fault_rc=0
+printf '{"action":"active-delivery","session":"none","pane":"3"}\n' | FORGE_LIFECYCLE_TIMEOUT_S=0.1 FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R" >/dev/null 2>&1 || fault_rc=$?
+[ "$fault_rc" -eq 3 ] || [ "$fault_rc" -eq 5 ]
+[ -n "$(find "$LQ/requests" -name '*.intent.json' -print -quit)$(find "$LQ/responses" -name '*.json' -print -quit)" ]
+rm -f "$LQ/requests"/* "$LQ/responses"/*
+fault_rc=0
+printf '{"action":"active-delivery","session":"none","pane":"3"}\n' | FORGE_BROKER_TEST_CONNECT_FAULT=ECONNREFUSED FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R" >/dev/null 2>&1 || fault_rc=$?
+[ "$fault_rc" -eq 4 ] && [ -z "$(find "$LQ/requests" -name '*.intent.json' -print -quit)" ]
+# Post-connect ambiguity is CONTROL_UNREACHABLE and never replays into the queue.
+rm -f "$LQ/requests"/* "$LQ/responses"/*
+fault_rc=0
+printf '{"action":"active-delivery","session":"none","pane":"3"}\n' | FORGE_BROKER_TEST_POST_CONNECT_FAULT=1 FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R" >/dev/null 2>&1 || fault_rc=$?
+[ "$fault_rc" -eq 4 ] && [ -z "$(find "$LQ/requests" -name '*.intent.json' -print -quit)" ]
+# Capability skew does not queue against an old daemon.
+cp "$P/pid.json" "$W/pid-capability.json"
+python3 - "$P/pid.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d.pop('lifecycle_queue',None); json.dump(d,open(p,'w'))
+PY
+fault_rc=0
+printf '{"action":"active-delivery","session":"none","pane":"3"}\n' | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R" >/dev/null 2>&1 || fault_rc=$?
+[ "$fault_rc" -eq 4 ] && [ -z "$(find "$LQ/requests" -name '*.intent.json' -print -quit)" ]
+mv "$W/pid-capability.json" "$P/pid.json"
+# Strict happy path, mismatch, expired host repair, and evidence-free operator reap.
+mkdir -p "$P/active" "$R/.dev/proposals/lifecycle" "$R/.dev/forge-tmp/callbacks"
+mk_delivery(){
+  python3 - "$P" "$R" "$RID" "$1" "$2" "$3" <<'PY'
+import datetime,json,os,sys
+p,root,rid,did,expiry,pane=sys.argv[1:]; root=os.path.realpath(root)
+d={'schema':'forge-delivery/1','state':'open','delivery_id':did,'slug':'lifecycle','stage':'adhoc',
+   'worker':'codex-a','session':'life','session_incarnation':'1','pane_index':int(pane),
+   'physical_code_root':root,'root_identity':rid,'capability_class':'workspace',
+   'opened_at':'2026-08-07T00:00:00Z','expires_at':expiry}
+json.dump(d,open(p+'/deliveries/'+did+'.json','w'))
+json.dump(d,open(p+'/active/life.p'+pane+'.json','w'))
+PY
+}
+future="$(python3 -c 'import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+past="2020-01-01T00:00:00Z"
+printf 'entries:\n  - timestamp: "2026-08-07T00:00:00Z"\n    stage: adhoc\n    response: "FORGE_DONE: adhoc"\n' > "$R/.dev/proposals/lifecycle/forge-log.yml"
+D2=delivery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; mk_delivery "$D2" "$future" 3
+CB="$(cd "$R/.dev/forge-tmp/callbacks" && pwd -P)/lifecycle-adhoc.life.1.callback"
+printf 'slug: lifecycle\nstage: adhoc\nstatus: DONE\nworker: codex-a\nsession: life\nincarnation: 1\ndelivery_id: %s\nselected_pending_timestamp: "2026-08-07T00:00:00Z"\n' "$D2" > "$CB"
+SHA="$(shasum -a 256 "$CB" | awk '{print $1}')"
+python3 - "$D2" "$CB" "$SHA" <<'PY' | FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R" | grep -q '"state": "completed"'
+import json,sys
+print(json.dumps({'action':'reconcile-delivery','delivery_id':sys.argv[1],'terminal':'completed',
+                  'callback_path':sys.argv[2],'callback_sha256':sys.argv[3]}))
+PY
+D3=delivery-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; mk_delivery "$D3" "$past" 4
+sed "s/$D2/$D3/" "$CB" > "$CB.tmp"; mv "$CB.tmp" "$CB"; SHA="$(shasum -a 256 "$CB" | awk '{print $1}')"
+python3 - "$D3" "$CB" "$SHA" <<'PY' | FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R" --json | grep -q '"state": "completed"'
+import json,sys
+print(json.dumps({'action':'reconcile-delivery','delivery_id':sys.argv[1],'terminal':'completed',
+                  'callback_path':sys.argv[2],'callback_sha256':sys.argv[3],'allow_expired':True}))
+PY
+D4=delivery-cccccccccccccccccccccccccccccccc; mk_delivery "$D4" "$past" 5
+printf '{"action":"reap-delivery","session":"life","pane":"5","operator_command":"forge codex-broker reap"}\n' | FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R" | grep -q '"state": "cancelled"'
+grep -R -q DELIVERY_REAPED "$P/audit"
+
+FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$R" >/dev/null
+
 echo "broker tests: PASS"

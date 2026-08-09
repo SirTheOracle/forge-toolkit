@@ -402,35 +402,62 @@ def control_call(protected: Path, request: dict) -> dict:
     token = (protected / "control.token").read_text(encoding="ascii").strip()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(180 if request.get("action") == "submit-operation" else 3)
-    sock.connect((host, port))
-    hello_raw = b""
-    while not hello_raw.endswith(b"\n"):
-        chunk = sock.recv(65536)
-        if not chunk:
-            break
-        hello_raw += chunk
     try:
-        hello = json.loads(hello_raw)
-        nonce = bytes.fromhex(str(hello["nonce"]))
-        proof = str(hello["server_proof"])
-    except (ValueError, KeyError, TypeError) as exc:
+        fault = os.environ.get("FORGE_BROKER_TEST_CONNECT_FAULT") if os.environ.get("FORGE_BROKER_TEST_ENABLE") == "1" else ""
+        if fault == "EPERM":
+            raise PermissionError(errno.EPERM, "injected connect denial")
+        if fault == "ECONNREFUSED":
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "injected refused connect")
+        sock.connect((host, port))
+    except OSError as exc:
         sock.close()
-        raise Refusal("CONTROL_HANDSHAKE_INVALID", str(exc)) from exc
-    expected = hmac.new(token.encode("ascii"), b"forge-server\0" + nonce, hashlib.sha256).hexdigest()
-    if not secrets.compare_digest(proof, expected):
+        denied = isinstance(exc, PermissionError) or getattr(exc, "errno", None) in {errno.EPERM, errno.EACCES}
+        if (denied and request.get("action") in LIFECYCLE_ACTIONS
+                and broker_pid_live(info) and info.get("lifecycle_queue") == 1):
+            return lifecycle_call(Path(info["physical_code_root"]), request)
+        raise Refusal("CONTROL_UNREACHABLE", f"{host}:{port}: {exc}") from exc
+    try:
+        hello_raw = b""
+        while not hello_raw.endswith(b"\n"):
+            if os.environ.get("FORGE_BROKER_TEST_POST_CONNECT_FAULT") == "1" and os.environ.get("FORGE_BROKER_TEST_ENABLE") == "1":
+                raise OSError(errno.ECONNRESET, "injected post-connect fault")
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            hello_raw += chunk
+        try:
+            hello = json.loads(hello_raw)
+            nonce = bytes.fromhex(str(hello["nonce"]))
+            proof = str(hello["server_proof"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise Refusal("CONTROL_HANDSHAKE_INVALID", str(exc)) from exc
+        expected = hmac.new(token.encode("ascii"), b"forge-server\0" + nonce, hashlib.sha256).hexdigest()
+        if not secrets.compare_digest(proof, expected):
+            raise Refusal("CONTROL_SERVER_UNAUTHENTICATED", host)
+        request = dict(request)
+        request["control_token"] = token
+        sock.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        try:
+            value = json.loads(data)
+        except ValueError as exc:
+            # N-8: only OSError was converted here, so a broker that closed
+            # after acting but before emitting a complete JSON line let this
+            # json.loads() raise ValueError — a raw traceback and exit 1 instead
+            # of the promised branchable refusal. Empty, truncated and malformed
+            # final replies are one ambiguous post-connect outcome. This never
+            # replays into the queue: the fallback lives in the connect-phase
+            # handler, which this path has already passed.
+            raise Refusal("CONTROL_REPLY_INVALID", f"{host}:{port}: {len(data)} bytes") from exc
+    except OSError as exc:
+        raise Refusal("CONTROL_UNREACHABLE", f"{host}:{port}: {exc}") from exc
+    finally:
         sock.close()
-        raise Refusal("CONTROL_SERVER_UNAUTHENTICATED", host)
-    request = dict(request)
-    request["control_token"] = token
-    sock.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
-    data = b""
-    while not data.endswith(b"\n"):
-        chunk = sock.recv(65536)
-        if not chunk:
-            break
-        data += chunk
-    sock.close()
-    value = json.loads(data)
     if value.get("status") != "ok":
         raise Refusal(value.get("code", "CONTROL_REFUSED"), value.get("detail", "control refused"))
     return value
@@ -594,6 +621,193 @@ def register_delivery(root: Path, git_dir: Path, common: Path, root_id: str,
     return delivery
 
 
+LIFECYCLE_SCHEMA = "forge-lifecycle-intent/1"
+LIFECYCLE_ACTIONS = frozenset({"active-delivery", "delivery-result", "reconcile-delivery"})
+LIFECYCLE_TIMEOUT = float(os.environ.get("FORGE_LIFECYCLE_TIMEOUT_S", "20"))
+LIFECYCLE_MAX_BYTES = 65536
+
+
+def delivery_results(protected: Path, delivery_id: str) -> dict:
+    if not re.fullmatch(r"delivery-[0-9a-f]{32}", delivery_id):
+        raise Refusal("DELIVERY_ID_INVALID", delivery_id)
+    rows = [load_json(p) for p in (protected / "results").glob("*.json")]
+    rows = [row for row in rows if row.get("delivery_id") == delivery_id]
+    if not rows:
+        raise Refusal("DELIVERY_RESULT_CARDINALITY", "0")
+    return {"schema": "forge-delivery-results/1", "delivery_id": delivery_id,
+            "status": "ok" if all(row.get("status") == "ok" for row in rows) else "error",
+            "operation_count": len(rows),
+            "operation_ids": sorted(str(row.get("operation_id", "")) for row in rows)}
+
+
+def callback_directory(root: Path) -> tuple[Path, int]:
+    base = root / ".dev" / "forge-tmp" / "callbacks"
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in (".dev", "forge-tmp", "callbacks"):
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return base, fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def callback_bytes(root: Path, raw_path: object) -> tuple[Path, bytes]:
+    if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path or "\\" in raw_path:
+        raise Refusal("LIFECYCLE_ARTIFACT_INVALID", repr(raw_path))
+    path = Path(raw_path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise Refusal("LIFECYCLE_ARTIFACT_INVALID", raw_path)
+    base, base_fd = callback_directory(root)
+    if path.parent != base or path.name in {"", ".", ".."}:
+        os.close(base_fd)
+        raise Refusal("LIFECYCLE_ARTIFACT_INVALID", raw_path)
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=base_fd)
+    except OSError as exc:
+        os.close(base_fd)
+        raise Refusal("LIFECYCLE_ARTIFACT_INVALID", raw_path) from exc
+    try:
+        meta = os.fstat(fd)
+        if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_size > LIFECYCLE_MAX_BYTES:
+            raise Refusal("LIFECYCLE_ARTIFACT_INVALID", raw_path)
+        data = os.read(fd, LIFECYCLE_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+        os.close(base_fd)
+    if len(data) > LIFECYCLE_MAX_BYTES:
+        raise Refusal("LIFECYCLE_ARTIFACT_INVALID", raw_path)
+    return path, data
+
+
+def callback_headers(data: bytes) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for line in data.decode("utf-8").splitlines():
+        match = re.match(r"^([a-z_]+): ?(.*)$", line)
+        if match:
+            key, value = match.groups()
+            if key in headers:
+                raise Refusal("LIFECYCLE_ARTIFACT_INCONSISTENT", f"duplicate:{key}")
+            headers[key] = value.strip().strip('"')
+    return headers
+
+
+def pending_is_closed(root: Path, slug: str, stage: str, selected: str) -> bool:
+    log = root / ".dev" / "proposals" / slug / "forge-log.yml"
+    text = log.read_text(encoding="utf-8")
+    blocks = re.split(r"(?m)^  - timestamp: ", text)[1:]
+    matches = [block for block in blocks if block.splitlines()[0].strip().strip('"') == selected
+               and re.search(rf"(?m)^    stage: {re.escape(stage)}$", block)]
+    if len(matches) != 1:
+        return False
+    response = re.search(r"(?m)^    response:\s*(.*)$", matches[0])
+    return bool(response and response.group(1).strip() not in {"", "null", "~"})
+
+
+def transition_delivery(root: Path, protected: Path, delivery: dict, terminal: str) -> dict:
+    # Idempotent by construction. Replay re-runs this to repair a partial
+    # transition (N-2), so the original terminal_at must survive a second pass.
+    delivery_id = str(delivery["delivery_id"])
+    delivery.update(state=terminal)
+    delivery.setdefault("terminal_at", utc())
+    atomic_json(protected / "deliveries" / f"{delivery_id}.json", delivery)
+    active = protected / "active" / f"{delivery['session']}.p{delivery['pane_index']}.json"
+    if active.exists() and load_json(active).get("delivery_id") == delivery_id:
+        active.unlink()
+    public = root / ".dev" / "forge-broker" / "envelopes" / f"{delivery_id}.json"
+    if public.exists():
+        atomic_json(public, delivery)
+    return delivery
+
+
+def reconcile_delivery(root: Path, git_dir: Path, common: Path, root_id: str,
+                       protected: Path, request: dict, *, allow_expired: bool,
+                       caller: str) -> dict:
+    # Strict worker-evidenced reconciliation is deliberately asymmetric with the
+    # permissive operator/cancellation terminalizer. Do not unify these paths.
+    allowed = {"action", "delivery_id", "terminal", "callback_path", "callback_sha256"}
+    if caller == "host":
+        allowed.add("allow_expired")
+    elif caller == "lifecycle":
+        allowed |= {"schema", "intent_id", "emitted_at"}
+    elif caller != "startup":
+        raise Refusal("LIFECYCLE_CALLER_INVALID", caller)
+    denied = set(request) - allowed
+    if denied:
+        raise Refusal("LIFECYCLE_FIELDS_DENIED", ",".join(sorted(denied)))
+    if caller == "lifecycle":
+        if request.get("schema") != LIFECYCLE_SCHEMA:
+            raise Refusal("SCHEMA_MISMATCH", str(request.get("schema")))
+        if not re.fullmatch(r"lci-[0-9a-f]{32}", str(request.get("intent_id", ""))):
+            raise Refusal("LIFECYCLE_INTENT_ID_INVALID", str(request.get("intent_id", "")))
+    delivery_id = str(request.get("delivery_id", ""))
+    terminal = str(request.get("terminal", ""))
+    if not re.fullmatch(r"delivery-[0-9a-f]{32}", delivery_id):
+        raise Refusal("DELIVERY_ID_INVALID", delivery_id)
+    if terminal not in {"completed", "failed"}:
+        raise Refusal("TERMINAL_STATE_INVALID", terminal)
+    delivery = load_json(protected / "deliveries" / f"{delivery_id}.json")
+    if delivery.get("state") == terminal:
+        # N-2: the transition writes the terminal record, THEN removes active/,
+        # THEN refreshes the envelope. A crash between the first two leaves the
+        # delivery terminal with its active record still open. Returning early
+        # here would report replay success on every retry without ever repairing
+        # it, and registration would refuse DELIVERY_ALREADY_ACTIVE forever —
+        # recreating the exact wedge this change exists to heal. So replay
+        # re-asserts every postcondition instead of trusting the state field.
+        return {**transition_delivery(root, protected, delivery, terminal),
+                "replayed": True}
+    if delivery.get("state") != "open":
+        raise Refusal("DELIVERY_CLOSED", delivery_id)
+    expires = dt.datetime.strptime(delivery["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    expired = dt.datetime.now(dt.timezone.utc) >= expires
+    if expired and not allow_expired:
+        raise Refusal("DELIVERY_EXPIRED", delivery_id)
+    if delivery.get("physical_code_root") != str(root) or delivery.get("root_identity") != root_id:
+        raise Refusal("LIFECYCLE_ROOT_MISMATCH", delivery_id)
+    active = protected / "active" / f"{delivery['session']}.p{delivery['pane_index']}.json"
+    if not active.exists() or load_json(active).get("delivery_id") != delivery_id:
+        raise Refusal("LIFECYCLE_NOT_ACTIVE_OWNER", delivery_id)
+    callback_path, data = callback_bytes(root, request.get("callback_path"))
+    digest = str(request.get("callback_sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", digest) or not secrets.compare_digest(sha(data), digest):
+        raise Refusal("LIFECYCLE_ARTIFACT_MISMATCH", str(callback_path))
+    headers = callback_headers(data)
+    expected = {"slug": str(delivery.get("slug", "")), "stage": str(delivery.get("stage", "")),
+                "worker": str(delivery.get("worker", "")), "session": str(delivery.get("session", "")),
+                "incarnation": str(delivery.get("session_incarnation", "")), "delivery_id": delivery_id}
+    if any(headers.get(key) != value for key, value in expected.items()):
+        raise Refusal("LIFECYCLE_ARTIFACT_INCONSISTENT", delivery_id)
+    if {"DONE": "completed", "ERROR": "failed"}.get(headers.get("status")) != terminal:
+        raise Refusal("LIFECYCLE_ARTIFACT_INCONSISTENT", "status")
+    if not pending_is_closed(root, expected["slug"], expected["stage"],
+                             headers.get("selected_pending_timestamp", "")):
+        raise Refusal("LIFECYCLE_PENDING_OPEN", delivery_id)
+    if terminal == "completed" and delivery.get("capability_class") in {"commit", "publish-pr-review"}:
+        try:
+            results_ok = delivery_results(protected, delivery_id).get("status") == "ok"
+        except Refusal as exc:
+            # delivery_results() raises DELIVERY_RESULT_CARDINALITY on zero rows
+            # BEFORE computing any status, so the no-result case would otherwise
+            # never reach the check below and the plan's named code would be
+            # unreachable for the very case it was named for. For this gate
+            # "no protected result" and "not an ok result" are the same refusal.
+            # Surface one code for one gate; let every other refusal propagate.
+            if exc.code != "DELIVERY_RESULT_CARDINALITY":
+                raise
+            results_ok = False
+        if not results_ok:
+            raise Refusal("LIFECYCLE_DELIVERY_RESULT_NOT_OK", delivery_id)
+    result = transition_delivery(root, protected, delivery, terminal)
+    audit_name = "RECONCILED_EXPIRED" if expired else "RECONCILED"
+    atomic_json(protected / "audit" / f"{utc().replace(':', '')}-{uuid.uuid4().hex}.json",
+                {"event": audit_name, "delivery_id": delivery_id, "caller": caller,
+                 "allow_expired": allow_expired, "callback_sha256": digest, "at": utc()})
+    return result
+
+
 def handle_control(root: Path, git_dir: Path, common: Path, root_id: str,
                    protected: Path, request: dict, mode: str, token: str) -> dict:
     global STOP
@@ -624,36 +838,47 @@ def handle_control(root: Path, git_dir: Path, common: Path, root_id: str,
         return register_delivery(root, git_dir, common, root_id, protected, request, mode)
     if action == "attest-launch":
         return inspect_live_codex(root, protected, request)
+    if action == "reap-delivery":
+        supplied = set(request) - {"action", "session", "pane", "operator_command"}
+        if supplied:
+            raise Refusal("CONTROL_FIELDS_DENIED", ",".join(sorted(supplied)))
+        session, pane = str(request.get("session", "")), str(request.get("pane", ""))
+        active_path = protected / "active" / f"{session}.p{pane}.json"
+        active_record = load_json(active_path)
+        delivery_id = str(active_record.get("delivery_id", ""))
+        delivery = load_json(protected / "deliveries" / f"{delivery_id}.json")
+        if delivery.get("state") != "open":
+            raise Refusal("DELIVERY_CLOSED", delivery_id)
+        opened = dt.datetime.strptime(delivery["opened_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        age_s = max(0, int((dt.datetime.now(dt.timezone.utc) - opened).total_seconds()))
+        result = transition_delivery(root, protected, delivery, "cancelled")
+        atomic_json(protected / "audit" / f"{utc().replace(':', '')}-{uuid.uuid4().hex}.json",
+                    {"event": "DELIVERY_REAPED", "delivery_id": delivery_id, "age_seconds": age_s,
+                     "operator_command": str(request.get("operator_command", "forge codex-broker reap")),
+                     "at": utc()})
+        return result
     if action == "terminalize-delivery":
+        # Permissive by design for operator reap, supersede, and cancellation.
+        # Do not unify with strict worker-evidenced reconcile-delivery.
         delivery_id = str(request.get("delivery_id", "")); terminal = str(request.get("terminal", ""))
         if terminal not in {"completed", "failed", "cancelled", "superseded"}:
             raise Refusal("TERMINAL_STATE_INVALID", terminal)
-        path = protected / "deliveries" / f"{delivery_id}.json"; d = active_delivery(protected, delivery_id)
-        d.update(state=terminal, terminal_at=utc()); atomic_json(path, d)
-        active = protected / "active" / f"{d['session']}.p{d['pane_index']}.json"
-        if active.exists() and load_json(active).get("delivery_id") == delivery_id:
-            active.unlink()
-        public = root / ".dev" / "forge-broker" / "envelopes" / f"{delivery_id}.json"
-        if public.exists():
-            atomic_json(public, d)
-        return d
+        delivery = active_delivery(protected, delivery_id)
+        result = transition_delivery(root, protected, delivery, terminal)
+        return result
+    if action == "reconcile-delivery":
+        allow_expired = request.get("allow_expired", False)
+        if not isinstance(allow_expired, bool):
+            raise Refusal("CONTROL_FIELDS_DENIED", "allow_expired")
+        return reconcile_delivery(root, git_dir, common, root_id, protected, request,
+                                  allow_expired=allow_expired, caller="host")
     if action == "active-delivery":
         path = protected / "active" / f"{request.get('session')}.p{request.get('pane')}.json"
         return active_delivery(protected, str(load_json(path).get("delivery_id")))
     if action == "query-result":
         return load_json(protected / "results" / f"{request.get('operation_id')}.json")
     if action == "delivery-result":
-        delivery_id = str(request.get("delivery_id", ""))
-        if not re.fullmatch(r"delivery-[0-9a-f]{32}", delivery_id):
-            raise Refusal("DELIVERY_ID_INVALID", delivery_id)
-        rows = [load_json(p) for p in (protected / "results").glob("*.json")]
-        rows = [row for row in rows if row.get("delivery_id") == delivery_id]
-        if not rows:
-            raise Refusal("DELIVERY_RESULT_CARDINALITY", "0")
-        return {"schema": "forge-delivery-results/1", "delivery_id": delivery_id,
-                "status": "ok" if all(row.get("status") == "ok" for row in rows) else "error",
-                "operation_count": len(rows),
-                "operation_ids": sorted(str(row.get("operation_id", "")) for row in rows)}
+        return delivery_results(protected, str(request.get("delivery_id", "")))
     raise Refusal("CONTROL_ACTION_DENIED", str(action))
 
 
@@ -687,18 +912,370 @@ def recover_transactions(root: Path, git_dir: Path, protected: Path, transaction
         tx["recovered_at"] = utc(); atomic_json(journal_path, tx)
 
 
+LIFECYCLE_REQUESTS_AT = (".dev", "forge-broker", "lifecycle", "requests")
+LIFECYCLE_RESPONSES_AT = (".dev", "forge-broker", "lifecycle", "responses")
+EFFECT_REQUESTS_AT = (".dev", "forge-broker", "requests")
+
+
+def lifecycle_call(root: Path, request: dict) -> dict:
+    if request.get("action") not in LIFECYCLE_ACTIONS:
+        raise Refusal("LIFECYCLE_ACTION_DENIED", str(request.get("action")))
+    request_fd = queue_directory(root, LIFECYCLE_REQUESTS_AT)
+    try:
+        response_fd = queue_directory(root, LIFECYCLE_RESPONSES_AT)
+    except BaseException:
+        os.close(request_fd)
+        raise
+    intent_id = "lci-" + uuid.uuid4().hex
+    intent = dict(request)
+    intent.setdefault("schema", LIFECYCLE_SCHEMA)
+    intent["intent_id"] = intent_id
+    intent["emitted_at"] = utc()
+    atomic_json_at(request_fd, f"{intent_id}.intent.json", intent)
+    deadline = time.monotonic() + LIFECYCLE_TIMEOUT
+    try:
+        response_name = f"{intent_id}.json"
+        while time.monotonic() < deadline:
+            try:
+                fd = os.open(response_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=response_fd)
+            except FileNotFoundError:
+                time.sleep(0.05)
+                continue
+            try:
+                meta = os.fstat(fd)
+                if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_size > LIFECYCLE_MAX_BYTES:
+                    raise Refusal("LIFECYCLE_QUEUE_UNSAFE", response_name)
+                value = json.loads(os.read(fd, LIFECYCLE_MAX_BYTES + 1))
+            finally:
+                os.close(fd)
+            if value.get("status") != "ok":
+                raise Refusal(str(value.get("code", "LIFECYCLE_REFUSED")), str(value.get("detail", "refused")))
+            return {"schema": "forge-broker-control-result/1", "status": "ok", "detail": value["detail"]}
+        raise Refusal("CONTROL_QUEUED", intent_id)
+    finally:
+        os.close(request_fd)
+        os.close(response_fd)
+
+
+def handle_lifecycle(root: Path, git_dir: Path, common: Path, root_id: str,
+                     protected: Path, request: dict) -> dict:
+    if request.get("schema") != LIFECYCLE_SCHEMA:
+        raise Refusal("SCHEMA_MISMATCH", str(request.get("schema")))
+    if not re.fullmatch(r"lci-[0-9a-f]{32}", str(request.get("intent_id", ""))):
+        raise Refusal("LIFECYCLE_INTENT_ID_INVALID", str(request.get("intent_id", "")))
+    try:
+        dt.datetime.strptime(str(request.get("emitted_at", "")), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise Refusal("LIFECYCLE_EMITTED_AT_INVALID", str(request.get("emitted_at", ""))) from exc
+    action = request.get("action")
+    if action not in LIFECYCLE_ACTIONS:
+        raise Refusal("LIFECYCLE_ACTION_DENIED", str(action))
+    if action == "active-delivery":
+        allowed = {"schema", "intent_id", "emitted_at", "action", "session", "pane"}
+        denied = set(request) - allowed
+        if denied:
+            raise Refusal("LIFECYCLE_FIELDS_DENIED", ",".join(sorted(denied)))
+        path = protected / "active" / f"{request.get('session')}.p{request.get('pane')}.json"
+        return active_delivery(protected, str(load_json(path).get("delivery_id")))
+    if action == "delivery-result":
+        allowed = {"schema", "intent_id", "emitted_at", "action", "delivery_id"}
+        denied = set(request) - allowed
+        if denied:
+            raise Refusal("LIFECYCLE_FIELDS_DENIED", ",".join(sorted(denied)))
+        return delivery_results(protected, str(request.get("delivery_id", "")))
+    return reconcile_delivery(root, git_dir, common, root_id, protected, request,
+                              allow_expired=False, caller="lifecycle")
+
+
+def queue_directory(root: Path, components: tuple, *, create: bool = False) -> int:
+    # N-1 (CRITICAL): O_NOFOLLOW on an absolute path protects only the FINAL
+    # component. `.dev`, `forge-broker` and `lifecycle` were unprotected, so a
+    # pane could replace any of them with a symlink and redirect every create,
+    # read, rename, prune and unlink the UNSANDBOXED broker performs here into a
+    # tree of its own choosing. Walk each component from the root with its own
+    # O_DIRECTORY|O_NOFOLLOW dirfd — exactly as callback_directory() does — and
+    # create dirfd-relative so creation cannot traverse a symlink either.
+    for component in components:
+        if component in {"", ".", ".."} or "/" in component or "\\" in component:
+            raise Refusal("LIFECYCLE_QUEUE_UNSAFE", str(component))
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in components:
+            if create:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise Refusal("LIFECYCLE_QUEUE_UNSAFE", str(component)) from exc
+            try:
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=fd)
+            except OSError as exc:
+                raise Refusal("LIFECYCLE_QUEUE_UNSAFE", str(component)) from exc
+            os.close(fd)
+            fd = child
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise Refusal("LIFECYCLE_QUEUE_UNSAFE", str(components[-1]))
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def atomic_json_at(dirfd: int, name: str, value: dict) -> None:
+    tmp = f".{name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        fd = os.open(tmp, flags, 0o600, dir_fd=dirfd)
+        data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+
+
+def reclaim_claims(root: Path, components: tuple, marker: str, protected: Path) -> None:
+    # Match ONLY the genuine orphan shape `<orig><marker>.claimed.<pid>`.
+    # The existing effect poller also leaves `.claimed.<pid>.done` (completed) and
+    # `.claimed.<pid>.error.json` (rejected) in this directory (forge-broker:751-755).
+    # A substring test on ".claimed." matches all three and split(".claimed.",1)[0]
+    # maps all three back to `<orig><marker>`, which would resurrect completed and
+    # errored effect requests into the live queue on every broker start — an
+    # unbounded churn loop on the one queue that carries commit and
+    # publish-pr-review intents. Anchor the match; do not loosen it.
+    claim_shape = re.compile(rf"(?P<orig>.+{re.escape(marker)})\.claimed\.\d+$")
+    directory_fd = queue_directory(root, components)
+    try:
+        for claim in sorted(os.listdir(directory_fd)):
+            shape = claim_shape.fullmatch(claim)
+            if not shape:
+                continue
+            original = shape.group("orig")
+            fd = os.open(claim, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            try:
+                meta = os.fstat(fd)
+                if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1:
+                    raise Refusal("LIFECYCLE_QUEUE_UNSAFE", claim)
+            finally:
+                os.close(fd)
+            # N-6: `if original in listdir` then os.replace() is check-then-
+            # replace — a live intent created in between is silently overwritten,
+            # violating the plan's never-overwrite requirement. `.orphan.<utc>`
+            # is also unique only to the second, so two collisions inside one
+            # second clobber each other. Link-then-unlink is atomic and refuses
+            # to overwrite; the UUID makes the parked name unique regardless.
+            try:
+                os.link(claim, original, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            except FileExistsError:
+                orphan = original.removesuffix(marker) + f".orphan.{uuid.uuid4().hex}"
+                os.link(claim, orphan, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                atomic_json(protected / "audit" / f"{uuid.uuid4().hex}.json",
+                            {"event": "LIFECYCLE_ORPHAN_COLLISION", "claim": claim,
+                             "orphan": orphan, "at": utc()})
+            os.unlink(claim, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def prune_lifecycle_responses(root: Path) -> None:
+    floor = max(LIFECYCLE_TIMEOUT, 86400.0)
+    cutoff = time.time() - floor
+    directory_fd = queue_directory(root, LIFECYCLE_RESPONSES_AT)
+    try:
+        for response in sorted(name for name in os.listdir(directory_fd) if name.endswith(".json")):
+            try:
+                fd = os.open(response, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    meta = os.fstat(fd)
+                    if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1:
+                        raise Refusal("LIFECYCLE_QUEUE_UNSAFE", response)
+                finally:
+                    os.close(fd)
+                if meta.st_mtime < cutoff:
+                    os.unlink(response, dir_fd=directory_fd)
+            except FileNotFoundError:
+                continue
+    finally:
+        os.close(directory_fd)
+
+
+def sweep_terminal_callbacks(root: Path, git_dir: Path, common: Path, root_id: str,
+                             protected: Path) -> None:
+    try:
+        callbacks, callbacks_fd = callback_directory(root)
+        names = sorted(name for name in os.listdir(callbacks_fd) if name.endswith(".callback"))
+    except OSError as exc:
+        atomic_json(protected / "audit" / f"{uuid.uuid4().hex}.json",
+                    {"event": "LIFECYCLE_SWEEP_REFUSED", "detail": str(exc), "at": utc()})
+        return
+    finally:
+        if "callbacks_fd" in locals():
+            os.close(callbacks_fd)
+    # N-9: index every callback ONCE, tolerating each bad artifact on its own.
+    # The parse used to run inside the per-delivery try, so a single invalid
+    # callback sorting first aborted reconciliation for EVERY active delivery,
+    # not just its own — one worker-writable file could block all of startup
+    # recovery. Record each invalid artifact once and keep searching.
+    index: dict = {}
+    for name in names:
+        callback = callbacks / name
+        try:
+            _, data = callback_bytes(root, str(callback))
+            headers = callback_headers(data)
+        except (Refusal, OSError, ValueError) as exc:
+            atomic_json(protected / "audit" / f"{uuid.uuid4().hex}.json",
+                        {"event": "LIFECYCLE_SWEEP_ARTIFACT_INVALID", "artifact": name,
+                         "detail": str(exc), "at": utc()})
+            continue
+        key = str(headers.get("delivery_id", ""))
+        if key and key not in index:
+            index[key] = (callback, data, headers)
+    for active_path in sorted((protected / "active").glob("*.json")):
+        try:
+            delivery = load_json(active_path)
+            delivery_id = str(delivery.get("delivery_id", ""))
+            found = index.get(delivery_id)
+            if not found:
+                continue
+            callback, data, headers = found
+            terminal = {"DONE": "completed", "ERROR": "failed"}.get(headers.get("status"))
+            if not terminal:
+                continue
+            reconcile_delivery(root, git_dir, common, root_id, protected,
+                               {"action": "reconcile-delivery", "delivery_id": delivery_id,
+                                "terminal": terminal, "callback_path": str(callback),
+                                "callback_sha256": sha(data)},
+                               allow_expired=True, caller="startup")
+        except (Refusal, OSError, ValueError) as exc:
+            atomic_json(protected / "audit" / f"{uuid.uuid4().hex}.json",
+                        {"event": "LIFECYCLE_SWEEP_REFUSED", "detail": str(exc), "at": utc()})
+
+
+def lifecycle_pass(root: Path, git_dir: Path, common: Path, root_id: str, protected: Path) -> None:
+    request_fd = queue_directory(root, LIFECYCLE_REQUESTS_AT)
+    try:
+        response_fd = queue_directory(root, LIFECYCLE_RESPONSES_AT)
+    except BaseException:
+        os.close(request_fd)
+        raise
+    try:
+        for name in sorted(os.listdir(request_fd)):
+            if not name.endswith(".intent.json"):
+                continue
+            claim = None
+            request = {}
+            try:
+                pre_ino = os.stat(name, dir_fd=request_fd, follow_symlinks=False).st_ino
+            except OSError:
+                continue
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=request_fd)
+                try:
+                    meta = os.fstat(fd)
+                    if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_size > LIFECYCLE_MAX_BYTES:
+                        raise Refusal("LIFECYCLE_QUEUE_UNSAFE", name)
+                finally:
+                    os.close(fd)
+                claim = name + f".claimed.{os.getpid()}"
+                os.replace(name, claim, src_dir_fd=request_fd, dst_dir_fd=request_fd)
+                claimed_fd = os.open(claim, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=request_fd)
+                try:
+                    claimed_meta = os.fstat(claimed_fd)
+                    if not stat.S_ISREG(claimed_meta.st_mode) or claimed_meta.st_nlink != 1 or claimed_meta.st_size > LIFECYCLE_MAX_BYTES:
+                        raise Refusal("LIFECYCLE_QUEUE_UNSAFE", claim)
+                    raw = os.read(claimed_fd, LIFECYCLE_MAX_BYTES + 1)
+                finally:
+                    os.close(claimed_fd)
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    # N-4: valid non-object JSON (a list, string or number) has
+                    # no .get, and AttributeError is NOT in the except clause
+                    # below, so it escaped to the serve loop — no response was
+                    # written and the claimed file was stranded until restart.
+                    # Refuse before any attribute access, and leave `request` a
+                    # dict so the error path can still read it safely.
+                    raise Refusal("LIFECYCLE_REQUEST_NOT_OBJECT", type(parsed).__name__)
+                request = parsed
+                atomic_json(protected / "audit" / f"{uuid.uuid4().hex}.json",
+                            {"event": "LIFECYCLE_FALLBACK", "action": request.get("action"),
+                             "intent_id": request.get("intent_id"), "at": utc()})
+                detail = handle_lifecycle(root, git_dir, common, root_id, protected, request)
+                reply = {"schema": "forge-lifecycle-response/1", "status": "ok", "detail": detail}
+            except (Refusal, OSError, ValueError) as exc:
+                reply = {"schema": "forge-lifecycle-response/1", "status": "error",
+                         "code": getattr(exc, "code", "LIFECYCLE_INVALID"), "detail": str(exc),
+                         "intent_id": request.get("intent_id"),
+                         "delivery_id": request.get("delivery_id")}
+                atomic_json(protected / "audit" / f"{uuid.uuid4().hex}.json",
+                            {"event": "LIFECYCLE_REFUSED", "intent_id": request.get("intent_id"),
+                             "delivery_id": request.get("delivery_id"),
+                             "code": getattr(exc, "code", "LIFECYCLE_INVALID"), "at": utc()})
+            response_name = name.removesuffix(".intent.json") + ".json"
+            try:
+                atomic_json_at(response_fd, response_name, reply)
+            except OSError as exc:
+                atomic_json(protected / "audit" / f"{uuid.uuid4().hex}.json",
+                            {"event": "LIFECYCLE_RESPONSE_WRITE_FAILED", "claim": claim,
+                             "detail": str(exc), "at": utc()})
+                continue
+            if claim is not None:
+                try:
+                    os.unlink(claim, dir_fd=request_fd)
+                except OSError:
+                    pass
+            else:
+                # N-5: this entry failed before it could be claimed, so it is
+                # still in the queue. Left in place it is re-read at 10 Hz
+                # forever and every pass writes another protected audit — one
+                # worker-writable bad file becomes an unbounded write amplifier
+                # against host-only state. Quarantine it once, verifying the
+                # inode so a file swapped underneath us is not the one moved.
+                try:
+                    if os.stat(name, dir_fd=request_fd,
+                               follow_symlinks=False).st_ino == pre_ino:
+                        os.rename(name, name + f".rejected.{uuid.uuid4().hex}",
+                                  src_dir_fd=request_fd, dst_dir_fd=request_fd)
+                except OSError:
+                    pass
+    finally:
+        os.close(request_fd)
+        os.close(response_fd)
+
+
 def serve(args: argparse.Namespace) -> int:
     global STOP
     root, git_dir, common, root_id = resolve_root(args.root)
     protected, transactions, requests, _ = state_paths(root, git_dir, common, root_id)
     protected.mkdir(parents=True, exist_ok=True, mode=0o700)
     requests.mkdir(parents=True, exist_ok=True)
+    # N-1: mkdir(parents=True) creates and traverses `.dev`, `forge-broker` and
+    # `lifecycle` BY PATH, before any no-follow validation runs — precisely the
+    # window a pane needs to redirect the queue with a symlink. Create
+    # dirfd-relative instead, validating every component on the way down.
+    os.close(queue_directory(root, LIFECYCLE_REQUESTS_AT, create=True))
+    os.close(queue_directory(root, LIFECYCLE_RESPONSES_AT, create=True))
     lock_fh = open(protected / "broker.lock", "a+")
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
         raise Refusal("BROKER_ALREADY_RUNNING", root_id) from exc
+    reclaim_claims(root, EFFECT_REQUESTS_AT, ".request.json", protected)
+    reclaim_claims(root, LIFECYCLE_REQUESTS_AT, ".intent.json", protected)
+    prune_lifecycle_responses(root)
     recover_transactions(root, git_dir, protected, transactions)
+    sweep_terminal_callbacks(root, git_dir, common, root_id, protected)
     token_path = protected / "control.token"
     if token_path.exists():
         token = token_path.read_text(encoding="ascii").strip()
@@ -714,6 +1291,7 @@ def serve(args: argparse.Namespace) -> int:
                 "session": args.session, "session_incarnation": args.incarnation,
                 "physical_code_root": str(root), "root_identity": root_id,
                 "control_host": control_host, "control_port": control_port,
+                "lifecycle_queue": 1,
                 "mode": args.mode, "started_at": utc(), "state": "running"})
     signal.signal(signal.SIGTERM, lambda *_: globals().__setitem__("STOP", True))
     while not STOP:
@@ -742,7 +1320,14 @@ def serve(args: argparse.Namespace) -> int:
                 except (Refusal, OSError, ValueError) as exc:
                     reply = {"schema": "forge-broker-control-result/1", "status": "error",
                              "code": getattr(exc, "code", "CONTROL_INVALID"), "detail": str(exc)}
-                conn.sendall(json.dumps(reply, separators=(",", ":")).encode() + b"\n")
+                try:
+                    conn.sendall(json.dumps(reply, separators=(",", ":")).encode() + b"\n")
+                except OSError as exc:
+                    try:
+                        atomic_json(protected / "audit" / f"{uuid.uuid4().hex}.json",
+                                    {"event": "CONTROL_REPLY_ABANDONED", "detail": str(exc), "at": utc()})
+                    except OSError:
+                        pass
         for path in sorted(requests.glob("*.request.json")):
             claim = path.with_name(path.name + f".claimed.{os.getpid()}")
             try:
@@ -760,6 +1345,15 @@ def serve(args: argparse.Namespace) -> int:
                     "code": getattr(exc, "code", "REQUEST_INVALID"),
                     "detail": str(exc), "finished_at": utc()})
             claim.rename(claim.with_name(claim.name + ".done"))
+        try:
+            lifecycle_pass(root, git_dir, common, root_id, protected)
+        except Exception as exc:
+            try:
+                atomic_json(protected / "audit" / f"{utc().replace(':', '')}-{uuid.uuid4().hex}.json",
+                            {"event": getattr(exc, "code", "LIFECYCLE_PASS_FAILED"),
+                             "detail": str(exc), "at": utc()})
+            except OSError:
+                pass
         time.sleep(0.1)
     info = load_json(protected / "pid.json")
     info.update(state="stopped", stopped_at=utc())
@@ -829,7 +1423,8 @@ def main() -> int:
     s = sub.add_parser("start"); s.add_argument("--root", required=True); s.add_argument("--session", required=True); s.add_argument("--incarnation", required=True); s.add_argument("--mode", required=True)
     s = sub.add_parser("stop"); s.add_argument("--root", required=True); s.add_argument("--timeout", type=float, default=10.0)
     s = sub.add_parser("status"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true")
-    s = sub.add_parser("control"); s.add_argument("--root", required=True)
+    s = sub.add_parser("control"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("paths"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true")
     s = sub.add_parser("once"); s.add_argument("--root", required=True); s.add_argument("--request", required=True)
     args = p.parse_args()
     root, git_dir, common, root_id = resolve_root(args.root)
@@ -910,6 +1505,10 @@ def main() -> int:
         request = json.load(sys.stdin)
         result = control_call(protected, request)
         print(json.dumps(result["detail"], sort_keys=True)); return 0
+    if args.cmd == "paths":
+        print(json.dumps({"schema": "forge-broker-paths/1",
+                          "protected": str(protected)}, sort_keys=True))
+        return 0
     if args.cmd == "once":
         if os.environ.get("FORGE_BROKER_TEST_ENABLE") != "1":
             raise Refusal("TEST_MODE_DENIED", "FORGE_BROKER_TEST_ENABLE=1 required")
@@ -921,5 +1520,14 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Refusal as exc:
-        print(json.dumps({"schema": RESULT_SCHEMA, "status": "error", "code": exc.code, "detail": exc.detail}), file=sys.stderr)
-        raise SystemExit(3)
+        value = {"schema": RESULT_SCHEMA, "status": "error", "code": exc.code, "detail": exc.detail}
+        if "--json" in sys.argv:
+            print(json.dumps(value, sort_keys=True))
+        else:
+            print(json.dumps(value, sort_keys=True), file=sys.stderr)
+        # CONTROL_REPLY_INVALID (N-8) shares exit 4 with CONTROL_UNREACHABLE:
+        # both mean the outcome is unknown, so a caller must not blindly retry.
+        # It stays a distinct code so the ambiguity is diagnosable.
+        raise SystemExit({"CONTROL_UNREACHABLE": 4, "CONTROL_REPLY_INVALID": 4,
+                          "CONTROL_QUEUED": 5,
+                          "DELIVERY_ALREADY_ACTIVE": 6}.get(exc.code, 3))
