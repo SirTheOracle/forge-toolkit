@@ -28,16 +28,22 @@ denial are live gates. Root-local TMPDIR is likewise disabled pending proof.
 The bridge creates the delivery envelope. Protected delivery authority lives
 under a root-identity namespace in the repository's common Git directory;
 index transaction journals and backups live under the physical worktree's Git
-directory. Worker markers, requests, responses, and `.dev` files are
-untrusted. Exact delivery/session/incarnation/root/stage/capability/prompt-
+directory. Worker markers, lifecycle requests and responses, and all `.dev`
+files are untrusted. Launch manifests and broker journals are never
+worker-writable — measured 2026-08-07, when a live contained pane was denied
+creating `.git/forge` in both a main checkout and a linked worktree. Enforcement
+is established but its source is not, so re-run that probe after any Codex
+version bump. Exact delivery/session/incarnation/root/stage/capability/prompt-
 digest matching, expiry, and a single unambiguous active owner are required.
-Launch manifests and broker journals are never worker-writable.
-Host control uses a server-authenticated loopback handshake; the attested
-network-deny sandbox prevents a contained pane from reaching that endpoint,
-and the client never sends its token before verifying the broker proof.
-Effectful `.dev` request files are never authoritative; commit and publication
-requests must arrive on that authenticated host transport. Enabling a future
-Codex mutation lane requires a separately proven worker-origin transport.
+Host control uses a server-authenticated loopback handshake. The network-deny
+sandbox is a containment control, not an authentication boundary. A separate
+credential-free lifecycle queue accepts only active-delivery, delivery-result,
+and strict reconcile-delivery; its handler has no route to process() or effectful
+actions. Lifecycle responses are advisory and never proof. Effectful `.dev`
+request files remain non-authoritative; commit and publication requests must
+arrive on authenticated host control. The callback artifact/owner checks prevent
+accidental divergence but do not authenticate one pane against another pane in
+the same writable root.
 
 ## Lanes
 

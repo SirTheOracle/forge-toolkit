@@ -705,11 +705,27 @@ recreates the runtime record; do not repair `pid.json` by hand or use a
 Before changing rollout mode, replacing a session incarnation, or completing a
 rollback, use `forge codex-broker stop --root <worktree>`; stop is authenticated,
 drains claimed work, and prevents a live daemon from being silently reused under
-a different session or mode. Its server-authenticated loopback control channel
-is reachable by the host lane, not by network-denied Codex panes. Files under
-`.dev/forge-broker/requests` cannot authorize a commit or publication; a future
-Codex mutation lane stays closed until it has a separately proven origin-bound
-request transport.
+a different session or mode. Its server-authenticated loopback control channel is reachable by the host lane,
+not by network-denied Codex panes. A policy-denied lifecycle call may use
+`.dev/forge-broker/lifecycle`; only `active-delivery`, `delivery-result`, and
+strict `reconcile-delivery` are implemented there. Responses are worker-writable
+and advisory. Files under `.dev/forge-broker/requests` and the lifecycle queue
+cannot authorize a commit or publication.
+
+Broker refusal exits are: 3 for ordinary refusal, 4 for CONTROL_UNREACHABLE, 5
+for CONTROL_QUEUED, and 6 for DELIVERY_ALREADY_ACTIVE. A callback ending in
+`TERMINALIZE_DEFERRED` has closed its pending entry and published its artifact;
+the host startup, wait, and next-dispatch paths reconcile it. `TERMINALIZE:
+PENDING` or `TERMINALIZE-REFUSED` requires operator inspection.
+
+Protected broker state stays under the repository's common Git directory. A
+contained pane was measured unable to write there on 2026-08-07 (codex-cli
+0.146.1, main checkout and linked worktree); re-run that probe after any Codex
+version bump. Verify the resolved location with
+`forge-broker paths --root <root> --json`, then confirm `lifecycle_queue: 1` in
+status. For an expired abandoned delivery with no valid callback, use the
+explicit host command `forge codex-broker reap --root <root> --pane <n>`; it
+cancels without artifact evidence and emits `DELIVERY_REAPED`.
 
 Callbacks are accepted only after their delivery-bound artifact matches the
 selected pipeline entry. A replayed callback ID, an old callback timestamp, or a
