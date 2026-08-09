@@ -11,7 +11,9 @@ import hmac
 import json
 import os
 from pathlib import Path, PurePosixPath
+import errno
 import re
+import stat
 import secrets
 import shutil
 import signal
@@ -107,6 +109,11 @@ def state_paths(root: Path, git_dir: Path, common: Path, root_id: str) -> tuple[
     transactions = git_dir / "forge" / "broker-v1" / "transactions"
     untrusted = root / ".dev" / "forge-broker"
     return protected, transactions, untrusted / "requests", untrusted / "responses"
+
+
+def lifecycle_paths(root: Path) -> tuple[Path, Path]:
+    base = root / ".dev" / "forge-broker" / "lifecycle"
+    return base / "requests", base / "responses"
 
 
 def git(root: Path, state: Path, *args: str, input_text: str | None = None,
@@ -346,13 +353,13 @@ def process(root_raw: str, request_path: Path, *, trusted_host: bool = False) ->
     if not isinstance(opid, str) or not re.fullmatch(r"[A-Za-z0-9._-]{8,128}", opid):
         raise Refusal("OPERATION_ID_INVALID", repr(opid))
     result_path = protected / "results" / f"{opid}.json"
-    if result_path.exists():
-        result = load_json(result_path)
-        atomic_json(responses / f"{opid}.json", result)
-        return result
     try:
         if not trusted_host:
             raise Refusal("HOST_CONTROL_REQUIRED", "effectful requests require authenticated host transport")
+        if result_path.exists():
+            result = load_json(result_path)
+            atomic_json(responses / f"{opid}.json", result)
+            return result
         delivery = active_delivery(protected, str(req.get("delivery_id")))
         validate_request(req, delivery, root, root_id)
         if req.get("operation") == "commit":
