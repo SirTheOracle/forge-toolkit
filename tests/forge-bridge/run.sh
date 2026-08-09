@@ -23,19 +23,26 @@ cat > "$BROKER_STUB" <<'SH'
 #!/bin/bash
 if [ "$1" != control ]; then exit 0; fi
 payload="$(cat)"
-python3 - "$payload" <<'PY'
-import json,sys
-d=json.loads(sys.argv[1]); action=d.get('action')
-if action == 'register-delivery':
-    print(json.dumps({'delivery_id':'delivery-test','session_incarnation':'test-incarnation'}))
-elif action == 'active-delivery':
-    print(json.dumps({'delivery_id':'delivery-test','state':'open','capability_class':'workspace'}))
-else:
-    print(json.dumps({'status':'ok'}))
-PY
+[ -n "${FORGE_BROKER_CAPTURE:-}" ] && printf '%s\n' "$payload" >> "$FORGE_BROKER_CAPTURE"
+action="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("action",""))' "$payload")"
+case "$action" in
+  register-delivery)
+    if [ "${FORGE_BROKER_REGISTER_ACTIVE:-0}" = 1 ]; then
+      printf '{"schema":"forge-broker-result/1","status":"error","code":"DELIVERY_ALREADY_ACTIVE","detail":"delivery-test"}\n'
+      exit 6
+    fi
+    printf '{"delivery_id":"delivery-test","session_incarnation":"test-incarnation"}\n' ;;
+  active-delivery) printf '{"delivery_id":"delivery-test","state":"open","capability_class":"workspace"}\n' ;;
+  delivery-result) printf '{"delivery_id":"delivery-test","status":"ok"}\n' ;;
+  reconcile-delivery)
+    [ "${FORGE_BROKER_RECONCILE_RC:-0}" -eq 0 ] || exit "$FORGE_BROKER_RECONCILE_RC"
+    printf '{"delivery_id":"delivery-test","state":"completed"}\n' ;;
+  *) printf '{"status":"ok"}\n' ;;
+esac
 SH
 chmod +x "$BROKER_STUB"
 export FORGE_BROKER_BIN="$BROKER_STUB"
+export FORGE_BROKER_CAPTURE="$WORK/broker-actions.jsonl"; : > "$FORGE_BROKER_CAPTURE"
 S1="fbid1-$$"; S2="fbid2-$$"; S3="fbid3-$$"; S4="fbid4-$$"; GS="fbguard-$$"
 trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; tmux kill-session -t "${HS:-none}" 2>/dev/null; tmux kill-session -t "${DS:-none}" 2>/dev/null; tmux kill-session -t "${VS:-none}" 2>/dev/null; tmux kill-session -t "${FS:-none}" 2>/dev/null; tmux kill-session -t "${US:-none}" 2>/dev/null; tmux kill-session -t "${SW:-none}" 2>/dev/null; tmux kill-session -t "${RS:-none}" 2>/dev/null; tmux kill-session -t "${HH:-none}" 2>/dev/null; rm -rf "$WORK"' EXIT
 
@@ -183,7 +190,11 @@ run_in_pane(){
     local pane="$1" name="$2"; shift 2
     local o="$WORK/out.$name"
     : > "$o"
-    tmux send-keys -t "$pane" "{ export FORGE_BROKER_BIN='$BROKER_STUB'; $* ; } > $o 2>&1; echo DONE_\$? >> $o" Enter
+    # FORGE_BROKER_CAPTURE must cross into the pane too. A tmux pane does not
+    # inherit this shell's exports, so without it every broker action a
+    # pane-driven bridge performs is invisible to the capture assertions — which
+    # is exactly the blind spot G-2 was raised about.
+    tmux send-keys -t "$pane" "{ export FORGE_BROKER_BIN='$BROKER_STUB' FORGE_BROKER_CAPTURE='$FORGE_BROKER_CAPTURE'; $* ; } > $o 2>&1; echo DONE_\$? >> $o" Enter
     local i=0
     while [ $i -lt 60 ]; do grep -q '^DONE_' "$o" 2>/dev/null && return 0; sleep 0.5; i=$((i+1)); done
     echo "TIMEOUT" >> "$o"; return 1
@@ -3581,6 +3592,22 @@ done
 ok "T-HEALTH names all five canonical pane/index pairs"
 tmux kill-session -t "$HH" 2>/dev/null
 
+python3 - "$FORGE_BROKER_CAPTURE" <<'PY' \
+  && ok "T-LIFECYCLE-PAYLOAD callbacks carry strict path and digest evidence" \
+  || bad "T-LIFECYCLE-PAYLOAD strict reconcile evidence missing"
+import json,os,re,sys
+all_rows=[]
+for line in open(sys.argv[1]):
+    try: row=json.loads(line)
+    except Exception: continue
+    all_rows.append(row)
+rows=[row for row in all_rows if row.get('action')=='reconcile-delivery']
+assert rows, 'no strict reconcile action captured'
+for row in rows:
+    assert os.path.isabs(str(row.get('callback_path') or '')), row
+    assert re.fullmatch(r'[0-9a-f]{64}',str(row.get('callback_sha256') or '')), row
+assert not any(row.get('action')=='terminalize-delivery' for row in all_rows), all_rows
+PY
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -4542,10 +4542,51 @@ d={k:v for k,v in d.items() if v!=''}
 print(json.dumps(d,separators=(',',':')))
 PY
 )"
-    DELIVERY_JSON="$(printf '%s\n' "$DELIVERY_INTENT" | "$FORGE_BROKER_BIN" control --root "$physical_code_root")" || {
+    local registration_rc=0
+    DELIVERY_JSON="$(printf '%s\n' "$DELIVERY_INTENT" | "$FORGE_BROKER_BIN" control --root "$physical_code_root" --json)" || registration_rc=$?
+    if [ "$registration_rc" -eq 6 ]; then
+        local blocking_cb blocking_delivery blocking_status blocking_terminal blocking_sha blocking_intent reconcile_rc=0
+        blocking_delivery="$(printf '%s' "$DELIVERY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("detail", ""))' 2>/dev/null)"
+        blocking_cb="$(python3 - "$project_root/.dev/forge-tmp/callbacks" "$blocking_delivery" <<'PY'
+import pathlib,re,sys
+base=pathlib.Path(sys.argv[1]); delivery=sys.argv[2]
+matches=[]
+for path in base.glob('*.callback'):
+    try: text=path.read_text()
+    except OSError: continue
+    if re.search(r'^delivery_id:\s*'+re.escape(delivery)+r'\s*$',text,re.M): matches.append(path)
+if len(matches)==1: print(matches[0])
+PY
+)"
+        if [ -n "$blocking_cb" ]; then
+            blocking_status="$(sed -n 's/^status:[[:space:]]*//p' "$blocking_cb" | head -1)"
+            case "$blocking_status" in DONE) blocking_terminal=completed ;; ERROR) blocking_terminal=failed ;; *) blocking_terminal="" ;; esac
+            if [ -n "$blocking_delivery" ] && [ -n "$blocking_terminal" ]; then
+                blocking_sha="$(shasum -a 256 "$blocking_cb" | awk '{print $1}')"
+                blocking_intent="$(python3 - "$blocking_delivery" "$blocking_terminal" "$blocking_cb" "$blocking_sha" <<'PY'
+import json,sys
+print(json.dumps({'action':'reconcile-delivery','delivery_id':sys.argv[1],
+                  'terminal':sys.argv[2],'callback_path':sys.argv[3],
+                  'callback_sha256':sys.argv[4],'allow_expired':True},separators=(',',':')))
+PY
+)"
+                printf '%s\n' "$blocking_intent" | "$FORGE_BROKER_BIN" control --root "$physical_code_root" >/dev/null || reconcile_rc=$?
+                if [ "$reconcile_rc" -eq 0 ]; then
+                    _emit_event LIFECYCLE_RECONCILED "$slug" "stage=$stage worker=$worker_canonical delivery_id=$blocking_delivery"
+                    echo "LIFECYCLE_RECONCILED delivery_id=$blocking_delivery" >&2
+                    registration_rc=0
+                    DELIVERY_JSON="$(printf '%s\n' "$DELIVERY_INTENT" | "$FORGE_BROKER_BIN" control --root "$physical_code_root")" || registration_rc=$?
+                fi
+            fi
+        fi
+        if [ "$reconcile_rc" -ne 0 ] || [ -z "$blocking_cb" ]; then
+            _emit_event LIFECYCLE_RECONCILE_REFUSED "$slug" "stage=$stage worker=$worker_canonical delivery_id=${blocking_delivery:-unknown}"
+        fi
+    fi
+    if [ "$registration_rc" -ne 0 ] || [ -z "$DELIVERY_JSON" ]; then
         _emit_event BROKER_REGISTRATION_FAILED "$slug" "stage=$stage worker=$worker_canonical"
-        _worker_unlock "$worker_canonical"; return 1;
-    }
+        _worker_unlock "$worker_canonical"; return 1
+    fi
     delivery_id="$(printf '%s' "$DELIVERY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["delivery_id"])')"
     delivery_inc="$(printf '%s' "$DELIVERY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_incarnation"])')"
     local ref_msg="Read and follow instructions in .dev/forge-tmp/${worker_canonical}-${stage}-${slug}.txt [delivery_id:$delivery_id]"
@@ -4902,11 +4943,24 @@ EOF
 
     # Terminalize only after the log close and callback publication succeed.
     # This preserves retryability if either lifecycle write fails.
+    local cb_suffix=""
     if [ -n "$pending_delivery_id" ] && [ -n "$terminal_state" ]; then
-        terminal_intent="$(printf '{"action":"terminalize-delivery","delivery_id":"%s","terminal":"%s"}\n' \
-            "$active_delivery_id" "$terminal_state")"
-        if ! printf '%s\n' "$terminal_intent" | "$FORGE_BROKER_BIN" control --root "$project_root" >/dev/null; then
+        local cb_sha terminal_rc=0
+        cb_sha="$(shasum -a 256 "$cb_file" | awk '{print $1}')"
+        terminal_intent="$(python3 - "$active_delivery_id" "$terminal_state" "$cb_file" "$cb_sha" <<'PY'
+import json,sys
+print(json.dumps({'action':'reconcile-delivery','delivery_id':sys.argv[1],
+                  'terminal':sys.argv[2],'callback_path':sys.argv[3],
+                  'callback_sha256':sys.argv[4]},separators=(',',':')))
+PY
+)"
+        printf '%s\n' "$terminal_intent" | "$FORGE_BROKER_BIN" control --root "$project_root" >/dev/null || terminal_rc=$?
+        if [ "$terminal_rc" -eq 5 ]; then
+            _emit_event LIFECYCLE_DEFERRED "$slug" "stage=$stage worker=$worker_canonical delivery_id=$active_delivery_id"
+            cb_suffix=" TERMINALIZE_DEFERRED"
+        elif [ "$terminal_rc" -ne 0 ]; then
             _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=broker-terminalize-failed delivery_id=$active_delivery_id"
+            echo "TERMINALIZE: REFUSED" >&2
             return 1
         fi
     fi
@@ -4958,7 +5012,7 @@ EOF
     fi
 
     _render_status_file
-    echo "CALLBACK $status stage=$stage slug=$slug worker=$worker_canonical → $cb_file"
+    echo "CALLBACK $status stage=$stage slug=$slug worker=$worker_canonical → $cb_file$cb_suffix"
 }
 
 # Pure P1-E validator. It constructs the only three eligible paths from bridge
@@ -5312,6 +5366,28 @@ cmd_wait() {
                     return 1
                     ;;
             esac
+            if grep -Eq '^delivery_id: [^[:space:]]' "$cb_file"; then
+                local wait_delivery wait_status wait_terminal wait_sha wait_intent wait_reply wait_code wait_rc=0
+                wait_delivery="$(sed -n 's/^delivery_id:[[:space:]]*//p' "$cb_file" | head -1)"
+                wait_status="$(sed -n 's/^status:[[:space:]]*//p' "$cb_file" | head -1)"
+                case "$wait_status" in DONE) wait_terminal=completed ;; ERROR) wait_terminal=failed ;; *) wait_terminal="" ;; esac
+                if [ -n "$wait_terminal" ]; then
+                    wait_sha="$(shasum -a 256 "$cb_file" | awk '{print $1}')"
+                    wait_intent="$(python3 - "$wait_delivery" "$wait_terminal" "$cb_file" "$wait_sha" <<'PY'
+import json,sys
+print(json.dumps({'action':'reconcile-delivery','delivery_id':sys.argv[1],
+                  'terminal':sys.argv[2],'callback_path':sys.argv[3],
+                  'callback_sha256':sys.argv[4],'allow_expired':True},separators=(',',':')))
+PY
+)"
+                    wait_reply="$(printf '%s\n' "$wait_intent" | "$FORGE_BROKER_BIN" control --root "$project_root" --json)" || wait_rc=$?
+                    wait_code="$(printf '%s' "$wait_reply" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("code", ""))' 2>/dev/null)"
+                    if [ "$wait_rc" -ne 0 ] && [ "$wait_code" != DELIVERY_CLOSED ]; then
+                        _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=terminalize-pending delivery_id=$wait_delivery"
+                        printf 'TERMINALIZE: PENDING\n'
+                    fi
+                fi
+            fi
             _wait_emit_callback "$cb_file" "$slug" "$stage" "$worker_canonical" \
                 "$digest_template" "$project_root"
             _render_status_file
