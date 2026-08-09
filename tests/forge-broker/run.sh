@@ -272,4 +272,186 @@ grep -R -q DELIVERY_REAPED "$P/audit"
 
 FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$R" >/dev/null
 
+# ─────────────────────────────────────────────────────────────────────────
+# Phase C — gap register G-1/G-3/G-5/G-6 and the §11 defect regressions.
+# Acceptance bar: every case below must FAIL against the unmodified source.
+#
+# Refusal assertions capture output AND rc before grepping: `control` exits
+# non-zero on refusal, so piping it straight into grep dies under pipefail.
+# ─────────────────────────────────────────────────────────────────────────
+LQ2="$R/.dev/forge-broker/lifecycle"
+say(){ echo "  ok: $1"; }
+ctl(){ # ctl <want-rc> <want-substring> <label>  — request JSON on stdin
+  local want_rc="$1" want="$2" label="$3" out rc=0
+  out="$(FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R" 2>&1)" || rc=$?
+  [ "$rc" = "$want_rc" ] || { echo "FAIL $label: rc=$rc want $want_rc :: $out" >&2; exit 1; }
+  grep -q -- "$want" <<<"$out" || { echo "FAIL $label: missing '$want' :: $out" >&2; exit 1; }
+  say "$label"
+}
+qwait(){ for _ in $(seq 1 100); do [ -f "$1" ] && return 0; sleep 0.05; done; echo "FAIL: no response $1" >&2; exit 1; }
+
+FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$R" --session life --incarnation 1 --mode contain >/dev/null
+mk_delivery delivery-dddddddddddddddddddddddddddddddd "$future" 6
+
+# ── G-1: the queue is a real transport, not just a refusal surface ──
+# Positive control: EPERM forces the fallback, the live poller answers, exit 0.
+qout="$(printf '{"action":"active-delivery","session":"life","pane":"6"}\n' \
+  | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R")"
+grep -q 'delivery-dddddddddddddddddddddddddddddddd' <<<"$qout"
+say "G-1 queued fallback answers with the real payload (exit 0)"
+# Parity: the same request over TCP returns the same delivery id.
+tout="$(printf '{"action":"active-delivery","session":"life","pane":"6"}\n' \
+  | FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R")"
+grep -q 'delivery-dddddddddddddddddddddddddddddddd' <<<"$tout"
+say "G-1 queue and TCP paths agree on the payload"
+
+# ── G-3: the lifecycle transport refuses what only the host may ask ──
+printf '{"action":"reconcile-delivery","delivery_id":"delivery-dddddddddddddddddddddddddddddddd","terminal":"completed","callback_path":"/x","callback_sha256":"%064d","allow_expired":true}\n' 0 \
+  | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_LIFECYCLE_TIMEOUT_S=6 \
+    ctl 3 LIFECYCLE_FIELDS_DENIED "G-3 allow_expired refused on the lifecycle transport"
+printf '{"action":"reconcile-delivery","delivery_id":"delivery-dddddddddddddddddddddddddddddddd","terminal":"completed","callback_path":"/x","callback_sha256":"%064d","surprise":1}\n' 0 \
+  | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_LIFECYCLE_TIMEOUT_S=6 \
+    ctl 3 LIFECYCLE_FIELDS_DENIED "G-3 unknown key refused on the lifecycle transport"
+printf '{"action":"reconcile-delivery","delivery_id":"delivery-dddddddddddddddddddddddddddddddd","terminal":"cancelled","callback_path":"/x","callback_sha256":"%064d"}\n' 0 \
+  | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_LIFECYCLE_TIMEOUT_S=6 \
+    ctl 3 TERMINAL_STATE_INVALID "G-3 terminal:cancelled refused on the lifecycle transport"
+# A non-lifecycle action under EPERM must not create an intent at all.
+rm -f "$LQ2/requests"/* "$LQ2/responses"/* 2>/dev/null || true
+printf '{"action":"submit-operation","operation_id":"op-nope"}\n' \
+  | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM ctl 4 CONTROL_UNREACHABLE "G-3 non-lifecycle EPERM does not queue"
+[ -z "$(find "$LQ2/requests" -name '*.intent.json' -print -quit)" ]
+say "G-3 no intent file was created for the denied non-lifecycle action"
+
+# ── N-7: reap requires expiry, or an explicit force ──
+mk_delivery delivery-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee "$future" 7
+printf '{"action":"reap-delivery","session":"life","pane":"7","operator_command":"forge codex-broker reap"}\n' \
+  | ctl 3 DELIVERY_NOT_EXPIRED "N-7 reap refuses a healthy unexpired delivery"
+printf '{"action":"reap-delivery","session":"life","pane":"7","operator_command":"forge codex-broker reap --force","force":true}\n' \
+  | ctl 0 '"state": "cancelled"' "N-7 reap --force cancels and is audited as forced"
+# Audits are written with compact separators, so match without a space.
+grep -R -q '"forced":true' "$P/audit"
+grep -R -q '"expired":false' "$P/audit"
+say "N-7 the audit records forced=true on an unexpired delivery"
+
+# ── G-6 / G-6a: strict and permissive terminalizers disagree, by design ──
+D6=delivery-ffffffffffffffffffffffffffffffff; mk_delivery "$D6" "$future" 8
+python3 - "$P/deliveries/$D6.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['capability_class']='commit'; json.dump(d,open(p,'w'))
+PY
+CB6="$(cd "$R/.dev/forge-tmp/callbacks" && pwd -P)/lifecycle-adhoc.life.1.callback"
+printf 'slug: lifecycle\nstage: adhoc\nstatus: DONE\nworker: codex-a\nsession: life\nincarnation: 1\ndelivery_id: %s\nselected_pending_timestamp: "2026-08-07T00:00:00Z"\n' "$D6" > "$CB6"
+SHA6="$(shasum -a 256 "$CB6" | awk '{print $1}')"
+mkdir -p "$P/results"
+python3 - "$D6" "$CB6" "$SHA6" <<'PY' | ctl 3 LIFECYCLE_DELIVERY_RESULT_NOT_OK "G-6 strict refuses a commit DONE with zero protected results"
+import json,sys
+print(json.dumps({'action':'reconcile-delivery','delivery_id':sys.argv[1],'terminal':'completed',
+                  'callback_path':sys.argv[2],'callback_sha256':sys.argv[3]}))
+PY
+# G-6a: a result that exists but is not ok surfaces the SAME named code.
+python3 - "$P/results/op-bad.json" "$D6" <<'PY'
+import json,sys
+json.dump({'delivery_id':sys.argv[2],'operation_id':'op-bad','status':'error'},open(sys.argv[1],'w'))
+PY
+python3 - "$D6" "$CB6" "$SHA6" <<'PY' | ctl 3 LIFECYCLE_DELIVERY_RESULT_NOT_OK "G-6a a present-but-error result surfaces the same code"
+import json,sys
+print(json.dumps({'action':'reconcile-delivery','delivery_id':sys.argv[1],'terminal':'completed',
+                  'callback_path':sys.argv[2],'callback_sha256':sys.argv[3]}))
+PY
+# The permissive legacy terminalizer still accepts exactly what strict refused.
+printf '{"action":"terminalize-delivery","delivery_id":"%s","terminal":"completed"}\n' "$D6" \
+  | ctl 0 '"state": "completed"' "G-6 legacy terminalize-delivery still accepts it (asymmetry proven)"
+rm -f "$P/results/op-bad.json"
+
+# ── N-8: a truncated final reply is a stable refusal, not a traceback ──
+printf '{"action":"active-delivery","session":"life","pane":"6"}\n' \
+  | FORGE_BROKER_TEST_REPLY_TRUNCATE=1 ctl 4 CONTROL_REPLY_INVALID "N-8 truncated post-connect reply refuses with exit 4"
+[ -z "$(find "$LQ2/requests" -name '*.intent.json' -print -quit)" ]
+say "N-8 the truncated reply did not replay into the queue"
+
+# ── N-2: replay repairs a half-finished transition ──
+D2R=delivery-99999999999999999999999999999999; mk_delivery "$D2R" "$future" 9
+CB2="$(cd "$R/.dev/forge-tmp/callbacks" && pwd -P)/lifecycle-adhoc.life.1.callback"
+printf 'slug: lifecycle\nstage: adhoc\nstatus: DONE\nworker: codex-a\nsession: life\nincarnation: 1\ndelivery_id: %s\nselected_pending_timestamp: "2026-08-07T00:00:00Z"\n' "$D2R" > "$CB2"
+SHA2="$(shasum -a 256 "$CB2" | awk '{print $1}')"
+# Simulate the crash window: terminal record written, active/ never removed.
+python3 - "$P/deliveries/$D2R.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['state']='completed'; json.dump(d,open(p,'w'))
+PY
+test -f "$P/active/life.p9.json"
+python3 - "$D2R" "$CB2" "$SHA2" <<'PY' | ctl 0 '"replayed": true' "N-2 replay of a partial transition reports replayed"
+import json,sys
+print(json.dumps({'action':'reconcile-delivery','delivery_id':sys.argv[1],'terminal':'completed',
+                  'callback_path':sys.argv[2],'callback_sha256':sys.argv[3]}))
+PY
+[ ! -e "$P/active/life.p9.json" ]
+say "N-2 replay REPAIRED the orphaned active record (was reported ok and left open)"
+
+# ── N-4: valid non-object JSON gets a response instead of stranding ──
+rm -f "$LQ2/requests"/* "$LQ2/responses"/* 2>/dev/null || true
+printf '[1,2,3]\n' > "$LQ2/requests/lci-$(printf '%032d' 4).intent.json"
+qwait "$LQ2/responses/lci-$(printf '%032d' 4).json"
+grep -q LIFECYCLE_REQUEST_NOT_OBJECT "$LQ2/responses/lci-$(printf '%032d' 4).json"
+say "N-4 non-object JSON is refused with a response, not an unhandled AttributeError"
+
+# ── N-5 + N-1: an unclaimable entry is quarantined, symlinks are refused ──
+rm -f "$LQ2/requests"/* "$LQ2/responses"/* 2>/dev/null || true
+ln -s /etc/hosts "$LQ2/requests/lci-$(printf '%032d' 5).intent.json"
+for _ in $(seq 1 100); do
+  [ -n "$(find "$LQ2/requests" -name '*.rejected.*' -print -quit)" ] && break; sleep 0.05
+done
+[ -n "$(find "$LQ2/requests" -name '*.rejected.*' -print -quit)" ]
+[ -z "$(find "$LQ2/requests" -name '*.intent.json' -print -quit)" ]
+say "N-5 a symlinked intent is quarantined once instead of reprocessed forever"
+find "$LQ2/requests" -name '*.rejected.*' -delete
+
+# ── G-5: every queue path component is symlink-hardened (needs N-1) ──
+# The daemon MUST stay live here: broker_pid_live() is a precondition of the
+# fallback, so against a stopped daemon every case short-circuits to exit 4
+# (CONTROL_UNREACHABLE) and never reaches queue_directory at all.
+DECOY="$W/decoy"; mkdir -p "$DECOY"
+g5(){ # g5 <relative-component-path> <label>
+  local target="$R/$1" label="$2" saved="$W/saved-$(echo "$1" | tr / _)" out rc=0
+  mv "$target" "$saved"; ln -s "$DECOY" "$target"
+  out="$(printf '{"action":"active-delivery","session":"life","pane":"6"}\n' \
+    | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_BROKER_TEST_ENABLE=1 \
+      "$B" control --root "$R" 2>&1)" || rc=$?
+  rm -f "$target"; mv "$saved" "$target"
+  [ "$rc" != 0 ] || { echo "FAIL G-5 $label: symlinked component was accepted" >&2; exit 1; }
+  grep -q LIFECYCLE_QUEUE_UNSAFE <<<"$out" || { echo "FAIL G-5 $label: $out" >&2; exit 1; }
+  [ -z "$(ls -A "$DECOY")" ] || { echo "FAIL G-5 $label: decoy was written through" >&2; exit 1; }
+  say "G-5 symlinked $label refused, decoy untouched"
+}
+g5 ".dev/forge-broker/lifecycle/requests" "requests"
+g5 ".dev/forge-broker/lifecycle/responses" "responses"
+g5 ".dev/forge-broker/lifecycle" "lifecycle"
+g5 ".dev/forge-broker" "forge-broker"
+g5 ".dev" ".dev"
+rmdir "$DECOY"
+FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$R" >/dev/null
+
+# ── N-6: an orphan collision preserves both files ──
+FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$R" >/dev/null 2>&1 || true
+mkdir -p "$LQ2/requests"; rm -f "$LQ2/requests"/* 2>/dev/null || true
+ORIG="lci-$(printf '%032d' 6).intent.json"
+printf '{"schema":"forge-lifecycle-intent/1","intent_id":"lci-%032d","action":"active-delivery","emitted_at":"2026-08-07T00:00:00Z"}\n' 6 > "$LQ2/requests/$ORIG"
+printf '{"stale":"claim"}\n' > "$LQ2/requests/$ORIG.claimed.99999"
+FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$R" --session life --incarnation 1 --mode contain >/dev/null
+for _ in $(seq 1 100); do [ -n "$(find "$LQ2/requests" -name '*.orphan.*' -print -quit)" ] && break; sleep 0.05; done
+[ -n "$(find "$LQ2/requests" -name '*.orphan.*' -print -quit)" ]
+say "N-6 a colliding orphan is parked under a unique name, never overwritten"
+FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$R" >/dev/null
+
+# ── G-1 timeout arm: exit EXACTLY 5, with the daemon alive but not servicing ──
+rm -f "$LQ2/requests"/* "$LQ2/responses"/* 2>/dev/null || true
+FORGE_BROKER_TEST_QUEUE_PAUSE=1 FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$R" --session life --incarnation 1 --mode contain >/dev/null
+qrc=0
+printf '{"action":"active-delivery","session":"life","pane":"6"}\n' \
+  | FORGE_LIFECYCLE_TIMEOUT_S=1 FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_BROKER_TEST_ENABLE=1 \
+    "$B" control --root "$R" >/dev/null 2>&1 || qrc=$?
+[ "$qrc" -eq 5 ] || { echo "FAIL G-1 timeout: rc=$qrc want exactly 5" >&2; exit 1; }
+say "G-1 an unserviced queue times out at exit EXACTLY 5 (CONTROL_QUEUED)"
+FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$R" >/dev/null
+
 echo "broker tests: PASS"
