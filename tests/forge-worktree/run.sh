@@ -140,6 +140,37 @@ repo expected; printf '# keep\nforge:\n  expected_root: "%s" # inline\n  worktre
 repo passthru; cp "$SRC/.claude/forge-project.yml" "$WORK/orig"; ensure s1 --print-path >/dev/null 2>&1; cmp -s "$WORK/orig" "$WT/.claude/forge-project.yml" && ok 'T-WT-EXPECTED-ROOT-PASSTHRU' || bad passthru
 repo refuse; FORGE_CFG_SOURCE="$SRC" cfgpy 'forge["expected_root"]=os.environ["FORGE_CFG_SOURCE"]'; git -C "$SRC" add .claude/forge-project.yml; git -C "$SRC" commit -qm cfg; ensure s1 >/dev/null 2>"$WORK/refuse.err"; [ $? = 2 ] && grep -q 'delete.*expected_root.*set it to' "$WORK/refuse.err" && ok 'T-WT-EXPECTED-ROOT-REFUSE' || bad expected-refuse
 repo modes; mkdir -p "$SRC/backend/.venv"; echo env > "$SRC/backend/.env"; cfgpy 'wt["seed"]=[{"path":"backend/.venv","mode":"symlink","required":True},{"path":"backend/.env","mode":"copy","required":True}]'; ensure s1 --print-path >/dev/null 2>&1; [ -L "$WT/backend/.venv" ] && [ -f "$WT/backend/.env" ] && [ ! -L "$WT/backend/.env" ] && ok 'T-WT-SEED-MODES' || bad modes
+# The three real project shapes. The point is not the paths but that a REQUIRED
+# DIRECTORY symlink resolves for reads from inside the worktree (R12), and that a
+# project with no .envrc still provisions cleanly (headless_factory).
+seedshape(){ # seedshape <label> <mk-cmd> <json-seed-list> <probe-dir-rel>
+  repo "seed-$1"; eval "$2"
+  FORGE_SEED_LIST="$3" cfgpy 'import json; wt["seed"]=json.loads(os.environ["FORGE_SEED_LIST"])'
+  ensure s1 --print-path >/dev/null 2>&1
+  [ -L "$WT/$4" ] && [ -r "$WT/$4" ] && [ "$(cat "$WT/$4/marker" 2>/dev/null)" = mk ] \
+    && ok "T-WT-SEED-SHAPE $1 required directory symlink resolves from the worktree" \
+    || bad "seed-shape-$1"
+}
+seedshape goparent \
+  'mkdir -p "$SRC/backend/.venv" "$SRC/frontend/node_modules"; echo mk > "$SRC/backend/.venv/marker"; echo env > "$SRC/backend/.env"' \
+  '[{"path":"backend/.env","mode":"symlink","required":true},{"path":"backend/.venv","mode":"symlink","required":true},{"path":"frontend/node_modules","mode":"symlink","required":true}]' \
+  backend/.venv
+# feedforge's backend/.env is itself a SYMLINK to the root .env, so the fixture must
+# be a symlink-to-a-symlink — that is the real shape under test.
+seedshape feedforge \
+  'mkdir -p "$SRC/backend/.venv" "$SRC/frontend/node_modules"; echo mk > "$SRC/backend/.venv/marker"; echo e > "$SRC/.env"; ln -sf "$SRC/.env" "$SRC/backend/.env"' \
+  '[{"path":".env","mode":"symlink","required":true},{"path":"backend/.env","mode":"symlink","required":true},{"path":"backend/.venv","mode":"symlink","required":true},{"path":"frontend/node_modules","mode":"symlink","required":true}]' \
+  backend/.venv
+seedshape headless \
+  'mkdir -p "$SRC/.venv" "$SRC/apps/web/node_modules"; echo mk > "$SRC/.venv/marker"; echo e > "$SRC/.env"; rm -f "$SRC/.envrc"' \
+  '[{"path":".env","mode":"symlink","required":true},{"path":".venv","mode":"symlink","required":true},{"path":"apps/web/node_modules","mode":"symlink","required":true}]' \
+  .venv
+# The implicit `.envrc` miss is silent by design, so assert the run SUCCEEDED rather
+# than that it warned.
+[ -e "$WT/.git" ] && [ ! -e "$WT/.envrc" ] \
+  && ok 'T-WT-SEED-SHAPE headless provisions cleanly with no .envrc present' \
+  || bad 'seed-shape-no-envrc'
+
 repo required; cfgpy 'wt["seed"]=[{"path":"missing","required":True}]'; ensure s1 >/dev/null 2>&1; [ $? = 4 ] && ok 'T-WT-SEED-REQUIRED true' || bad required
 repo optional; cfgpy 'wt["seed"]=[{"path":"missing","required":False}]'; ensure s1 --print-path >/dev/null 2>"$WORK/optional.err"; [ $? = 0 ] && grep -q optional "$WORK/optional.err" && ok 'T-WT-SEED-REQUIRED false' || bad optional
 group_ok=1; for q in /abs ../x .git/x .dev/x 'back\\slash'; do repo "u-$RANDOM"; export FORGE_SEED_PATH="$q"; cfgpy 'wt["seed"]=[{"path":os.environ["FORGE_SEED_PATH"]}]'; before=$(nw); ensure s1 >/dev/null 2>&1; [ $? = 2 ] && [ "$(nw)" = "$before" ] || group_ok=0; done; unset FORGE_SEED_PATH; [ "$group_ok" = 1 ] && ok 'T-WT-SEED-MODES unsafe' || bad unsafe-seeds
