@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic queue logic for the forge-fix-runner skill.
+"""Deterministic queue logic for the forge-fix-runner skill. TEMPLATE.
 
 Pure functions operate on a list of issue dicts shaped like `gh issue list
 --json number,title,labels` output. The CLI reads live from `gh` by default, or
@@ -7,7 +7,12 @@ from a JSON file (`--json FILE`) for tests / dry-run.
 
 The actionable predicate here is the load-bearing safety contract: it is what
 keeps the runner from re-queuing an issue that is already awaiting retest or
-already in flight (e.g. issue #81, which carries both forge-fix and needs-retest).
+already in flight.
+
+This is the toolkit TEMPLATE copy. Projects take a project-local copy under
+`.claude/skills/forge-fix-runner/scripts/`; it is behaviourally identical
+everywhere and only the PER-PROJECT CONFIG block below differs. When logic
+changes here, propagate the change and leave each project's CONFIG block alone.
 """
 from __future__ import annotations
 import argparse
@@ -15,8 +20,20 @@ import json
 import subprocess
 import sys
 
-# Labels that make an issue NON-actionable even when forge-fix is present.
+# ──────────────────────────────────────────────────────────────────────────
+# PER-PROJECT CONFIG  — the only block that differs between projects.
+# In the template DEFAULT_REPO is unset: a project copy must set it, or the
+# caller must pass --repo. Never let this template guess a repo.
+DEFAULT_REPO = None                  # e.g. "SirTheOracle/goparent-ai"
+TRIGGER_LABEL = "forge-fix"          # human-added triage signal; the runner never adds it
+CLASSIFIER_PREFIX = "service:"       # how issues bucket (GoParent/anim8e2e: "service:", FeedMint: "area:")
 BLOCKING_LABELS = {"needs-retest", "in-progress", "fix-pr-open"}
+# ──────────────────────────────────────────────────────────────────────────
+
+# Display noun derived from the classifier, so a project that buckets by
+# "area:" prints "area" rather than a hardcoded "service".
+CLASSIFIER_NOUN = CLASSIFIER_PREFIX.rstrip(":")
+
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 SEVERITY_NONE = 99
 
@@ -26,7 +43,7 @@ def label_names(issue: dict) -> list[str]:
 
 
 def service_labels(issue: dict) -> list[str]:
-    return [n for n in label_names(issue) if n.startswith("service:")]
+    return [n for n in label_names(issue) if n.startswith(CLASSIFIER_PREFIX)]
 
 
 def severity_of(issue: dict) -> str | None:
@@ -39,11 +56,11 @@ def severity_rank(issue: dict) -> int:
 
 
 def is_actionable(issue: dict) -> bool:
-    """Open + forge-fix + exactly one service:* + no blocking label."""
+    """Open + trigger label + exactly one classifier label + no blocking label."""
     if issue.get("state", "OPEN").upper() != "OPEN":
         return False
     names = set(label_names(issue))
-    if "forge-fix" not in names:
+    if TRIGGER_LABEL not in names:
         return False
     if len(service_labels(issue)) != 1:
         return False
@@ -87,15 +104,19 @@ def queue_for(service: str, issues: list[dict]) -> list[dict]:
     return sel
 
 
-DEFAULT_REPO = "SirTheOracle/goparent-ai"
-
-
 def _load(args) -> list[dict]:
     if args.json:
         with open(args.json) as fh:
             return json.load(fh)
+    if not args.repo:
+        sys.exit(
+            "no repo configured: set DEFAULT_REPO in the PER-PROJECT CONFIG block "
+            "of this queue.py, or pass --repo owner/name.\n"
+            "(You are probably running the toolkit TEMPLATE copy instead of the "
+            "project-local one under .claude/skills/forge-fix-runner/.)"
+        )
     cmd = [
-        "gh", "issue", "list", "--repo", args.repo, "--label", "forge-fix",
+        "gh", "issue", "list", "--repo", args.repo, "--label", TRIGGER_LABEL,
         "--state", "open", "--limit", "300", "--json", "number,title,labels,state",
     ]
     return json.loads(subprocess.check_output(cmd, text=True))
@@ -108,12 +129,13 @@ def _cmd_tally(args):
         print(json.dumps(rows, indent=2))
         return
     if not rows:
-        print("No actionable forge-fix issues.")
+        print(f"No actionable {TRIGGER_LABEL} issues.")
         return
-    print(f"{'service':<12}{'crit':>5}{'high':>5}{'med':>5}{'total':>7}")
+    print(f"{CLASSIFIER_NOUN:<12}{'crit':>5}{'high':>5}{'med':>5}{'total':>7}")
     for r in rows:
         print(f"{r['service']:<12}{r['critical']:>5}{r['high']:>5}{r['medium']:>5}{r['total']:>7}")
-    print(f"\nNext service (worst-first): {rows[0]['service']}  ({rows[0]['critical']} criticals)")
+    print(f"\nNext {CLASSIFIER_NOUN} (worst-first): {rows[0]['service']}"
+          f"  ({rows[0]['critical']} criticals)")
 
 
 def _cmd_select(args):
@@ -124,7 +146,7 @@ def _cmd_select(args):
                            "title": i.get("title", "")} for i in q], indent=2))
         return
     if not q:
-        print(f"No actionable issues for service:{args.service}")
+        print(f"No actionable issues for {CLASSIFIER_PREFIX}{args.service}")
         return
     for i in q:
         print(f"#{i['number']}\t{severity_of(i) or '-':<8}\t{i.get('title','')[:70]}")
@@ -136,9 +158,10 @@ def main(argv=None):
     p.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repo (owner/name) for gh")
     p.add_argument("--format", choices=["table", "json"], default="table")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("tally", help="worst-first service ordering over actionable issues")
-    s = sub.add_parser("select", help="actionable queue for one service, severity-ordered")
-    s.add_argument("--service", required=True)
+    sub.add_parser("tally", help=f"worst-first {CLASSIFIER_NOUN} ordering over actionable issues")
+    s = sub.add_parser("select", help=f"actionable queue for one {CLASSIFIER_NOUN}, severity-ordered")
+    s.add_argument("--service", required=True,
+                   help=f"the {CLASSIFIER_NOUN} value (bare, without the '{CLASSIFIER_PREFIX}' prefix)")
     args = p.parse_args(argv)
     {"tally": _cmd_tally, "select": _cmd_select}[args.cmd](args)
 

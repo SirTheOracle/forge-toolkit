@@ -16,9 +16,20 @@ the existing forge pipeline. You are the **management layer**; forge is the engi
 You do NOT reinvent fixing — you select work, scout it, gate it, and keep issue
 status in sync.
 
-**Repo:** `SirTheOracle/goparent-ai`. **Design of record:**
+> **This is the toolkit TEMPLATE copy.** It is not runnable as-is: its
+> `DEFAULT_REPO` is unset on purpose. Every project keeps its own copy under
+> `.claude/skills/forge-fix-runner/`, which is what actually loads when you invoke
+> the skill in that project. See **Project deployment** at the bottom.
+
+**Repo:** set by `DEFAULT_REPO` in the PER-PROJECT CONFIG block of
+`scripts/queue.py`. **Design of record:**
 `.dev/proposals/qa-github-issues/forge-fix-pipeline-design.md` (read it if anything
-here is ambiguous). **Queue logic:** `scripts/queue.py` (deterministic, tested).
+here is ambiguous). **Queue logic:** `scripts/queue.py` (deterministic, tested) —
+run it with no `--repo` flag; a project copy already points at its own repo.
+
+**Classifier:** issues bucket by a configurable label prefix — `service:*` by
+default, but a project may use another (FeedMint uses `area:*`). This document
+says "service"; read that as whatever `CLASSIFIER_PREFIX` your project copy sets.
 
 ## Non-negotiable invariants
 
@@ -36,13 +47,14 @@ here is ambiguous). **Queue logic:** `scripts/queue.py` (deterministic, tested).
 ## The actionable predicate (what you may pick up)
 
 Use `scripts/queue.py` — do not eyeball labels. An issue is actionable iff:
-open + `forge-fix` + exactly one `service:*` + none of
-`needs-retest` / `in-progress` / `fix-pr-open`.
-(This is why #81 — `forge-fix` + `needs-retest` — is correctly skipped.)
+open + the trigger label + exactly one classifier label + none of the project's
+`BLOCKING_LABELS` (by default `needs-retest` / `in-progress` / `fix-pr-open`).
+(So an issue carrying `forge-fix` + `needs-retest` is correctly skipped — it is
+already awaiting retest.) All four inputs come from the PER-PROJECT CONFIG block.
 
 ```
-python3 scripts/queue.py tally                 # worst-first services, proposes next
-python3 scripts/queue.py select --service eval  # the actionable queue for one service
+python3 scripts/queue.py tally                    # worst-first services, proposes next
+python3 scripts/queue.py select --service <NAME>  # the actionable queue for one service
 ```
 
 ## Procedure
@@ -57,7 +69,7 @@ python3 scripts/queue.py select --service eval  # the actionable queue for one s
 
 ### 1. Pick the service
 Run `queue.py tally`. Propose the worst-first service as a one-liner the user can
-redirect ("Run EVAL next? 6 criticals"). Counts are live — never hard-code them.
+redirect ("Run <SERVICE> next? N criticals"). Counts are live — never hard-code them.
 
 ### 2. Scout (read-only — change no code)
 The scout is a fixed contract (prompt `~/.config/forge/prompts/fix-scout.txt` + the group
@@ -72,8 +84,9 @@ schema in step 3), so it is **agent-agnostic** — run it either way:
 Either way the scout reads each issue body + the implicated code and produces **groups**,
 each a cluster (several issues, ONE shared root cause) or a singleton. A cluster means
 *one fix resolves all covered issues* — shared root cause, NOT shared service or shared
-symptom wording. (Live caution: EVAL's queue mixes "section empty" and "code showing" —
-different causes — so derive groups from evidence; never assume a service is one cluster.)
+symptom wording. Derive groups from evidence; never assume a service is one cluster.
+(Live caution from GoParent: one service's queue mixed "section empty" and "code
+showing" symptoms that turned out to have entirely different causes.)
 
 **Multi-cause issues (many-to-many):** an issue can have several causes, and a cause can
 span issues. A group's `Closes` may list an issue only if the group fixes ALL its causes;
@@ -89,16 +102,16 @@ Write `.dev/proposals/qa-github-issues/fix-plans/<SERVICE>-<YYYY-MM-DD>.md`. One
 record per group (YAML block + a short prose rationale):
 
 ```yaml
-group_id:                # eval-2026-06-08-g1
-service:                 # eval
+group_id:                # <service>-<YYYY-MM-DD>-g1
+service:                 # <service>   (the classifier value)
 tier:                    # quick | full
 covered_issue_numbers:   # [68, 69]
-covered_coded_ids:       # [EVAL-012, EVAL-013]
+covered_coded_ids:       # [<SVC>-012, <SVC>-013]
 current_labels:          # per-issue label snapshot (for idempotency/abort)
 root_cause_hypothesis:   # short prose (NON-AUTHORITATIVE for full pipeline)
 confidence:              # high|medium|low + one-line why
-slug:                    # eval-evaluator-lens-empty
-branch_name:             # fix/eval-evaluator-lens-empty
+slug:                    # <service>-<short-cause-description>
+branch_name:             # fix/<service>-<short-cause-description>
 close_keywords:          # "Closes #68 #69"  (emitted to PR ONLY after verification)
 required_tests:          # commands the fix must pass
 drop_conditions:         # when to un-cover an issue from this group
@@ -147,8 +160,9 @@ remove `in-progress`, add `fix-pr-open`, and comment the PR link (tag the commen
 
 ### 7. Report and stop
 Summarize groups dispatched, PRs opened, issues dropped/escalated. **Merging is a
-human action** — on merge GitHub auto-closes the issues; the daily `goparent-qa-review`
-task then adds `needs-retest` and pings the tester. Do not merge.
+human action** — on merge GitHub auto-closes the issues; the project's daily QA
+task (`<project>-qa-review` / `<project>-qa-issue-sync`) then reconciles status,
+typically adding `needs-retest` and pinging the tester. Do not merge.
 
 ## Cluster abort (when a covered issue turns out different)
 If a covered issue has a different cause (found during fix or failing verification),
@@ -172,3 +186,24 @@ Never let a silent `Closes` close an unfixed bug.
 - Never modify files outside `.dev/proposals/<slug>/` and the fix's own source changes.
 - You add status labels (`in-progress`/`fix-pr-open`) and runner comments; you never
   add `forge-fix` and never write to the Google Sheets.
+
+## Project deployment (how the copies relate)
+
+This toolkit copy is the **template of record**. Each project holds a physical copy
+at `<project>/.claude/skills/forge-fix-runner/` — that copy, not this one, is what
+loads when the skill is invoked in that project. `.claude/skills/` is untracked, so
+git will not reconcile them for you.
+
+**Only the PER-PROJECT CONFIG block in `scripts/queue.py` may differ**, plus the
+matching label names in `SKILL.md` prose and `test_queue.py` fixtures:
+
+| Project | Repo | `CLASSIFIER_PREFIX` | Extra blocking labels |
+|---|---|---|---|
+| `goparent-ai` | `SirTheOracle/goparent-ai` | `service:` | — |
+| `feedforge` | `SirTheOracle/feedmint` | `area:` | `status:in-progress` |
+| `headless_factory` | `SirTheOracle/animation-factory` | `service:` | — |
+
+Procedure/invariant changes belong to **all** copies — when you change one, propagate
+to the rest and re-run each `test_queue.py`. Note that git worktrees get a physical
+snapshot of `.claude/skills/` at creation time; those snapshots are disposable, and
+refreshing the parent checkout is what fixes future ones.

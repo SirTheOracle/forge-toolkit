@@ -1,9 +1,13 @@
 """Core tests for the forge-fix-runner queue predicate and ordering.
 
 Run: python3 -m pytest test_queue.py   (or: python3 test_queue.py for a quick check)
-These cover the load-bearing safety logic: the actionable predicate (the #81
-hazard), exactly-one-service validation, worst-first ordering, and per-service
-severity ordering.
+These cover the load-bearing safety logic: the actionable predicate (the
+needs-retest hazard), exactly-one-classifier validation, worst-first ordering,
+and per-classifier severity ordering.
+
+TEMPLATE copy: labels below use the default `service:` classifier. A project
+copy rewrites these fixtures to its own classifier and adds a case per extra
+BLOCKING_LABEL it configures (see FeedMint's `status:in-progress` test).
 """
 import queue as q
 
@@ -21,7 +25,7 @@ def test_actionable_happy_path():
 
 
 def test_needs_retest_excluded():
-    # The live #81 hazard: forge-fix + needs-retest must NOT be actionable.
+    # forge-fix + needs-retest must NOT be actionable (already awaiting retest).
     assert not q.is_actionable(issue(81, FF, "service:plan", "severity:critical", "needs-retest"))
 
 
