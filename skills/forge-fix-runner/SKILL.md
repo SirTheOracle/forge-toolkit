@@ -97,9 +97,72 @@ issues between groups. (See the design doc's "Multi-cause issues" section.)
 If you suspect a **cross-service** root cause, flag it and STOP for the user — do not
 force it into a service-local group.
 
-### 3. Write the routing plan + get approval
-Write `.dev/proposals/qa-github-issues/fix-plans/<SERVICE>-<YYYY-MM-DD>.md`. One
-record per group (YAML block + a short prose rationale):
+### 3. Write the plan DIRECTORY + get approval  (INITIATOR ONLY)
+
+**Location — the PRIMARY root, never your worktree.** Your worktree is itself
+disposable and gets pruned; the plan must outlive it and resolve identically from
+every sibling session:
+
+    PRIMARY_ROOT="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+    PLAN_DIR="$PRIMARY_ROOT/.dev/proposals/qa-github-issues/fix-plans/<SERVICE>-<YYYY-MM-DD>"
+
+That is the same anchor the infra lock resolves, and it is byte-identical from a
+linked worktree and from the primary.
+
+    <PLAN_DIR>/
+        plan.md            # deal table + one YAML record per bucket   (human audit; SEALED)
+        deal.json          # CANONICAL mechanical source               (SEALED)
+        packets/<gid>.md   # one self-contained task packet per bucket (SEALED)
+        manifest.json      # sha256 of every sealed file, written at approval
+        claims/            # MUTABLE — created on demand by `queue.py claim`
+        journal/<queue>.md # MUTABLE — append-only, exactly ONE writer per file
+
+**Immutability rule (invariant 4, applied literally).** After approval, `plan.md`,
+`deal.json` and `packets/` are **read-only to every session** and their hashes are
+sealed in `manifest.json`. `deal.json` is **canonical** for anything a claim or an
+execute-mode decision depends on; `plan.md` is the human artifact. `claim` and
+execute mode both refuse on a seal mismatch. No session writes per-bucket status
+anywhere. Progress is reconstructed from GitHub: `in-progress` ⇒ claimed,
+unstarted-or-running; `fix-pr-open` + an open PR carrying the bucket's `Closes` set ⇒
+done; issue closed ⇒ merged. This removes the three-concurrent-writers lost-update
+shape entirely.
+
+**Grouping rules — now load-bearing, not advice.** Two concurrently executing
+branches must not touch one file, and a bucket can never see another bucket's
+unmerged work:
+
+- **Groups that would edit the same files MUST be merged into one bucket.**
+- **A group that consumes a symbol another group creates MUST be merged into that
+  group.**
+- **`depends_on` must be empty.** A non-empty value is refused at `deal`,
+  `deal --verify`, `claim` and `packet-check`. There is no execution path for it:
+  every bucket branches from a freshly fetched `origin/<base_branch>` and no session
+  waits for a merge, so a later bucket branches from a ref that does not contain the
+  earlier one's work. Queue locality supplies **ordering**, not **ancestry** — keeping
+  a chain in one queue would only make the failure sequential instead of parallel.
+  Re-introducing chains needs an explicit merge gate or stacked ancestry; both are out
+  of scope. Do not smuggle one in as queue order.
+
+**Packet contract** — `packets/<gid>.md` **is** the `problem-statement.md`. Step 4 no
+longer writes one; it copies this in. YAML front matter first (mechanically validated
+by `packet-check`), verbatim issue bodies after:
+
+    ---
+    group_id · service · tier · slug · branch_name · queue_id · plan_dir
+    base_branch · base_sha
+    covered_issue_numbers · covered_coded_ids · current_labels
+    root_cause_hypothesis (NON-AUTHORITATIVE) · confidence · anchors
+    required_tests · infra_required · close_keywords · drop_conditions
+    verification_targets:   # ONE ROW PER COVERED ISSUE
+      - issue · coded_id · symptom · check · evidence
+    ---
+    VERBATIM `gh issue view` body for every covered issue.
+
+`packet-check` gates the invariant: **every `covered_issue_number` has a verification
+row, and no row names an issue the bucket does not cover** — an issue with no row
+could never earn its `Closes`.
+
+One record per bucket in `deal.json` (mirrored into `plan.md` prose):
 
 ```yaml
 group_id:                # <service>-<YYYY-MM-DD>-g1
@@ -115,10 +178,56 @@ branch_name:             # fix/<service>-<short-cause-description>
 close_keywords:          # "Closes #68 #69"  (emitted to PR ONLY after verification)
 required_tests:          # commands the fix must pass
 drop_conditions:         # when to un-cover an issue from this group
-approval_status:         # pending
+approval_status:         # pending | approved | dropped
+base_branch:             # main   <- BARE. `origin/` is added at USE, never stored.
+base_sha:                # 40-hex sha of origin/<base_branch> at grouping time
+anchors:                 # symbol anchors (function/class names), never line numbers
+depends_on:              # [] — MUST be empty (see the grouping rules above)
+infra_required:          # derived (S6); absent => treat as true
+weight:                  # derived: TIER_BASE[tier] + len(covered_issue_numbers)
+queue:                   # S1|S2|S3 — operator-editable BEFORE approval only
+packet:                  # packets/<group_id>.md
 ```
-Present the plan. The user may flip tiers, split/merge groups, or drop groups. Set
-`approval_status: approved` on what they bless. Execute ONLY approved groups.
+
+> **`base_branch` is stored bare.** Store `main`, not `origin/main`, and build
+> `origin/$base_branch` at the point of use. Storing the qualified ref produced
+> `origin/origin/main` at every branch cut and every moved-ground check.
+
+**Then deal and check:**
+
+```bash
+python3 scripts/queue.py deal --plan "$PLAN_DIR/deal.json" --sessions 3 --write
+python3 scripts/queue.py deal --verify --plan "$PLAN_DIR/deal.json"
+python3 scripts/queue.py packet-check --plan-dir "$PLAN_DIR"
+```
+
+Present the deal table with **per-queue weight totals alongside bucket counts**, so a
+single-bucket S3 reads as a heavy bucket and not as a bug. (There are no "units":
+chains are refused, not collapsed.) The derived `infra_required` value is shown per
+bucket. The user may flip tiers, split/merge groups, drop groups, or move a bucket
+between queues — then re-run `deal --verify`. Before approving a 3-way deal, check
+headroom with `~/bin/forge-bridge usage --refresh`; deal to 2 if it is thin.
+
+**The approval transaction — ordered, and every step is idempotent.** Owner-aware
+status and `ROOT_CONFLICT` both assume every queue has a claim, so the initiator's own
+transition cannot be left implicit. Do these in exactly this order; a crash at any
+boundary is recoverable by re-running:
+
+1. Set `approval_status: approved` on the blessed buckets; re-run `deal --verify` and
+   `packet-check`. **Execute ONLY approved buckets.**
+2. `python3 scripts/queue.py seal --plan-dir "$PLAN_DIR"` — the artifacts freeze.
+3. Apply `in-progress` to every covered issue of every approved bucket
+   (check-before-write, so re-running adds nothing twice). On a **partial failure do
+   not roll back**: record which issues were labelled in `journal/S1.md`, report the
+   failures, and **stop** — do not claim, do not print the tab block.
+   `reconcile --dry-run` is the recovery path; the labels are not lost work.
+4. `python3 scripts/queue.py claim --plan-dir "$PLAN_DIR" --queue S1 --root "$(git rev-parse --show-toplevel)"`
+   — the initiator claims **before** any assisting tab can.
+5. **Only now** print the tab block (step 3b).
+
+`in-progress` at approval time is what makes a second tab's `tally` refuse. It also
+creates an orphaned-label class if a session dies, which is why `reconcile` ships in
+the same change and is the documented remedy.
 
 ### 4. Execute each approved group (severity order; quick-criticals first)
 For each group, set `in-progress` on every covered issue, then by tier:
