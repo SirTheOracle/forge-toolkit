@@ -16,13 +16,15 @@ the existing forge pipeline. You are the **management layer**; forge is the engi
 You do NOT reinvent fixing — you select work, scout it, gate it, and keep issue
 status in sync.
 
-> **This is the toolkit TEMPLATE copy.** It is not runnable as-is: its
-> `DEFAULT_REPO` is unset on purpose. Every project keeps its own copy under
-> `.claude/skills/forge-fix-runner/`, which is what actually loads when you invoke
-> the skill in that project. See **Project deployment** at the bottom.
+> **Project specifics** — repo name, classifier vocabulary, extra blocking labels,
+> the seed set, the readiness probes (including the two verbatim probe commands
+> execute mode needs), and any project-local caveats — live in `PROJECT.md` beside
+> this file. **Read it first.** Everything in *this* document is identical in every
+> project.
 
 **Repo:** set by `DEFAULT_REPO` in the PER-PROJECT CONFIG block of
-`scripts/queue.py`. **Design of record:**
+`scripts/queue.py` (each project's `scripts/` is a real directory, never a symlink).
+**Design of record:**
 `.dev/proposals/qa-github-issues/forge-fix-pipeline-design.md` (read it if anything
 here is ambiguous). **Queue logic:** `scripts/queue.py` (deterministic, tested) —
 run it with no `--repo` flag; a project copy already points at its own repo.
@@ -533,15 +535,31 @@ Never let a silent `Closes` close an unfixed bug.
 - You add status labels (`in-progress`/`fix-pr-open`) and runner comments; you never
   add `forge-fix` and never write to the Google Sheets.
 
-## Project deployment (how the copies relate)
+## Maintainer note — deployment topology
 
-This toolkit copy is the **template of record**. Each project holds a physical copy
-at `<project>/.claude/skills/forge-fix-runner/` — that copy, not this one, is what
-loads when the skill is invoked in that project. `.claude/skills/` is untracked, so
-git will not reconcile them for you.
+*(Operators can skip this section; it is for whoever edits the toolkit.)*
 
-**Only the PER-PROJECT CONFIG block in `scripts/queue.py` may differ**, plus the
-matching label names in `SKILL.md` prose and `test_queue.py` fixtures:
+`skills/forge-fix-runner/SKILL.md` in `forge-toolkit` is the **only** copy of this
+document. Each project's `<project>/.claude/skills/forge-fix-runner/SKILL.md` is a
+**symlink** to it. `scripts/` stays a **physical directory** in every project — the
+PER-PROJECT CONFIG block is the whole point, and a symlinked `scripts/` would erase
+it. That is exactly the verified topology of `~/.claude/skills/forge-fix-runner/`
+(SKILL.md symlink, real `scripts/` dir).
+
+**Convert one project first.** Symlink resolution is proven for `~/.claude/skills/`;
+a project-level `.claude/skills/` is a *different loader path*. Convert
+`goparent-ai`, invoke the skill there, confirm it loads. Only then convert the other
+two. **Fallback if it does not resolve:** keep physical copies and rely on
+`test_matches_template_outside_config_block()` to catch drift either way.
+
+**The worktree inversion, stated so nobody debugs it twice:** a git worktree gets a
+*physical snapshot* of `.claude/` at creation time, and `shutil.copytree(…,
+symlinks=True)` **preserves the symlink** — so after conversion a worktree's copy is a
+symlink pointing at the **primary** checkout. A toolkit edit you are testing inside a
+forge-toolkit worktree is therefore *not* what loads. Edit and test from the primary
+checkout, or accept that the worktree copy is inert.
+
+Project-specific prose lives in `PROJECT.md` next to each project's copy:
 
 | Project | Repo | `CLASSIFIER_PREFIX` | Extra blocking labels |
 |---|---|---|---|
