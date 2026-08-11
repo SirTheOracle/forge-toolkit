@@ -6,6 +6,14 @@ color: magenta
 tools: ["Bash", "Read", "Write", "Edit", "Grep", "Glob", "Agent"]
 ---
 
+> **Not synced with `skills/forge-orchestrator/SKILL.md`.** This body predates Hard
+> Rule 23 (the cross-worktree infra lock) and does not carry it. `forge-bridge
+> dispatch` now REFUSES any `commit`/`live-qa` stage — `coding`, `qa`, `qa-fix`,
+> `qa-retry`, `verify`, `fix-code`, `fix-qa`, `fix-qa-retry` — unless the session
+> holds the infra lock: acquire with
+> `~/bin/forge-bridge infra-lock acquire --slug <s> --stage <stage>` first, and
+> release only on terminal DONE/ERROR. Prefer `/forge`, which loads the SKILL in-pane
+> and carries the full rule.
 
 > **Invocation mode:** if you are reading this loaded into a user session
 > (via `/forge-orchestrator`), you are in **escape-hatch / manual-driving
