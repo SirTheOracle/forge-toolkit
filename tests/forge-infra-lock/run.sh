@@ -619,6 +619,140 @@ out=$(cd "$PROJ" && FORGE_INFRA_LOCK_DIR="$FRESH" \
       "$BRIDGE" infra-lock status 2>&1)
 echo "$out" | grep -q 'FREE' && ok "infra-lock status on a fresh anchor → FREE (wired end-to-end)" || bad "fresh status wrong: $out"
 
+# ═══════════════════════════════════════════════════════════════════════════
+echo "══ S1: the fix stages and the fix-verify LABEL are first-class ══"
+# fix-code/fix-qa/fix-qa-retry joined the locked set (capability commit|live-qa).
+# `fix-verify` is a lock LABEL with no stage_capabilities entry — step-5 inline
+# verification, Shape B — and must still round-trip, because `acquire` validates
+# neither --slug nor --stage.
+FIXA="$WORK/fixlock"; mkdir -p "$FIXA"
+fixil() { ( cd "$PROJ" && env -u TMUX FORGE_INFRA_LOCK_DIR="$FIXA" \
+              FORGE_LOCK_SELF_HOST=fixhost FORGE_LOCK_SELF_SESSION=fixsess \
+              FORGE_LOCK_SELF_SESSION_ID=fixsid FORGE_LOCK_SELF_SESSION_CREATED=1 \
+              "$BRIDGE" infra-lock "$@" 2>&1 ); }
+for st in fix-code fix-qa fix-qa-retry fix-verify; do
+    out=$(fixil acquire --slug fixslug --stage "$st")
+    echo "$out" | grep -q 'ACQUIRED' || { bad "S1 acquire failed for $st: $out"; continue; }
+    # Assert the STAGE on the SIDECAR, not on the rendered status line. These fixtures
+    # use a synthetic FORGE_LOCK_SELF_* identity that is deliberately not a live tmux
+    # session, so `status` resolves STALE — and the STALE rendering names the holder
+    # and session but not the stage. The sidecar is the authoritative record and is
+    # what the ownership predicate actually compares, so this is the stronger check.
+    grep -Fqx "stage: $st" "$FIXA/infra.holder" \
+      || { bad "S1 holder sidecar omits stage $st: $(tr '\n' ' ' < "$FIXA/infra.holder")"; continue; }
+    out=$(fixil status)
+    echo "$out" | grep -qE 'STALE|HELD' || { bad "S1 status did not report a holder for $st: $out"; continue; }
+    out=$(fixil release --slug fixslug --stage "$st")
+    echo "$out" | grep -q 'RELEASED' \
+      && ok "S1 infra-lock acquire/status/release round-trips $st" \
+      || bad "S1 release failed for $st: $out"
+done
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo "══ V3 unit: _infra_lock_owned_by_me and _stage_capability_class ══"
+# FNS-extraction idiom (cf. tests/forge-bridge/run.sh's HFNS block). NOTE the two
+# spellings: multi-line functions use a RANGE to the next `^}$`; `_il_field` is a
+# ONE-LINE function and must use a single-line print, or the range over-runs and
+# drags cmd_infra_lock's body in (the T-ACM-EXTRACT hazard).
+ILFNS="$WORK/ilfns.sh"
+# THREE spellings, not two. `_infra_lock_run` embeds a python heredoc whose `me = {`
+# dict literal closes with a BARE `}` in column 0, so a /^}$/ range terminates ~19
+# lines into a ~140-line function and every helper below it goes undefined (rc=127).
+# It is therefore ranged to its heredoc terminator, with the function's closing brace
+# re-appended. If PYEOF is ever renamed, this range must follow it.
+{
+  sed -n '/^_il_field()/p' "$BRIDGE"
+  sed -n '/^_infra_lock_anchor()/,/^}$/p' "$BRIDGE"
+  sed -n '/^_infra_lock_identity()/,/^}$/p' "$BRIDGE"
+  sed -n '/^_infra_lock_run()/,/^PYEOF$/p' "$BRIDGE"; printf '}\n'
+  sed -n '/^_infra_lock_owned_by_me()/,/^}$/p' "$BRIDGE"
+  sed -n '/^_stage_capability_class()/,/^}$/p' "$BRIDGE"
+} > "$ILFNS"
+bash -n "$ILFNS" && ok "V3-EXTRACT the extracted helpers parse" || bad "V3-EXTRACT extracted helpers do not parse"
+for fn in _il_field _infra_lock_anchor _infra_lock_identity _infra_lock_run _infra_lock_owned_by_me _stage_capability_class; do
+    grep -q "^$fn()" "$ILFNS" || bad "V3-EXTRACT $fn missing from the extraction"
+done
+
+OWNA="$WORK/ownlock"; mkdir -p "$OWNA"
+# The identity used below is a REAL tmux session, not a synthetic one. The predicate
+# requires verdict=HELD_LIVE, and liveness is resolved by shelling out to the real
+# `tmux list-sessions` (there is deliberately no seam for it — see the comment on
+# _infra_lock_identity). A synthetic FORGE_LOCK_SELF_* identity is therefore ALWAYS
+# STALE, and the positive case could never pass with one. The negative cases below are
+# unaffected: FREE, another stage, another slug and another session are all not-owned
+# regardless of whose identity is live.
+OWNSESS="ilown-$$"
+tmux new-session -d -s "$OWNSESS" -x 80 -y 24 2>/dev/null
+OWN_HOST="$(hostname 2>/dev/null)"
+OWN_SID="$(tmux display-message -p -t "$OWNSESS" '#{session_id}' 2>/dev/null)"
+OWN_CREATED="$(tmux display-message -p -t "$OWNSESS" '#{session_created}' 2>/dev/null)"
+# NOTE: never funnel these through `eval`. A tmux session_id is literally of the form
+# `$811`, so an eval'd assignment re-expands it as positional parameter $8 and silently
+# yields `11` — the lock is then taken under one identity and queried under another,
+# and every ownership case reads FREE.
+own() {  # own <slug> <stage> -> prints the holder line; rc is the predicate's
+    ( set +u
+      . "$ILFNS"
+      export FORGE_LOCK_SELF_HOST="$OWN_HOST" FORGE_LOCK_SELF_SESSION="$OWNSESS" \
+             FORGE_LOCK_SELF_SESSION_ID="$OWN_SID" FORGE_LOCK_SELF_SESSION_CREATED="$OWN_CREATED"
+      FORGE_INFRA_LOCK_DIR="$OWNA" _infra_lock_owned_by_me "$1" "$2" )
+}
+ownacq() { ( cd "$PROJ" \
+      && export FORGE_LOCK_SELF_HOST="$OWN_HOST" FORGE_LOCK_SELF_SESSION="$OWNSESS" \
+                FORGE_LOCK_SELF_SESSION_ID="$OWN_SID" FORGE_LOCK_SELF_SESSION_CREATED="$OWN_CREATED" \
+      && env -u TMUX FORGE_INFRA_LOCK_DIR="$OWNA" "$BRIDGE" infra-lock "$@" >/dev/null 2>&1 ); }
+
+out=$(own s1 fix-code); rc=$?
+{ [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'verdict=FREE'; } \
+  && ok "T-OWN-FREE a FREE lock is not owned" || bad "T-OWN-FREE rc=$rc out=$out"
+
+ownacq acquire --slug s1 --stage fix-code
+out=$(own s1 fix-code); rc=$?
+[ "$rc" -eq 0 ] && ok "T-OWN-OK the exact (slug,stage) held by this identity IS owned" \
+                || bad "T-OWN-OK rc=$rc out=$out"
+out=$(own s1 qa); rc=$?
+{ [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'stage=fix-code'; } \
+  && ok "T-OWN-OTHER-STAGE a lock on another stage is not ownership" || bad "T-OWN-OTHER-STAGE rc=$rc out=$out"
+out=$(own s2 fix-code); rc=$?
+{ [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'held_by=s1'; } \
+  && ok "T-OWN-OTHER-SLUG a lock on another slug is not ownership; the holder is named" \
+  || bad "T-OWN-OTHER-SLUG rc=$rc out=$out"
+# A DIFFERENT identity must not match, even for the same (slug,stage).
+out=$( set +u; . "$ILFNS"; FORGE_INFRA_LOCK_DIR="$OWNA" \
+        FORGE_LOCK_SELF_HOST=ownhost FORGE_LOCK_SELF_SESSION=other \
+        FORGE_LOCK_SELF_SESSION_ID=othersid FORGE_LOCK_SELF_SESSION_CREATED=1 \
+        _infra_lock_owned_by_me s1 fix-code ); rc=$?
+[ "$rc" -ne 0 ] && ok "T-OWN-OTHER-SESSION another session's live hold is not ownership" \
+                || bad "T-OWN-OTHER-SESSION rc=$rc out=$out"
+# FAIL-CLOSED: no resolvable tmux identity at all.
+# `env -u TMUX <fn>` cannot work here — env execs a BINARY and this is a shell
+# function, so it exits 127 and the assertion passes for the wrong reason. Unset TMUX
+# in the subshell instead, and point TMUX_TMPDIR at an empty directory so tmux finds
+# no server at all: without it, `tmux display-message -p` can still resolve against
+# whatever session the host happens to be running and the identity would succeed.
+mkdir -p "$WORK/notmux"
+out=$( set +u; . "$ILFNS"; unset TMUX TMUX_PANE FORGE_LOCK_SELF_HOST \
+        FORGE_LOCK_SELF_SESSION FORGE_LOCK_SELF_SESSION_ID FORGE_LOCK_SELF_SESSION_CREATED
+       TMUX_TMPDIR="$WORK/notmux" FORGE_INFRA_LOCK_DIR="$OWNA" \
+        _infra_lock_owned_by_me s1 fix-code 2>/dev/null ); rc=$?
+{ [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'no-tmux-identity'; } \
+  && ok "T-OWN-NOID an unresolvable tmux identity fails closed" || bad "T-OWN-NOID rc=$rc out=$out"
+ownacq release --slug s1 --force
+tmux kill-session -t "$OWNSESS" 2>/dev/null || true
+
+cap() { ( set +u; . "$ILFNS"; _stage_capability_class "$1" "${2:-$ROOT}" ); }
+[ "$(cap fix-code)" = commit ]      && ok "T-CAP-COMMIT fix-code resolves to commit" || bad "T-CAP-COMMIT"
+[ "$(cap fix-scout)" = workspace ]  && ok "T-CAP-WORKSPACE fix-scout resolves to workspace" || bad "T-CAP-WORKSPACE"
+cap fix-verify >/dev/null 2>&1; [ $? -eq 2 ] \
+  && ok "T-CAP-UNKNOWN an unknown stage returns rc 2 (leave unguarded), not an error" \
+  || bad "T-CAP-UNKNOWN did not return 2"
+mkdir -p "$WORK/badbin"; printf '#!/bin/sh\necho boom >&2\nexit 1\n' > "$WORK/badbin/forge"
+chmod +x "$WORK/badbin/forge"
+( set +u; . "$ILFNS"; PATH="$WORK/badbin:$PATH" _stage_capability_class fix-code "$ROOT" ) >/dev/null 2>&1
+[ $? -eq 1 ] \
+  && ok "T-CAP-BROKEN a broken lookup returns rc 1 (fail closed), never rc 2" \
+  || bad "T-CAP-BROKEN did not return 1"
+
 # ── callback-consume is live end to end (no callback → NOOP exit 0) ──
 P="$(mkproj acc-consume)"
 out=$(consume "$P" --slug nothing --stage coding --status BLOCKED 2>&1); rc=$?

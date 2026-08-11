@@ -510,6 +510,13 @@ mk_session "$GS" 220 50 "$GROOT"
 GINC="$(tmux display-message -p -t "$GS:0.0" '#{session_created}')"
 GPROMPTS="$WORK/guard-prompts"; mkdir -p "$GPROMPTS"
 printf 'P0 live guard prompt for {{slug}} at {{stage}} to {{worker}}\n' > "$GPROMPTS/adhoc.txt"
+# S1/V3: the infra-lock ownership guard is exercised on real infra-class stages. The
+# guard sits AFTER _render_template, so every stage it tests needs a template or the
+# dispatch fails at render for the wrong reason.
+for _s in fix-code qa qa-fix coding; do
+  printf 'P0 infra guard prompt for {{slug}} at {{stage}} to {{worker}}\n' > "$GPROMPTS/$_s.txt"
+done
+ILGLOCKS="$GROOT/.dev/forge-tmp/ilg-infra-locks"; mkdir -p "$ILGLOCKS"
 
 guard_wait_pane_ready(){
     local pane="$1" ready="$GROOT/.dev/forge-tmp/guard-pane-$1.ready" attempt=0 poll
@@ -734,6 +741,116 @@ guard_require_clean "T-GUARD-FIXTURE-HYGIENE-B15-FAILURE" || exit 1
 
 guard_block b17-hold coding codex-a 3 b17-hold || bad "B17 setup"
 run_in_pane "$GS:0.0" b17-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug b17-next --stage adhoc --worker codex-b --allow-blocked p0-b17 )"
+
+# ---- S1/V3: infra-lock ownership guard on the dispatch path ----
+# Hard Rule 23 said "acquire before dispatch" and nothing checked. These cases are the
+# enforcement half. They MUST run in a real pane: cmd_dispatch's first act is
+# `require_identity dispatch host-pane`, which shells to `tmux has-session` and
+# `require_pane_count 5` — no env seam satisfies it. Both the dispatch's identity and
+# the guard's lock identity therefore come from this live $GS session, which is what
+# makes the positive case a genuine ownership match.
+ILGENV="FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_INFRA_LOCK_DIR=$ILGLOCKS FORGE_WORKER_HYGIENE_MODE=observe"
+
+# T-ILG-1  commit-class, lock FREE -> refuse, exit 5, no STATE mutation.
+run_in_pane "$GS:0.0" ilg1 "( cd $GROOT && $ILGENV $BRIDGE dispatch --slug ilg-neg --stage fix-code --worker claude-opus --allow-blocked p0-ilg )"
+if [ "$(rc_of ilg1)" = 5 ] && out_of ilg1 | grep -q 'INFRA_LOCK_REQUIRED' \
+   && out_of ilg1 | grep -q 'infra-lock acquire --slug ilg-neg --stage fix-code' \
+   && [ ! -f "$GROOT/.dev/proposals/ilg-neg/forge-log.yml" ]; then
+    ok "T-ILG-1 commit-class dispatch without the lock refuses (exit 5, no pending, remedy printed)"
+else bad "T-ILG-1 rc=$(rc_of ilg1) $(out_of ilg1 | tr '\n' ' ')"; fi
+
+# T-ILG-2  live-qa class is guarded too, not just commit.
+run_in_pane "$GS:0.0" ilg2 "( cd $GROOT && $ILGENV $BRIDGE dispatch --slug ilg-neg2 --stage qa --worker codex-b --allow-blocked p0-ilg )"
+{ [ "$(rc_of ilg2)" = 5 ] && out_of ilg2 | grep -q 'INFRA_LOCK_REQUIRED'; } \
+  && ok "T-ILG-2 live-qa-class dispatch without the lock refuses" \
+  || bad "T-ILG-2 rc=$(rc_of ilg2) $(out_of ilg2 | tr '\n' ' ')"
+
+# T-ILG-3  a lock held for a DIFFERENT STAGE does not authorize this one.
+run_in_pane "$GS:0.0" ilg-acq-qa "( cd $GROOT && FORGE_INFRA_LOCK_DIR=$ILGLOCKS $BRIDGE infra-lock acquire --slug ilg-pos --stage qa )"
+run_in_pane "$GS:0.0" ilg3 "( cd $GROOT && $ILGENV $BRIDGE dispatch --slug ilg-pos --stage fix-code --worker claude-opus --allow-blocked p0-ilg )"
+{ [ "$(rc_of ilg-acq-qa)" = 0 ] && [ "$(rc_of ilg3)" = 5 ]; } \
+  && ok "T-ILG-3 a lock on another stage does not authorize" \
+  || bad "T-ILG-3 acq=$(rc_of ilg-acq-qa) rc=$(rc_of ilg3)"
+
+# T-ILG-4  a lock held for a DIFFERENT SLUG does not authorize, and names the holder.
+run_in_pane "$GS:0.0" ilg-rel-qa "( cd $GROOT && FORGE_INFRA_LOCK_DIR=$ILGLOCKS $BRIDGE infra-lock release --slug ilg-pos --stage qa --force )"
+run_in_pane "$GS:0.0" ilg-acq-oth "( cd $GROOT && FORGE_INFRA_LOCK_DIR=$ILGLOCKS $BRIDGE infra-lock acquire --slug ilg-other --stage fix-code )"
+run_in_pane "$GS:0.0" ilg4 "( cd $GROOT && $ILGENV $BRIDGE dispatch --slug ilg-pos --stage fix-code --worker claude-opus --allow-blocked p0-ilg )"
+{ [ "$(rc_of ilg4)" = 5 ] && out_of ilg4 | grep -q 'held_by=ilg-other'; } \
+  && ok "T-ILG-4 a lock on another slug does not authorize; the holder is named" \
+  || bad "T-ILG-4 rc=$(rc_of ilg4) $(out_of ilg4 | tr '\n' ' ')"
+run_in_pane "$GS:0.0" ilg-rel-oth "( cd $GROOT && FORGE_INFRA_LOCK_DIR=$ILGLOCKS $BRIDGE infra-lock release --slug ilg-other --stage fix-code --force )"
+
+# T-ILG-5  POSITIVE: the correct (slug,stage) held by THIS live session passes the
+# guard AND the dispatch proceeds all the way to cmd_log (a pending appears).
+run_in_pane "$GS:0.0" ilg-acq-pos "( cd $GROOT && FORGE_INFRA_LOCK_DIR=$ILGLOCKS $BRIDGE infra-lock acquire --slug ilg-pos --stage fix-code )"
+run_in_pane "$GS:0.0" ilg5 "( cd $GROOT && $ILGENV $BRIDGE dispatch --slug ilg-pos --stage fix-code --worker claude-opus --allow-blocked p0-ilg )"
+if [ "$(rc_of ilg-acq-pos)" = 0 ] && ! out_of ilg5 | grep -q 'INFRA_LOCK_REQUIRED' \
+   && [ -f "$GROOT/.dev/proposals/ilg-pos/forge-log.yml" ]; then
+    ok "T-ILG-5 a correctly-held lock lets the infra stage past the guard and open a pending"
+else bad "T-ILG-5 acq=$(rc_of ilg-acq-pos) rc=$(rc_of ilg5) $(out_of ilg5 | tr '\n' ' ')"; fi
+run_in_pane "$GS:0.0" ilg-rel-pos "( cd $GROOT && FORGE_INFRA_LOCK_DIR=$ILGLOCKS $BRIDGE infra-lock release --slug ilg-pos --stage fix-code --force )"
+
+# T-ILG-6  NON-REGRESSION: a workspace-class stage is never guarded.
+run_in_pane "$GS:0.0" ilg6 "( cd $GROOT && $ILGENV $BRIDGE dispatch --slug ilg-ws --stage adhoc --worker codex-b --allow-blocked p0-ilg )"
+! out_of ilg6 | grep -q 'INFRA_LOCK_REQUIRED' \
+  && ok "T-ILG-6 a workspace stage (adhoc) is not guarded" \
+  || bad "T-ILG-6 guarded a workspace stage: $(out_of ilg6 | tr '\n' ' ')"
+
+# T-ILG-DRYRUN  PLACEMENT PIN: --dry-run of an infra stage renders and needs no lock.
+# This is what makes the "after the dry-run return" decision mechanical rather than a
+# comment. Do NOT delete it to "tighten" the guard.
+# NOTE the trailing `; echo`: --dry-run ends with `printf '%s' "$rendered"` and emits
+# NO trailing newline, so the pane's DONE_<rc> completion marker would be glued onto
+# the last line of the rendered prompt and rc_of could not parse it. The newline is a
+# harness requirement, not a behaviour change.
+run_in_pane "$GS:0.0" ilgdry "( cd $GROOT && $ILGENV $BRIDGE dispatch --slug ilg-dry --stage fix-code --worker claude-opus --dry-run; echo )"
+# The `{?…}?` is deliberate: this suite's fixture templates use {{slug}} (see the
+# $GPROMPTS writers above), and the renderer substitutes the INNER {slug}, so the
+# rendered text is literally `{ilg-dry}`. The assertion still proves the prompt
+# rendered with the correct slug.
+if [ "$(rc_of ilgdry)" = 0 ] && out_of ilgdry | grep -qE 'infra guard prompt for \{?ilg-dry\}?' \
+   && ! out_of ilgdry | grep -q 'INFRA_LOCK_REQUIRED'; then
+    ok "T-ILG-DRYRUN --dry-run of an infra stage renders and needs no lock"
+else bad "T-ILG-DRYRUN rc=$(rc_of ilgdry) $(out_of ilgdry | tr '\n' ' ')"; fi
+
+# T-ILG-OBS  KILL SWITCH: observe warns and proceeds; enforce is the default.
+run_in_pane "$GS:0.0" ilgobs "( cd $GROOT && $ILGENV FORGE_INFRA_GUARD_MODE=observe $BRIDGE dispatch --slug ilg-obs --stage fix-code --worker claude-opus --allow-blocked p0-ilg )"
+{ [ "$(rc_of ilgobs)" != 5 ] && out_of ilgobs | grep -q 'observe mode'; } \
+  && ok "T-ILG-OBS FORGE_INFRA_GUARD_MODE=observe warns and proceeds" \
+  || bad "T-ILG-OBS rc=$(rc_of ilgobs) $(out_of ilgobs | tr '\n' ' ')"
+
+# T-ILG-MODE  a typo'd mode is a HARD ERROR, never a silent fall-through to observe.
+# NOTE rc 1 is also the identity-failure code, so the message assertions are what
+# distinguish this from a harness fault — including the explicit negative.
+run_in_pane "$GS:0.0" ilgmode "( cd $GROOT && $ILGENV FORGE_INFRA_GUARD_MODE=enfroce $BRIDGE dispatch --slug ilg-mode --stage fix-code --worker claude-opus --allow-blocked p0-ilg )"
+if [ "$(rc_of ilgmode)" = 1 ] && out_of ilgmode | grep -q 'must be enforce|observe' \
+   && ! out_of ilgmode | grep -q 'no such tmux session exists'; then
+    ok "T-ILG-MODE an invalid FORGE_INFRA_GUARD_MODE is a hard error"
+else bad "T-ILG-MODE rc=$(rc_of ilgmode) $(out_of ilgmode | tr '\n' ' ')"; fi
+
+# T-ILG-CFG  FAIL-CLOSED: a capability lookup that FAILS (as opposed to
+# capability-unknown) must refuse. `forge` is shadowed by a failing stub; $BRIDGE is
+# an absolute path, so only the lookup is affected. The stub must precede ~/bin.
+mkdir -p "$WORK/ilgbadbin"; printf '#!/bin/sh\necho boom >&2\nexit 1\n' > "$WORK/ilgbadbin/forge"
+chmod +x "$WORK/ilgbadbin/forge"
+run_in_pane "$GS:0.0" ilgcfg "( cd $GROOT && PATH=$WORK/ilgbadbin:\$PATH $ILGENV $BRIDGE dispatch --slug ilg-cfg --stage fix-code --worker claude-opus --allow-blocked p0-ilg )"
+if [ "$(rc_of ilgcfg)" = 1 ] && out_of ilgcfg | grep -q 'capability class' \
+   && ! out_of ilgcfg | grep -q 'no such tmux session exists'; then
+    ok "T-ILG-CFG a failed capability lookup refuses (fail-closed), never falls through"
+else bad "T-ILG-CFG rc=$(rc_of ilgcfg) $(out_of ilgcfg | tr '\n' ' ')"; fi
+
+# T-ILG cleanup. The three cases that legitimately PASS the guard (ilg-pos with the
+# lock held, ilg-ws as a workspace stage, ilg-obs under the kill switch) open REAL
+# pendings — that is precisely what T-ILG-5 asserts. guard_assert_clean scans every
+# proposal for `response: null`, so these must be closed before the B17 fixture
+# checkpoint below, which this block is interleaved with. Closing them here keeps the
+# T-ILG cases where they are (they need this live 5-pane session) without leaking
+# residue into an unrelated fixture's hygiene assertion.
+guard_done ilg-pos fix-code claude-opus 1 ilg-pos-clean || bad "T-ILG cleanup: close ilg-pos"
+guard_done ilg-ws  adhoc    codex-b     4 ilg-ws-clean  || bad "T-ILG cleanup: close ilg-ws"
+guard_done ilg-obs fix-code claude-opus 1 ilg-obs-clean || bad "T-ILG cleanup: close ilg-obs"
+
 if [ "$(rc_of b17-dispatch)" = 0 ] && guard_capture_has 4 'codex-b-adhoc-b17-next.txt' \
    && grep -Eq 'GUARD_BLOCK: pipeline=multi stage=\? boundary=dispatch reason=allow-blocked-bypass n=1 .*bypassed=b17-hold.*allow_reason=p0-b17' "$GROOT/.dev/forge-tmp/orchestrator-events.log" \
    && ! out_of b17-dispatch | grep -q 'HOOK BLOCKED: send refused'; then

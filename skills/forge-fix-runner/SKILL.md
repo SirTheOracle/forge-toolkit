@@ -133,6 +133,28 @@ For each group, set `in-progress` on every covered issue, then by tier:
    for the protected lane decision. In the default `contain` rollout, dispatch
    the coder stage to `claude-opus` (the reviewed-host lane). Use `codex-a` only
    when the result explicitly says `lane=codex`; never bypass `LANE_REQUIRED`.
+
+   **`fix-code` is an infra stage (Hard Rule 23) — wrap the dispatch in Shape A.**
+   Its capability class is `commit`, so the bridge REFUSES the dispatch outright
+   (`INFRA_LOCK_REQUIRED`, exit 5) unless this session already holds the lock for
+   this exact `(slug, stage)`. This is not optional:
+
+   ```bash
+   ~/bin/forge-bridge infra-lock acquire --slug <slug> --stage fix-code
+   ~/bin/forge-bridge dispatch --slug <slug> --stage fix-code --worker <W>
+   #   dispatch FAILS -> infra-lock release --slug <slug> --stage fix-code ; surface ; STOP
+   # wait loop: DONE|ERROR -> release. HOLD through PROMPTING/STALLED/TIMEOUT/DEAD/BLOCKED.
+   ~/bin/forge-bridge infra-lock release --slug <slug> --stage fix-code
+   ```
+
+   Under fan-out a `WAIT reason=held-by-live-session` here is **expected** — a
+   sibling session is on the shared stack. Wait it out. A `TIMEOUT` is a conflict
+   with work being done, so surface it (see **Surfacing**). Never
+   `release --force` another session's lock.
+
+   Full tier inherits the same protection through the orchestrator, which locks
+   `fix-code` / `fix-qa` / `fix-qa-retry` per Hard Rule 23.
+
    The selected worker writes `fix-coder-report.md` + test evidence on branch
    `fix/<slug>` and requests its exact-path commit through the broker.
 4. **Escalation backstop:** if the worker reports it needs more than the planned files,
@@ -146,11 +168,37 @@ For each group, set `in-progress` on every covered issue, then by tier:
 2. Run the forge pipeline for the slug (`forge-pipeline <slug>` in a forge session via
    the orchestrator). It produces diagnosis → plan → code → qa on branch `fix/<slug>`.
 
-### 5. Per-issue verification (gates the PR)
-Before opening the PR, build a verification report — one row per covered issue:
+### 5. Per-issue verification (gates the PR) — UNDER THE INFRA LOCK
+
+This step runs `required_tests` **inline in your own session**, with no dispatch
+and no `wait` to key off — so it takes **Shape B**
+(`forge-orchestrator/SKILL.md`, Hard Rule 23). It is not bookkeeping: this is
+where the backend suites actually execute, and GoParent's
+`backend/tests/conftest.py` runs a **session-scoped autouse** fixture that
+`pg_terminate_backend()`s every other connection to the shared
+`goparent_platform_test` database. Two sessions verifying at once corrupt each
+other's failure counts **silently**, and a corrupted failure count is how a
+`Closes #N` reaches an unfixed bug.
+
+```bash
+~/bin/forge-bridge infra-lock acquire --slug <slug> --stage fix-verify
+# run required_tests here; capture evidence paths; build the verification table
+~/bin/forge-bridge infra-lock release --slug <slug> --stage fix-verify
+```
+
+**Release on the success path AND on the failure path.** A step 5 that errors
+before the release leaks the lock and blocks every sibling session until a
+dead-session steal or an operator force-release. Do **not** wrap the release in a
+blanket `trap EXIT` — that would release while a test process may still be live.
+
+`fix-verify` is a **lock label, not a dispatchable stage**: `infra-lock acquire`
+validates neither `--slug` nor `--stage`, so it works with no bridge change, and
+`fix-verify` has no `stage_capabilities` entry, so nothing will ever dispatch it.
+
+Build the verification report — one row per covered issue:
 `issue # | coded ID | symptom | check (command/manual) | result | evidence`.
 A cluster that resolves 6 of 7 covered issues closes only the 6; the 7th is dropped
-(see Cluster abort). Run `required_tests`; capture evidence paths.
+(see Cluster abort).
 
 ### 6. Open the PR (you/runner own this — not the worker)
 One PR per group, from `fix/<slug>` to the default branch. The body ends with

@@ -152,11 +152,15 @@ Between stages the orchestrator:
 
 ### Infra-lock discipline
 
-The five infra-touching stages (`coding`, `qa`, `qa-fix`, `qa-retry`,
-`verify`) are wrapped in `forge-bridge infra-lock` so parallel worktrees
-do not collide on fixed ports or the shared database. Reasoning stages
-(`proposal`, `review`, `incorporate`, `implementation`, `impl-review`)
-never lock and can run in parallel across worktrees.
+Every `commit`/`live-qa` stage — today `coding`, `qa`, `qa-fix`, `qa-retry`,
+`verify`, `fix-code`, `fix-qa`, `fix-qa-retry` — is wrapped in
+`forge-bridge infra-lock` so parallel worktrees do not collide on fixed ports
+or, more importantly, on the shared test database. `workspace` stages
+(`proposal`, `adhoc`, `review`, `incorporate`, `implementation`, `impl-review`,
+and the `fix-scout` / `fix-plan*` / `fix-investigate*` / `fix-reproduce` family)
+never lock and can run in parallel across worktrees. `dispatch` refuses an infra
+stage outright when the caller does not hold the lock (`INFRA_LOCK_REQUIRED`,
+exit 5).
 
 For dispatched infra stages, the orchestrator acquires before dispatch
 and releases only after terminal `DONE` or `ERROR`. It intentionally holds
@@ -507,9 +511,10 @@ Recovery order:
    artifact on disk. If complete, re-spawn the digest via `forge-bridge
    digest`. If not, re-dispatch the stage
 
-If the stage is one of `coding`, `qa`, `qa-fix`, `qa-retry`, or `verify`,
-the infra lock may intentionally still be held while the stage is
-non-terminal. Do not release it merely because the orchestrator restarted.
+If the stage is an infra stage (`coding`, `qa`, `qa-fix`, `qa-retry`, `verify`,
+`fix-code`, `fix-qa`, `fix-qa-retry`), the infra lock may intentionally still be
+held while the stage is non-terminal. Do not release it merely because the
+orchestrator restarted.
 
 ### Handling FORGE_BLOCKED
 
@@ -761,10 +766,12 @@ impl-review) overlap freely. The catch is the **shared infra stack** — fixed-p
 services + a shared Postgres — which only one pipeline may touch at a time.
 
 A single cross-worktree **infra lock** enforces this automatically (orchestrator
-Hard Rule 23; mechanics in the technical reference). The five infra stages
-(`coding`, `qa`, `qa-fix`, `qa-retry`, `verify`) acquire the lock before running
-and release it when the stage completes. You normally never touch the lock — it
-is held and released for you. The cases where you *do* see it:
+Hard Rule 23; mechanics in the technical reference). The infra stages
+(`coding`, `qa`, `qa-fix`, `qa-retry`, `verify`, `fix-code`, `fix-qa`,
+`fix-qa-retry`) acquire the lock before running and release it when the stage
+completes. You normally never touch the lock — it is held and released for you.
+A fix pipeline and a build pipeline now block each other on these stages; that is
+correct, because they share one database. The cases where you *do* see it:
 
 ### A pipeline is waiting on the lock
 

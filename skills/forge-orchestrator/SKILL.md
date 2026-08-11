@@ -1234,17 +1234,63 @@ Background agent failures follow this protocol:
     history). Fix-pipeline, commit-review, and ad-hoc stages are not
     tier-constrained.
 
-23. **Cross-worktree infra lock (the five infra stages run one at a time
-    globally).** Forge is share-nothing per worktree EXCEPT all worktrees hit
-    one shared infra stack (fixed-port services + a shared Postgres). A single
+23. **Cross-worktree infra lock (infra stages run one at a time globally).**
+    Forge is share-nothing per worktree EXCEPT all worktrees hit one shared
+    infra stack (fixed-port services + **one shared Postgres**). A single
     cross-worktree mutex (`forge-bridge infra-lock`, anchored at the git common
-    dir so every worktree resolves it identically) serializes the **five
-    infra-touching stages** so they never overlap across worktrees:
+    dir so every worktree resolves it identically) serializes the
+    **infra-touching stages** so they never overlap across worktrees.
 
-    - **Infra stages (locked):** `coding`, `qa`, `qa-fix`, `qa-retry`, `verify`.
-    - **Reasoning stages (NEVER locked):** `proposal`, `review`, `incorporate`,
-      `implementation`, `impl-review` — these stay fully parallel across
+    **The set is DERIVED, not curated.** A stage is locked iff its
+    `stage_capabilities` class in `config/codex-forge-runtime.json` is `commit`
+    or `live-qa`. Adding a stage to that file with either class adds it here.
+    The enumerations below are the actionable reading of that derivation and are
+    held to it by a lockstep test (`tests/forge-fix-runner/run.sh`) — never edit
+    one without the other.
+
+    - **Infra stages (locked)** — class `commit` or `live-qa`. Today the eight:
+      `coding`, `qa`, `qa-fix`, `qa-retry`, `verify`,
+      `fix-code`, `fix-qa`, `fix-qa-retry`.
+    - **Reasoning stages (NEVER locked)** — class `workspace`, plus `proposal`
+      (which runs locally in the orchestrator and is not dispatchable, so it has
+      no capability entry): `proposal`, `adhoc`, `review`, `incorporate`,
+      `implementation`, `impl-review`, `fix-scout`, `fix-reproduce`,
+      `fix-investigate`, `fix-investigate-solo`, `fix-plan`, `fix-plan-review`,
+      `fix-plan-revise`, `fix-plan-solo` — these stay fully parallel across
       worktrees and must never call `infra-lock`.
+    - `commit-review` (`materialized-review`) and `pr-review`
+      (`publish-pr-review`) are governed by the broker rollout, not by this rule.
+
+    **The contended resource is the shared test DATABASE, not only the fixed
+    ports.** A bound port fails loudly; a second `pytest` against the shared test
+    database fails *quietly*. GoParent's `backend/tests/conftest.py` derives one
+    `goparent_platform_test` URL from `settings.DATABASE_URL` and runs a
+    **session-scoped autouse** fixture that `pg_terminate_backend()`s every other
+    connection to it, so a second worktree starting `pytest` deterministically
+    kills the first run's connections mid-test. The observable damage is a wrong
+    failure count, not an error — and a wrong failure count is how a `Closes #N`
+    reaches an unfixed bug. Every `required_tests` list containing a backend
+    `pytest` command is therefore infra-touching whether or not a port is involved.
+
+    **Consequence, and it is correct:** a *fix* pipeline's `fix-code` now blocks a
+    concurrent *build* pipeline's `coding`, and vice versa. They share the stack.
+    Expect to feel it; do not "fix" it by narrowing the set.
+
+    **Enforcement is code, not prose.** `forge-bridge dispatch` REFUSES any
+    `commit`/`live-qa` stage unless this session+incarnation already holds the
+    lock for that exact slug+stage: `INFRA_LOCK_REQUIRED`, **exit 5**. It fails
+    closed — a `STALE` or foreign-host holder, an unresolvable identity, or an
+    unreadable capability map all count as not-held.
+    `FORGE_INFRA_GUARD_MODE=observe` downgrades the refusal to a warning and is a
+    rollback lever, not a normal setting. Shapes A and B below remain the
+    lifecycle and release discipline; only the *acquisition* precondition moved
+    into the bridge.
+
+    **`fix-verify` is a lock LABEL, not a stage.** The fix runner's step-5
+    verification runs inline and brackets itself with
+    `infra-lock acquire/release --stage fix-verify`. `acquire` validates neither
+    `--slug` nor `--stage`, so this needs no bridge change; `fix-verify` has no
+    `stage_capabilities` entry and is not dispatchable.
 
     **Terminality rule (the core discipline).** Acquire the lock **before**
     `dispatch` (or before an inline Shape B run). **Release only when the stage
@@ -1324,8 +1370,8 @@ Background agent failures follow this protocol:
     `release --force`. Env: `FORGE_INFRA_LOCK_TIMEOUT_S` (wait ceiling, default
     1800s), `FORGE_INFRA_LOCK_INTERVAL_S` (poll, default 15s). On the ceiling,
     `acquire` exits non-zero with a full holder-metadata escalation block — surface
-    it to the user; do not silently retry forever. The five reasoning stages are
-    explicitly out of this rule's scope.
+    it to the user; do not silently retry forever. The reasoning stages enumerated
+    above are explicitly out of this rule's scope.
 
 ---
 

@@ -4165,6 +4165,79 @@ PY
         return 0
     fi
 
+    # --- Infra-lock ownership guard (SKILL Hard Rule 23, enforcement half) ---
+    # Every stage whose stage_capabilities class is `commit` or `live-qa` touches the
+    # ONE shared infra stack (fixed-port services AND one shared Postgres test
+    # database). Rule 23 says acquire before dispatch; until now nothing verified it,
+    # so the rule was advisory and its hand-maintained stage list rotted silently.
+    # Fail CLOSED: no lock held by THIS session+incarnation for THIS slug+stage, or an
+    # unreadable capability map, means no dispatch.
+    #
+    # PLACEMENT IS DELIBERATE — two decisions, do not "fix" either:
+    #  (a) AFTER the --dry-run early return. A dry run renders a prompt and touches no
+    #      infra, so gating it would be a refusal with no safety value. (Hard Rule 22
+    #      sits before the return because it checks ARGUMENT LEGALITY; this checks a
+    #      RESOURCE PRECONDITION.) tests/forge-bridge/run.sh's T-ILG-DRYRUN pins it.
+    #  (b) BEFORE the orphan-pending guard. The lock is the coarser gate — a session
+    #      that may not dispatch at all should not be told about pendings first — and
+    #      placing it after would let an unrelated GUARD_BLOCK emit precede a lock
+    #      refusal. Cost: one `forge codex-lane` on the refusal path.
+    # Do NOT move it down to the capability_class derivation near the LANE_REQUIRED
+    # emit: by that line the pending guard has run, _worker_lock is held, a
+    # --clear/threshold reset may have wiped the worker's context, and the whole
+    # --supersede close-and-archive block has executed. That is fail-after-damage.
+    #
+    # "Zero mutation" here means zero STATE: no pending, no lock, no worker reset, no
+    # keystroke. One GUARD_BLOCK audit event IS written, by design.
+    #
+    # Kill switch: FORGE_INFRA_GUARD_MODE=observe warns and proceeds. Default enforce;
+    # a typo is a HARD ERROR, never a silent fall-through (same discipline as
+    # FORGE_WORKER_HYGIENE_MODE).
+    local _ilg_mode="${FORGE_INFRA_GUARD_MODE:-enforce}"
+    case "$_ilg_mode" in
+        enforce|observe) ;;
+        *) _emit_event ERROR "$slug" "stage=$stage reason=infra-guard-mode-invalid mode=$(_sanitize_event_value "$_ilg_mode")"
+           echo "ERROR: FORGE_INFRA_GUARD_MODE must be enforce|observe (got '$_ilg_mode')." >&2
+           return 1 ;;
+    esac
+    local _cap_class _cap_rc
+    _cap_class="$(_stage_capability_class "$stage" "$project_root")"; _cap_rc=$?
+    if [ "$_cap_rc" -eq 1 ]; then
+        _emit_event ERROR "$slug" "stage=$stage reason=capability-lookup-failed"
+        echo "ERROR: could not resolve the capability class for stage '$stage' ('forge codex-lane' failed) — refusing to dispatch (fail-closed, Hard Rule 23). An unreadable capability map is not evidence that a stage is safe." >&2
+        return 1
+    fi
+    case "$_cap_class" in
+        commit|live-qa)
+            local _ilg_holder _ilg_rc
+            _ilg_holder="$(_infra_lock_owned_by_me "$slug" "$stage" "$project_root")"; _ilg_rc=$?
+            if [ "$_ilg_rc" -ne 0 ]; then
+                _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=infra-lock-not-held capability=$_cap_class mode=$_ilg_mode worker=$worker_canonical holder=$(_sanitize_event_value "$_ilg_holder")"
+                if [ "$_ilg_mode" = observe ]; then
+                    echo "WARN: INFRA_LOCK_REQUIRED (observe mode) — dispatching '$stage' (capability $_cap_class) WITHOUT the infra lock. Lock state: $_ilg_holder" >&2
+                else
+                    {
+                        echo "INFRA_LOCK_REQUIRED: stage '$stage' has capability class '$_cap_class' (Hard Rule 23) and this session does not hold the infra lock for slug='$slug' stage='$stage'."
+                        echo "    lock state: $_ilg_holder"
+                        echo "  Acquire before dispatching (Shape A):"
+                        echo "    ~/bin/forge-bridge infra-lock acquire --slug $slug --stage $stage"
+                        echo "    ~/bin/forge-bridge dispatch --slug $slug --stage $stage --worker $worker_canonical"
+                        echo "  Release only on stage terminality (wait -> DONE/ERROR); HOLD through"
+                        echo "  PROMPTING/STALLED/TIMEOUT/DEAD/BLOCKED. Never release --force a sibling's lock."
+                        echo "  Reading the lock state:"
+                        echo "    verdict=FREE      nobody holds it — just acquire."
+                        echo "    verdict=STALE     the holder's tmux session is dead; your acquire will STEAL it."
+                        echo "    verdict=HELD_LIVE a live sibling holds it; acquire blocks until it releases."
+                        echo "    verdict=FOREIGN   another host holds it; liveness is unverifiable from here."
+                        echo "  Rollback lever (audited, not a normal setting): FORGE_INFRA_GUARD_MODE=observe"
+                        echo "  downgrades this refusal to a warning."
+                    } >&2
+                    return 5
+                fi
+            fi
+            ;;
+    esac
+
     # --- Slug-scoped dispatch guard (orphan-log-entries fix) ---
     # Refuse to dispatch a new stage while ANY pending (response: null) entry
     # exists for this slug, unless --supersede. Stops class-2 (advance-without-
@@ -6334,8 +6407,13 @@ PY
 #
 # Forge is share-nothing per worktree EXCEPT all worktrees hit one shared infra
 # stack (fixed-port services + a shared Postgres). This is a single global mutex
-# so the five infra stages {coding, qa, qa-fix, qa-retry, verify} never run
-# simultaneously across worktrees; the five reasoning stages stay fully parallel.
+# so the infra stages — DERIVED as every stage whose stage_capabilities class in
+# config/codex-forge-runtime.json is `commit` or `live-qa`, today {coding, qa,
+# qa-fix, qa-retry, verify, fix-code, fix-qa, fix-qa-retry} — never run
+# simultaneously across worktrees; the `workspace` stages stay fully parallel.
+# The binding shared resource is the shared Postgres TEST DATABASE, not only the
+# fixed ports. cmd_dispatch enforces the acquisition precondition at runtime
+# (INFRA_LOCK_REQUIRED, exit 5).
 # It is a LOCK, not a scheduler. See docs/forge-technical-reference.md (Hard
 # Rule 23) and the orchestrator SKILL (Shapes A/B).
 #
@@ -6539,6 +6617,86 @@ PYEOF
 
 # Parse `k=v` field from a VERDICT line.
 _il_field() { printf '%s\n' "$1" | sed -n "s/.*[[:space:]]$2=\\([^ ]*\\).*/\\1/p" | head -1; }
+
+# ── Hard Rule 23, enforcement half ────────────────────────────────────────────
+# Rule 23 was prose plus a hand-maintained list, and nothing verified that the lock
+# it documents was actually held. That is exactly how fix-code/fix-qa/fix-qa-retry
+# came to sit outside the locked set unnoticed. The two helpers below make the
+# ACQUISITION PRECONDITION code. Deliberately additive: no existing function, action
+# set, sidecar field or emit is modified.
+
+# _infra_lock_owned_by_me <slug> <stage> [project_root]
+#   rc 0 = the infra lock is HELD, LIVE, and owned by THIS host + THIS tmux session
+#          identity for exactly this (slug, stage).
+#   rc 1 = anything else. Echoes a one-line holder description on stdout for the
+#          caller's error message.
+# Ownership key = (host, session_id, session_created, slug) — the key `release`
+# matches on — PLUS stage, because a stage_update moves the holder and a stale stage
+# means another stage's worker may still be on the shared stack.
+# Every non-owning outcome (FREE, STALE, FOREIGN, ESCALATE, unresolvable anchor,
+# unresolvable tmux identity) is NOT-OWNED, so callers fail CLOSED by default.
+_infra_lock_owned_by_me() {
+    local want_slug="$1" want_stage="$2" root="${3:-}"
+    local anchor ident host session sid screated tpid out v
+    [ -n "$want_slug" ] && [ -n "$want_stage" ] || { echo "UNRESOLVABLE reason=empty-slug-or-stage"; return 1; }
+    # Resolve the anchor from the project root, in a SUBSHELL so the caller's cwd is
+    # untouched. FORGE_INFRA_LOCK_DIR still wins inside _infra_lock_anchor (test seam).
+    anchor=$( if [ -n "$root" ]; then cd "$root" 2>/dev/null || exit 1; fi; _infra_lock_anchor ) \
+        || { echo "UNRESOLVABLE reason=no-git-common-dir"; return 1; }
+    [ -n "$anchor" ] || { echo "UNRESOLVABLE reason=no-git-common-dir"; return 1; }
+    ident=$(_infra_lock_identity) || { echo "UNRESOLVABLE reason=no-tmux-identity"; return 1; }
+    host="${ident%%|*}";     ident="${ident#*|}"
+    session="${ident%%|*}";  ident="${ident#*|}"
+    sid="${ident%%|*}";      ident="${ident#*|}"
+    screated="${ident%%|*}"; ident="${ident#*|}"
+    tpid="${ident%%|*}"
+    out=$(FORGE_IL_ANCHOR="$anchor" FORGE_IL_ACTION=status \
+          FORGE_IL_HOST="$host" FORGE_IL_SESSION="$session" \
+          FORGE_IL_SID="$sid" FORGE_IL_SCREATED="$screated" FORGE_IL_TPID="$tpid" \
+          FORGE_IL_SLUG="$want_slug" FORGE_IL_STAGE="$want_stage" \
+          _infra_lock_run 2>/dev/null) || { echo "UNRESOLVABLE reason=status-failed"; return 1; }
+    v=$(printf '%s' "$out" | sed -n 's/^VERDICT=\([A-Z_]*\).*/\1/p')
+    if [ "$v" != "HELD_LIVE" ]; then
+        printf 'not-owned verdict=%s held_by=%s stage=%s session=%s\n' \
+            "${v:-UNKNOWN}" "$(_il_field "$out" held_by)" "$(_il_field "$out" held_stage)" \
+            "$(_il_field "$out" held_session)"
+        return 1
+    fi
+    if [ "$(_il_field "$out" held_host)"       = "$host" ] \
+    && [ "$(_il_field "$out" session_id)"      = "$sid" ] \
+    && [ "$(_il_field "$out" session_created)" = "$screated" ] \
+    && [ "$(_il_field "$out" held_by)"         = "$want_slug" ] \
+    && [ "$(_il_field "$out" held_stage)"      = "$want_stage" ]; then
+        return 0
+    fi
+    printf 'not-owned verdict=HELD_LIVE held_by=%s stage=%s session=%s sid=%s created=%s\n' \
+        "$(_il_field "$out" held_by)" "$(_il_field "$out" held_stage)" \
+        "$(_il_field "$out" held_session)" "$(_il_field "$out" session_id)" \
+        "$(_il_field "$out" session_created)"
+    return 1
+}
+
+# _stage_capability_class <stage> <project_root>
+#   rc 0 -> the class is on stdout (workspace | commit | live-qa | materialized-review | …)
+#   rc 2 -> the stage has NO stage_capabilities entry. NOT an error: ad-hoc stage
+#           names and the `fix-verify` LOCK LABEL live here, and treating them as
+#           errors would break every ad-hoc dispatch. Caller leaves them unguarded.
+#   rc 1 -> the lookup itself failed (forge missing, corrupt runtime JSON, bad
+#           rollout). Caller MUST fail CLOSED: an unreadable capability map is not
+#           evidence that a stage is safe.
+_stage_capability_class() {
+    local stage="$1" root="$2" out rc
+    [ -n "$stage" ] && [ -n "$root" ] || return 1
+    out=$(forge codex-lane --root "$root" --stage "$stage" --worker claude 2>&1); rc=$?
+    if [ "$rc" -eq 0 ]; then
+        printf '%s\n' "$out" | sed -n 's/^capability_class=//p' | head -1
+        return 0
+    fi
+    case "$out" in
+        *capability-unknown*) return 2 ;;
+        *)                    return 1 ;;
+    esac
+}
 
 cmd_infra_lock() {
     local action="" slug="" stage="" timeout="" interval="" force=false
@@ -8327,7 +8485,8 @@ case "${1:-help}" in
         echo "  blocked-audit [--root <path>] [--json]"
         echo "                                Read-only audit of BLOCKED/PARKED callbacks, half-parked records, duplicate open pendings, and stale state keys. MUTATES NOTHING."
         echo "  infra-lock <acquire|release|status> --slug <s> --stage <t> [--timeout N] [--interval I] [--force]"
-        echo "                                Cross-worktree mutex for infra stages {coding,qa,qa-fix,qa-retry,verify}. acquire blocks (default ${FORGE_INFRA_LOCK_TIMEOUT_S:-1800}s ceiling, ${FORGE_INFRA_LOCK_INTERVAL_S:-15}s poll); release on stage terminality; status reports FREE/HELD/STALE/foreign."
+        echo "                                Cross-worktree mutex for infra stages (capability commit|live-qa): {coding,qa,qa-fix,qa-retry,verify,fix-code,fix-qa,fix-qa-retry}. acquire blocks (default ${FORGE_INFRA_LOCK_TIMEOUT_S:-1800}s ceiling, ${FORGE_INFRA_LOCK_INTERVAL_S:-15}s poll); release on stage terminality; status reports FREE/HELD/STALE/foreign."
+        echo "                                dispatch REFUSES an infra stage unless this session holds the lock for that slug+stage (INFRA_LOCK_REQUIRED, exit 5). FORGE_INFRA_GUARD_MODE=observe downgrades the refusal to a warning."
         echo "  digest --slug <s> --stage <s> --template <name> [--worker <w>]"
         echo "                                Render digest prompt to .dev/forge-tmp/ for ad-hoc Agent dispatch"
         echo "  emit <TYPE> --slug <s> [--stage <s>] [key=value …]"

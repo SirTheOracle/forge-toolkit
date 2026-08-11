@@ -5,6 +5,7 @@ for suite in \
   tests/codex-policy-smoke/run.sh \
   tests/forge-broker/run.sh \
   tests/forge-worktree/run.sh \
+  tests/forge-fix-runner/run.sh \
   tests/forge-start/run.sh \
   tests/forge-bridge/run.sh \
   tests/forge-cc/run.sh \
