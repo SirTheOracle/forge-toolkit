@@ -17,10 +17,30 @@ A forge project needs:
    service/test/qa sections that workers read for their environment
    preamble. (See the project-config section of `technical-reference.md`
    for the schema.)
-2. **`forge-start`** to provision a session-named sibling Git worktree, seed
-   its root-local Forge assets, create the 5-pane tmux session there, and write
+2. **`forge-start`** to provision a session-named Git worktree, seed its
+   root-local Forge assets, create the 5-pane tmux session there, and write
    `.dev/.forge-session` with the session name. Worktrees are deliberately
    never auto-removed.
+
+   Worktrees land in `.forge-worktrees/` **inside the project the session
+   works on** — `goparent-ai/.forge-worktrees/goparent-ai-<session>` — so each
+   project keeps its own worktrees and no project's sessions litter the
+   directory your projects live in. The container is anchored at the main
+   working tree, so starting a session from inside a worktree still lands flat
+   beside its siblings instead of nesting. On first use Forge adds the
+   container to the repository-local `.git/info/exclude` (never a tracked
+   `.gitignore`), because an unignored container would make every later
+   `git status` and dirty-base check see an untracked root.
+
+   Override per project with `forge.worktree.parent` in
+   `.claude/forge-project.yml`, or per invocation with `FORGE_WORKTREE_PARENT`;
+   both still accept a path anywhere on disk. `forge.worktree.prefix` names the
+   leaf (default: the repository directory name).
+
+   Because the container sits inside the working tree, `git clean -xdf` at the
+   project root will delete every worktree under it. The dot-prefix keeps it out
+   of ripgrep and pytest collection by default, but it is not a `git clean`
+   guard.
 
 `forge-start --here [name]` is the escape hatch: it starts in the current
 physical Git root and does not provision. Use `forge-start --here` when working

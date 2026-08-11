@@ -18,9 +18,11 @@
 #   forge-start [--here] [--allow-dirty-base] [name]
 #   forge-start --populate-existing <name>
 #
-# Plain starts provision a sibling Git worktree by default. --here (or
-# FORGE_START_WORKTREE=0) keeps the current physical root; use it while working
-# on forge-toolkit itself because the installed launchers point at this checkout.
+# Plain starts provision a Git worktree by default, under .forge-worktrees/
+# inside the project being worked on (anchored at the main working tree, so
+# starting from a worktree does not nest). --here (or FORGE_START_WORKTREE=0)
+# keeps the current physical root; use it while working on forge-toolkit itself
+# because the installed launchers point at this checkout.
 # ============================================================
 
 set -e

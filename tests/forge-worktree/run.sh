@@ -87,6 +87,29 @@ repo unknown; cfgpy 'wt["future_key"]={"nested":True}'; ensure s1 --print-path >
 repo physical; REALP="$WORK/real-parent"; LINKP="$WORK/link-parent"; mkdir -p "$REALP"; ln -s "$REALP" "$LINKP"; LINKP="$LINKP" cfgpy 'wt["parent"]=os.environ["LINKP"]'; out=$(ensure s1 --print-path 2>/dev/null); [ "$out" = "$REALP/proj-s1" ] && ok 'T-WT-PARENT-PHYSICAL' || bad physical-parent
 repo mkparent; NEWP="$WORK/not-created/a/b"; NEWP="$NEWP" cfgpy 'wt["parent"]=os.environ["NEWP"]'; ensure s1 --print-path >/dev/null 2>&1; [ $? = 0 ] && [ -d "$NEWP" ] && ok 'T-WT-PARENT-CREATE' || bad parent-create
 repo parentfail; printf x > "$WORK/parent-file"; BADP="$WORK/parent-file/child"; BADP="$BADP" cfgpy 'wt["parent"]=os.environ["BADP"]'; ensure s1 >/dev/null 2>"$WORK/parentfail.err"; [ $? = 4 ] && grep -q 'could not create worktree parent' "$WORK/parentfail.err" && ok 'T-WT-PARENT-FAIL' || bad parent-fail
+# Default parent (no forge.worktree.parent declared): a hidden container INSIDE
+# the project, anchored at the main working tree.
+repo defparent; cfgpy 'wt.pop("parent", None)'
+[ "$("$FORGE" worktree path --session s1 --from "$SRC")" = "$SRC/.forge-worktrees/proj-s1" ] && ok 'T-WT-DEFAULT-PARENT-IN-PROJECT' || bad default-parent
+out=$(ensure s1 --print-path 2>"$WORK/defparent.err"); [ "$out" = "$SRC/.forge-worktrees/proj-s1" ] && [ -e "$out/.git" ] && ok 'T-WT-DEFAULT-PARENT-CREATE' || bad default-parent-create
+# Unignored, the container would make every later dirty-base check see an
+# untracked root — so the engine must exclude it, exactly once.
+! git -C "$SRC" status --porcelain | grep -q 'forge-worktrees' && grep -q '^/\.forge-worktrees/$' "$SRC/.git/info/exclude" && ok 'T-WT-DEFAULT-PARENT-EXCLUDED' || bad default-parent-exclude
+ensure s2 --print-path >/dev/null 2>&1; [ "$(grep -c '^/\.forge-worktrees/$' "$SRC/.git/info/exclude")" = 1 ] && ok 'T-WT-DEFAULT-PARENT-EXCLUDE-ONCE' || bad default-parent-exclude-dup
+# From a LINKED worktree the default still anchors at the main tree, so
+# worktrees stay flat instead of nesting one inside another.
+[ "$("$FORGE" worktree path --session s3 --from "$SRC/.forge-worktrees/proj-s1")" = "$SRC/.forge-worktrees/proj-s3" ] && ok 'T-WT-DEFAULT-PARENT-NO-NEST' || bad default-parent-nest
+# The default leaf name anchors at the project too, so a session started inside
+# a worktree does not compound its name into the next one.
+repo defprefix; cfgpy 'wt.pop("parent", None); wt.pop("prefix", None)'
+BASE="$(basename "$SRC")"; ensure s1 --print-path >/dev/null 2>&1
+[ "$("$FORGE" worktree path --session s3 --from "$SRC/.forge-worktrees/$BASE-s1")" = "$SRC/.forge-worktrees/$BASE-s3" ] && ok 'T-WT-DEFAULT-PREFIX-NO-COMPOUND' || bad default-prefix-compound
+# An explicit parent still outranks the default, by config and by env.
+repo defoverride; cfgpy 'wt.pop("parent", None)'
+[ "$(FORGE_WORKTREE_PARENT="$PARENT" "$FORGE" worktree path --session s1 --from "$SRC")" = "$PARENT/proj-s1" ] && ok 'T-WT-DEFAULT-PARENT-ENV-WINS' || bad default-parent-env
+PARENT="$PARENT" cfgpy 'wt["parent"]=os.environ["PARENT"]'
+[ "$("$FORGE" worktree path --session s1 --from "$SRC")" = "$PARENT/proj-s1" ] && ok 'T-WT-DEFAULT-PARENT-CONFIG-WINS' || bad default-parent-config
+
 repo conflict
 mkdir -p "$PARENT/proj-empty"; ensure empty >/dev/null 2>&1; [ $? = 4 ] && [ -z "$(find "$PARENT/proj-empty" -mindepth 1 -print -quit)" ] && ok 'T-WT-DIR-CONFLICT-EMPTY' || bad empty-conflict
 mkdir -p "$PARENT/proj-full"; echo x > "$PARENT/proj-full/x"; ensure full >/dev/null 2>&1; [ $? = 4 ] && [ -f "$PARENT/proj-full/x" ] && ok 'T-WT-DIR-CONFLICT-NONEMPTY' || bad full-conflict

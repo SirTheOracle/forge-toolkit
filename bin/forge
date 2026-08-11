@@ -865,6 +865,31 @@ else:
 PY
 }
 
+# A worktree container that lives inside the working tree would otherwise show
+# up as untracked in every `git status` and in this engine's own dirty-base
+# accounting, so the second session on a project would see a dirty root. Record
+# it in the repository-local exclude file — shared by every worktree through the
+# common dir and never committed — instead of editing a tracked .gitignore.
+# No-op when the container is outside the working tree or already ignored.
+_worktree_ensure_ignored() {
+    local src="$1" parent="$2" main="$3" rel exclude
+    case "$parent/" in "$main"/*) ;; *) return 0 ;; esac
+    rel="${parent#"$main"/}"; rel="${rel%/}"
+    [ -n "$rel" ] && [ "$rel" != "$parent" ] || return 0
+    git -C "$src" check-ignore -q --no-index -- "$rel/probe" 2>/dev/null && return 0
+    exclude="$(git -C "$src" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/info/exclude"
+    mkdir -p "${exclude%/exclude}" || {
+        echo "forge worktree: could not create ${exclude%/exclude}" >&2; return 4; }
+    # Append-safe: a file whose last byte is not a newline would otherwise get
+    # its final pattern fused with ours.
+    if [ -s "$exclude" ] && [ -n "$(tail -c 1 "$exclude" 2>/dev/null)" ]; then printf '\n' >> "$exclude"; fi
+    printf '# forge: session worktrees live here\n/%s/\n' "$rel" >> "$exclude" || {
+        echo "forge worktree: could not write $exclude" >&2; return 4; }
+    git -C "$src" check-ignore -q --no-index -- "$rel/probe" 2>/dev/null || {
+        echo "forge worktree: /$rel/ is still not ignored in $src after updating $exclude" >&2; return 4; }
+    echo "forge worktree: excluded /$rel/ via $exclude" >&2
+}
+
 # Validate declared seed paths before git worktree add so every refusal is
 # zero-mutation. Unknown worktree keys remain intentionally ignored.
 _worktree_validate_seed_config() {
@@ -1055,11 +1080,24 @@ cmd_worktree() {
     }
     _worktree_validate_seed_config "$src" || return 2
 
-    local parent prefix branch_prefix wt branch fetch expected tracked_project=0
+    local parent prefix branch_prefix wt branch fetch expected tracked_project=0 main_root
+    # Git's first `worktree list` entry is the main working tree, from any root.
+    main_root="$(git -C "$src" worktree list --porcelain 2>/dev/null | awk '$1=="worktree"{print substr($0,10); exit}')"
+    [ -n "$main_root" ] && [ -d "$main_root" ] || {
+        echo "forge worktree: cannot resolve the main working tree for $src" >&2; return 2; }
+    main_root="$(cd "$main_root" && pwd -P)"
     parent="${FORGE_WORKTREE_PARENT:-$(_worktree_cfg "$src" parent)}" || return 2
-    [ -n "$parent" ] || parent="$(dirname "$src")"
+    # Default: a hidden container INSIDE the project this session works in, so a
+    # project's worktrees live with that project instead of littering the
+    # directory its projects sit in. Anchored at the MAIN working tree, so a
+    # session started from inside a linked worktree still lands flat beside its
+    # siblings rather than nesting a worktree inside a worktree.
+    [ -n "$parent" ] || parent="$main_root/.forge-worktrees"
     prefix="$(_worktree_cfg "$src" prefix)" || return 2
-    [ -n "$prefix" ] || prefix="$(basename "$src")"
+    # Name the leaf after the PROJECT, not the root this was invoked from —
+    # otherwise a session started inside a linked worktree compounds its name
+    # into the next one (goparent-ai-goparentbugs-g700).
+    [ -n "$prefix" ] || prefix="$(basename "$main_root")"
     case "$prefix" in .|..|*/*|*\\*) echo "forge worktree: forge.worktree.prefix must be one safe path component" >&2; return 2 ;; esac
     branch_prefix="$(_worktree_cfg "$src" branch_prefix)" || return 2
     fetch="$(_worktree_cfg "$src" fetch)" || return 2
@@ -1191,6 +1229,8 @@ PY
         printf 'codex-trust %s\n' "$codex_plan"
         rm -f "$manifest"; return 0
     fi
+
+    _worktree_ensure_ignored "$src" "$parent" "$main_root" || { rm -f "$manifest"; return 4; }
 
     if [ "$is_reattach" = 1 ]; then
         echo "ENSURE worktree @$wt (branch $branch) — reusing, not re-cutting" >&2
