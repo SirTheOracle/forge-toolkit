@@ -137,4 +137,65 @@ grep -q 'success path AND on the failure path' "$RUNNER" \
 grep -q 'never bypass `LANE_REQUIRED`' "$RUNNER" \
   && ok "T-FR-LANE the lane gate survived the Shape A edit" || bad "T-FR-LANE lost the lane gate"
 
+echo "== 3. S4 protocol anchors (V1, V2, V4, V7 — prose with no other guard) =="
+grep -q 'never from the previous bucket' "$RUNNER" \
+  && ok "T-V1-RULE the SKILL mandates branching from freshly fetched origin" \
+  || bad "T-V1-RULE the branch-cut rule is missing"
+grep -q 'depends_on' "$RUNNER" && grep -q 'MUST be empty' "$RUNNER" \
+  && ok "T-V1-DEPENDS the SKILL states depends_on must be empty" \
+  || bad "T-V1-DEPENDS the SKILL does not reject depends_on"
+grep -q 'MUST be merged into one bucket' "$RUNNER" \
+  && ok "T-V1-GROUPING same-files grouping is stated as a REQUIREMENT" \
+  || bad "T-V1-GROUPING the same-files rule is missing or advisory"
+grep -q 'origin/\$base_branch' "$RUNNER" && ! grep -qE '^base_branch: *origin/' "$RUNNER" \
+  && ok "T-V4-NODOUBLE base_branch is stored bare (no origin/origin/main)" \
+  || bad "T-V4-NODOUBLE the base branch is stored remote-qualified"
+grep -q 'Do \*\*not\*\* require the branch to' "$RUNNER" \
+  && ok "T-V7-BASE the equals-main preflight requirement is dropped" \
+  || bad "T-V7-BASE preflight still requires the base branch"
+# Whitespace-normalised: the sentence is markdown prose and soft-wraps mid-phrase
+# ("never a" / "contract."), so a per-line grep asserts where the line break fell
+# rather than what the SKILL says.
+sed 's/^>[[:space:]]\{0,1\}//' "$RUNNER" | tr '\n' ' ' | tr -s ' ' \
+  | grep -q 'estimate pending timing data, never a contract' \
+  && ok "T-C1-ESTIMATE criterion 1 is stated as an estimate, not a contract" \
+  || bad "T-C1-ESTIMATE the speedup reads as a promise"
+grep -q 'claims/<queue>.json' "$RUNNER" && grep -q 'journal/<queue>.md' "$RUNNER" \
+  && ok "T-SCOPE-EXC the scope guard names the claims/ + journal/ exception" \
+  || bad "T-SCOPE-EXC the narrow exception is unstated"
+# The claim -> lock -> readiness ORDER (V2) has no other mechanical guard.
+python3 - "$RUNNER" <<'PY' && ok "T-V2-ORDER execute mode orders claim -> lock -> readiness" \
+                           || bad "T-V2-ORDER readiness is not ordered after claim + lock"
+import sys
+t = open(sys.argv[1]).read()
+i_claim = t.find("queue.py claim --plan-dir")
+i_lock  = t.find("infra-lock acquire --slug <first-slug>")
+i_ready = t.find("queue.py readiness --plan-dir")
+sys.exit(0 if -1 not in (i_claim, i_lock, i_ready) and i_claim < i_lock < i_ready else 1)
+PY
+
+echo "== 4. V1 branch-protocol regression guard (real git) =="
+# WHY non-empty depends_on is rejected: under "branch every bucket from freshly
+# fetched origin/<base_branch>" + "never wait for the merge", a later bucket CANNOT
+# see an earlier bucket's unmerged commit. Prove it on real git so the rule cannot be
+# softened back into "keep the chain in one queue".
+G="$WORK/proto"; mkdir -p "$G"
+git -C "$G" init -q -b main
+git -C "$G" config user.email t@e; git -C "$G" config user.name T
+echo base > "$G/f"; git -C "$G" add f; git -C "$G" commit -qm base
+git clone -q --bare "$G" "$WORK/proto.git" >/dev/null 2>&1
+git -C "$G" remote add origin "$WORK/proto.git"; git -C "$G" fetch -q origin
+git -C "$G" checkout -q -b fix/bucket-a origin/main
+echo a6-symbol > "$G/a"; git -C "$G" add a; git -C "$G" commit -qm bucket-a
+A_SHA="$(git -C "$G" rev-parse HEAD)"
+git -C "$G" fetch -q origin
+git -C "$G" checkout -q -b fix/bucket-b origin/main
+if git -C "$G" merge-base --is-ancestor "$A_SHA" HEAD 2>/dev/null; then
+    bad "T-V1-ANCESTRY bucket B can see bucket A's unmerged commit — the no-stacked-PR protocol is broken"
+else
+    ok "T-V1-ANCESTRY bucket B cannot see bucket A's unmerged commit (queue locality != ancestry)"
+fi
+[ ! -f "$G/a" ] && ok "T-V1-WORKTREE bucket A's file did not leak into bucket B's worktree" \
+               || bad "T-V1-WORKTREE bucket A's file leaked into bucket B"
+
 printf '\nPASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"; [ "$FAIL" = 0 ]
