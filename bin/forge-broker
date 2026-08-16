@@ -391,6 +391,26 @@ def runtime_policy() -> dict:
     return load_json(Path(__file__).resolve().parent.parent / "config" / "codex-forge-runtime.json")
 
 
+def broker_lock_held(protected: Path) -> bool:
+    """Return whether a broker holds the protected daemon-lifetime lock."""
+    fd = -1
+    try:
+        fd = os.open(protected / "broker.lock", os.O_RDONLY | os.O_NOFOLLOW)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as exc:
+            return exc.errno in {errno.EWOULDBLOCK, errno.EAGAIN}
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def control_call(protected: Path, request: dict) -> dict:
     # Control rides authenticated loopback: contained Codex panes have an
     # attested network-deny sandbox. Authenticate the server before disclosing
@@ -413,7 +433,8 @@ def control_call(protected: Path, request: dict) -> dict:
         sock.close()
         denied = isinstance(exc, PermissionError) or getattr(exc, "errno", None) in {errno.EPERM, errno.EACCES}
         if (denied and request.get("action") in LIFECYCLE_ACTIONS
-                and broker_pid_live(info) and info.get("lifecycle_queue") == 1):
+                and info.get("lifecycle_queue") == 1
+                and broker_lock_held(protected)):
             return lifecycle_call(Path(info["physical_code_root"]), request)
         raise Refusal("CONTROL_UNREACHABLE", f"{host}:{port}: {exc}") from exc
     try:
@@ -1178,11 +1199,11 @@ def sweep_terminal_callbacks(root: Path, git_dir: Path, common: Path, root_id: s
 
 
 def lifecycle_pass(root: Path, git_dir: Path, common: Path, root_id: str, protected: Path) -> None:
-    # Test hook: keep the daemon fully alive — pid live, lifecycle_queue
-    # advertised — but stop servicing the queue. Reaching CONTROL_QUEUED any
-    # other way is impossible: broker_pid_live() is a PRECONDITION of the
-    # fallback, so simply stopping the daemon short-circuits to exit 4 and can
-    # never produce exit 5.
+    # Test hook: keep the daemon fully alive — exclusive lock held and
+    # lifecycle_queue advertised — but stop servicing the queue. Reaching
+    # CONTROL_QUEUED any other way is impossible: lock contention is a
+    # PRECONDITION of the fallback, so simply stopping the daemon short-circuits
+    # to exit 4 and can never produce exit 5.
     if (os.environ.get("FORGE_BROKER_TEST_ENABLE") == "1"
             and os.environ.get("FORGE_BROKER_TEST_QUEUE_PAUSE") == "1"):
         return

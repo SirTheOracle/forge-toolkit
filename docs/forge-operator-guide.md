@@ -737,11 +737,21 @@ strict `reconcile-delivery` are implemented there. Responses are worker-writable
 and advisory. Files under `.dev/forge-broker/requests` and the lifecycle queue
 cannot authorize a commit or publication.
 
+Before entering the lifecycle queue, a contained client requires the advertised
+`lifecycle_queue: 1` capability and probes the protected `broker.lock` read-only.
+Only contention from the daemon's lifetime-exclusive lock makes a queue attempt
+viable. This transport check does not replace identity validation: host start,
+stop, status, orphan-reaping, and stale-incarnation handling still require the
+exact PID/start-stamp checks. Missing, symlinked, inaccessible, unlocked, or
+otherwise invalid lock state fails closed to `CONTROL_UNREACHABLE`.
+
 Broker refusal exits are: 3 for ordinary refusal, 4 for CONTROL_UNREACHABLE, 5
 for CONTROL_QUEUED, and 6 for DELIVERY_ALREADY_ACTIVE. A callback ending in
 `TERMINALIZE_DEFERRED` has closed its pending entry and published its artifact;
 the host startup, wait, and next-dispatch paths reconcile it. `TERMINALIZE:
 PENDING` or `TERMINALIZE-REFUSED` requires operator inspection.
+`CONTROL_QUEUED` is advisory and can occur only after the live exclusive lock
+was observed and the bounded lifecycle-response wait expired.
 
 Protected broker state stays under the repository's common Git directory. A
 contained pane was measured unable to write there on 2026-08-07 (codex-cli

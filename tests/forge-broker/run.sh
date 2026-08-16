@@ -294,16 +294,44 @@ FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$R" --session life --incarnation 1
 mk_delivery delivery-dddddddddddddddddddddddddddddddd "$future" 6
 
 # ── G-1: the queue is a real transport, not just a refusal surface ──
-# Positive control: EPERM forces the fallback, the live poller answers, exit 0.
+# Discriminating positive: make PID/start-stamp validation unusable while the
+# daemon stays alive and holds broker.lock. The old broker_pid_live() predicate
+# exits 4 here; the lock-based predicate queues and receives the real payload.
+cp "$P/pid.json" "$W/pid-lock-liveness.json"
+python3 - "$P/pid.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['pid_started']='unusable-client-start-stamp'; json.dump(d,open(p,'w'))
+PY
+audit_before="$(grep -Rl '"event":"LIFECYCLE_FALLBACK"' "$P/audit" 2>/dev/null | wc -l | tr -d ' ')"
+responses_before="$(find "$LQ2/responses" -name '*.json' | wc -l | tr -d ' ')"
 qout="$(printf '{"action":"active-delivery","session":"life","pane":"6"}\n' \
   | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R")"
+mv "$W/pid-lock-liveness.json" "$P/pid.json"
 grep -q 'delivery-dddddddddddddddddddddddddddddddd' <<<"$qout"
-say "G-1 queued fallback answers with the real payload (exit 0)"
+audit_after="$(grep -Rl '"event":"LIFECYCLE_FALLBACK"' "$P/audit" 2>/dev/null | wc -l | tr -d ' ')"
+responses_after="$(find "$LQ2/responses" -name '*.json' | wc -l | tr -d ' ')"
+[ "$audit_after" -gt "$audit_before" ]
+[ "$responses_after" -gt "$responses_before" ]
+say "G-1 held lock routes despite unusable PID stamp and processes the real payload"
 # Parity: the same request over TCP returns the same delivery id.
 tout="$(printf '{"action":"active-delivery","session":"life","pane":"6"}\n' \
   | FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R")"
 grep -q 'delivery-dddddddddddddddddddddddddddddddd' <<<"$tout"
 say "G-1 queue and TCP paths agree on the payload"
+
+# A symlink at the protected lock path fails closed even while the daemon keeps
+# the underlying inode locked. O_NOFOLLOW must prevent any queue intent.
+rm -f "$LQ2/requests"/* "$LQ2/responses"/* 2>/dev/null || true
+mv "$P/broker.lock" "$W/broker.lock.held"
+ln -s "$W/broker.lock.held" "$P/broker.lock"
+lock_rc=0
+lock_out="$(printf '{"action":"active-delivery","session":"life","pane":"6"}\n' \
+  | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_BROKER_TEST_ENABLE=1 \
+    "$B" control --root "$R" 2>&1)" || lock_rc=$?
+rm -f "$P/broker.lock"; mv "$W/broker.lock.held" "$P/broker.lock"
+[ "$lock_rc" -eq 4 ] && grep -q CONTROL_UNREACHABLE <<<"$lock_out"
+[ -z "$(find "$LQ2/requests" -name '*.intent.json' -print -quit)" ]
+say "G-1 a symlinked live broker.lock fails closed without queueing"
 
 # ── G-3: the lifecycle transport refuses what only the host may ask ──
 printf '{"action":"reconcile-delivery","delivery_id":"delivery-dddddddddddddddddddddddddddddddd","terminal":"completed","callback_path":"/x","callback_sha256":"%064d","allow_expired":true}\n' 0 \
@@ -407,9 +435,10 @@ say "N-5 a symlinked intent is quarantined once instead of reprocessed forever"
 find "$LQ2/requests" -name '*.rejected.*' -delete
 
 # ── G-5: every queue path component is symlink-hardened (needs N-1) ──
-# The daemon MUST stay live here: broker_pid_live() is a precondition of the
-# fallback, so against a stopped daemon every case short-circuits to exit 4
-# (CONTROL_UNREACHABLE) and never reaches queue_directory at all.
+# The daemon MUST stay live here: exclusive broker-lock contention is a
+# precondition of the fallback, so against a stopped daemon every case
+# short-circuits to exit 4 (CONTROL_UNREACHABLE) and never reaches
+# queue_directory at all.
 DECOY="$W/decoy"; mkdir -p "$DECOY"
 g5(){ # g5 <relative-component-path> <label>
   local target="$R/$1" label="$2" saved="$W/saved-$(echo "$1" | tr / _)" out rc=0
@@ -430,6 +459,27 @@ g5 ".dev/forge-broker" "forge-broker"
 g5 ".dev" ".dev"
 rmdir "$DECOY"
 FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$R" >/dev/null
+
+# A stale queue-advertising pid.json cannot authorize fallback after the daemon
+# releases its exclusive lock. Unlocked, absent, and symlinked lock states all
+# return exit 4 and create no intent.
+dead_lock_refuses(){ # dead_lock_refuses <label>
+  local label="$1" out rc=0
+  rm -f "$LQ2/requests"/* "$LQ2/responses"/* 2>/dev/null || true
+  out="$(printf '{"action":"active-delivery","session":"life","pane":"6"}\n' \
+    | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_BROKER_TEST_ENABLE=1 \
+      "$B" control --root "$R" 2>&1)" || rc=$?
+  [ "$rc" -eq 4 ] || { echo "FAIL G-1 $label: rc=$rc want 4 :: $out" >&2; exit 1; }
+  grep -q CONTROL_UNREACHABLE <<<"$out"
+  [ -z "$(find "$LQ2/requests" -name '*.intent.json' -print -quit)" ]
+  say "G-1 $label fails closed without queueing"
+}
+dead_lock_refuses "an unlocked stale broker.lock"
+mv "$P/broker.lock" "$W/broker.lock.unlocked"
+dead_lock_refuses "an absent broker.lock"
+ln -s "$W/broker.lock.unlocked" "$P/broker.lock"
+dead_lock_refuses "a symlinked stale broker.lock"
+rm -f "$P/broker.lock"; mv "$W/broker.lock.unlocked" "$P/broker.lock"
 
 # ── N-6: an orphan collision preserves both files ──
 FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$R" >/dev/null 2>&1 || true
