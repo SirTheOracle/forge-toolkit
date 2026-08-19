@@ -10,7 +10,7 @@ validation target resolved relative to the project root, not ownership.
 
 ## Contain launch
 
-The supported interactive binary is `/opt/homebrew/bin/codex` 0.147.0. Forge
+The supported interactive binary is `/opt/homebrew/bin/codex` 0.148.0. Forge
 passes `-C <physical root> --strict-config --sandbox workspace-write
 --ask-for-approval never -c sandbox_workspace_write.network_access=false -c
 sandbox_workspace_write.writable_roots=[]`. Named doctor fields must report

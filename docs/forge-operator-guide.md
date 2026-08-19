@@ -684,7 +684,7 @@ Fix:
 ## Codex containment and rollout
 
 The default is `contain`. New panes use the exact-version-gated interactive
-binary, currently validated through 0.147.0,
+binary, currently validated through 0.148.0,
 and explicit Never/workspace-write/network-off/empty-extra-roots flags. The
 current file credential store means private `CODEX_HOME`, unattended default,
 and authentication isolation remain **unproven**; do not enable them merely

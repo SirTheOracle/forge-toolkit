@@ -1,7 +1,7 @@
 schema: forge-idle-prompts/2
 classifier_version: 2
 supported:
-  codex_versions: ["0.145.0", "0.146.0", "0.146.1", "0.147.0"]
+  codex_versions: ["0.145.0", "0.146.0", "0.146.1", "0.147.0", "0.148.0"]
   locales: ["en-US"]
 codex-a: &codex
   family: codex

@@ -10,7 +10,7 @@ idle=yaml.safe_load(open(sys.argv[2]))
 interactive=runtime['codex']['supported_interactive_versions']
 classifier=runtime['classifier']['supported_codex_versions']
 assert interactive == classifier == idle['supported']['codex_versions']
-assert '0.147.0' in interactive
+assert '0.148.0' in interactive
 PY
 out="$(FORGE_CODEX_ROLLOUT=contain "$ROOT/bin/forge" codex-lane --root "$ROOT" --stage coding --worker codex-a)"
 grep -q '^lane=reviewed-host$' <<<"$out"
