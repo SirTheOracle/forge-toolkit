@@ -732,10 +732,22 @@ rollback, use `forge codex-broker stop --root <worktree>`; stop is authenticated
 drains claimed work, and prevents a live daemon from being silently reused under
 a different session or mode. Its server-authenticated loopback control channel is reachable by the host lane,
 not by network-denied Codex panes. A policy-denied lifecycle call may use
-`.dev/forge-broker/lifecycle`; only `active-delivery`, `delivery-result`, and
-strict `reconcile-delivery` are implemented there. Responses are worker-writable
-and advisory. Files under `.dev/forge-broker/requests` and the lifecycle queue
-cannot authorize a commit or publication.
+`.dev/forge-broker/lifecycle`; only `active-delivery`, `delivery-result`, strict
+`reconcile-delivery`, and read-only advisory `verify-session-incarnation` are
+implemented there. Responses are worker-writable and advisory. Files under
+`.dev/forge-broker/requests` and the lifecycle queue cannot authorize a commit
+or publication.
+
+Callback publication rechecks the actor incarnation while holding the lifecycle
+lock. `callback actor incarnation changed before lock` means a local or broker
+probe returned a confirmed nonempty mismatch, usually a same-name session
+rebirth. `callback actor incarnation could not be verified after lock` means
+neither the local probe nor a compatible broker response established the live
+incarnation. If the broker refused the action, is absent, or returned incompatible
+or unavailable evidence, retrying the worker callback will not repair the
+structural problem; inspect and restart the root-scoped broker. If the broker did
+not answer within the bounded lifecycle-queue timeout, it may be occupied by a
+commit or publication, so retry the callback once before restarting it.
 
 Before entering the lifecycle queue, a contained client requires the advertised
 `lifecycle_queue: 1` capability and probes the protected `broker.lock` read-only.

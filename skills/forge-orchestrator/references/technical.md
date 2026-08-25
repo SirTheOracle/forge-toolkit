@@ -38,12 +38,12 @@ digest matching, expiry, and a single unambiguous active owner are required.
 Host control uses a server-authenticated loopback handshake. The network-deny
 sandbox is a containment control, not an authentication boundary. A separate
 credential-free lifecycle queue accepts only active-delivery, delivery-result,
-and strict reconcile-delivery; its handler has no route to process() or effectful
-actions. Lifecycle responses are advisory and never proof. Effectful `.dev`
-request files remain non-authoritative; commit and publication requests must
-arrive on authenticated host control. The callback artifact/owner checks prevent
-accidental divergence but do not authenticate one pane against another pane in
-the same writable root.
+strict reconcile-delivery, and read-only verify-session-incarnation; its handler
+has no route to process() or effectful actions. Lifecycle responses are advisory
+and never proof. Effectful `.dev` request files remain non-authoritative; commit
+and publication requests must arrive on authenticated host control. The callback
+artifact/owner checks prevent accidental divergence but do not authenticate one
+pane against another pane in the same writable root.
 
 ## Lanes
 
