@@ -348,4 +348,27 @@ grep -q 'NOT ignored' "$WORK/v13.err" && ok 'T-DEV-V13 names the target-side rul
 git -C "$SRC" worktree list --porcelain | grep -q "^worktree $PARENT/proj-s1$" \
   && ok 'T-DEV-V13 residue documented: worktree remains after post-cut refusal' || bad 'T-DEV-V13 unexpected rollback'
 
+# T-DEV-REATTACH: a session whose pipeline moved onto a feature branch must
+# still be restartable under its own name. Requiring the worktree to remain on
+# forge/<session> asserted a property normal work invalidates — the same shape
+# as the .dev/ guard above, and it permanently blocked reusing a session name.
+repo reatt; out=$(ensure s1 --print-path 2>/dev/null)
+git -C "$out" checkout -q -b fix/some-real-work
+echo work >> "$out/README"; git -C "$out" commit -qam work
+before=$(nw)
+out2=$(ensure s1 --print-path 2>"$WORK/reatt.err"); rc=$?
+{ [ "$rc" = 0 ] && [ "$out2" = "$out" ] && [ "$(nw)" = "$before" ]; } \
+  && ok 'T-DEV-REATTACH restarts a session whose branch moved' || bad "T-DEV-REATTACH rc=$rc out=$out2"
+[ "$(git -C "$out" symbolic-ref --short HEAD)" = fix/some-real-work ] \
+  && ok 'T-DEV-REATTACH leaves the working branch untouched' || bad 'T-DEV-REATTACH switched the branch'
+[ "$(git -C "$out" log -1 --format=%s)" = work ] \
+  && ok 'T-DEV-REATTACH preserves committed work' || bad 'T-DEV-REATTACH lost work'
+grep -q "fix/some-real-work" "$WORK/reatt.err" \
+  && ok 'T-DEV-REATTACH names the branch actually held' || bad "T-DEV-REATTACH diagnostic: $(cat "$WORK/reatt.err")"
+
+# Still refuse a path that is NOT a registered worktree of this repository —
+# that guard is about foreign directories, not branch drift, and stays.
+repo reattf; mkdir -p "$PARENT/proj-s1"; : > "$PARENT/proj-s1/stray"
+ensure s1 --print-path >/dev/null 2>"$WORK/reattf.err" && bad 'T-DEV-REATTACH adopted a foreign directory' || ok 'T-DEV-REATTACH still refuses an unregistered path'
+
 printf '\nPASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"; [ "$FAIL" = 0 ]

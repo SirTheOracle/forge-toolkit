@@ -1370,8 +1370,16 @@ PY
         $1=="branch" && p==w {sub(/^refs\/heads\//,"",$2); print $2; exit}')"
     printf '%s\n' "$record" | awk -v w="$wt" '$1=="worktree" && substr($0,10)==w {f=1} END{exit !f}' && registered_path=1 || true
     if [ "$registered_path" = 1 ]; then
+        # This path is derived from the session NAME, so a worktree registered
+        # here IS this session's container. Requiring it to still sit on
+        # forge/<session> asserted a property normal pipeline work invalidates:
+        # workers legitimately cut and check out feature branches as they go, so
+        # a session that did any real work could never be restarted under its own
+        # name. Reattach to the container and report the branch it actually
+        # holds. Git already guarantees no two worktrees share a branch, and
+        # reattach never touches the working tree.
         if [ "$registered_branch" != "$branch" ]; then
-            echo "forge worktree: target is registered on '$registered_branch', expected '$branch': $wt" >&2; return 4
+            echo "forge worktree: NOTICE: reusing this session's worktree on '${registered_branch:-detached HEAD}' rather than '$branch' — a session's branch moves as its pipeline works" >&2
         fi
         is_reattach=1
     elif [ -e "$wt" ] || [ -L "$wt" ]; then
@@ -1488,7 +1496,7 @@ PY
     _worktree_ensure_ignored "$src" "$parent" "$main_root" || { rm -f "$manifest"; return 4; }
 
     if [ "$is_reattach" = 1 ]; then
-        echo "ENSURE worktree @$wt (branch $branch) — reusing, not re-cutting" >&2
+        echo "ENSURE worktree @$wt (branch ${registered_branch:-detached HEAD}) — reusing, not re-cutting" >&2
     else
         if ! mkdir -p "$parent"; then
             echo "forge worktree: could not create worktree parent: $parent" >&2
