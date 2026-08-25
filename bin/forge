@@ -17,6 +17,10 @@
 #   forge worktree ensure --session S [--from DIR] [--print-path]
 #                  [--allow-dirty-base] [--dry-run]
 #   forge worktree path --session S [--from DIR]
+#   forge root-assets ensure-dev-exclusion --root PATH
+#                 install + verify the toolkit-owned /.dev/ exclusion in the
+#                 repo's common-dir info/exclude. Fail-closed: no --force here;
+#                 --force remains a register/spawn-only override.
 #   forge board [--all]             human board (--all lists maintenance residue)
 #   forge board --json              machine cc-board/1 JSON
 #   forge status [--board]          alias for board (--board = the JSON)
@@ -193,7 +197,7 @@ PY
 }
 
 # One-time migration: seed the registry from the live watch-roots list (P3c).
-# Registry-only — skips the gitignore gate + hook merge (those roots came
+# Registry-only — skips the .dev/ exclusion gate + hook merge (those roots came
 # through the normal register path already, or will).
 registry_seed() {
     local wr="$HOME/.config/forge/watch-roots"
@@ -686,6 +690,222 @@ PY
     return 0
 }
 
+# ── .dev exclusion + verification (session-start project independence) ───────
+# Three primitives, deliberately separate (see .dev/proposals/
+# session-start-project-independence/proposal.md §4.1 for the call-site matrix):
+#   _forge_dev_type_ok        C8 — refuse a non-directory .dev before mutating
+#   _ensure_exclude_pattern   C2 — toolkit-owned line in common-dir info/exclude
+#   _verify_dev_runtime_ignored  C1 — randomized multi-class probe
+# Do NOT collapse these into _worktree_ensure_ignored: that helper early-returns
+# on ANY effective match, which would skip the common-dir write for every repo
+# whose .gitignore already names .dev/ — the exclusion would then vanish the
+# moment the project edited that file.
+
+# C8. `mkdir -p` silently accepts a symlink to an existing directory, which
+# would place runtime state outside the root. Absent is fine; anything that is
+# not a real directory is not.
+_forge_dev_type_ok() {   # _forge_dev_type_ok <root>
+    local d="$1/.dev"
+    if [ -L "$d" ]; then
+        echo "forge: $d is a symlink — forge runtime state must live inside the root" >&2; return 1
+    fi
+    if [ -e "$d" ] && [ ! -d "$d" ]; then
+        echo "forge: $d exists and is not a directory" >&2; return 1
+    fi
+    return 0
+}
+
+# C2. Idempotence is judged on the TARGET FILE's own contents, never on an
+# effective pre-probe. flock + atomic replace mirrors registry_write so two
+# concurrent first starts cannot duplicate the line or publish a partial edit.
+_ensure_exclude_pattern() {   # _ensure_exclude_pattern <root> <pattern>
+    local root="$1" pattern="$2" common
+    common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
+        echo "forge: cannot resolve the git common dir for $root" >&2; return 1; }
+    [ -n "$common" ] || { echo "forge: empty git common dir for $root" >&2; return 1; }
+    FORGE_EXC_COMMON="$common" FORGE_EXC_PATTERN="$pattern" python3 - <<'PY'
+import os, sys, fcntl, tempfile
+common = os.environ["FORGE_EXC_COMMON"]; pattern = os.environ["FORGE_EXC_PATTERN"]
+info = os.path.join(common, "info"); exclude = os.path.join(info, "exclude")
+COMMENT = b"# forge: toolkit-owned runtime exclusion"
+pat = pattern.encode()
+
+if os.path.islink(info):
+    sys.exit(f"forge: {info} is a symlink — refusing to write the exclude file")
+try:
+    os.makedirs(info, exist_ok=True)
+except OSError as e:
+    sys.exit(f"forge: could not create {info}: {e}")
+# An atomic replace would swap the symlink itself rather than update its target.
+if os.path.islink(exclude):
+    sys.exit(f"forge: {exclude} is a symlink — refusing to replace it")
+
+lock = os.path.join(info, ".forge-exclude.lock")
+try:
+    lf = open(lock, "w")
+except OSError as e:
+    sys.exit(f"forge: could not open {lock}: {e}")
+with lf:
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    cur = b""
+    mode = None
+    if os.path.exists(exclude):
+        try:
+            with open(exclude, "rb") as f: cur = f.read()
+        except OSError as e:
+            sys.exit(f"forge: could not read {exclude}: {e}")
+        try: mode = os.stat(exclude).st_mode & 0o7777
+        except OSError: mode = None
+
+    lines = cur.split(b"\n")
+    trailing_nl = cur.endswith(b"\n") or cur == b""
+    if lines and lines[-1] == b"": lines.pop()
+    hits = [i for i, l in enumerate(lines) if l.strip() == pat]
+
+    if len(hits) == 1 and trailing_nl:
+        sys.exit(0)                      # already correct — byte and inode stable
+
+    if hits:
+        keep = hits[0]
+        lines = [l for i, l in enumerate(lines) if i == keep or l.strip() != pat]
+    else:
+        if lines and lines[-1].strip() != b"": pass
+        lines.append(COMMENT); lines.append(pat)
+
+    out = b"\n".join(lines) + b"\n"
+    if out == cur: sys.exit(0)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=info, prefix=".forge-exclude.")
+        with os.fdopen(fd, "wb") as f: f.write(out)
+        if mode is not None: os.chmod(tmp, mode)
+        os.replace(tmp, exclude)
+    except OSError as e:
+        try: os.unlink(tmp)
+        except Exception: pass
+        sys.exit(f"forge: could not write {exclude}: {e}")
+PY
+}
+
+# C1. A fixed probe set is defeatable: a project can negate the whole tree and
+# then re-ignore each known probe path by name (reproduced — see proposal §0.1).
+# Randomized, never-created names per runtime class cannot be pre-enumerated, so
+# re-inclusion has to be broad enough for a probe to catch it. Best-effort
+# hardening, NOT proof: only relocating runtime state closes this absolutely.
+_verify_dev_runtime_ignored() {   # _verify_dev_runtime_ignored <root>
+    FORGE_VDR_ROOT="$1" python3 - <<'PY'
+import os, subprocess, sys, uuid
+root = os.environ["FORGE_VDR_ROOT"]
+r = lambda: uuid.uuid4().hex[:12]
+probes = [
+    f".dev/{r()}.tmp",                      # top-level file
+    f".dev/.forge-{r()}",                   # top-level dotfile
+    f".dev/attention/{r()}.json",           # attention/
+    f".dev/signals/{r()}.json",             # signals/
+    f".dev/forge-broker/{r()}.json",        # forge-broker/
+    f".dev/forge-tmp/{r()}",                # forge-tmp/
+    f".dev/proposals/{r()}/forge-log.yml",  # runtime nested in a durable dir
+]
+p = subprocess.run(
+    ["git", "-C", root, "check-ignore", "-v", "--no-index", "--non-matching", "-z", "--stdin"],
+    input=("\0".join(probes) + "\0").encode(), capture_output=True)
+if p.returncode not in (0, 1):
+    sys.exit(f"forge: check-ignore failed in {root}: {p.stderr.decode(errors='replace').strip()}")
+f = p.stdout.split(b"\0")
+bad = []
+for i in range(0, len(f) - 1, 4):
+    rec = f[i:i + 4]
+    if len(rec) < 4: break
+    src, ln, pat, path = (x.decode(errors="replace") for x in rec)
+    if not pat:
+        bad.append((path, "no ignore rule matches it"))
+    elif pat.startswith("!"):
+        bad.append((path, f"re-included by {src}:{ln}: {pat}"))
+# --dry-run must REPORT, never refuse a state a real ensure would repair.
+if os.environ.get("FORGE_VDR_PLAN") == "1":
+    if not bad: print("satisfied")
+    elif any("re-included by" in why for _, why in bad): print("blocked-by-negation")
+    else: print("install-on-ensure")
+    sys.exit(0)
+if bad:
+    sys.stderr.write(f"forge: forge runtime state under .dev/ is NOT ignored in {root}\n")
+    for path, why in bad:
+        sys.stderr.write(f"       {path} — {why}\n")
+    sys.stderr.write("       Fix the project's .gitignore (a '!' rule outranks the toolkit's own exclusion), then re-run.\n")
+    sys.exit(1)
+PY
+}
+
+# C4 — tracked runtime state is REPORTED, never fatal (operator ruling
+# 2026-08-25: informal, no always-fatal subset). Glob-based, because .dev/ is
+# not classifiable by prefix: .dev/reviews/ holds durable results AND queue
+# state, and .dev/proposals/<slug>/forge-log.yml is runtime nested inside a
+# durable artifact directory. Two of these paths are written only by
+# skills/forge-orchestrator/SKILL.md, not by any binary — keep them in lockstep.
+_audit_tracked_runtime() {   # _audit_tracked_runtime <root> [seen-file]
+    FORGE_ART_ROOT="$1" FORGE_ART_SEEN="${2:-}" python3 - <<'PY'
+import os, subprocess, sys, fnmatch
+root = os.environ["FORGE_ART_ROOT"]; seen_fp = os.environ.get("FORGE_ART_SEEN", "")
+GLOBS = [
+    ".dev/.forge-session", ".dev/.forge-digest-ack", ".dev/.forge-fix-alternation",
+    ".dev/forge-context*.yml", ".dev/forge-status*.md", ".dev/forge-log.yml",
+    ".dev/forge-worktree.json", ".dev/attention/*", ".dev/signals/*",
+    ".dev/forge-broker/*", ".dev/forge-tmp/*", ".dev/reviews/hook.log",
+    ".dev/reviews/pending/*", ".dev/reviews/pending-pr/*",
+    ".dev/proposals/*/forge-log.yml",
+]
+try:
+    out = subprocess.run(["git", "-C", root, "ls-files", "-z", "--", ".dev"],
+                         capture_output=True).stdout
+except Exception:
+    sys.exit(0)
+paths = [x.decode(errors="replace") for x in out.split(b"\0") if x]
+def is_runtime(pth):
+    return any(fnmatch.fnmatch(pth, g) for g in GLOBS)
+seen = set()
+if seen_fp and os.path.exists(seen_fp):
+    seen = {l.strip() for l in open(seen_fp) if l.strip()}
+hits = [x for x in paths if is_runtime(x) and x not in seen]
+if hits:
+    sys.stderr.write(f"forge: NOTICE: {len(hits)} forge runtime path(s) are TRACKED in {root}:\n")
+    for x in hits: sys.stderr.write(f"       {x}\n")
+    sys.stderr.write("       Runtime state is not meant to be committed; this does NOT block session start.\n")
+if seen_fp:
+    with open(seen_fp, "a") as f:
+        for x in hits: f.write(x + "\n")
+PY
+}
+
+# ── C6: narrow machine-facing verb ────────────────────────────────────────
+# forge-start's --here and --populate-existing paths never call `worktree
+# ensure`, so they never install the toolkit-owned exclusion. They cannot call
+# the helpers directly (internals of this script) and must NOT call
+# `forge register`, which also merges hooks and writes watch-root and registry
+# state. This verb is the shared implementation contract. Fail-closed by
+# design: --force stays a register/spawn-only override (proposal C5).
+cmd_root_assets() {
+    local action="${1:-}"; shift 2>/dev/null || true
+    [ "$action" = "ensure-dev-exclusion" ] \
+        || die "forge root-assets: expected ensure-dev-exclusion (got '${action:-}')"
+    local root=""
+    while [ $# -gt 0 ]; do case "$1" in
+        --root) [ $# -ge 2 ] || die "forge root-assets: --root requires a value"; root="$2"; shift 2 ;;
+        --*) die "forge root-assets: unknown flag $1" ;;
+        *) die "forge root-assets: unexpected argument '$1'" ;;
+    esac; done
+    [ -n "$root" ] || die "forge root-assets: --root is required"
+    local top
+    top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" \
+        || die "forge root-assets: not a Git worktree: $root"
+    top="$(cd "$top" && pwd -P)"
+    _forge_dev_type_ok "$top" || die "forge root-assets: refusing $top"
+    _ensure_exclude_pattern "$top" "/.dev/" \
+        || die "forge root-assets: could not install the .dev/ exclusion in $top"
+    _audit_tracked_runtime "$top" "${FORGE_AUDIT_SEEN:-}"
+    _verify_dev_runtime_ignored "$top" \
+        || die "forge root-assets: the .dev/ exclusion could not be verified in $top"
+    echo "EXCLUSION ok root=$top"
+}
+
 # ── root bootstrap + register ─────────────────────────────────────────────
 # Worktree provisioning calls only this helper. Keep watch-roots and registry
 # writes in cmd_register: registry identity is common-dir keyed, and dead
@@ -693,15 +913,28 @@ PY
 bootstrap_root_assets() { # bootstrap_root_assets <root> [force]
     local root="$1" force="${2:-0}"
 
-    # A `.dev/` (trailing-slash) gitignore pattern can only match an EXISTING
-    # directory — create it first or a brand-new root fails the gate below
-    # despite a correct .gitignore (found on the Phase C live smoke).
+    # C8 — validate the type BEFORE mkdir -p, which silently accepts a symlink
+    # to a directory outside the root.
+    _forge_dev_type_ok "$root" || die "refusing to bootstrap $root"
+    # Verification no longer needs this directory to exist (C1 probes paths, not
+    # the directory), but bootstrap output still lands here.
     mkdir -p "$root/.dev"
 
-    if [ "$force" != 1 ] && ! git -C "$root" check-ignore -q .dev 2>/dev/null; then
-        die ".dev/ is not gitignored in $root — attention files would be committable.
-       Fix: echo '.dev/' >> '$root/.gitignore'  (untrack any tracked .dev paths), then re-run.
-       Override with --force only if you accept the exposure."
+    # C2 then C1. The old guard asked `check-ignore -q .dev` — index-aware and
+    # directory-level — which git refuses for ANY directory holding tracked
+    # content, however correct the ignore rule. Committing a proposal under
+    # .dev/ therefore disabled session start for the whole project. Install the
+    # toolkit-owned exclusion, then verify the property we actually need: that
+    # NEW runtime files under .dev/ are ignored. W runs best-effort even under
+    # --force so a forced register still installs the pattern when it can.
+    if ! _ensure_exclude_pattern "$root" "/.dev/"; then
+        [ "$force" = 1 ] || die "could not install the .dev/ exclusion in $root (see above)"
+    fi
+    _audit_tracked_runtime "$root" "${FORGE_AUDIT_SEEN:-}"
+    if [ "$force" != 1 ] && ! _verify_dev_runtime_ignored "$root"; then
+        die "refusing to bootstrap $root — forge runtime state under .dev/ would be visible to git.
+       A project '!' rule outranks the toolkit's own exclusion; fix the rule named above.
+       Override with --force only if you accept that exposure."
     fi
 
     local block="$(_toolkit_root)/config/claude-cc-hooks.json"
@@ -815,7 +1048,7 @@ cmd_register() {
     if ! grep -qxF "$root" "$wr"; then echo "$root" >> "$wr"; echo "added $root to $wr"; fi
 
     # Durable per-repo declaration (P3). LAST — a hook-merge refuse or the
-    # gitignore gate above aborts BEFORE any registry write.
+    # .dev/ exclusion gate above aborts BEFORE any registry write.
     local rid; rid="$(repo_identity "$root")" \
         || die "register: '$root' is not a git repo (repo identity requires git)"
     [ -n "$alias" ] || alias="$(sanitize_name "$(basename "$root")")"
@@ -1075,9 +1308,12 @@ cmd_worktree() {
         echo "forge worktree: forge-bridge requires .claude/forge-project.yml; the source root does not have one. Run 'forge register' there first, or use 'forge-start --here'." >&2
         return 2
     }
-    git -C "$src" check-ignore -q --no-index .dev/probe 2>/dev/null || {
-        echo "forge worktree: .dev/ is not gitignored in $src — refusing before worktree creation" >&2; return 2;
-    }
+    # The .dev/ ignore precondition used to live here. It refused before the
+    # self-healing writer could ever run, so a project that simply never
+    # mentioned .dev/ could not start a session at all. Moved to the pre-fetch
+    # boundary below, where a real ensure installs the exclusion first and only
+    # then verifies. `worktree path` and --dry-run must reach their returns
+    # without writing or refusing (proposal §4.1).
     _worktree_validate_seed_config "$src" || return 2
 
     local parent prefix branch_prefix wt branch fetch expected tracked_project=0 main_root
@@ -1178,6 +1414,24 @@ PY
         [ "$allow_dirty" = 0 ] || echo "forge worktree: WARNING: --allow-dirty-base accepted the listed tracked paths" >&2
     fi
 
+    # C3 — every zero-mutation validation is done and nothing has been fetched
+    # or created yet. Install the toolkit-owned exclusion and verify it HERE, so
+    # a source-root failure costs no fetch, no ref, and no worktree. `path`
+    # returned far above; --dry-run reports its plan below instead of writing.
+    # The post-cut bootstrap re-verifies the TARGET root, whose checked-out
+    # .gitignore can differ from the source's.
+    if [ "$dry" = 0 ]; then
+        _forge_dev_type_ok "$src" || return 2
+        _ensure_exclude_pattern "$src" "/.dev/" || return 2
+        _verify_dev_runtime_ignored "$src" || return 2
+        # Audit the source now, and hand the reported set to the post-cut
+        # bootstrap so a path present in both roots is named once — while a
+        # runtime file tracked only on the TARGET base is still reported.
+        FORGE_AUDIT_SEEN="$(mktemp "${TMPDIR:-/tmp}/forge-audit-seen.XXXXXX")"
+        export FORGE_AUDIT_SEEN
+        _audit_tracked_runtime "$src" "$FORGE_AUDIT_SEEN"
+    fi
+
     # All exit-2 validation and the create-only dirty refusal are complete.
     # Fetch may now mutate refs; resolve the ladder again so the cut uses them.
     local fetch_failed=0
@@ -1208,6 +1462,7 @@ PY
     local manifest; manifest="$(mktemp "${TMPDIR:-/tmp}/forge-worktree-seed.XXXXXX")"
     if [ "$dry" = 1 ]; then
         printf 'PLAN worktree=%s\nPLAN branch=%s\nPLAN base_ref=%s\nPLAN base_sha=%s\n' "$wt" "$branch" "$base" "$base_sha"
+        printf 'PLAN dev-exclusion=%s\n' "$(FORGE_VDR_PLAN=1 _verify_dev_runtime_ignored "$src" 2>/dev/null)"
         printf 'PLAN divergence tracked_dirty=%s untracked=%s ahead=%s\n' "$([ -n "$dirty_paths" ] && echo yes || echo no)" "$untracked" "$ahead"
         _worktree_seed "$src" "$wt" "$manifest" 1 || { local rc=$?; rm -f "$manifest"; return "$rc"; }
         # Verbose advisory belongs here, not on the real run: --dry-run is exactly
@@ -1426,7 +1681,7 @@ cmd_spawn() {
         die "spawn: billing preflight failed for $root (use --allow-api-billing to override)"
     fi
 
-    # 2. Register: gitignore gate + hook MERGE (P5) + watch-roots + registry (P3).
+    # 2. Register: .dev/ exclusion gate + hook MERGE (P5) + watch-roots + registry (P3).
     #    Mutating — SKIPPED in --dry-run (naming below only READS the registry).
     if [ "$dry" = false ]; then
         if [ "$force" = 1 ]; then cmd_register "$root" --force >/dev/null
@@ -2882,9 +3137,10 @@ case "${1:-help}" in
     board)     shift; if [ "${1:-}" = "--json" ]; then exec "$FORGE_WATCH_BIN" status --board; else exec "$FORGE_WATCH_BIN" status --pretty "$@"; fi ;;
     # Read-only per-TASK projection over cc-board/1 tasks[] (no task-creating verb).
     tasks)     shift; exec "$FORGE_WATCH_BIN" status --tasks "$@" ;;
+    root-assets) shift; cmd_root_assets "$@" ;;
     gc)        shift; cmd_gc "$@" ;;
     recover)   shift; cmd_recover "$@" ;;
     parked)    shift; cmd_parked "$@" ;;
     -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register worktree status board tasks gc recover parked codex-broker)" ;;
+    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register worktree root-assets status board tasks gc recover parked codex-broker)" ;;
 esac

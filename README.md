@@ -87,7 +87,9 @@ This makes every `git commit` in Claude Code automatically dispatch a code revie
 
 ### Per-Project Setup
 
-Each project needs a `forge-project.yml` and optionally the git post-commit hook:
+Each project needs a `forge-project.yml` and optionally the git post-commit hook.
+You do **not** need to add `.dev/` to the project's `.gitignore` — Forge installs
+that exclusion itself, in the repository-local `.git/info/exclude`, on first use:
 
 ```bash
 # In your project root:

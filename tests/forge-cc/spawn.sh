@@ -182,10 +182,12 @@ out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$R" 2>&1); rc=$?
 { [ "$rc" -ne 0 ] && echo "$out" | grep -q 'must be a non-empty list'; } && ok "T11 malformed on_spawn dies loud" || bad "T11 malformed (rc=$rc): $out"
 
 echo "── spawn: gitignore gate + --force (T12) ──"
-UG="$WORK/ungit"; mkdir -p "$UG/.dev"; git -C "$UG" init -q; : > "$UG/.gitignore"; UG="$(cd "$UG" && pwd -P)"
+# C5: empty .gitignore self-heals now; only an unprovable exclusion refuses.
+UG="$WORK/ungit"; mkdir -p "$UG/.dev"; git -C "$UG" init -q
+printf '!/.dev/\n!/.dev/**\n' > "$UG/.gitignore"; UG="$(cd "$UG" && pwd -P)"
 TL t12
 out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$UG" --no-populate 2>&1); rc=$?
-[ "$rc" -ne 0 ] && ok "T12 non-gitignored .dev refused" || bad "T12 accepted ungitignored root"
+[ "$rc" -ne 0 ] && ok "T12 unprovable .dev exclusion refused" || bad "T12 accepted a negated root"
 out=$(TMUX_LOG="$TMUX_LOG" FORGE_TMUX_BIN="$FAKE" spawn --root "$UG" --no-populate --force 2>&1); rc=$?
 { [ "$rc" -eq 0 ] && echo "$out" | grep -q 'SPAWNED'; } && ok "T12 --force proceeds to SPAWNED" || bad "T12 --force (rc=$rc): $out"
 

@@ -211,4 +211,141 @@ repo defer; out=$(ensure s1 --print-path 2>"$WORK/defer.err"); ! grep -q '^allow
 repo nobin; out=$(FORGE_DIRENV_BIN="$WORK/no-direnv" ensure s1 --print-path 2>"$WORK/nobin.err"); python3 -c 'import json,sys;assert json.load(open(sys.argv[1]))["direnv"]=="deferred"' "$out/.dev/forge-worktree.json" && grep -q "direnv allow '$out'" "$WORK/nobin.err" && ok 'T-WT-DIRENV binary-absent-is-deferred' || bad direnv-no-binary
 repo absent; rm "$SRC/.envrc"; out=$(ensure s1 --print-path 2>/dev/null); ! grep -q '^allow ' "$DIRENV_LOG" && python3 -c 'import json,sys;assert json.load(open(sys.argv[1]))["direnv"]=="absent"' "$out/.dev/forge-worktree.json" && ok 'T-WT-DIRENV absent' || bad direnv-absent
 repo dfail; out=$(DIRENV_ALLOWED=0 DIRENV_RC=7 ensure s1 --print-path 2>"$WORK/dfail.err"); [ $? = 0 ] && grep -q 'direnv allow failed' "$WORK/dfail.err" && ok 'T-WT-DIRENV nonfatal' || bad direnv-failure
+# ══ .dev exclusion + verification (session-start project independence) ══════
+# Regression cover for the guard that made session start depend on repo content.
+# See .dev/proposals/session-start-project-independence/proposal.md §6.
+echo "── T-DEV: toolkit-owned .dev exclusion ──"
+
+# V1: .dev/ absent from .gitignore — the case the OLD early precondition refused
+# outright, before any self-healing writer could run.
+repo v1; printf 'README\n' > "$SRC/.gitignore"; git -C "$SRC" commit -qam nodev
+out=$(ensure s1 --print-path 2>"$WORK/v1.err")
+{ [ -n "$out" ] && [ -d "$out" ]; } && ok 'T-DEV-V1 starts with .dev/ absent from .gitignore' || bad "T-DEV-V1: $(cat "$WORK/v1.err")"
+grep -qx '/.dev/' "$SRC/.git/info/exclude" && ok 'T-DEV-V1 toolkit exclusion installed' || bad 'T-DEV-V1 no exclusion written'
+
+# V4: .gitignore ALREADY names .dev/ — the early-return trap. A helper that
+# short-circuits on any effective match never writes the toolkit line, and the
+# exclusion then vanishes the moment the project edits .gitignore (V5).
+repo v4; out=$(ensure s1 --print-path 2>/dev/null)
+n=$(grep -cx '/.dev/' "$SRC/.git/info/exclude" 2>/dev/null || echo 0)
+[ "$n" = 1 ] && ok 'T-DEV-V4 exclusion written exactly once despite .gitignore match' || bad "T-DEV-V4 wrote $n line(s)"
+
+# V5: project drops its own rule — the toolkit's exclusion must still hold.
+rm "$SRC/.gitignore"; git -C "$SRC" commit -qam dropignore
+out=$(ensure s2 --print-path 2>"$WORK/v5.err")
+{ [ -n "$out" ] && [ -d "$out" ]; } && ok 'T-DEV-V5 survives deletion of the project .gitignore rule' || bad "T-DEV-V5: $(cat "$WORK/v5.err")"
+
+# V2/V3: a tracked durable work product under .dev/ must not block. This is the
+# exact goparent-ai failure: committing a proposal disabled session start.
+repo v2; mkdir -p "$SRC/.dev/proposals"; echo doc > "$SRC/.dev/proposals/x.md"
+git -C "$SRC" add -f .dev/proposals/x.md; git -C "$SRC" commit -qm proposal
+git -C "$SRC" push -q origin main
+out=$(ensure s1 --print-path 2>"$WORK/v2.err")
+{ [ -n "$out" ] && [ -d "$out" ]; } && ok 'T-DEV-V2/V3 tracked .dev/ work product does not block' || bad "T-DEV-V2: $(cat "$WORK/v2.err")"
+
+# V6: a whole-tree negation outranks info/exclude, so exclusion cannot be
+# proven. Provisioning is fail-closed (C5): no --force here by design.
+repo v6; printf '!/.dev/\n!/.dev/**\n' > "$SRC/.gitignore"; git -C "$SRC" commit -qam negate
+before=$(nw); ensure s1 --print-path >/dev/null 2>"$WORK/v6.err"; rc=$?
+{ [ "$rc" != 0 ] && [ "$(nw)" = "$before" ]; } && ok 'T-DEV-V6 refuses a negated tree, cuts nothing' || bad "T-DEV-V6 rc=$rc worktrees $before->$(nw)"
+grep -q 'NOT ignored' "$WORK/v6.err" && ok 'T-DEV-V6 names the offending rule' || bad "T-DEV-V6 diagnostic: $(cat "$WORK/v6.err")"
+
+# V7b: the four-probe spoof. A fixed probe list is defeated by negating the tree
+# and re-ignoring each KNOWN probe path by name; randomized probes are not.
+repo v7; { printf '!/.dev/\n!/.dev/**\n'; printf '/.dev/.forge-session\n/.dev/attention/probe\n'; printf '/.dev/signals/probe\n/.dev/forge-log.yml\n'; } > "$SRC/.gitignore"
+git -C "$SRC" commit -qam spoof
+ensure s1 --print-path >/dev/null 2>"$WORK/v7.err"; rc=$?
+[ "$rc" != 0 ] && ok 'T-DEV-V7b randomized probes defeat the fixed-probe spoof' || bad 'T-DEV-V7b accepted a spoofed tree'
+
+# V8: a lone subtree negation cannot re-include beneath an excluded parent, so
+# it is inert and must NOT refuse.
+repo v8; printf '.dev/\n!/.dev/attention/**\n' > "$SRC/.gitignore"; git -C "$SRC" commit -qam subneg
+out=$(ensure s1 --print-path 2>"$WORK/v8.err")
+{ [ -n "$out" ] && [ -d "$out" ]; } && ok 'T-DEV-V8 inert subtree negation does not block' || bad "T-DEV-V8: $(cat "$WORK/v8.err")"
+
+# V10/V10b: read-only query and dry-run must not write, and dry-run must REPORT
+# a repairable state rather than refuse it.
+repo v10; printf 'README\n' > "$SRC/.gitignore"; git -C "$SRC" commit -qam nodev
+: > "$SRC/.git/info/exclude"; b1=$(md5 -q "$SRC/.git/info/exclude")
+"$FORGE" worktree path --session s1 --from "$SRC" >/dev/null 2>&1
+[ "$(md5 -q "$SRC/.git/info/exclude")" = "$b1" ] && ok 'T-DEV-V10 worktree path never writes' || bad 'T-DEV-V10 path mutated info/exclude'
+outd=$(ensure s1 --dry-run 2>&1); rcd=$?
+[ "$(md5 -q "$SRC/.git/info/exclude")" = "$b1" ] && ok 'T-DEV-V10 --dry-run never writes' || bad 'T-DEV-V10 dry-run mutated info/exclude'
+{ [ "$rcd" = 0 ] && printf '%s\n' "$outd" | grep -q 'PLAN dev-exclusion=install-on-ensure'; } \
+  && ok 'T-DEV-V10b --dry-run reports the planned self-heal without refusing' || bad "T-DEV-V10b rc=$rcd: $(printf '%s' "$outd" | grep -i 'dev-exclusion' || echo none)"
+
+# V11: repeat ensure is a true no-op on the exclude file — bytes AND inode.
+repo v11; out=$(ensure s1 --print-path 2>/dev/null)
+i1=$(stat -f %i "$SRC/.git/info/exclude"); m1=$(md5 -q "$SRC/.git/info/exclude")
+out=$(ensure s2 --print-path 2>/dev/null)
+{ [ "$(stat -f %i "$SRC/.git/info/exclude")" = "$i1" ] && [ "$(md5 -q "$SRC/.git/info/exclude")" = "$m1" ]; } \
+  && ok 'T-DEV-V11 second ensure leaves info/exclude byte+inode stable' || bad 'T-DEV-V11 rewrote info/exclude'
+
+# V12: concurrent first use — one canonical line, valid trailing newline.
+repo v12; for _i in 1 2 3 4 5 6; do ( "$FORGE" root-assets ensure-dev-exclusion --root "$SRC" >/dev/null 2>&1 ) & done; wait
+n=$(grep -cx '/.dev/' "$SRC/.git/info/exclude"); t=$(tail -c 1 "$SRC/.git/info/exclude" | od -An -c | tr -d ' ')
+{ [ "$n" = 1 ] && [ "$t" = '\n' ]; } && ok 'T-DEV-V12 six concurrent writers -> one line, valid file' || bad "T-DEV-V12 lines=$n trailing=$t"
+
+# V11b: pre-existing duplicates collapse; unrelated content survives.
+repo v11b; printf '# keep me\n/.dev/\nnode_modules/\n/.dev/\n' > "$SRC/.git/info/exclude"
+"$FORGE" root-assets ensure-dev-exclusion --root "$SRC" >/dev/null 2>&1
+{ [ "$(grep -cx '/.dev/' "$SRC/.git/info/exclude")" = 1 ] && grep -qx '# keep me' "$SRC/.git/info/exclude" && grep -qx 'node_modules/' "$SRC/.git/info/exclude"; } \
+  && ok 'T-DEV-V11b duplicates collapsed, unrelated lines preserved' || bad 'T-DEV-V11b normalization damaged the file'
+
+# V11c: an atomic replace would swap a symlink itself rather than its target.
+repo v11c; echo real > "$WORK/realexclude"; ln -sf "$WORK/realexclude" "$SRC/.git/info/exclude"
+"$FORGE" root-assets ensure-dev-exclusion --root "$SRC" >/dev/null 2>&1 && bad 'T-DEV-V11c replaced a symlink' || ok 'T-DEV-V11c refuses a symlinked info/exclude'
+[ "$(cat "$WORK/realexclude")" = real ] && ok 'T-DEV-V11c symlink target untouched' || bad 'T-DEV-V11c wrote through the symlink'
+
+# V14: tracked RUNTIME state is reported, never fatal (operator ruling:
+# informal, no always-fatal subset). Covers top-level, suffixed, directory and
+# the mixed reviews/ case in one root.
+repo v14; mkdir -p "$SRC/.dev/attention" "$SRC/.dev/reviews/pending" "$SRC/.dev/proposals/slug"
+echo s > "$SRC/.dev/.forge-session"; echo c > "$SRC/.dev/forge-context.sess.yml"
+echo a > "$SRC/.dev/attention/e1.json"; echo r > "$SRC/.dev/reviews/pending/x.review"
+echo l > "$SRC/.dev/proposals/slug/forge-log.yml"; echo d > "$SRC/.dev/proposals/slug/plan.md"
+git -C "$SRC" add -f .dev; git -C "$SRC" commit -qm runtime; git -C "$SRC" push -q origin main
+out=$(ensure s1 --print-path 2>"$WORK/v14.err")
+{ [ -n "$out" ] && [ -d "$out" ]; } && ok 'T-DEV-V14 tracked runtime state does not block' || bad "T-DEV-V14 blocked: $(cat "$WORK/v14.err")"
+for f in .forge-session forge-context.sess.yml attention/e1.json reviews/pending/x.review proposals/slug/forge-log.yml; do
+  grep -q "\.dev/$f" "$WORK/v14.err" || { bad "T-DEV-V14 missed runtime path $f"; break; }
+done
+grep -q 'NOTICE' "$WORK/v14.err" && ok 'T-DEV-V14 NOTICE names the tracked runtime paths' || bad 'T-DEV-V14 no NOTICE emitted'
+grep -q 'proposals/slug/plan.md' "$WORK/v14.err" && bad 'T-DEV-V14 misreported a durable artifact as runtime' || ok 'T-DEV-V14 durable artifact not reported'
+
+# V15: .dev must be a real directory. mkdir -p silently accepts a symlink to a
+# directory outside the root, which would relocate runtime state.
+repo v15; rm -rf "$SRC/.dev"; mkdir -p "$WORK/elsewhere"; ln -sf "$WORK/elsewhere" "$SRC/.dev"
+before=$(nw); ensure s1 --print-path >/dev/null 2>"$WORK/v15.err"; rc=$?
+{ [ "$rc" != 0 ] && [ "$(nw)" = "$before" ]; } && ok 'T-DEV-V15 refuses a symlinked .dev, cuts nothing' || bad "T-DEV-V15 rc=$rc"
+repo v15b; rm -rf "$SRC/.dev"; : > "$SRC/.dev"
+ensure s1 --print-path >/dev/null 2>&1 && bad 'T-DEV-V15 accepted .dev as a file' || ok 'T-DEV-V15 refuses .dev as a file'
+
+# V9: the exclusion write itself fails (unwritable common info/). The refusal
+# must land BEFORE fetch, ref creation, or worktree creation.
+repo v9; printf 'README\n' > "$SRC/.gitignore"; git -C "$SRC" commit -qam nodev
+before=$(nw); brefs=$(git -C "$SRC" for-each-ref --format='%(refname)' refs/heads | wc -l | tr -d ' ')
+chmod 555 "$SRC/.git/info"
+ensure s1 --print-path >/dev/null 2>"$WORK/v9.err"; rc=$?
+chmod 755 "$SRC/.git/info"
+arefs=$(git -C "$SRC" for-each-ref --format='%(refname)' refs/heads | wc -l | tr -d ' ')
+{ [ "$rc" != 0 ] && [ "$(nw)" = "$before" ] && [ "$arefs" = "$brefs" ]; } \
+  && ok 'T-DEV-V9 unwritable info/ refuses before any ref or worktree' || bad "T-DEV-V9 rc=$rc worktrees $before->$(nw) refs $brefs->$arefs"
+
+# V13: the SOURCE root verifies clean but the TARGET base commit carries a
+# higher-precedence negation. The exclusion is repo-wide; ignore rules are
+# worktree-content-specific, so this can only be caught after the cut. Assert
+# the concrete post-cut contract: nonzero exit, named diagnostic, and the
+# worktree left in place (this change does not add bootstrap rollback).
+repo v13
+git -C "$SRC" checkout -q -b negbase
+printf '!/.dev/\n!/.dev/**\n' > "$SRC/.gitignore"; git -C "$SRC" commit -qam negatebase
+git -C "$SRC" push -q origin negbase; git -C "$SRC" checkout -q main
+cfgpy 'wt["base_ref"]="origin/negbase"'
+"$FORGE" worktree ensure --session s1 --from "$SRC" --print-path >/dev/null 2>"$WORK/v13.err"; rc=$?
+[ "$rc" = 4 ] && ok 'T-DEV-V13 post-cut target verification exits 4' || bad "T-DEV-V13 rc=$rc"
+grep -q 'NOT ignored' "$WORK/v13.err" && ok 'T-DEV-V13 names the target-side rule' || bad "T-DEV-V13 diagnostic: $(cat "$WORK/v13.err")"
+git -C "$SRC" worktree list --porcelain | grep -q "^worktree $PARENT/proj-s1$" \
+  && ok 'T-DEV-V13 residue documented: worktree remains after post-cut refusal' || bad 'T-DEV-V13 unexpected rollback'
+
 printf '\nPASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"; [ "$FAIL" = 0 ]

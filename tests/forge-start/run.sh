@@ -17,6 +17,19 @@ bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 
 # Bridge stub (line-84 call is absolute-path; PATH cannot shadow it).
 FB="$WORK/fake-bridge"; printf '#!/bin/bash\nexit 0\n' > "$FB"; chmod +x "$FB"
+# C6: --here and --populate-existing now invoke `forge root-assets
+# ensure-dev-exclusion` before any tmux state. Stub it and log the call.
+# $HOME/bin/forge covers every case that does not set FORGE_BIN explicitly.
+RALOG="$WORK/root-assets.calls"; : > "$RALOG"; export RALOG
+mkdir -p "$WORK/h/bin"
+RA="$WORK/h/bin/forge"
+cat > "$RA" <<'SH'
+#!/bin/bash
+echo "$*" >> "${RALOG:?}"
+[ "${RA_FAIL:-0}" = 1 ] && { echo "forge: stub refusal" >&2; exit 1; }
+exit 0
+SH
+chmod +x "$RA"
 DOCTORCALLS="$WORK/codex-doctor.calls"; : > "$DOCTORCALLS"
 FORGE_CODEX_DOCTOR_BIN="$WORK/fake-codex-doctor"; export FORGE_CODEX_DOCTOR_BIN DOCTORCALLS
 cat > "$FORGE_CODEX_DOCTOR_BIN" <<'SH'
@@ -54,7 +67,8 @@ echo "── T-START-IDENTITY: plain no-arg path byte-identical (HC4 golden) ─
 D="$(mktemp -d "${TMPDIR:-/tmp}/fstd.XXXXXX")"; D="$(cd "$D" && pwd -P)"   # normalize /var → /private/var so physical-root launch golden matches
 git -C "$D" init -q
 TMLOG="$WORK/plain.log"; : > "$TMLOG"
-( cd "$D" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_BRIDGE_BIN="$FB" FORGE_BIN="$WORK/never-forge" HOME="$WORK/h" bash "$START" --here >/dev/null 2>&1 )
+: > "$RALOG"
+( cd "$D" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_BRIDGE_BIN="$FB" FORGE_BIN="$RA" HOME="$WORK/h" bash "$START" --here >/dev/null 2>&1 )
 prc=$?
 sed "s|$D|__DIR__|g" "$TMLOG" > "$WORK/plain.norm"
 if diff -q "$GOLD" "$WORK/plain.norm" >/dev/null 2>&1; then
@@ -81,7 +95,13 @@ for _pane in 3 4; do
       bad "T-START-CODEX-ORDER-$_pane: routing field order drifted" ;;
   esac
 done
-[ ! -e "$WORK/never-forge" ] && ok "T-START-HERE-GOLDEN: FORGE_BIN never invoked" || bad "--here invoked FORGE_BIN"
+# C6 replaces the historical "--here never invokes FORGE_BIN" contract: --here
+# must now install the toolkit-owned /.dev/ exclusion, because it never calls
+# `worktree ensure` and an old root started only this way would never migrate.
+# The tmux golden above is unchanged; only the invocation contract moved.
+grep -qx "root-assets ensure-dev-exclusion --root $D" "$RALOG" \
+  && ok "T-START-HERE-C6: --here installs the .dev/ exclusion" \
+  || bad "T-START-HERE-C6: --here did not invoke root-assets (log: $(cat "$RALOG"))"
 rm -rf "$D"
 
 echo "── provisioning and broker atomicity ──"
@@ -160,7 +180,7 @@ out=$(TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_DISP="$W
 [ "$rc" != 0 ] && ! grep -q 'kill-session\|split-window' "$TMLOG" && echo "$out" | grep -q 'broker start failed' && ! echo "$out" | grep -q 'failed mid-layout' \
   && ok "T-START-BROKERFAIL-POP" || bad "populate broker failure"
 TMLOG="$WORK/noprov.log"; : > "$TMLOG"
-TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_DISP="$WTD" FORGE_BIN="$WORK/never-forge" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --populate-existing noprov >/dev/null 2>&1
+TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_DISP="$WTD" FORGE_BIN="$RA" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --populate-existing noprov >/dev/null 2>&1
 [ $? = 0 ] && ok "T-START-POPULATE-NO-PROVISION" || bad "populate invoked provisioning"
 
 echo "── T-START-POP-VALIDATE: populate refuses a non-1-pane session ──"
@@ -174,7 +194,7 @@ echo "── T-START-PLAIN-LAYOUTFAIL: plain layout failure stops broker before 
 D2="$(mktemp -d "${TMPDIR:-/tmp}/fstd.XXXXXX")"; D2="$(cd "$D2" && pwd -P)"
 git -C "$D2" init -q
 TMLOG="$WORK/plainfail.log"; : > "$TMLOG"; : > "$BRKLOG"
-( cd "$D2" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_LAYOUT=bad FORGE_BRIDGE_BIN="$FB" FORGE_BIN="$WORK/never-forge" HOME="$WORK/h" bash "$START" --here >/dev/null 2>&1 )
+( cd "$D2" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_LAYOUT=bad FORGE_BRIDGE_BIN="$FB" FORGE_BIN="$RA" HOME="$WORK/h" bash "$START" --here >/dev/null 2>&1 )
 rc=$?
 [ "$rc" -ne 0 ] && ok "plain layout failure exits nonzero" || bad "plain layout failure exited 0"
 sed -n '1p' "$BRKLOG" | grep -q '^start --root ' && ok "broker start recorded before the failure" || bad "broker start missing from log: $(cat "$BRKLOG")"
@@ -232,7 +252,7 @@ if command -v tmux >/dev/null 2>&1; then
   DL="$WORK/livetrap"; mkdir -p "$DL/.dev"; git -C "$DL" init -q
   echo "prior-session" > "$DL/.dev/.forge-session"
   tmux new-session -d -s "$RSESS" -c "$DL"
-  out=$( cd "$DL" && FORGE_BRIDGE_BIN="$FB" FORGE_START_FAIL_AFTER=3 bash "$START" --populate-existing "$RSESS" 2>&1 ); rc=$?
+  out=$( cd "$DL" && FORGE_BRIDGE_BIN="$FB" FORGE_BIN="$ROOT/bin/forge" FORGE_START_FAIL_AFTER=3 bash "$START" --populate-existing "$RSESS" 2>&1 ); rc=$?
   [ "$rc" -ne 0 ] && ok "live injected failure exits nonzero" || bad "live failure exited 0"
   tmux has-session -t "$RSESS" 2>/dev/null && ok "session still ALIVE after failure" || bad "session was killed"
   lp=$(tmux list-panes -t "$RSESS" -F '#{pane_index}' 2>/dev/null | grep -c .)
@@ -261,7 +281,7 @@ SH
   printf 'export PATH="%s:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"\n' "$WORK/rolebin" > "$FH2/.zprofile"
   cp "$FH2/.zprofile" "$FH2/.zshrc"
   ( cd "$DR" && tmux new-session -d -s "$ROLESESS" -c "$DR" -e "HOME=$FH2" -e "PATH=$WORK/rolebin:$PATH" -e "TMUX_SESSION=$ROLESESS" )
-  ( cd "$DR" && FORGE_BRIDGE_BIN="$FB" bash "$START" --populate-existing "$ROLESESS" >/dev/null 2>&1 ) || true
+  ( cd "$DR" && FORGE_BRIDGE_BIN="$FB" FORGE_BIN="$ROOT/bin/forge" bash "$START" --populate-existing "$ROLESESS" >/dev/null 2>&1 ) || true
   for _i in $(seq 1 15); do
     [ -f "$WORK/roles/0" ] && [ -f "$WORK/roles/1" ] && [ -f "$WORK/roles/2" ] && break
     sleep 1
@@ -291,7 +311,7 @@ SH
   echo "── T-START-POP-RELAUNCH-LIVE: unstamped populate stamps + relaunches pane 0 ──"
   DP="$WORK/liverelaunch"; mkdir -p "$DP/.dev"; git -C "$DP" init -q
   ( cd "$DP" && tmux new-session -d -s "$PRELSESS" -c "$DP" -e "HOME=$FH2" -e "PATH=$WORK/rolebin:$PATH" )
-  ( cd "$DP" && FORGE_BRIDGE_BIN="$FB" bash "$START" --populate-existing "$PRELSESS" >/dev/null 2>&1 ) || true
+  ( cd "$DP" && FORGE_BRIDGE_BIN="$FB" FORGE_BIN="$ROOT/bin/forge" bash "$START" --populate-existing "$PRELSESS" >/dev/null 2>&1 ) || true
   _stamp_live="$(tmux show-environment -t "$PRELSESS" TMUX_SESSION 2>/dev/null | sed -n 's/^TMUX_SESSION=//p')"
   [ "$_stamp_live" = "$PRELSESS" ] && ok "unstamped populate installed the session env stamp" || bad "populate stamp missing: '$_stamp_live'"
   tmux has-session -t "$PRELSESS" 2>/dev/null && ok "session survived the pane-0 relaunch" || bad "session died during relaunch"
@@ -301,6 +321,37 @@ SH
 else
   echo "  (skip live blocks: no tmux)"
 fi
+
+echo "── T-DEV-MIGRATE: --here / populate install the .dev exclusion (C6) ──"
+# These two paths never call `worktree ensure`, so an old root started only this
+# way would never migrate. The step must run BEFORE any tmux state exists.
+
+# V16a: the env form, not just the literal flag.
+MIG="$WORK/mig-env"; mkdir -p "$MIG/.dev"; git -C "$MIG" init -q; MIG="$(cd "$MIG" && pwd -P)"
+TMLOG="$WORK/mig1.log"; : > "$TMLOG"; : > "$RALOG"
+( cd "$MIG" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" FORGE_START_WORKTREE=0 FORGE_BIN="$RA" \
+    FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" migenv >/dev/null 2>&1 )
+grep -qx "root-assets ensure-dev-exclusion --root $MIG" "$RALOG" \
+  && ok 'T-DEV-V16 FORGE_START_WORKTREE=0 installs the exclusion' || bad "T-DEV-V16 env form skipped it (log: $(cat "$RALOG"))"
+
+# V16b: refusal leaves NO tmux state — not one new-session, not one split.
+MIG2="$WORK/mig-refuse"; mkdir -p "$MIG2/.dev"; git -C "$MIG2" init -q; MIG2="$(cd "$MIG2" && pwd -P)"
+TMLOG="$WORK/mig2.log"; : > "$TMLOG"; : > "$RALOG"
+out=$( cd "$MIG2" && TMLOG="$TMLOG" PATH="$SHIM:$PATH" RA_FAIL=1 FORGE_BIN="$RA" \
+    FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --here migref 2>&1 ); rc=$?
+{ [ "$rc" = 3 ] && ! grep -qE '^(new-session|split-window|send-keys) ' "$TMLOG"; } \
+  && ok 'T-DEV-V16 refusal precedes any tmux state' || bad "T-DEV-V16 rc=$rc tmux log: $(cat "$TMLOG")"
+printf '%s' "$out" | grep -q 'exclusion could not be established' \
+  && ok 'T-DEV-V16 refusal names the cause' || bad "T-DEV-V16 diagnostic: $out"
+
+# V17: --populate-existing is a migration entry point too (cmd_spawn re-registers
+# first, but a direct invocation does not). Pane 0 must survive the refusal.
+TMLOG="$WORK/mig3.log"; : > "$TMLOG"; : > "$RALOG"
+out=$( TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_DISP="$WTD" RA_FAIL=1 \
+    FORGE_BIN="$RA" FORGE_BRIDGE_BIN="$FB" HOME="$WORK/h" bash "$START" --populate-existing migpop 2>&1 ); rc=$?
+[ "$rc" != 0 ] && ok 'T-DEV-V17 populate refuses when the exclusion fails' || bad "T-DEV-V17 rc=$rc"
+! grep -q '^kill-session ' "$TMLOG" && ok 'T-DEV-V17 populate refusal never kills the session' || bad 'T-DEV-V17 killed the session'
+! grep -qE '^(split-window|send-keys) ' "$TMLOG" && ok 'T-DEV-V17 no panes added before the refusal' || bad "T-DEV-V17 split before refusal: $(cat "$TMLOG")"
 
 echo
 echo "═══════════════════════════════════════"

@@ -32,6 +32,20 @@ A forge project needs:
    `.gitignore`), because an unignored container would make every later
    `git status` and dirty-base check see an untracked root.
 
+   Forge writes `/.dev/` to that same `.git/info/exclude` on first use, for the
+   same reason and one more: the exclusion has to be Forge's to own. A project
+   that never mentions `.dev/` in `.gitignore`, or that later deletes the line,
+   still starts sessions. Two things follow. **Committing files under `.dev/`
+   no longer breaks session start** — a proposal or QA report under
+   `.dev/proposals/` is durable work product and is left alone; tracked
+   *runtime* state (`attention/`, `signals/`, `.forge-session`, and friends) is
+   reported as a NOTICE and still does not block. And because a project's own
+   `.gitignore` outranks `info/exclude`, a rule that actively re-includes the
+   tree — `!/.dev/` — is refused with the offending rule named, since Forge
+   would otherwise write runtime state that git reports as committable. That
+   refusal is fail-closed: `--force` exists on `forge register` and
+   `forge spawn`, not on `forge-start` or `forge worktree ensure`.
+
    Override per project with `forge.worktree.parent` in
    `.claude/forge-project.yml`, or per invocation with `FORGE_WORKTREE_PARENT`;
    both still accept a path anywhere on disk. `forge.worktree.prefix` names the

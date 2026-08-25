@@ -139,6 +139,22 @@ if [ "$FORGE_START_CODEX_PREFLIGHT" = 1 ]; then
     fi
 fi
 
+# C6 — --here and --populate-existing never call `forge worktree ensure`, so
+# they never install the toolkit-owned /.dev/ exclusion and an old root started
+# only this way would never migrate. Do it HERE: before `tmux new-session`
+# below and before populate's respawn, so a refusal leaves no tmux state at all.
+# Guarded on FORGE_START_WORKTREE, which covers the env form as well as --here.
+if [ "$POPULATE" = 1 ] || [ "$FORGE_START_WORKTREE" != 1 ]; then
+    if ! "$FORGE_BIN" root-assets ensure-dev-exclusion --root "$DIR" >/dev/null; then
+        echo "forge-start: the .dev/ exclusion could not be established for $DIR; no panes were launched" >&2
+        if [ "$POPULATE" = 1 ]; then
+            _FAIL_REASON=".dev/ exclusion could not be established"
+            exit 1
+        fi
+        exit 3
+    fi
+fi
+
 # Per-pane role stamps (P1d) — ONLY in populate mode; plain mode keeps the
 # byte-identical launch strings (HC4/HC5: forge-1..4 stay stamp-free, structural).
 if [ "$POPULATE" = 1 ]; then

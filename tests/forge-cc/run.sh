@@ -425,10 +425,19 @@ PY
 done
 
 echo "── merge tool: refuse ungitignored; --force; no-write on invalid/non-object ──"
-U="$WORK/ungit"; mkdir -p "$U/.claude" "$U/.dev"; git -C "$U" init -q; : > "$U/.gitignore"
+# C5: an EMPTY .gitignore is no longer a refusal — the toolkit installs its own
+# exclusion in common-dir info/exclude and self-heals. The gate now fires only
+# when exclusion cannot be PROVEN, i.e. a higher-precedence project negation
+# outranks the toolkit pattern. --force overrides exactly that.
+S="$WORK/selfheal"; mkdir -p "$S/.claude" "$S/.dev"; git -C "$S" init -q; : > "$S/.gitignore"
+echo '{}' > "$S/.claude/settings.json"
+reg "$S" >/dev/null 2>&1 && ok "self-heals an empty .gitignore (no refusal)" || bad "refused a self-healable root"
+grep -qx '/.dev/' "$S/.git/info/exclude" 2>/dev/null && ok "self-heal wrote the toolkit exclusion" || bad "no toolkit exclusion written"
+U="$WORK/ungit"; mkdir -p "$U/.claude" "$U/.dev"; git -C "$U" init -q
+printf '!/.dev/\n!/.dev/**\n' > "$U/.gitignore"
 echo '{}' > "$U/.claude/settings.json"
-reg "$U" >/dev/null 2>&1 && bad "did not refuse ungitignored .dev" || ok "refuses when .dev not gitignored"
-reg "$U" --force >/dev/null 2>&1 && ok "--force overrides gitignore gate" || bad "--force failed"
+reg "$U" >/dev/null 2>&1 && bad "did not refuse a negated .dev tree" || ok "refuses when exclusion cannot be proven"
+reg "$U" --force >/dev/null 2>&1 && ok "--force overrides an unprovable exclusion" || bad "--force failed"
 V="$WORK/badjson"; mkdir -p "$V/.claude" "$V/.dev"; git -C "$V" init -q; echo '.dev/' > "$V/.gitignore"
 printf '{ broken' > "$V/.claude/settings.json"; b0=$(md5 -q "$V/.claude/settings.json" 2>/dev/null || md5sum "$V/.claude/settings.json")
 regout=$(reg "$V" 2>&1) || true
