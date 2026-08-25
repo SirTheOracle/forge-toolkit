@@ -11,6 +11,7 @@
       "0.148.0",
       "0.149.1"
     ],
+    "unknown_version_policy": "probe",
     "exec_compatibility": "deferred",
     "private_codex_home_default": false,
     "required_flags": [

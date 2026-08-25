@@ -12,6 +12,10 @@ classifier=runtime['classifier']['supported_codex_versions']
 assert interactive == classifier == idle['supported']['codex_versions']
 assert '0.148.0' in interactive
 assert '0.149.1' in interactive
+# Containment-first gate: the allowlist records versions whose containment has
+# been reviewed, but an unrecorded version is admitted when every measured
+# containment check passes. "refuse" restores hard pinning.
+assert runtime['codex'].get('unknown_version_policy') in ('probe', 'refuse')
 PY
 out="$(FORGE_CODEX_ROLLOUT=contain "$ROOT/bin/forge" codex-lane --root "$ROOT" --stage coding --worker codex-a)"
 grep -q '^lane=reviewed-host$' <<<"$out"
@@ -26,8 +30,16 @@ grep -q '^lane=reviewed-host$' <<<"$out" # private runtime/origin gate remains u
 "$ROOT/bin/forge" codex-launch --root "$ROOT" --session test --pane 3 --effort xhigh --print 2>/dev/null | grep -F -- '--ask-for-approval never'
 if [ "${1:-}" != "--live" ]; then echo "policy smoke: hermetic PASS (live gates skipped)"; exit 0; fi
 doctor="$($ROOT/bin/forge codex-doctor "$ROOT" || true)"
-expected="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["codex"]["supported_interactive_versions"][-1])' "$ROOT/config/codex-forge-runtime.json")"
-grep -q "^codex_version=$expected$" <<<"$doctor"
-for field in approval_never filesystem_restricted network_restricted cwd_exact version_supported; do grep -q "^$field=true$" <<<"$doctor"; done
+# Do NOT pin the installed version to the last recorded one: Homebrew moves
+# ahead of the allowlist routinely, and asserting equality here is the same
+# brittleness that made every upgrade a lockout.
+grep -qE '^codex_version=[0-9]+\.[0-9]+\.[0-9]+$' <<<"$doctor"
+for field in approval_never filesystem_restricted network_restricted cwd_exact; do grep -q "^$field=true$" <<<"$doctor"; done
+# Containment proven => launchable, whether or not the version is recorded.
+grep -q '^contained_ready=true$' <<<"$doctor"
+grep -q '^launch_ready=true$' <<<"$doctor"
+if ! grep -q '^version_supported=true$' <<<"$doctor"; then
+  grep -q '^version_admitted_by=containment-probe$' <<<"$doctor"
+fi
 grep -q '^private_codex_home=false$' <<<"$doctor"
 echo "Run the disposable-pane canaries: edit/test succeeds; main/sibling/protected/.git writes and direct commit fail without a prompt; auth file/env/keychain and child listener are inaccessible; broker exact commit and host publish succeed. Store the signed results below the worktree Git dir before enforce."

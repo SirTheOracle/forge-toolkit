@@ -3020,8 +3020,20 @@ checks={'approval_never':sandbox.get('approval policy')=='Never',
         'network_restricted':sandbox.get('network sandbox')=='restricted',
         'cwd_exact':os.path.realpath(str(loaded.get('cwd','')))==os.path.realpath(root)}
 version=str(d.get('codexVersion') or '')
-checks['version_supported']=version in cfg['codex']['supported_interactive_versions']
+allow=cfg['codex']['supported_interactive_versions']
+policy=str(cfg['codex'].get('unknown_version_policy','probe')).lower()
+if policy not in ('probe','refuse'): policy='refuse'   # unreadable config fails closed
+version_known=bool(version) and version in allow
+checks['version_supported']=version_known
 checks['binary_exact']=os.path.realpath(str(install.get('current executable','')))==os.path.realpath(bin)
+# A version string is not a containment property. Containment is MEASURED from
+# the installed binary above; pinning an allowlist made every upstream release a
+# lockout, and the list is hand-edited in four places after the fact, which is
+# how it went stale four times. Treat an unrecorded version as "prove it":
+# admit it only when every measured containment check passes, and say so.
+# Set codex.unknown_version_policy="refuse" to restore hard pinning.
+contained=all(v for k,v in checks.items() if k!='version_supported')
+admitted=version_known or (policy=='probe' and bool(version) and contained)
 print(f"codex_version={version or 'unknown'}")
 print('supported_interactive_versions=' + ','.join(cfg['codex']['supported_interactive_versions']))
 for k,v in checks.items(): print(f'{k}={str(v).lower()}')
@@ -3033,8 +3045,17 @@ print('policy_file_loaded=false')
 print('auth_boundary=unproven-file-store')
 print(f'doctor_aggregate_rc={aggregate_rc}')
 print('doctor_unrelated_failures=reported-separately')
-print(f'contained_ready={str(all(checks.values())).lower()}')
-print(f'launch_ready={str(all(checks.values())).lower()}')
+print(f'unknown_version_policy={policy}')
+if contained and not version_known:
+    if admitted:
+        print(f'version_admitted_by=containment-probe')
+        print(f'NOTICE codex {version} is not in supported_interactive_versions; admitted because every')
+        print(f'NOTICE containment check passed. Record it in config/codex-forge-runtime.json when convenient.')
+    else:
+        print('version_admitted_by=none')
+        print(f'NOTICE codex {version} is unrecorded and unknown_version_policy=refuse.')
+print(f'contained_ready={str(contained).lower()}')
+print(f'launch_ready={str(contained and admitted).lower()}')
 PY
 }
 
