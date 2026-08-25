@@ -646,9 +646,43 @@ def register_delivery(root: Path, git_dir: Path, common: Path, root_id: str,
 
 
 LIFECYCLE_SCHEMA = "forge-lifecycle-intent/1"
-LIFECYCLE_ACTIONS = frozenset({"active-delivery", "delivery-result", "reconcile-delivery"})
+SESSION_INCARNATION_VERIFICATION_SCHEMA = "forge-session-incarnation-verification/1"
+LIFECYCLE_ACTIONS = frozenset({"active-delivery", "delivery-result", "reconcile-delivery",
+                               "verify-session-incarnation"})
 LIFECYCLE_TIMEOUT = float(os.environ.get("FORGE_LIFECYCLE_TIMEOUT_S", "20"))
 LIFECYCLE_MAX_BYTES = 65536
+
+
+def verify_session_incarnation(request: dict, *, caller: str) -> dict:
+    if caller == "control":
+        allowed = {"action", "session", "expected_incarnation"}
+        fields_code = "CONTROL_FIELDS_DENIED"
+    elif caller == "lifecycle":
+        allowed = {"schema", "intent_id", "emitted_at", "action", "session",
+                   "expected_incarnation"}
+        fields_code = "LIFECYCLE_FIELDS_DENIED"
+    else:
+        raise Refusal("LIFECYCLE_CALLER_INVALID", caller)
+    denied = set(request) - allowed
+    if denied:
+        raise Refusal(fields_code, ",".join(sorted(denied)))
+    session = request.get("session")
+    expected = request.get("expected_incarnation")
+    if not isinstance(session, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", session):
+        raise Refusal("SESSION_NAME_INVALID", repr(session))
+    if not isinstance(expected, str) or not expected:
+        raise Refusal("EXPECTED_INCARNATION_INVALID", repr(expected))
+    live = tmux_session_created(session)
+    if not live:
+        result = "unavailable"
+        live = ""
+    elif live == expected:
+        result = "match"
+    else:
+        result = "mismatch"
+    return {"schema": SESSION_INCARNATION_VERIFICATION_SCHEMA,
+            "session": session, "expected_incarnation": expected,
+            "live_incarnation": live, "result": result}
 
 
 def delivery_results(protected: Path, delivery_id: str) -> dict:
@@ -914,6 +948,8 @@ def handle_control(root: Path, git_dir: Path, common: Path, root_id: str,
         return load_json(protected / "results" / f"{request.get('operation_id')}.json")
     if action == "delivery-result":
         return delivery_results(protected, str(request.get("delivery_id", "")))
+    if action == "verify-session-incarnation":
+        return verify_session_incarnation(request, caller="control")
     raise Refusal("CONTROL_ACTION_DENIED", str(action))
 
 
@@ -1018,6 +1054,8 @@ def handle_lifecycle(root: Path, git_dir: Path, common: Path, root_id: str,
         if denied:
             raise Refusal("LIFECYCLE_FIELDS_DENIED", ",".join(sorted(denied)))
         return delivery_results(protected, str(request.get("delivery_id", "")))
+    if action == "verify-session-incarnation":
+        return verify_session_incarnation(request, caller="lifecycle")
     return reconcile_delivery(root, git_dir, common, root_id, protected, request,
                               allow_expired=False, caller="lifecycle")
 
@@ -1334,7 +1372,7 @@ def serve(args: argparse.Namespace) -> int:
                 "session": args.session, "session_incarnation": args.incarnation,
                 "physical_code_root": str(root), "root_identity": root_id,
                 "control_host": control_host, "control_port": control_port,
-                "lifecycle_queue": 1,
+                "lifecycle_queue": 1, "callback_incarnation_probe": 1,
                 "mode": args.mode, "started_at": utc(), "state": "running"})
     signal.signal(signal.SIGTERM, lambda *_: globals().__setitem__("STOP", True))
     while not STOP:

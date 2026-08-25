@@ -199,7 +199,8 @@ FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$WR" >/dev/null
 # not pane authentication. The worker-writable callback can only support accidental-
 # divergence checks; dangerous actions must remain absent from the handler itself.
 LQ="$R/.dev/forge-broker/lifecycle"; mkdir -p "$LQ/requests" "$LQ/responses"
-FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$R" --session life --incarnation 1 --mode contain >/dev/null
+FORGE_BROKER_TEST_TMUX_SESSIONS='probe-match=111,probe-mismatch=222,probe-empty=' \
+  FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$R" --session life --incarnation 1 --mode contain >/dev/null
 FORGE_BROKER_TEST_ENABLE=1 "$B" status --root "$R" --json | grep -q '"lifecycle_queue": 1'
 lq_head_before="$(git -C "$R" rev-parse HEAD)"
 for action in submit-operation register-delivery attest-launch stop-broker query-result; do
@@ -270,8 +271,6 @@ D4=delivery-cccccccccccccccccccccccccccccccc; mk_delivery "$D4" "$past" 5
 printf '{"action":"reap-delivery","session":"life","pane":"5","operator_command":"forge codex-broker reap"}\n' | FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R" | grep -q '"state": "cancelled"'
 grep -R -q DELIVERY_REAPED "$P/audit"
 
-FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$R" >/dev/null
-
 # ─────────────────────────────────────────────────────────────────────────
 # Phase C — gap register G-1/G-3/G-5/G-6 and the §11 defect regressions.
 # Acceptance bar: every case below must FAIL against the unmodified source.
@@ -290,8 +289,78 @@ ctl(){ # ctl <want-rc> <want-substring> <label>  — request JSON on stdin
 }
 qwait(){ for _ in $(seq 1 100); do [ -f "$1" ] && return 0; sleep 0.05; done; echo "FAIL: no response $1" >&2; exit 1; }
 
-FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$R" --session life --incarnation 1 --mode contain >/dev/null
 mk_delivery delivery-dddddddddddddddddddddddddddddddd "$future" 6
+
+# The fixture belongs to the daemon. Compare full detail objects over authenticated
+# control and injected-EPERM lifecycle fallback for every result shape.
+grep -Eq '"callback_incarnation_probe":[[:space:]]*1' "$P/pid.json"
+probe_match='{"action":"verify-session-incarnation","session":"probe-match","expected_incarnation":"111"}'
+probe_mismatch='{"action":"verify-session-incarnation","session":"probe-mismatch","expected_incarnation":"111"}'
+probe_absent='{"action":"verify-session-incarnation","session":"probe-absent","expected_incarnation":"111"}'
+probe_empty='{"action":"verify-session-incarnation","session":"probe-empty","expected_incarnation":"111"}'
+for request in "$probe_match" "$probe_mismatch" "$probe_absent" "$probe_empty"; do
+  probe_direct="$(printf '%s\n' "$request" | FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R")"
+  probe_queue="$(printf '%s\n' "$request" | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM \
+    FORGE_LIFECYCLE_TIMEOUT_S=6 FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R")"
+  [ "$probe_direct" = "$probe_queue" ]
+done
+probe_direct="$(printf '%s\n' "$probe_match" | FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R")"
+printf '%s\n' "$probe_direct" | grep -q '"result": "match"'
+printf '%s\n' "$probe_direct" | grep -q '"live_incarnation": "111"'
+probe_direct="$(printf '%s\n' "$probe_mismatch" | FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R")"
+printf '%s\n' "$probe_direct" | grep -q '"result": "mismatch"'
+printf '%s\n' "$probe_direct" | grep -q '"live_incarnation": "222"'
+for request in "$probe_absent" "$probe_empty"; do
+  probe_direct="$(printf '%s\n' "$request" | FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R")"
+  printf '%s\n' "$probe_direct" | grep -q '"result": "unavailable"'
+  printf '%s\n' "$probe_direct" | grep -q '"live_incarnation": ""'
+done
+say "callback incarnation result shapes have direct/lifecycle parity"
+
+printf '{"action":"verify-session-incarnation","session":"probe-match","expected_incarnation":"111","surprise":1}\n' \
+  | ctl 3 CONTROL_FIELDS_DENIED "probe control rejects extra fields"
+printf '{"action":"verify-session-incarnation","session":"probe-match","expected_incarnation":"111","surprise":1}\n' \
+  | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_LIFECYCLE_TIMEOUT_S=6 \
+    ctl 3 LIFECYCLE_FIELDS_DENIED "probe lifecycle rejects extra fields"
+printf '{"action":"verify-session-incarnation","session":"bad/name","expected_incarnation":"111"}\n' \
+  | ctl 3 SESSION_NAME_INVALID "probe rejects malformed session"
+printf '{"action":"verify-session-incarnation","session":"probe-match","expected_incarnation":""}\n' \
+  | ctl 3 EXPECTED_INCARNATION_INVALID "probe control rejects empty incarnation"
+printf '{"action":"verify-session-incarnation","session":"probe-match","expected_incarnation":""}\n' \
+  | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM FORGE_LIFECYCLE_TIMEOUT_S=6 \
+    ctl 3 EXPECTED_INCARNATION_INVALID "probe lifecycle rejects empty incarnation"
+printf '{"action":"verify-session-incarnation","session":"probe-match","expected_incarnation":111}\n' \
+  | ctl 3 EXPECTED_INCARNATION_INVALID "probe rejects non-string incarnation"
+
+probe_head_before="$(git -C "$R" rev-parse HEAD)"
+probe_index_before="$(git -C "$R" diff --cached --binary | shasum -a 256 | awk '{print $1}')"
+probe_worktree_before="$(git -C "$R" status --porcelain=v2 -z | shasum -a 256 | awk '{print $1}')"
+probe_active_before="$(if [ -d "$P/active" ]; then find "$P/active" -type f -exec shasum -a 256 {} \;; else printf 'ABSENT\n'; fi 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+probe_deliveries_before="$(find "$P/deliveries" -type f -exec shasum -a 256 {} \; | sort | shasum -a 256 | awk '{print $1}')"
+probe_callbacks_before="$(find "$R/.dev/forge-tmp/callbacks" -type f -exec shasum -a 256 {} \; 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+probe_logs_before="$(find "$R/.dev/proposals" -name forge-log.yml -type f -exec shasum -a 256 {} \; 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+probe_audit_before="$(grep -Rl '"action":"verify-session-incarnation"' "$P/audit" 2>/dev/null | wc -l | tr -d ' ')"
+printf '%s\n' "$probe_match" | FORGE_BROKER_TEST_CONNECT_FAULT=EPERM \
+  FORGE_LIFECYCLE_TIMEOUT_S=6 FORGE_BROKER_TEST_ENABLE=1 "$B" control --root "$R" >/dev/null
+[ "$probe_head_before" = "$(git -C "$R" rev-parse HEAD)" ]
+[ "$probe_index_before" = "$(git -C "$R" diff --cached --binary | shasum -a 256 | awk '{print $1}')" ]
+[ "$probe_worktree_before" = "$(git -C "$R" status --porcelain=v2 -z | shasum -a 256 | awk '{print $1}')" ]
+[ "$probe_active_before" = "$(if [ -d "$P/active" ]; then find "$P/active" -type f -exec shasum -a 256 {} \;; else printf 'ABSENT\n'; fi 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')" ]
+[ "$probe_deliveries_before" = "$(find "$P/deliveries" -type f -exec shasum -a 256 {} \; | sort | shasum -a 256 | awk '{print $1}')" ]
+[ "$probe_callbacks_before" = "$(find "$R/.dev/forge-tmp/callbacks" -type f -exec shasum -a 256 {} \; 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')" ]
+[ "$probe_logs_before" = "$(find "$R/.dev/proposals" -name forge-log.yml -type f -exec shasum -a 256 {} \; 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')" ]
+probe_audit_after="$(grep -Rl '"action":"verify-session-incarnation"' "$P/audit" 2>/dev/null | wc -l | tr -d ' ')"
+[ "$probe_audit_after" -gt "$probe_audit_before" ]
+say "probe changes only the expected lifecycle fallback audit"
+
+# Unknown-action denial models an older/missing operation and is never a match.
+printf '{"action":"verify-session-incarnation-v0","session":"probe-match","expected_incarnation":"111"}\n' \
+  | ctl 3 CONTROL_ACTION_DENIED "unknown control action is not accepted as match"
+oldid="lci-$(printf '%032d' 91)"
+printf '{"schema":"forge-lifecycle-intent/1","intent_id":"%s","action":"verify-session-incarnation-v0","session":"probe-match","expected_incarnation":"111","emitted_at":"2026-08-07T00:00:00Z"}\n' "$oldid" > "$LQ2/requests/$oldid.intent.json"
+qwait "$LQ2/responses/$oldid.json"
+grep -q LIFECYCLE_ACTION_DENIED "$LQ2/responses/$oldid.json"
+say "unknown lifecycle action is denied, never represented as match"
 
 # ── G-1: the queue is a real transport, not just a refusal surface ──
 # Discriminating positive: make PID/start-stamp validation unusable while the
