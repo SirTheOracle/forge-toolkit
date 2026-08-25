@@ -49,6 +49,58 @@ WC_TMUX_LIST="$WORK/p1wc-tmux-list.tsv"
 : > "$WC_TMUX_LIST"
 export FORGE_TMUX_LIST="$WC_TMUX_LIST"
 
+WC_BROKER_STUB="$WORK/forge-broker-stub"
+cat > "$WC_BROKER_STUB" <<'SH'
+#!/bin/bash
+[ "$1" = control ] || exit 4
+payload="$(cat)"
+[ -n "${FORGE_BROKER_CAPTURE:-}" ] && printf '%s\n' "$payload" >> "$FORGE_BROKER_CAPTURE"
+action="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("action",""))' "$payload" 2>/dev/null)" || exit 3
+case "$action" in
+  verify-session-incarnation)
+    session="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("session",""))' "$payload")"
+    expected="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("expected_incarnation",""))' "$payload")"
+    case "${FORGE_BROKER_MODE:-match}" in
+      match) live="$expected"; result=match ;;
+      mismatch) live=999999; result=mismatch ;;
+      unavailable) live=''; result=unavailable ;;
+      malformed) printf '{bad-json\n'; exit 0 ;;
+      echo-mismatch) session=wrong-session; live="$expected"; result=match ;;
+      refuse) exit 3 ;;
+      unreachable) exit 4 ;;
+      timeout)
+        [ -n "${FORGE_BROKER_TIMEOUT_FILE:-}" ] \
+          && printf '%s\n' "${FORGE_LIFECYCLE_TIMEOUT_S:-20}" > "$FORGE_BROKER_TIMEOUT_FILE"
+        sleep "${FORGE_LIFECYCLE_TIMEOUT_S:-20}"
+        exit 5
+        ;;
+      slow)
+        [ -n "${FORGE_BROKER_PID_FILE:-}" ] && printf '%s\n' "$$" > "$FORGE_BROKER_PID_FILE"
+        exec sleep 30
+        ;;
+      *) exit 3 ;;
+    esac
+    python3 - "$session" "$expected" "$live" "$result" <<'PY'
+import json,sys
+print(json.dumps({'schema':'forge-session-incarnation-verification/1','session':sys.argv[1],
+                  'expected_incarnation':sys.argv[2],'live_incarnation':sys.argv[3],
+                  'result':sys.argv[4]},sort_keys=True))
+PY
+    ;;
+  active-delivery) printf '{"delivery_id":"delivery-11111111111111111111111111111111","state":"open","capability_class":"workspace"}\n' ;;
+  reconcile-delivery) printf '{"delivery_id":"delivery-11111111111111111111111111111111","state":"completed"}\n' ;;
+  *) exit 3 ;;
+esac
+SH
+chmod +x "$WC_BROKER_STUB"
+
+WC_WATCH_STUB="$WORK/forge-watch-stub"
+cat > "$WC_WATCH_STUB" <<'SH'
+#!/bin/bash
+[ -n "${FORGE_WATCH_CAPTURE:-}" ] && printf 'called\n' >> "$FORGE_WATCH_CAPTURE"
+SH
+chmod +x "$WC_WATCH_STUB"
+
 # Every hermetic root has one live exact identity in the shared topology seam.
 mkproj() {  # mkproj <name> -> echoes abs path
     local p="$WORK/$1"
@@ -147,6 +199,27 @@ briL() {  # all-legacy actor: session known, incarnation unavailable
     local tl; tl="$(mktemp)"; printf '%s\t%s\n' "$s" "$r" > "$tl"
     ( cd "$r" && env -u TMUX TMUX_SESSION="$s" FORGE_TMUX_LIST="$tl" "$BRIDGE" "$@" )
     local rc=$?; rm -f "$tl"; return $rc
+}
+cbU() {  # cbU <root> <session> <broker-mode> followed by callback arguments
+    local r="$1" s="$2" mode="$3"; shift 3
+    local i="${FORGE_TEST_SESSION_INCARNATION:-$WC_TEST_INCARNATION}" slug stage tl
+    slug="$(arg_value --slug "$@")"; stage="$(arg_value --stage "$@")"
+    stamp_pending_identity "$r" "$slug" "$stage" "$s" "$i"
+    tl="$(mktemp)"; printf '%s\t%s\n' "$s" "$r" > "$tl"
+    ( cd "$r" && env -u TMUX_PANE TMUX=unavailable TMUX_SESSION="$s" FORGE_TMUX_LIST="$tl" \
+        FORGE_BROKER_BIN="$WC_BROKER_STUB" FORGE_BROKER_MODE="$mode" "$BRIDGE" callback "$@" )
+    local rc=$?; rm -f "$tl"; return $rc
+}
+stamp_pending_delivery() {  # <root> <slug> <delivery-id>
+    python3 - "$1/.dev/proposals/$2/forge-log.yml" "$3" <<'PY'
+import sys
+path,did=sys.argv[1:3]; raw=open(path).read()
+assert raw.count('    response: null')==1
+open(path,'w').write(raw.replace('    response: null','    delivery_id: '+did+'\n    response: null',1))
+PY
+}
+incarnation_scratch_present() { # <root>
+    find "$1/.dev/forge-tmp/callbacks" -name '*.incarnation.*' -print 2>/dev/null | grep -q .
 }
 parked_pending() {  # <root> <slug> <stage> <to> <ts> <reason> [session]
     local d="$1/.dev/proposals/$2"; mkdir -p "$d"
@@ -1277,6 +1350,175 @@ else
           || bad "WC rebirth during lock wait mutated predecessor: $(cat "$P/.race-out")"
     fi
 fi
+
+echo "== callback incarnation broker fallback =="
+
+# Adopted, delivery-bound DONE: active check, fallback, close/publish, reconcile.
+P="$(mkproj cb-inc-fallback-done)"; pending_entry "$P" cifd coding codex-a "2026-08-18T00:00:00Z"
+stamp_pending_delivery "$P" cifd delivery-11111111111111111111111111111111
+CAP="$P/.broker-capture"; : > "$CAP"
+out="$(FORGE_BROKER_CAPTURE="$CAP" cbU "$P" "$WC_TEST_SESSION" match --slug cifd --stage coding --status DONE --worker codex-a --quiet 2>&1)"; rc=$?
+CF="$(wc_callback_path "$P" cifd coding)"
+[ "$rc" -eq 0 ] && [ -f "$CF" ] && [ "$(field "$CF")" = DONE ] \
+  && ! grep -q 'response: null' "$P/.dev/proposals/cifd/forge-log.yml" \
+  && ! incarnation_scratch_present "$P" \
+  && ok "CB-INC fallback DONE closes, publishes, and removes scratch" \
+  || bad "CB-INC fallback DONE failed: rc=$rc out=$out"
+python3 - "$CAP" <<'PY' && ok "CB-INC delivery action ordering is active, verify, reconcile" || bad "CB-INC delivery action sequence"
+import json,sys
+actions=[json.loads(line)['action'] for line in open(sys.argv[1]) if line.strip()]
+assert actions==['active-delivery','verify-session-incarnation','reconcile-delivery'],actions
+PY
+grep -q "CALLBACK_INCARNATION_VERIFIED: pipeline=cifd stage=coding worker=codex-a session=$WC_TEST_SESSION expected_incarnation=$WC_TEST_INCARNATION source=broker-fallback" "$P/.dev/forge-tmp/orchestrator-events.log" \
+  && ok "CB-INC fallback match records complete evidence" || bad "CB-INC fallback match event missing"
+
+# BLOCKED publishes but leaves the pending open.
+P="$(mkproj cb-inc-fallback-blocked)"; pending_entry "$P" cifb coding codex-a "2026-08-18T00:01:00Z"
+out="$(cbU "$P" "$WC_TEST_SESSION" match --slug cifb --stage coding --status BLOCKED --worker codex-a --quiet 2>&1)"; rc=$?
+CF="$(wc_callback_path "$P" cifb coding)"
+[ "$rc" -eq 0 ] && [ "$(field "$CF")" = BLOCKED ] \
+  && grep -q 'response: null' "$P/.dev/proposals/cifb/forge-log.yml" \
+  && ! incarnation_scratch_present "$P" \
+  && ok "CB-INC fallback BLOCKED publishes, keeps pending open, and removes scratch" \
+  || bad "CB-INC fallback BLOCKED failed: rc=$rc out=$out"
+
+# Broker mismatch preserves bytes and historical text.
+P="$(mkproj cb-inc-broker-mismatch)"; pending_entry "$P" cifm coding codex-a "2026-08-18T00:02:00Z"
+stamp_pending_identity "$P" cifm coding "$WC_TEST_SESSION" "$WC_TEST_INCARNATION"
+BEFORE="$(wc_matrix_fingerprint "$P" cifm)"
+out="$(cbU "$P" "$WC_TEST_SESSION" mismatch --slug cifm --stage coding --status DONE --worker codex-a --quiet 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'callback actor incarnation changed before lock' \
+  && [ "$BEFORE" = "$(wc_matrix_fingerprint "$P" cifm)" ] \
+  && ! incarnation_scratch_present "$P" \
+  && grep -q "CALLBACK_INCARNATION_MISMATCH: pipeline=cifm stage=coding worker=codex-a session=$WC_TEST_SESSION expected_incarnation=$WC_TEST_INCARNATION source=broker-fallback" "$P/.dev/forge-tmp/orchestrator-events.log" \
+  && ok "CB-INC broker mismatch is immutable, audited, and scratch-clean" \
+  || bad "CB-INC broker mismatch failed: rc=$rc out=$out"
+
+# Structural, incompatible, and unavailable responses all fail closed.
+for mode in unavailable unreachable malformed echo-mismatch refuse; do
+  P="$(mkproj "cb-inc-$mode")"; pending_entry "$P" "cif-$mode" coding codex-a "2026-08-18T00:03:00Z"
+  stamp_pending_identity "$P" "cif-$mode" coding "$WC_TEST_SESSION" "$WC_TEST_INCARNATION"
+  BEFORE="$(wc_matrix_fingerprint "$P" "cif-$mode")"
+  out="$(cbU "$P" "$WC_TEST_SESSION" "$mode" --slug "cif-$mode" --stage coding --status DONE --worker codex-a --quiet 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'could not be verified after lock' \
+    && printf '%s' "$out" | grep -q 'inspect or restart the root-scoped broker' \
+    && [ "$BEFORE" = "$(wc_matrix_fingerprint "$P" "cif-$mode")" ] \
+    && ! incarnation_scratch_present "$P" \
+    && grep -q "CALLBACK_INCARNATION_UNAVAILABLE: pipeline=cif-$mode stage=coding worker=codex-a session=$WC_TEST_SESSION expected_incarnation=$WC_TEST_INCARNATION" "$P/.dev/forge-tmp/orchestrator-events.log" \
+    && ok "CB-INC $mode fails closed, immutable, and scratch-clean" \
+    || bad "CB-INC $mode failed: rc=$rc out=$out"
+done
+
+# Timeout consumes the invocation-scoped value and gets distinct guidance.
+P="$(mkproj cb-inc-timeout)"; pending_entry "$P" cift coding codex-a "2026-08-18T00:04:00Z"
+stamp_pending_identity "$P" cift coding "$WC_TEST_SESSION" "$WC_TEST_INCARNATION"
+BEFORE="$(wc_matrix_fingerprint "$P" cift)"; TIMEFILE="$P/.timeout-value"; t0="$(date +%s)"
+out="$(FORGE_BROKER_TIMEOUT_FILE="$TIMEFILE" cbU "$P" "$WC_TEST_SESSION" timeout --slug cift --stage coding --status DONE --worker codex-a --quiet 2>&1)"; rc=$?
+elapsed=$(( $(date +%s) - t0 ))
+[ "$rc" -ne 0 ] && [ "$(cat "$TIMEFILE")" = 3 ] \
+  && [ "$elapsed" -ge 2 ] && [ "$elapsed" -lt 6 ] \
+  && printf '%s' "$out" | grep -q 'broker did not answer in time, so retry the callback' \
+  && [ "$BEFORE" = "$(wc_matrix_fingerprint "$P" cift)" ] \
+  && ! incarnation_scratch_present "$P" \
+  && grep -q 'reason=broker-timeout' "$P/.dev/forge-tmp/orchestrator-events.log" \
+  && ok "CB-INC timeout is scoped, retryable, immutable, and scratch-clean" \
+  || bad "CB-INC timeout failed: rc=$rc elapsed=$elapsed out=$out"
+
+# Exact local evidence never contacts the broker.
+P="$(mkproj cb-inc-local-match)"; pending_entry "$P" cilm coding codex-a "2026-08-18T00:05:00Z"
+CAP="$P/.broker-capture"; : > "$CAP"
+out="$(FORGE_BROKER_BIN="$WC_BROKER_STUB" FORGE_BROKER_CAPTURE="$CAP" \
+  cb "$P" --slug cilm --stage coding --status BLOCKED --worker codex-a --quiet 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && [ ! -s "$CAP" ] && ! incarnation_scratch_present "$P" \
+  && ok "CB-INC local exact match has no broker dependency or scratch residue" \
+  || bad "CB-INC local match regression: rc=$rc out=$out cap=$(cat "$CAP")"
+
+# A post-selection local mismatch cannot be overruled and the lock-safe event
+# append must not invoke forge-watch even when watch triggering is enabled.
+P="$(mkproj cb-inc-local-mismatch)"; pending_entry "$P" cilmx coding codex-a "2026-08-18T00:06:00Z"
+stamp_pending_identity "$P" cilmx coding "$WC_TEST_SESSION" "$WC_TEST_INCARNATION"
+TL="$P/.local-mismatch.tsv"; printf '%s\t%s\t%s\t%s\n' "$WC_TEST_SESSION" "$P" "$$" "$WC_TEST_INCARNATION" > "$TL"
+READY="$P/.prelock-ready"; RELEASE="$P/.prelock-release"; CAP="$P/.broker-capture"; WATCHCAP="$P/.watch-capture"
+: > "$CAP"; : > "$WATCHCAP"; BEFORE="$(wc_matrix_fingerprint "$P" cilmx)"
+( cd "$P" && exec env -u TMUX TMUX_SESSION="$WC_TEST_SESSION" FORGE_TMUX_LIST="$TL" \
+    FORGE_BROKER_BIN="$WC_BROKER_STUB" FORGE_BROKER_MODE=match FORGE_BROKER_CAPTURE="$CAP" \
+    FORGE_WATCH_TRIGGER=1 FORGE_WATCH_BIN="$WC_WATCH_STUB" FORGE_WATCH_CAPTURE="$WATCHCAP" \
+    FORGE_CALLBACK_PRELOCK_READY="$READY" FORGE_CALLBACK_PRELOCK_RELEASE="$RELEASE" \
+    "$BRIDGE" callback --slug cilmx --stage coding --status DONE --worker codex-a --quiet > "$P/.local-mismatch.out" 2>&1 ) & CBPID=$!
+wc_matrix_wait_file "$READY"
+for _ in $(seq 1 100); do [ -s "$WATCHCAP" ] && break; sleep 0.01; done
+watch_before="$(wc -l < "$WATCHCAP" | tr -d ' ')"
+printf '%s\t%s\t%s\t%s\n' "$WC_TEST_SESSION" "$P" "$$" "$((WC_TEST_INCARNATION+1))" > "$TL"; : > "$RELEASE"
+wait "$CBPID"; rc=$?; sleep 0.2
+[ "$rc" -ne 0 ] && grep -q 'callback actor incarnation changed before lock' "$P/.local-mismatch.out" \
+  && [ ! -s "$CAP" ] && [ "$watch_before" -ge 1 ] \
+  && [ "$watch_before" = "$(wc -l < "$WATCHCAP" | tr -d ' ')" ] \
+  && [ "$BEFORE" = "$(wc_matrix_fingerprint "$P" cilmx)" ] \
+  && ! incarnation_scratch_present "$P" \
+  && grep -q 'source=local-probe' "$P/.dev/forge-tmp/orchestrator-events.log" \
+  && ok "CB-INC local mismatch is immutable, broker-free, and watcher-free under lock" \
+  || bad "CB-INC local mismatch regression: $(cat "$P/.local-mismatch.out")"
+
+# Zero/multiple adoption candidates refuse before broker contact.
+P="$(mkproj cb-inc-zero)"; CAP="$P/.broker-capture"; : > "$CAP"
+out="$(FORGE_BROKER_CAPTURE="$CAP" cbU "$P" "$WC_TEST_SESSION" match --slug zero --stage coding --status DONE --worker codex-a --quiet 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [ ! -s "$CAP" ] && ok "CB-INC zero adoptable pendings refuses before broker" \
+  || bad "CB-INC zero cardinality: rc=$rc out=$out"
+P="$(mkproj cb-inc-multiple)"; pending_entry "$P" multi coding codex-a "2026-08-18T00:07:00Z"
+cat >> "$P/.dev/proposals/multi/forge-log.yml" <<EOF
+  - timestamp: "2026-08-18T00:07:01Z"
+    stage: coding
+    to: codex-a
+    response: null
+EOF
+CAP="$P/.broker-capture"; : > "$CAP"
+out="$(FORGE_BROKER_CAPTURE="$CAP" cbU "$P" "$WC_TEST_SESSION" match --slug multi --stage coding --status DONE --worker codex-a --quiet 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && [ ! -s "$CAP" ] && ok "CB-INC multiple adoptable pendings refuses before broker" \
+  || bad "CB-INC multiple cardinality: rc=$rc out=$out"
+
+# Prove both exact locks held, kill the exact bridge PID, keep the stub alive,
+# then prove both locks free. Kill-only scratch is bounded diagnostic residue.
+P="$(mkproj cb-inc-lock-hygiene)"; pending_entry "$P" cilh coding codex-a "2026-08-18T00:08:00Z"
+stamp_pending_identity "$P" cilh coding "$WC_TEST_SESSION" "$WC_TEST_INCARNATION"
+TL="$P/.unavailable.tsv"; printf '%s\t%s\n' "$WC_TEST_SESSION" "$P" > "$TL"; BPIDFILE="$P/.slow-broker-pid"
+( cd "$P" && exec env -u TMUX_PANE TMUX=unavailable TMUX_SESSION="$WC_TEST_SESSION" FORGE_TMUX_LIST="$TL" \
+    FORGE_BROKER_BIN="$WC_BROKER_STUB" FORGE_BROKER_MODE=slow FORGE_BROKER_PID_FILE="$BPIDFILE" \
+    "$BRIDGE" callback --slug cilh --stage coding --status DONE --worker codex-a --quiet > "$P/.slow.out" 2>&1 ) & CBPID=$!
+wc_matrix_wait_file "$BPIDFILE"; IFS= read -r BROKER_PID < "$BPIDFILE"
+LK="$(lifelock_path "$P" cilh coding)"; WL="$P/.dev/forge-tmp/hygiene-locks/$WC_TEST_SESSION.$WC_TEST_INCARNATION.codex-a.lock"
+pre_lifecycle_held=0; pre_worker_held=0
+( exec 9>"$LK"; flock -n 9 ) || pre_lifecycle_held=1
+( exec 11>"$WL"; flock -n 11 ) || pre_worker_held=1
+SCRATCH_COUNT="$(find "$P/.dev/forge-tmp/callbacks" -name '*.incarnation.*' -print 2>/dev/null | wc -l | tr -d ' ')"
+kill -0 "$CBPID" 2>/dev/null && kill -0 "$BROKER_PID" 2>/dev/null \
+  && [ "$pre_lifecycle_held" -eq 1 ] && [ "$pre_worker_held" -eq 1 ] \
+  && [ "$SCRATCH_COUNT" -ge 1 ] && [ "$SCRATCH_COUNT" -le 4 ] \
+  && ok "CB-INC setup holds both locks with live broker and bounded scratch" \
+  || bad "CB-INC lock-hygiene precondition failed: scratch=$SCRATCH_COUNT"
+kill "$CBPID" 2>/dev/null || true; wait "$CBPID" 2>/dev/null || true
+post_lifecycle_free=0; post_worker_free=0
+( exec 9>"$LK"; flock -n 9 ) && post_lifecycle_free=1
+( exec 11>"$WL"; flock -n 11 ) && post_worker_free=1
+kill -0 "$BROKER_PID" 2>/dev/null \
+  && [ "$post_lifecycle_free" -eq 1 ] && [ "$post_worker_free" -eq 1 ] \
+  && ok "CB-INC bridge death frees both locks while slow broker survives" \
+  || bad "CB-INC surviving child retained a callback lock"
+kill "$BROKER_PID" 2>/dev/null || true
+find "$P/.dev/forge-tmp/callbacks" -name '*.incarnation.*' -delete
+
+# A scoped three-second holder leaves room for a five-second waiter.
+P="$(mkproj cb-inc-lock-budget)"; pending_entry "$P" cilb coding codex-a "2026-08-18T00:09:00Z"
+stamp_pending_identity "$P" cilb coding "$WC_TEST_SESSION" "$WC_TEST_INCARNATION"
+TL="$P/.unavailable.tsv"; printf '%s\t%s\n' "$WC_TEST_SESSION" "$P" > "$TL"; TIMEFILE="$P/.budget-timeout"
+( cd "$P" && exec env -u TMUX_PANE TMUX=unavailable TMUX_SESSION="$WC_TEST_SESSION" FORGE_TMUX_LIST="$TL" \
+    FORGE_BROKER_BIN="$WC_BROKER_STUB" FORGE_BROKER_MODE=timeout FORGE_BROKER_TIMEOUT_FILE="$TIMEFILE" \
+    "$BRIDGE" callback --slug cilb --stage coding --status DONE --worker codex-a --quiet > "$P/.budget.out" 2>&1 ) & CBPID=$!
+wc_matrix_wait_file "$TIMEFILE"; LK="$(lifelock_path "$P" cilb coding)"; t0="$(date +%s)"
+( exec 9>"$LK"; flock -w 5 9 ); lrc=$?; elapsed=$(( $(date +%s) - t0 ))
+wait "$CBPID" 2>/dev/null || true
+[ "$(cat "$TIMEFILE")" = 3 ] && [ "$lrc" -eq 0 ] && [ "$elapsed" -lt 5 ] \
+  && ok "CB-INC three-second fallback leaves room in a five-second lock wait" \
+  || bad "CB-INC fallback starved waiter: value=$(cat "$TIMEFILE") rc=$lrc elapsed=$elapsed"
 
 echo ""
 echo "═══════════════════════════════════════"

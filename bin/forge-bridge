@@ -242,6 +242,116 @@ session_incarnation_of() {   # <session>; empty when unavailable
     fi
 }
 
+_CALLBACK_INCARNATION_RESULT=""
+_CALLBACK_INCARNATION_REASON=""
+
+_callback_incarnation_cleanup() {   # <scratch-prefix>
+    command rm -f "$1.live" "$1.request" "$1.response" "$1.parsed" \
+        9>&- 10>&- 11>&- 12>&- 13>&- 2>/dev/null || true
+}
+
+# Builtin-only append for outcomes determined while callback locks are held.
+# It deliberately does not call _emit_event: that helper resolves paths through
+# command substitution and can spawn forge-watch. This append creates no child
+# that could inherit or outlive either lock; periodic watch polling sees the line.
+_callback_incarnation_event_locked() {   # <root> <type> <slug> <fields>
+    local root="$1" type="$2" slug="$3" fields="$4"
+    [ -d "$root/.dev/forge-tmp" ] || return 0
+    printf '%s: pipeline=%s %s\n' "$type" "$slug" "$fields" \
+        >> "$root/.dev/forge-tmp/orchestrator-events.log" 2>/dev/null || true
+}
+
+# Normal function call only: result globals avoid a waiting command-substitution
+# wrapper. Scratch paths are selected by cmd_callback before lock acquisition.
+_callback_verify_live_incarnation() {   # <root> <session> <expected> <scratch-prefix>
+    local root="$1" session="$2" expected="$3" scratch="$4"
+    local live_file="$scratch.live" request_file="$scratch.request"
+    local response_file="$scratch.response" parsed_file="$scratch.parsed"
+    local live="" parsed="" broker_rc=0 inject="${FORGE_TMUX_LIST:-}"
+    _CALLBACK_INCARNATION_RESULT=unavailable
+    _CALLBACK_INCARNATION_REASON=broker-incompatible
+
+    : > "$live_file" || return 0
+    if [ -n "$inject" ]; then
+        awk -F'\t' -v s="$session" '$1==s && NF>=4{print $4; exit}' "$inject" \
+            > "$live_file" 9>&- 10>&- 11>&- 12>&- 13>&- || true
+    else
+        tmux display-message -p -t "$session" '#{session_created}' \
+            > "$live_file" 2>/dev/null 9>&- 10>&- 11>&- 12>&- 13>&- || true
+    fi
+    IFS= read -r live < "$live_file" || live=""
+    if [ -n "$live" ]; then
+        if [ "$live" = "$expected" ]; then
+            _CALLBACK_INCARNATION_RESULT=match
+        else
+            _CALLBACK_INCARNATION_RESULT=mismatch
+        fi
+        _CALLBACK_INCARNATION_REASON=local-probe
+        _callback_incarnation_cleanup "$scratch"
+        return 0
+    fi
+
+    if ! python3 - "$session" "$expected" > "$request_file" \
+            9>&- 10>&- 11>&- 12>&- 13>&- <<'PY'
+import json,sys
+print(json.dumps({'action':'verify-session-incarnation','session':sys.argv[1],
+                  'expected_incarnation':sys.argv[2]},separators=(',',':')))
+PY
+    then
+        _CALLBACK_INCARNATION_REASON=broker-request-invalid
+        _callback_incarnation_cleanup "$scratch"
+        return 0
+    fi
+    FORGE_LIFECYCLE_TIMEOUT_S=3 "$FORGE_BROKER_BIN" control --root "$root" \
+        < "$request_file" > "$response_file" 2>/dev/null \
+        9>&- 10>&- 11>&- 12>&- 13>&- || broker_rc=$?
+    if [ "$broker_rc" -ne 0 ]; then
+        if [ "$broker_rc" -eq 5 ]; then
+            _CALLBACK_INCARNATION_REASON=broker-timeout
+        else
+            _CALLBACK_INCARNATION_REASON=broker-refused-or-absent
+        fi
+        _callback_incarnation_cleanup "$scratch"
+        return 0
+    fi
+    if ! python3 - "$response_file" "$session" "$expected" > "$parsed_file" \
+            9>&- 10>&- 11>&- 12>&- 13>&- <<'PY'
+import json,sys
+try:
+    row=json.load(open(sys.argv[1]))
+    session,expected=sys.argv[2:4]
+    assert isinstance(row,dict)
+    assert set(row)=={'schema','session','expected_incarnation','live_incarnation','result'}
+    assert row['schema']=='forge-session-incarnation-verification/1'
+    assert row['session']==session and row['expected_incarnation']==expected
+    live=row['live_incarnation']; result=row['result']
+    assert isinstance(live,str) and result in {'match','mismatch','unavailable'}
+    assert ((result=='match' and live==expected) or
+            (result=='mismatch' and bool(live) and live!=expected) or
+            (result=='unavailable' and not live))
+    print(result)
+except (AssertionError,KeyError,OSError,TypeError,ValueError):
+    raise SystemExit(1)
+PY
+    then
+        _CALLBACK_INCARNATION_REASON=broker-incompatible
+        _callback_incarnation_cleanup "$scratch"
+        return 0
+    fi
+    IFS= read -r parsed < "$parsed_file" || parsed=""
+    _callback_incarnation_cleanup "$scratch"
+    case "$parsed" in
+        match|mismatch)
+            _CALLBACK_INCARNATION_RESULT="$parsed"
+            _CALLBACK_INCARNATION_REASON=broker-fallback
+            ;;
+        *)
+            _CALLBACK_INCARNATION_RESULT=unavailable
+            _CALLBACK_INCARNATION_REASON=broker-observation-unavailable
+            ;;
+    esac
+}
+
 _forge_identity() {
     ID_host_session=""; ID_host_pane=""; ID_host_root=""; ID_host_incarnation=""
     ID_target_session=""; ID_target_source="none"; ID_target_root=""; ID_target_incarnation=""
@@ -4919,6 +5029,9 @@ EOF
     # Atomic publish writes to a temp file in the SAME dir (same filesystem) then
     # renames into place.
     local cb_tmp="$cb_dir/.$(basename "$cb_file").tmp.$$"
+    # Advisory incarnation-probe scratch files share the callback temp prefix.
+    # The prefix is selected before either worker/lifecycle lock is acquired.
+    local cb_incarnation_scratch="${cb_tmp}.incarnation"
     # Worker-context-hygiene Step 5: invalidate prior observation coverage BEFORE publication so
     # a concurrent dispatch can never read an old safe reading while this callback publishes.
     # P0-4: a RETURN trap releases the worker (and lifecycle) lock on EVERY callback error path.
@@ -4948,13 +5061,36 @@ EOF
     # (slug,stage). Acquire before close-then-publish; release after the mv.
     _callback_prelock_barrier
     _lifecycle_lock "$slug" "$stage" || return 1
-    local live_cb_incarnation
-    live_cb_incarnation="$(session_incarnation_of "$cb_session")"
-    if [ -z "$live_cb_incarnation" ] || [ "$live_cb_incarnation" != "$cb_incarnation" ]; then
-        _lifecycle_unlock
-        echo "REFUSED: callback actor incarnation changed before lock; no callback was published." >&2
-        return 1
-    fi
+    _callback_verify_live_incarnation "$project_root" "$cb_session" \
+        "$cb_incarnation" "$cb_incarnation_scratch"
+    local incarnation_result="$_CALLBACK_INCARNATION_RESULT"
+    local incarnation_reason="$_CALLBACK_INCARNATION_REASON"
+    case "$incarnation_result" in
+        match)
+            if [ "$incarnation_reason" = broker-fallback ]; then
+                _callback_incarnation_event_locked "$project_root" CALLBACK_INCARNATION_VERIFIED "$slug" \
+                    "stage=$stage worker=$worker_canonical session=$cb_session expected_incarnation=$cb_incarnation source=broker-fallback"
+            fi
+            ;;
+        mismatch)
+            _callback_incarnation_event_locked "$project_root" CALLBACK_INCARNATION_MISMATCH "$slug" \
+                "stage=$stage worker=$worker_canonical session=$cb_session expected_incarnation=$cb_incarnation source=${incarnation_reason:-unknown}"
+            _lifecycle_unlock
+            echo "REFUSED: callback actor incarnation changed before lock; no callback was published." >&2
+            return 1
+            ;;
+        *)
+            _callback_incarnation_event_locked "$project_root" CALLBACK_INCARNATION_UNAVAILABLE "$slug" \
+                "stage=$stage worker=$worker_canonical session=$cb_session expected_incarnation=$cb_incarnation reason=${incarnation_reason:-broker-incompatible}"
+            _lifecycle_unlock
+            if [ "$incarnation_reason" = broker-timeout ]; then
+                echo "REFUSED: callback actor incarnation could not be verified after lock; broker did not answer in time, so retry the callback before restarting anything; no callback was published." >&2
+            else
+                echo "REFUSED: callback actor incarnation could not be verified after lock; broker refused, was absent, or returned incompatible or unavailable evidence; inspect or restart the root-scoped broker; no callback was published." >&2
+            fi
+            return 1
+            ;;
+    esac
     local selected_under_lock
     selected_under_lock="$(_callback_pending_select_exact "$pipeline_log" "$stage" "$worker_canonical" "$cb_session" "$cb_incarnation")" || {
         _lifecycle_unlock
