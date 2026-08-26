@@ -6,7 +6,7 @@
   forge-issue-sync file drafts.json -w   create the issues, label, backlink
 
 drafts.json is a list of:
-  {"source","title","kind","component","priority","what","evidence"}
+  {"source","title","kind","component","severity","what","evidence"}
 
 Run it daily or by hand. `scan` is silent and exits 0 when there is nothing new.
 """
@@ -18,7 +18,7 @@ MEM = os.path.expanduser(
 KINDS = {"bug", "pipeline-work", "live-gate", "unlanded", "known-gap"}
 COMPONENTS = {"bridge", "watch", "cc-hook", "start", "recover",
               "broker", "skills", "swiftbar", "install"}
-PRIORITIES = {"critical", "high", "medium", "low"}
+SEVERITIES = {"critical", "high", "medium", "low"}  # queue.py reads severity:*
 ORIGINS = {"operator", "pipeline"}   # provenance: who surfaced it
 # Never publish these to a public repo.
 DENY = ("/Users/", "goparent", "feedforge", "promptlol", "headless", "feedmint", "sk-")
@@ -77,12 +77,13 @@ def cmd_file(path, write):
     seen = existing_markers()
     todo = []
     for d in drafts:
-        for k in ("source", "title", "kind", "component", "priority", "what", "evidence"):
+        d.setdefault("severity", d.pop("priority", None))   # accept the old field name
+        for k in ("source", "title", "kind", "component", "severity", "what", "evidence"):
             if not d.get(k):
                 sys.exit(f"draft {d.get('source', '?')}: missing {k}")
         d.setdefault("origin", "pipeline")
         for f, valid in (("kind", KINDS), ("component", COMPONENTS),
-                         ("priority", PRIORITIES), ("origin", ORIGINS)):
+                         ("severity", SEVERITIES), ("origin", ORIGINS)):
             if d[f] not in valid:
                 sys.exit(f"draft {d['source']}: bad {f}={d[f]!r}")
         leak_check(d["title"] + body_of(d), d["source"])
@@ -90,7 +91,7 @@ def cmd_file(path, write):
             print(f"  DUP  #{seen[d['source']]:<4} {d['title']}")
         else:
             todo.append(d)
-            print(f"  NEW  [{d['kind']}/{d['component']}/{d['priority']}/{d['origin']}] {d['title']}")
+            print(f"  NEW  [{d['kind']}/{d['component']}/{d['severity']}/{d['origin']}] {d['title']}")
     if not write:
         print(f"\n{len(todo)} would be created ({len(drafts) - len(todo)} already tracked). "
               f"Re-run with -w to create.")
@@ -102,7 +103,7 @@ def cmd_file(path, write):
                             "--title", d["title"], "--body", body_of(d),
                             "--label", f"kind:{d['kind']}",
                             "--label", f"component:{d['component']}",
-                            "--label", f"priority:{d['priority']}",
+                            "--label", f"severity:{d['severity']}",
                             "--label", f"source:{d['origin']}"],
                            capture_output=True, text=True)
         if r.returncode:
@@ -110,12 +111,13 @@ def cmd_file(path, write):
         url = r.stdout.strip().splitlines()[-1]
         filed[d["source"]] = url.rsplit("/", 1)[1]
         print(f"{url}  {d['title']}")
-    backlink(filed)
-    print(f"\ncreated {len(filed)}, backlinked {len(filed)} memories")
+    n_linked = backlink(filed)
+    print(f"\ncreated {len(filed)}, backlinked {n_linked} memories")
     return 0
 
 
 def backlink(filed):
+    done = 0
     for slug, n in filed.items():
         p = os.path.join(MEM, slug + ".md")
         if not os.path.exists(p):
@@ -125,6 +127,7 @@ def backlink(filed):
             continue
         open(p, "w").write(t.rstrip("\n") + f"\n\n{TRACKED} forge-toolkit issue #{n} — "
                            "status lives in GitHub; this file is history, not the queue.\n")
+        done += 1
     idx = os.path.join(MEM, "MEMORY.md")
     lines = open(idx).read().splitlines()
     for i, ln in enumerate(lines):
@@ -132,6 +135,7 @@ def backlink(filed):
         if m and m.group(1) in filed and f"(#{filed[m.group(1)]})" not in ln:
             lines[i] = ln.rstrip() + f" (#{filed[m.group(1)]})"
     open(idx, "w").write("\n".join(lines) + "\n")
+    return done
 
 
 if __name__ == "__main__":
