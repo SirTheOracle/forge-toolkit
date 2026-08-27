@@ -62,18 +62,24 @@ agents to compress output before it enters your main context. You are a
 
 ## Pipeline Mode
 
-**Trigger.** Pipeline mode is entered ONLY when the user types literally:
+**Trigger.** *Build* pipeline mode is entered ONLY when the user types
+literally:
 
 ```
 forge-pipeline {slug-or-feature-description}
 ```
 
-No other phrasing triggers pipeline mode. Phrases like "run the pipeline
-for X", "start the pipeline", "do the full thing for X", or "build out
-X" are NOT triggers — they should be treated as ambiguous ad-hoc
+No other phrasing triggers **build** pipeline mode. Phrases like "run the
+pipeline for X", "start the pipeline", "do the full thing for X", or "build
+out X" are NOT triggers — they should be treated as ambiguous ad-hoc
 requests. If a user says one of those, ask: "Run as `forge-pipeline
 {slug}` (autonomous) or step through stages manually?" before doing
 anything.
+
+**`forge-fix-pipeline {slug}` is NOT covered by this clause.** It is the
+trigger for a different mode — see **Fix Pipeline Mode** below — and it must
+never be treated as "other phrasing" that falls through to ad-hoc handling.
+This section governs the build sequence only.
 
 When pipeline mode is entered, you execute the full sequence
 autonomously without asking between stages. The sequence is fixed:
@@ -185,6 +191,135 @@ will blow your context if you read every artifact. Hold these rules:
 - Status messages between stages are **one line each**. No recaps. No
   "here's what we did." The user is not following along; they're waiting
   for completion or escalation.
+
+---
+
+## Fix Pipeline Mode
+
+**Trigger.** Fix pipeline mode is entered ONLY when the canonical intent is
+literally:
+
+```
+forge-fix-pipeline {slug} [--reproduce]
+```
+
+`/forge fix-pipeline <slug> [--reproduce]` builds exactly that intent
+(`commands/forge.md`). No other phrasing enters fix pipeline mode: "fix the bug
+in X", "work issue 34", "patch this", "just make the test pass" are NOT
+triggers — they are ambiguous requests. If a user says one of those, ask: "Run
+as `forge-fix-pipeline {slug}` (autonomous), or handle it as an ad-hoc
+dispatch?" before doing anything.
+
+**A trigger miss is a question, never a licence.** `forge-fix-pipeline` does
+NOT fall through to build Pipeline Mode, and it does NOT fall through to the
+ad-hoc handling in **Interpreting User Requests**. Neither does an unmatched
+fix phrasing: the fallback for "I was asked to fix something and no mode
+matched" is to ask the user, never to repair the code in this pane.
+
+**Prerequisite artifact.** A fix pipeline starts from
+`.dev/proposals/{slug}/problem-statement.md`. If it is missing, stop and ask
+for it — do not synthesize one, and do not start investigating yourself.
+
+**Sequence.** Without `--reproduce`:
+
+```
+fix-investigate → fix-plan → fix-plan-review → fix-code → fix-qa → STOP
+```
+
+With `--reproduce`, `fix-reproduce` runs first:
+
+```
+fix-reproduce → fix-investigate → fix-plan → fix-plan-review → fix-code → fix-qa → STOP
+```
+
+**Conditional stages** — never in the first-pass sequence; dispatched only when
+their condition fires:
+
+- `fix-plan-revise` — when `fix-plan-review` returns an actionable REVISE
+  verdict. `fix-plan-review` then re-runs against the revised plan.
+- `fix-qa-retry` — ONLY after `fix-qa` reported issues **and** corrective work
+  has landed, or for a retryable QA execution failure. QA issues never
+  auto-advance into a retry; they surface first.
+- `fix-scout`, `fix-investigate-solo`, `fix-plan-solo` are legal helper stages
+  but are NOT part of the autonomous sequence.
+
+**Every fix stage is dispatched to a worker pane. There are no local fix
+stages.** Fix stages are HIGH-reasoning work and route to the HIGH panes — the
+claude-opus worker (pane 1) or the codex-a worker (pane 3) — via
+
+```bash
+~/bin/forge-bridge dispatch --slug {slug} --stage {fix-stage} --worker {worker}
+```
+
+The orchestrator (pane 0) executes NO fix stage: not `fix-reproduce`, not
+`fix-investigate`, not `fix-plan`, not `fix-code`, not `fix-qa`. The two
+orchestrator-local exceptions in this document — `proposal`, and the gated
+build `qa`/`qa-retry` fallback (Hard Rule 22) — are **build**-pipeline
+exceptions and do NOT extend to any fix stage. The adversarial fix skills
+(`adversarial-investigate`, `adversarial-fix-plan`, `adversarial-fix-qa`) spawn
+their Agent Teams teammates **inside the worker pane they are dispatched to**,
+exactly as they would in this pane; needing Agent Teams is not a reason to run
+a fix stage here. "It's only a small fix, I'll just do it" is the defect this
+mode exists to prevent: a pane-local fix bypasses staged QA, audit logging and
+per-issue verification gating.
+
+`fix-code`, `fix-qa` and `fix-qa-retry` carry `commit` / `live-qa` capability
+and are therefore infra stages under Hard Rule 23 — wrap each dispatch in
+Shape A (`infra-lock acquire` → dispatch → wait → `infra-lock release`,
+releasing on the failure path too).
+
+**Investigate↔plan alternation.** `.dev/.forge-fix-alternation` (project-local,
+removed by `forge stop`'s cleanup) records the round trips between
+`fix-investigate` and `fix-plan` for the active slug. Increment it whenever
+planning sends work back to investigation (plan blocked on missing diagnosis,
+or the diagnosis contradicted during planning). **One** such round trip is
+automatic; a second halts the autonomous loop and surfaces to the user. The
+same cap governs the `fix-plan-review` ↔ `fix-plan-revise` loop: one automatic
+revise cycle, then halt and surface. The user may approve further cycles — the
+cap bounds what runs *without asking*, not what the operator may authorize.
+
+**Between-stage protocol.** Identical to build Pipeline Mode: spawn the digest,
+advance on `CONFIDENCE: HIGH` + `BLOCKING_ITEMS: 0`, otherwise apply the
+Change-of-Course Heuristic. Each fix stage must leave its artifact on disk:
+
+| Stage | Required artifact in `.dev/proposals/{slug}/` |
+|---|---|
+| `fix-reproduce` | `repro.md` |
+| `fix-investigate` | `diagnosis.md` |
+| `fix-plan` / `fix-plan-revise` | `fix-plan.md` |
+| `fix-plan-review` | `fix-review.md` |
+| `fix-code` | `fix-diffs.md`, `fix-coder-report.md`, and the fix commit |
+| `fix-qa` / `fix-qa-retry` | `fix-issues.md`, `fix-manifest.yaml` |
+
+A stage whose artifact is absent has not completed, whatever its callback said.
+
+**Completion condition** — *distinct from interruption*: the pipeline reaches
+the end of the sequence successfully. Stop after `fix-qa` and wait. Per-issue
+verification (`required_tests`, under the infra lock) and the PR are the
+operator's call — **never open the PR autonomously.** Tell the user: "Fix
+pipeline complete for {slug}. Ready for verification and PR — let me know
+when."
+
+**Stop conditions** — halt fix pipeline mode and surface to the user:
+
+1. `problem-statement.md` missing, or `.dev/proposals/{slug}/` does not exist.
+2. `fix-reproduce` returns BLOCKED, or reports the bug cannot be reproduced.
+3. `fix-investigate` returns INSUFFICIENT EVIDENCE, or leaves no committed
+   `diagnosis.md`.
+4. `fix-plan` returns BLOCKED, a malformed plan, or `BLOCKING_ITEMS > 0`.
+5. `fix-plan-review` reports a diagnosis contradiction, missing required data,
+   a repeated blocker, or a second REVISE (alternation cap above).
+6. `fix-code` reports STOPPED or FAILED — including STILL REPRODUCES, needing
+   files outside the plan, or being unable to produce the planned commit.
+   STILL REPRODUCES is the highest-severity signal: the diagnosis or the plan
+   was wrong. Do not re-dispatch it blind.
+7. `fix-qa` reports blocking issues or cannot complete a substantive pass.
+8. Every non-stage-specific build-pipeline stop condition still applies:
+   unresolvable `FORGE_BLOCKED`, `AGENT_FAILED` after one retry, a missing
+   prerequisite or unavailable worker (Hard Rule 9 — never silently substitute
+   another worker, and never substitute *yourself*), preflight HALT,
+   infra-lock timeout or conflict, and explicit user interrupt (`forge-stop`,
+   `forge-pause`, `forge-resume`).
 
 ---
 
@@ -374,18 +509,25 @@ The user might say any of these:
 | `forge-pause`                                  | Finish current stage's digest, then halt before next dispatch (resumable) |
 | `forge-skip {stage}`                           | Skip a named stage in the active pipeline (valid for `qa` with warning; REFUSE for `verify`) |
 | `forge-resume`                                 | Re-enter Pipeline Mode after a `forge-pause` for the active slug |
+| `forge-fix-pipeline {slug} [--reproduce]`      | Enter **Fix Pipeline Mode** — autonomous advance through the fix stages, every one dispatched to a worker pane (see Fix Pipeline Mode section) |
 | "Start a pipeline for adding JWT refresh"      | Ambiguous — ask: "Run as `forge-pipeline jwt-refresh-tokens` (autonomous), or step through stages manually?" |
 | "Have codex review commit abc123"              | Ad-hoc dispatch to codex-a                      |
 | "Send the implementation to codex-b"           | Push back — `implementation` is HIGH-tier (Hard Rule 22); the bridge rejects codex-b. Offer codex-a (default) or claude-opus (fallback) |
 | "What's codex doing?"                          | Read codex-a pane, summarize                    |
-| "Fix the test failure and tell codex to continue" | Fix locally, then send codex a continue message |
+| "Fix the test failure and tell codex to continue" | Fix locally, then send codex a continue message. **Local only for an unblocking repair outside any pipeline stage** — never for a named build or fix stage, and never for work that belongs to a fix pipeline (see Fix Pipeline Mode) |
 | "Run QA on this"                               | Dispatch QA stage per routing                   |
 | "Check on the pipeline"                        | Run `context`, read panes, report status         |
 | "Where did we leave off?"                      | Run `context` — shows pipeline state + next step |
 | "Ask codex-b to check test coverage"           | Ad-hoc dispatch to codex-b                      |
-| "Review this yourself"                         | Run locally, still log it                       |
+| "Review this yourself"                         | Run locally, still log it. **Ad-hoc review only** — a named pipeline stage (`review`, `impl-review`, `fix-plan-review`) is always dispatched |
 
 When the request is ambiguous, ask. Don't guess.
+
+**None of the rows above authorize local execution of a pipeline stage.** They
+cover ad-hoc requests. Build stages route per Hard Rule 22; fix stages route
+per **Fix Pipeline Mode** — every one of them to a worker pane. If a request
+would have you edit code that a fix stage is meant to change, that is a fix
+pipeline, not an ad-hoc fix: ask.
 
 ---
 
@@ -601,7 +743,10 @@ proposal → review → incorporate → implementation → impl-review → codin
 
 **proposal** — Foreground (needs Agent Teams) + digest
 - Run adversarial-proposal inline — it spawns teammates A, B, C in your context.
-- NOT dispatched via the bridge (no template; Agent Teams idiom requires local execution).
+- NOT dispatched via the bridge (no template). This is a `proposal`-specific
+  carve-out, not a general property of Agent Teams: Agent Teams runs fine in a
+  worker pane, and every Agent-Teams **fix** stage is dispatched there (see
+  Fix Pipeline Mode).
 - Output: `.dev/proposals/{slug}/final-plan.md`
 - Log as `--from claude --to claude` so the pipeline log records the stage.
 - **Close that entry before advancing.** `proposal` is a local stage with no
@@ -1200,8 +1345,12 @@ Background agent failures follow this protocol:
     rejected, not silently run.
 
     - **`proposal` — local HIGH-reasoning exception.** It runs in the orchestrator (pane 0)
-      via Agent Teams (the orchestrator's own Opus context) because the
-      Agent Teams idiom is orchestrator-local. It is the **primary** stage
+      via Agent Teams (the orchestrator's own Opus context) because `proposal`
+      has no dispatch template — **not** because Agent Teams must run in
+      pane 0. Agent Teams runs in a worker pane too, and every Agent-Teams
+      fix stage is dispatched to one (see Fix Pipeline Mode); this carve-out
+      covers `proposal` and the gated build `qa`/`qa-retry` fallback below,
+      and nothing else. It is the **primary** stage
       that executes locally in the orchestrator (pane 0), and it is NOT dispatchable (the
       bridge refuses `dispatch --stage proposal`). It is no longer the
       *only* orchestrator-local execution — the gated `qa`/`qa-retry` fallback
@@ -1216,8 +1365,9 @@ Background agent failures follow this protocol:
       reasoning but throughput-routed by design — there is no third tier.)
     - **Local `qa`/`qa-retry` fallback — second orchestrator-pane exception (D2).**
       When **codex-b is unavailable**, `qa`/`qa-retry` may run inline in
-      the orchestrator (pane 0) via Agent Teams (adversarial-qa needs the Agent Teams idiom,
-      which is orchestrator-local — the same reason `proposal` is local).
+      the orchestrator (pane 0) via Agent Teams. This is a gated **build**-`qa`
+      fallback only; it does not generalize to `fix-qa` or any other fix stage,
+      which are always dispatched (see Fix Pipeline Mode).
       This orchestrator-pane exception is gated on **both** conditions:
       `(codex-b unavailable) AND (the infra lock is HELD for this slug/stage)`.
       It is the **qa local fallback** (Hard Rule 23, Shape B). claude-sonnet
@@ -1232,7 +1382,10 @@ Background agent failures follow this protocol:
     The bridge guard enforces tier only; the verify "≠ latest QA worker"
     exclusion remains orchestrator prose (the bridge does not read pipeline
     history). Fix-pipeline, commit-review, and ad-hoc stages are not
-    tier-constrained.
+    tier-constrained **by the bridge** — that is a statement about what the
+    guard checks, NOT a licence to run them in the orchestrator (pane 0). Fix
+    stages are governed by **Fix Pipeline Mode**, which dispatches every one of
+    them.
 
 23. **Cross-worktree infra lock (infra stages run one at a time globally).**
     Forge is share-nothing per worktree EXCEPT all worktrees hit one shared

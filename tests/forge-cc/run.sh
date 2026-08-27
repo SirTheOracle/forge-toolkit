@@ -1048,4 +1048,42 @@ else
 fi
 rm -rf "$IH"
 
+echo "── T-DELEGATION-REF: commands/forge.md delegation targets exist in SKILL.md ──"
+# The bug this row exists to catch (#34): commands/forge.md delegated fix-pipeline routing
+# to SKILL.md "Fix Pipeline Mode" from ab4d988 (2026-07-03) onward, and that section had
+# never existed on any ref. A prose delegation is an edge like any other — assert it lands.
+# Repo-to-repo on purpose: the deployed SKILL.md symlinks into the PRIMARY checkout, which
+# is a different branch, so asserting against the deployed copy would test the wrong file.
+delref=$(python3 - "$ROOT/commands/forge.md" "$ROOT/skills/forge-orchestrator/SKILL.md" <<'PYDEL'
+import re, sys
+cmd, skill = (open(p, encoding='utf-8').read() for p in sys.argv[1:3])
+# Collapse whitespace on both sides: markdown wraps a quoted section name across lines
+# ("Fix\n     Pipeline Mode"), and that is the same target as the one-line spelling.
+norm = lambda t: ' '.join(t.split())
+targets = sorted({norm(t) for t in re.findall(r'SKILL\.md\s+"([^"]+)"', cmd)})
+headings = {norm(h) for h in re.findall(r'^#{1,6}\s+(.+?)\s*$', skill, re.M)}
+if not targets:
+    print('NO-TARGETS')
+    raise SystemExit(0)
+missing = [t for t in targets if t not in headings]
+print('MISSING ' + ','.join(missing) if missing else 'OK ' + str(len(targets)))
+PYDEL
+)
+case "$delref" in
+  OK\ *)      ok "T-DELEGATION-REF all ${delref#OK } SKILL.md delegation targets exist" ;;
+  NO-TARGETS) bad "T-DELEGATION-REF found no SKILL.md \"Section\" delegations to check — the extractor or commands/forge.md changed shape" ;;
+  MISSING\ *) bad "T-DELEGATION-REF dangling delegation target(s): ${delref#MISSING }" ;;
+  *)          bad "T-DELEGATION-REF extractor error: $delref" ;;
+esac
+
+# L3: the deployed fix-coder skill licensed pane-local work ("Claude Code local is the
+# default") long after the repo text moved to the reviewed-host lane. Same `[ -f ] ||`
+# convention as the lockstep loop above — a host with no install is skipped, not failed.
+DEPLOYED_FIXCODER="$HOME/.claude/skills/fix-coder/SKILL.md"
+if [ -f "$DEPLOYED_FIXCODER" ]; then
+  grep -qF 'Claude Code local is the default' "$DEPLOYED_FIXCODER" \
+    && bad "T-DELEGATION-REF deployed fix-coder still licenses local work: $DEPLOYED_FIXCODER" \
+    || ok "T-DELEGATION-REF deployed fix-coder no longer licenses local work"
+fi
+
 echo "═══ PASS: $PASS  FAIL: $FAIL ═══"; [ "$FAIL" -eq 0 ]
