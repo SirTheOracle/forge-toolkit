@@ -37,13 +37,13 @@ import uuid
 # PER-PROJECT CONFIG  — the only block that differs between projects.
 # In the template DEFAULT_REPO is unset: a project copy must set it, or the
 # caller must pass --repo. Never let this template guess a repo.
-DEFAULT_REPO = None                  # e.g. "SirTheOracle/goparent-ai"
+DEFAULT_REPO = None                  # e.g. "<org>/<repo>"
 TRIGGER_LABEL = "forge-fix"          # human-added triage signal; the runner never adds it
-CLASSIFIER_PREFIX = "service:"       # how issues bucket (GoParent/anim8e2e: "service:", FeedMint: "area:")
+CLASSIFIER_PREFIX = "service:"       # how issues bucket; a project may use another prefix
 BLOCKING_LABELS = {"needs-retest", "in-progress", "fix-pr-open"}
 
-# Where this project's plan directories live under the PRIMARY root. Confirmed for
-# goparent-ai (39 artifacts on disk); each project records its real value here.
+# Where this project's plan directories live under the PRIMARY root. Each project
+# records its real value here.
 PLANS_SUBDIR = ".dev/proposals/qa-github-issues/fix-plans"
 
 # Readiness rungs (V2). One cheap probe per TOOLCHAIN this project uses. A queue's
@@ -58,9 +58,9 @@ READINESS_RUNGS = {
 
 # Patterns meaning "this worktree resolved the HARDCODED fallback, not the seeded
 # value". NEGATIVE-ONLY on purpose: the correct seeded URL is project-specific and a
-# positive assertion would refuse a HEALTHY worktree (GoParent's seeded value is
-# `…@localhost:5432/goparent_platform`, with no `_test` in it — conftest derives the
-# `_test` name by .replace() at import). GoParent's copy sets [r"localhost:5433"].
+# positive assertion would refuse a HEALTHY worktree: a project's seeded URL often
+# has no `_test` substring at all, because its conftest derives the `_test` name by
+# .replace() at import. A project copy sets the marker matching its own fallback.
 DB_FALLBACK_MARKERS: list[str] = []
 
 # Commands PROVEN not to touch shared infra (no database, no fixed port). Anything

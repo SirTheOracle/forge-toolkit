@@ -12,7 +12,7 @@ and per-classifier severity ordering.
 
 TEMPLATE copy: labels below use the default `service:` classifier. A project
 copy rewrites these fixtures to its own classifier and adds a case per extra
-BLOCKING_LABEL it configures (see FeedMint's `status:in-progress` test).
+BLOCKING_LABEL it configures (see the `status:in-progress` test).
 """
 import contextlib
 import json
@@ -779,7 +779,7 @@ def test_readiness_flags_the_hardcoded_database_fallback():
         with tmpdir() as root:
             fails = q.run_readiness(
                 _no_rung_deal(), "S1", root,
-                db_probe="echo postgresql+asyncpg://u@localhost:5433/goparent_platform")
+                db_probe="echo postgresql+asyncpg://u@localhost:5433/example_app")
             assert any("hardcoded-fallback marker" in f for f in fails), fails
     finally:
         q.DB_FALLBACK_MARKERS = saved
@@ -787,7 +787,7 @@ def test_readiness_flags_the_hardcoded_database_fallback():
 
 def test_readiness_accepts_a_correctly_seeded_database_url():
     """The paired POSITIVE case, and the reason the check is negative-only: the
-    healthy value is `…@localhost:5432/goparent_platform` with NO `_test` substring,
+    healthy value is `…@localhost:5432/example_app` with NO `_test` substring,
     because conftest derives the `_test` name by .replace() at import. Any positive
     assertion on `_test` would refuse every healthy worktree."""
     saved = q.DB_FALLBACK_MARKERS
@@ -796,7 +796,7 @@ def test_readiness_accepts_a_correctly_seeded_database_url():
         with tmpdir() as root:
             fails = q.run_readiness(
                 _no_rung_deal(), "S1", root,
-                db_probe="echo postgresql+asyncpg://u@localhost:5432/goparent_platform")
+                db_probe="echo postgresql+asyncpg://u@localhost:5432/example_app")
             assert fails == [], fails
     finally:
         q.DB_FALLBACK_MARKERS = saved
