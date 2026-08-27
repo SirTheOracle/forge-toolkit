@@ -23,7 +23,7 @@ A forge project needs:
    never auto-removed.
 
    Worktrees land in `.forge-worktrees/` **inside the project the session
-   works on** — `goparent-ai/.forge-worktrees/goparent-ai-<session>` — so each
+   works on** — `<project>/.forge-worktrees/<project>-<session>` — so each
    project keeps its own worktrees and no project's sessions litter the
    directory your projects live in. The container is anchored at the main
    working tree, so starting a session from inside a worktree still lands flat

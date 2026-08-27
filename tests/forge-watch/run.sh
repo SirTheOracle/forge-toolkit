@@ -1870,7 +1870,7 @@ wpromptf "$R" forge-1 2 30 ptask-s1 claude "Read and follow instructions in .dev
   || bad "T-FW-STAGE-1 got: $(ep_tag forge-1 2)"
 
 # T-FW-STAGE-2 — tier 2 (pane fallback) when the live prompt is a follow-up nudge, not the
-# original ref_msg. This is the common live shape (verified 2026-07-29 on feedmint p3).
+# original ref_msg. This is the common live shape (verified 2026-07-29 on a live worker pane).
 new_env tstage2
 R=$(mk_root sproj); live_session forge-1 "$R"
 dispatch_log "$R" t2slug verify codex-a "$(iso_ago 300)" forge-1
@@ -1983,7 +1983,7 @@ if [ -f "$PLUGIN" ]; then
     printf '%s' "$1" > "$f.json"
     FORGE_BIN="$f" bash "$PLUGIN"
   }
-  EP1='{"episode_id":"e1","session":"forge-3","pane":"1","root":"/r","label":"goparent-ai","agent":"claude","state":"in_progress","mid_turn":false,"turn_count":3,"current":true,"quiet_s":120,"first_at":"2026-01-01T00:00:00Z","last_at":"2026-01-01T00:02:00Z","last_snippet":"building the parser"}'
+  EP1='{"episode_id":"e1","session":"forge-3","pane":"1","root":"/r","label":"demo-project","agent":"claude","state":"in_progress","mid_turn":false,"turn_count":3,"current":true,"quiet_s":120,"first_at":"2026-01-01T00:00:00Z","last_at":"2026-01-01T00:02:00Z","last_snippet":"building the parser"}'
   BASE='"schema":"cc-board/1","active":[],"maintenance":{"collapsed":true,"count":0,"rows":[]}'
 
   # SB1 — in-progress title + row (titles carry the icon param; compare the text
@@ -2074,7 +2074,7 @@ print(json.dumps(eps))')
     && echo "$out" | grep -q -- "-- pipeline: my-slug / coding" \
     && echo "$out" | grep -q -- "-- skill: forge-coder" \
     && echo "$out" | grep -q -- "-- last: \"building the parser\"" \
-    && echo "$out" | grep -q -- "-- 3 turn(s) · goparent-ai"; } \
+    && echo "$out" | grep -q -- "-- 3 turn(s) · demo-project"; } \
     && ok "SB13: tagged pane → stage on parent, pipeline/skill/last/turns in submenu" || bad "SB13: $out"
   echo "$out" | grep -q -- "-- dispatched .* ago · claude-sonnet" \
     && ok "SB13: submenu carries dispatch age + worker" || bad "SB13 dispatch row: $out"

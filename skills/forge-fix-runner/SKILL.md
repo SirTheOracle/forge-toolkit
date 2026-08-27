@@ -448,7 +448,7 @@ and no `wait` to key off — so it takes **Shape B**
 where the backend suites actually execute, and GoParent's
 `backend/tests/conftest.py` runs a **session-scoped autouse** fixture that
 `pg_terminate_backend()`s every other connection to the shared
-`goparent_platform_test` database. Two sessions verifying at once corrupt each
+the shared test database. Two sessions verifying at once corrupt each
 other's failure counts **silently**, and a corrupted failure count is how a
 `Closes #N` reaches an unfixed bug.
 
@@ -548,7 +548,7 @@ it. That is exactly the verified topology of `~/.claude/skills/forge-fix-runner/
 
 **Convert one project first.** Symlink resolution is proven for `~/.claude/skills/`;
 a project-level `.claude/skills/` is a *different loader path*. Convert
-`goparent-ai`, invoke the skill there, confirm it loads. Only then convert the other
+one project, invoke the skill there, confirm it loads. Only then convert the other
 two. **Fallback if it does not resolve:** keep physical copies and rely on
 `test_matches_template_outside_config_block()` to catch drift either way.
 
@@ -563,9 +563,9 @@ Project-specific prose lives in `PROJECT.md` next to each project's copy:
 
 | Project | Repo | `CLASSIFIER_PREFIX` | Extra blocking labels |
 |---|---|---|---|
-| `goparent-ai` | `SirTheOracle/goparent-ai` | `service:` | — |
-| `feedforge` | `SirTheOracle/feedmint` | `area:` | `status:in-progress` |
-| `headless_factory` | `SirTheOracle/animation-factory` | `service:` | — |
+| `<project-a>` | `<org>/<repo-a>` | `service:` | — |
+| `<project-b>` | `<org>/<repo-b>` | `area:` | `status:in-progress` |
+| `<project-c>` | `<org>/<repo-c>` | `service:` | — |
 
 Procedure/invariant changes belong to **all** copies — when you change one, propagate
 to the rest and re-run each `test_queue.py`. Note that git worktrees get a physical

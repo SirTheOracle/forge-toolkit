@@ -17,3 +17,7 @@ docs/*
 .claude/worktrees/
 __pycache__/
 *.pyc
+
+# Handoff notes reference private project names and local paths; keep local.
+handoffs/
+.claude/docs-refresh.yml

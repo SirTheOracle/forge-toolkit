@@ -142,7 +142,7 @@ repo refuse; FORGE_CFG_SOURCE="$SRC" cfgpy 'forge["expected_root"]=os.environ["F
 repo modes; mkdir -p "$SRC/backend/.venv"; echo env > "$SRC/backend/.env"; cfgpy 'wt["seed"]=[{"path":"backend/.venv","mode":"symlink","required":True},{"path":"backend/.env","mode":"copy","required":True}]'; ensure s1 --print-path >/dev/null 2>&1; [ -L "$WT/backend/.venv" ] && [ -f "$WT/backend/.env" ] && [ ! -L "$WT/backend/.env" ] && ok 'T-WT-SEED-MODES' || bad modes
 # The three real project shapes. The point is not the paths but that a REQUIRED
 # DIRECTORY symlink resolves for reads from inside the worktree (R12), and that a
-# project with no .envrc still provisions cleanly (headless_factory).
+# project with no .envrc still provisions cleanly.
 seedshape(){ # seedshape <label> <mk-cmd> <json-seed-list> <probe-dir-rel>
   repo "seed-$1"; eval "$2"
   FORGE_SEED_LIST="$3" cfgpy 'import json; wt["seed"]=json.loads(os.environ["FORGE_SEED_LIST"])'
@@ -151,7 +151,7 @@ seedshape(){ # seedshape <label> <mk-cmd> <json-seed-list> <probe-dir-rel>
     && ok "T-WT-SEED-SHAPE $1 required directory symlink resolves from the worktree" \
     || bad "seed-shape-$1"
 }
-seedshape goparent \
+seedshape demoproj \
   'mkdir -p "$SRC/backend/.venv" "$SRC/frontend/node_modules"; echo mk > "$SRC/backend/.venv/marker"; echo env > "$SRC/backend/.env"' \
   '[{"path":"backend/.env","mode":"symlink","required":true},{"path":"backend/.venv","mode":"symlink","required":true},{"path":"frontend/node_modules","mode":"symlink","required":true}]' \
   backend/.venv
@@ -236,7 +236,7 @@ out=$(ensure s2 --print-path 2>"$WORK/v5.err")
 { [ -n "$out" ] && [ -d "$out" ]; } && ok 'T-DEV-V5 survives deletion of the project .gitignore rule' || bad "T-DEV-V5: $(cat "$WORK/v5.err")"
 
 # V2/V3: a tracked durable work product under .dev/ must not block. This is the
-# exact goparent-ai failure: committing a proposal disabled session start.
+# exact live failure: committing a proposal disabled session start.
 repo v2; mkdir -p "$SRC/.dev/proposals"; echo doc > "$SRC/.dev/proposals/x.md"
 git -C "$SRC" add -f .dev/proposals/x.md; git -C "$SRC" commit -qm proposal
 git -C "$SRC" push -q origin main

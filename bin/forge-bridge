@@ -202,7 +202,7 @@ PY
 }
 
 # _same_root_sessions <dir> — list every LIVE session whose ownership_root equals
-# ownership_root(dir), REGARDLESS of name prefix (fixes the goparentbugs miss). Test
+# ownership_root(dir), REGARDLESS of name prefix (fixes the sibling-name-prefix miss). Test
 # seam FORGE_TMUX_LIST names a 'name<TAB>path' file (seat/forge-watch convention,
 # bin/forge:67-75). One name per line. bash-3.2-safe.
 _same_root_sessions() {

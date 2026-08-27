@@ -1384,7 +1384,7 @@ def _eval_context(root, label, cp, embedded, is_live,
 # edges (`2 * 3` and `*.json` globs survive), heading hashes need a following
 # space (`#192` survives), underscore emphasis is never touched (`__init__`,
 # snake_case). The unterminated-link rule handles snip()-truncated tails like
-# "[diagnosis.md](/Users/sirdrafton/sirtheoracle/auto".
+# "[diagnosis.md](/long/absolute/path/to/auto".
 _MD_SUBS = [
     (re.compile(r'`{3,}[A-Za-z0-9_-]*'), ' '),                  # code fences
     (re.compile(r'!?\[([^\]]*)\]\([^)]*\)'), r'\1'),            # links/images → text

@@ -350,7 +350,7 @@ of each pipeline. Example:
 
 ```
 Environment setup (run before any other commands):
-  Working directory: /Users/sirdrafton/sirtheoracle/automation/promptlol
+  Working directory: /path/to/your/project
   Python venv: source backend/.venv/bin/activate
   APP_ENV: development
   Backend port: 8001
@@ -1264,7 +1264,7 @@ Background agent failures follow this protocol:
     **The contended resource is the shared test DATABASE, not only the fixed
     ports.** A bound port fails loudly; a second `pytest` against the shared test
     database fails *quietly*. GoParent's `backend/tests/conftest.py` derives one
-    `goparent_platform_test` URL from `settings.DATABASE_URL` and runs a
+    shared test-database URL from `settings.DATABASE_URL` and runs a
     **session-scoped autouse** fixture that `pg_terminate_backend()`s every other
     connection to it, so a second worktree starting `pytest` deterministically
     kills the first run's connections mid-test. The observable damage is a wrong

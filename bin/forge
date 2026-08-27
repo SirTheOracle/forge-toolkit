@@ -1220,7 +1220,7 @@ PY
 
 # Verbose (arg 4 = 1, used by --dry-run) prints one line per unseeded gitignored
 # path. A real provision prints ONE grouped summary line instead: enumerating
-# every path floods the start banner (74 lines in goparent-ai) and buries the two
+# every path floods the start banner (74 lines in a large monorepo) and buries the two
 # or three that matter — backend/.venv, backend/.env — under .tmpDocs, caches,
 # node_modules and test-results. An advisory that fires 74 times per start is
 # noise the operator learns to scroll past, which defeats its purpose.
@@ -1332,7 +1332,7 @@ cmd_worktree() {
     prefix="$(_worktree_cfg "$src" prefix)" || return 2
     # Name the leaf after the PROJECT, not the root this was invoked from —
     # otherwise a session started inside a linked worktree compounds its name
-    # into the next one (goparent-ai-goparentbugs-g700).
+    # into the next one (<project>-<session>-g700).
     [ -n "$prefix" ] || prefix="$(basename "$main_root")"
     case "$prefix" in .|..|*/*|*\\*) echo "forge worktree: forge.worktree.prefix must be one safe path component" >&2; return 2 ;; esac
     branch_prefix="$(_worktree_cfg "$src" branch_prefix)" || return 2

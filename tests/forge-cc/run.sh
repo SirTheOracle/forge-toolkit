@@ -397,9 +397,13 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$SENT" ] && break; sleep 0.3; done
 { [ "$elapsed" -lt 5 ] && [ -f "$SENT" ]; } && ok "orchestrator Stop trigger detaches AND fires (Diffs 6a/6b)" || bad "orchestrator trigger blocked ${elapsed}s or never fired"
 
 echo "── hook merge tool (on COPIES of live settings) ──"
-for pair in "headless_factory:PostToolUse" "feedforge:PreToolUse" "goparent-ai:__nohooks__"; do
+# Live-settings fixtures are machine-specific and name private projects, so they are
+# NOT hardcoded here (this repo is public). Point FORGE_CC_LIVE_SETTINGS at a
+# space-separated list of "<root-name>:<expected-hook-event>" pairs under
+# FORGE_CC_LIVE_ROOT to exercise this row; unset, the row skips cleanly.
+for pair in ${FORGE_CC_LIVE_SETTINGS:-}; do
   name="${pair%%:*}"; expect="${pair##*:}"
-  src="/Users/sirdrafton/sirtheoracle/automation/$name/.claude/settings.json"
+  src="${FORGE_CC_LIVE_ROOT:-$HOME/projects}/$name/.claude/settings.json"
   [ -f "$src" ] || { echo "  (skip $name — settings absent)"; continue; }
   C="$WORK/reg-$name"; mkdir -p "$C/.claude" "$C/.dev"; git -C "$C" init -q; echo '.dev/' > "$C/.gitignore"
   cp "$src" "$C/.claude/settings.json"
