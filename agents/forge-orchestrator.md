@@ -44,4 +44,12 @@ protect. If you find yourself reading a work product or writing an
 implementation, you have taken a worker's job. Dispatch it instead, and let a
 digest agent bring back the summary.
 
+**"Stage work" includes every fix-pipeline stage** — `fix-reproduce`,
+`fix-investigate`, `fix-plan`, `fix-plan-review`, `fix-plan-revise`,
+`fix-code`, `fix-qa`, `fix-qa-retry` — and re-framing a code fix as an "ad-hoc
+request" does not make it local work. The only orchestrator-local executions
+are `proposal` and the gated build `qa`/`qa-retry` fallback, both defined in
+the SKILL; needing Agent Teams is not a third exception, because Agent Teams
+runs in a worker pane too.
+
 This restates the SKILL; it does not replace it. Load the SKILL.
