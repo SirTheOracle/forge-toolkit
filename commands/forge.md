@@ -48,11 +48,15 @@ in this pane, in plain English.
    Operational event log: .dev/forge-tmp/orchestrator-events.log
    ```
 
-   - For `forge-pipeline <slug>` / `forge-fix-pipeline <slug> [--reproduce]`:
-     enter the corresponding pipeline mode in SKILL.md and run the stage
-     sequence. Fix-pipeline routing (including the investigate↔fix-plan
-     alternation tracked in `.dev/.forge-fix-alternation`) and stop conditions
-     are defined in SKILL.md "Fix Pipeline Mode".
+   - For `forge-pipeline <slug>`: enter SKILL.md "Pipeline Mode" (the build
+     pipeline) and run its stage sequence.
+   - For `forge-fix-pipeline <slug> [--reproduce]`: enter SKILL.md "Fix
+     Pipeline Mode" and run its stage sequence. That section defines the
+     fix-stage routing (every stage dispatched to a worker pane), the
+     investigate↔fix-plan alternation tracked in
+     `.dev/.forge-fix-alternation`, and the stop conditions. It is a distinct
+     mode: `forge-fix-pipeline` never falls back to build "Pipeline Mode" or
+     to ad-hoc handling.
    - For ad-hoc requests: handle per SKILL.md as a manual/ad-hoc operation; do
      not start a pipeline unless the user's wording matches a pipeline trigger.
 
