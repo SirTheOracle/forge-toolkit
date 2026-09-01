@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""forge-issue-sync — turn untracked session memories into GitHub issues.
+
+  forge-issue-sync scan                  list project memories with no issue yet
+  forge-issue-sync file drafts.json      dry-run: show what would be created
+  forge-issue-sync file drafts.json -w   create the issues, label, backlink
+
+drafts.json is a list of:
+  {"source","title","kind","component","severity","what","evidence"}
+
+Run it daily or by hand. `scan` is silent and exits 0 when there is nothing new.
+"""
+import json, os, re, subprocess, sys
+
+REPO = "SirTheOracle/forge-toolkit"
+MEM = os.path.expanduser(
+    "~/.claude/projects/-Users-sirdrafton-sirtheoracle-automation-forge-toolkit/memory")
+KINDS = {"bug", "pipeline-work", "live-gate", "unlanded", "known-gap"}
+COMPONENTS = {"bridge", "watch", "cc-hook", "start", "recover",
+              "broker", "skills", "swiftbar", "install"}
+SEVERITIES = {"critical", "high", "medium", "low"}  # queue.py reads severity:*
+ORIGINS = {"operator", "pipeline"}   # provenance: who surfaced it
+# Never publish these to a public repo.
+DENY = ("/Users/", "goparent", "feedforge", "promptlol", "headless", "feedmint", "sk-")
+TRACKED = "**Tracked as**"
+
+
+def memories():
+    for fn in sorted(os.listdir(MEM)):
+        if not fn.endswith(".md") or fn == "MEMORY.md":
+            continue
+        p = os.path.join(MEM, fn)
+        t = open(p, errors="replace").read()
+        m = re.search(r"^  type: (project|feedback)\s*$", t, re.M)
+        if m:
+            yield fn[:-3], p, t, m.group(1)
+
+
+def cmd_scan():
+    new = [(s, t, k) for s, _, t, k in memories() if TRACKED not in t]
+    for slug, t, kind in new:
+        body = re.sub(r"\s+", " ", re.sub(r"^---.*?^---", "", t, flags=re.S | re.M)).strip()
+        print(f"[{kind}] {slug}\n    {body[:200]}\n")
+    print(f"{len(new)} untracked, {sum(1 for _ in memories())} memories in scope",
+          file=sys.stderr)
+    return 0
+
+
+def leak_check(text, where):
+    low = text.lower()
+    for bad in DENY:
+        if bad.lower() in low:
+            sys.exit(f"LEAK: {where} contains {bad!r} — refusing (public repo)")
+
+
+def body_of(d):
+    return (f"**What's wrong**\n\n{d['what']}\n\n"
+            f"**Evidence**\n\n`{d['evidence']}` — local only, not in this repo.\n\n"
+            f"**How it was found**\n\nSession memory `{d['source']}`.\n\n"
+            f"<!-- forge-backlog:{d['source']} -->\n")
+
+
+def existing_markers():
+    r = subprocess.run(["gh", "issue", "list", "--repo", REPO, "--state", "all",
+                        "--limit", "500", "--json", "number,body"],
+                       capture_output=True, text=True, check=True)
+    out = {}
+    for i in json.loads(r.stdout):
+        m = re.search(r"<!-- forge-backlog:(.+?) -->", i.get("body") or "")
+        if m:
+            out[m.group(1)] = i["number"]
+    return out
+
+
+def cmd_file(path, write):
+    drafts = json.load(open(path))
+    seen = existing_markers()
+    todo = []
+    for d in drafts:
+        d.setdefault("severity", d.pop("priority", None))   # accept the old field name
+        for k in ("source", "title", "kind", "component", "severity", "what", "evidence"):
+            if not d.get(k):
+                sys.exit(f"draft {d.get('source', '?')}: missing {k}")
+        d.setdefault("origin", "pipeline")
+        for f, valid in (("kind", KINDS), ("component", COMPONENTS),
+                         ("severity", SEVERITIES), ("origin", ORIGINS)):
+            if d[f] not in valid:
+                sys.exit(f"draft {d['source']}: bad {f}={d[f]!r}")
+        leak_check(d["title"] + body_of(d), d["source"])
+        if d["source"] in seen:
+            print(f"  DUP  #{seen[d['source']]:<4} {d['title']}")
+        else:
+            todo.append(d)
+            print(f"  NEW  [{d['kind']}/{d['component']}/{d['severity']}/{d['origin']}] {d['title']}")
+    if not write:
+        print(f"\n{len(todo)} would be created ({len(drafts) - len(todo)} already tracked). "
+              f"Re-run with -w to create.")
+        return 0
+
+    filed = {}
+    for d in todo:
+        r = subprocess.run(["gh", "issue", "create", "--repo", REPO,
+                            "--title", d["title"], "--body", body_of(d),
+                            "--label", f"kind:{d['kind']}",
+                            "--label", f"component:{d['component']}",
+                            "--label", f"severity:{d['severity']}",
+                            "--label", f"source:{d['origin']}"],
+                           capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(f"gh failed on {d['source']}: {r.stderr.strip()}")
+        url = r.stdout.strip().splitlines()[-1]
+        filed[d["source"]] = url.rsplit("/", 1)[1]
+        print(f"{url}  {d['title']}")
+    n_linked = backlink(filed)
+    print(f"\ncreated {len(filed)}, backlinked {n_linked} memories")
+    return 0
+
+
+def backlink(filed):
+    done = 0
+    for slug, n in filed.items():
+        p = os.path.join(MEM, slug + ".md")
+        if not os.path.exists(p):
+            continue
+        t = open(p).read()
+        if TRACKED in t:
+            continue
+        open(p, "w").write(t.rstrip("\n") + f"\n\n{TRACKED} forge-toolkit issue #{n} — "
+                           "status lives in GitHub; this file is history, not the queue.\n")
+        done += 1
+    idx = os.path.join(MEM, "MEMORY.md")
+    lines = open(idx).read().splitlines()
+    for i, ln in enumerate(lines):
+        m = re.match(r"- \[.*?\]\((.*?)\.md\)", ln)
+        if m and m.group(1) in filed and f"(#{filed[m.group(1)]})" not in ln:
+            lines[i] = ln.rstrip() + f" (#{filed[m.group(1)]})"
+    open(idx, "w").write("\n".join(lines) + "\n")
+    return done
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["scan"]:
+        sys.exit(cmd_scan())
+    if a[:1] == ["file"] and len(a) >= 2:
+        sys.exit(cmd_file(a[1], "-w" in a or "--write" in a))
+    sys.exit(__doc__)
