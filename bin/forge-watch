@@ -1757,6 +1757,12 @@ def scan_attention(root, label):
     EPISODES.extend(episodes)     # R3a — module-level accumulator, mirrors TASKS; the board
                                   # sorts + caps ONCE at assembly, never scan-locally
     # worker NEEDS-PERMISSION (reuses the hot condition); a later worker Stop supersedes it.
+    # A pane holds at most ONE open permission dialog, so unresolved residue must collapse to
+    # the NEWEST eligible record per (session, pane) before emitting. Emitting one finding per
+    # record is what rendered ~48 identical rows for a single stage — and one notification
+    # ring key each, which then broke bridge escalation (#17). The eligibility filters below
+    # (ZOMBIE_AGE_S freshness, wstop-supersedes-wperm) are UNCHANGED; only the fan-out is.
+    newest_perm = {}
     for pr in worker_perms:
         sess = pr.get('session'); pane = pr.get('pane_index')
         a = age_s(pr.get('emitted_at'))
@@ -1767,6 +1773,10 @@ def scan_attention(root, label):
         wat = parse_iso(ws.get('emitted_at')) if ws else None
         if wat is not None and pat is not None and wat > pat:
             continue
+        cur = newest_perm.get((sess, pane))
+        if cur is None or (pat is not None and (cur[0] is None or pat > cur[0])):
+            newest_perm[(sess, pane)] = (pat, pr)
+    for (sess, pane), (_pat, pr) in newest_perm.items():
         delivery_id = pr.get('delivery_id') or 'legacy'
         key = f"{sess}\tp{pane}\t{delivery_id}\t{pr.get('command_hash','')}"
         f = add_finding('NEEDS-PERMISSION', root, key,

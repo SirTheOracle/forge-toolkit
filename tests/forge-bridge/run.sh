@@ -3603,6 +3603,55 @@ grep -q 'STATUS: needs_permission' "$BRIDGE" \
   && grep -q 'permission_correlation_ambiguous' "$BRIDGE" \
   && ok "typed fast permission path installed" || bad "fast permission path absent"
 
+echo "── #17 same-pane permission pile-up correlates to a single row ──"
+# bin/forge-bridge is deliberately NOT changed by the #17 fix: the pile-up is prevented
+# upstream (forge-cc-hook sweeps superseded same-pane wperm records on write). This
+# asserts the POST-FIX property at the bridge boundary. The correlation probe is
+# EXTRACTED VERBATIM from $BRIDGE — production code, not a copy of it.
+PP="$WORK/perm-probe.py"
+sed -n '/^import datetime,glob,json,os,sys$/,/^PY$/p' "$BRIDGE" | sed '$d' > "$PP"
+grep -q "ambiguous" "$PP" && ok "#17 permission-correlation probe extracted from bin/forge-bridge" \
+  || bad "#17 could not extract the correlation probe (anchor drifted)"
+PR="$WORK/perm17"; PA="$PR/.dev/attention"
+mkdir -p "$PA" "$PR/.dev/forge-broker/envelopes"
+PSESS="fbperm17-$$"
+python3 - "$PR" "$PSESS" <<'PY'
+import json,os,sys
+root,sess=sys.argv[1],sys.argv[2]
+d={"schema":"forge-delivery/1","state":"open","delivery_id":"delivery-perm17","session":sess,
+   "pane_index":1,"session_incarnation":"inc-perm17","physical_code_root":os.path.realpath(root),
+   "root_identity":"rid-perm17","slug":"perm17-slug","stage":"fix-code",
+   "capability_class":"workspace","prompt_sha256":"a"*64}
+json.dump(d,open(os.path.join(root,".dev","forge-broker","envelopes","delivery-perm17.json"),"w"))
+PY
+for c in "first command" "second command" "third command"; do
+  printf '{"tool_name":"Bash","tool_input":{"command":"%s"}}' "$c" \
+    | FORGE_CC_PANE_META="$(printf '1\t%s\t%s\t5' "$PSESS" "$PR")" "$ROOT/bin/forge-cc-hook" permissionrequest >/dev/null
+done
+PAUTH="$(python3 - "$PR" <<'PY'
+import datetime,json,os,sys
+n=datetime.datetime.now(datetime.timezone.utc)
+f=lambda d:(n+datetime.timedelta(seconds=d)).strftime('%Y-%m-%dT%H:%M:%SZ')
+print(json.dumps({"delivery_id":"delivery-perm17","session_incarnation":"inc-perm17",
+  "physical_code_root":os.path.realpath(sys.argv[1]),"root_identity":"rid-perm17",
+  "stage":"fix-code","prompt_sha256":"a"*64,"opened_at":f(-3600),"expires_at":f(3600)}))
+PY
+)"
+probe17(){ FORGE_ACTIVE_DELIVERY="$PAUTH" python3 "$PP" "$PA" "$PSESS" 1 perm17-slug fix-code; }
+PJ="$(probe17)"
+{ [ -n "$PJ" ] && ! printf '%s' "$PJ" | grep -q '"ambiguous"'; } \
+  && ok "#17 three same-pane permission requests correlate to a SINGLE bridge row" \
+  || bad "#17 bridge correlation returned [$PJ]"
+printf '%s' "$PJ" | python3 -c 'import hashlib,json,sys; d=json.load(sys.stdin); assert d["command_hash"]==hashlib.sha256(b"third command").hexdigest(), d["command_hash"]' \
+  && ok "#17 the correlated row is the NEWEST request" || bad "#17 bridge correlated a superseded row"
+# Negative control: the probe really is live — a second matching record still trips ambiguity,
+# so the single-row result above comes from the upstream sweep, not from a probe that never matches.
+cp "$(ls "$PA"/wperm."$PSESS".p1.*.json | head -1)" "$PA/wperm.$PSESS.p1.delivery-perm17.ffffffffffff.json"
+printf '%s' "$(probe17)" | grep -q '"ambiguous": true' \
+  && ok "#17 negative control: a genuine same-pane duplicate still reports ambiguous" \
+  || bad "#17 negative control did not trip — the assertion above is vacuous"
+rm -rf "$PR"
+
 echo "── alias-self-test negative fixtures ──"
 alias_negative() {
   local id="$1" edit="$2" needle="$3" d out rc

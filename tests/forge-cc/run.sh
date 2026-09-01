@@ -142,6 +142,54 @@ printf '{"tool_name":"Bash","tool_input":{"command":"pytest"}}' | FORGE_CC_PANE_
 test ! -f "$wperm" && ls "$R"/.dev/attention/archive/"$(basename "$wperm")".resolved.* >/dev/null 2>&1 \
   && ok "worker posttooluse archives the wperm event" || bad "wperm survived posttooluse"
 
+echo "── #17 permission lifecycle: PostToolUse registration + same-pane wperm sweep ──"
+# C1 — the posttooluse RESOLVER was always tool-agnostic; its REGISTRATION was scoped
+# to AskUserQuestion, so a Bash wperm had nothing that would ever resolve it and piled
+# up until ZOMBIE_AGE_S. Assert the repo-owned hook block can fire for Bash.
+python3 - "$ROOT/config/claude-cc-hooks.json" <<'PY' && ok "#17 PostToolUse registration is no longer scoped to AskUserQuestion" || bad "#17 PostToolUse matcher still cannot fire for Bash"
+import json,re,sys
+b=json.load(open(sys.argv[1]))
+ents=[e for e in b.get("PostToolUse",[])
+      if any("forge-cc-hook" in (h.get("command") or "") for h in e.get("hooks",[]) or [])]
+assert ents, "no forge-cc-hook PostToolUse entry in the block"
+def fires_for(m, tool):
+    if m in (None, "", "*"): return True
+    return re.fullmatch(m, tool) is not None
+assert any(fires_for(e.get("matcher"), "Bash") for e in ents), [e.get("matcher") for e in ents]
+assert any(fires_for(e.get("matcher"), "AskUserQuestion") for e in ents), "AskUserQuestion coverage regressed"
+PY
+
+new_root pl17a
+printf '{"tool_name":"Bash","tool_input":{"command":"terraform apply"}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null
+pl17_live="$(find "$R/.dev/attention" -name 'wperm.forge-x.p1.*.json' -print -quit)"
+# same-pane residue for a DIFFERENT command: the resolver must leave it alone.
+pl17_other="$R/.dev/attention/wperm.forge-x.p1.delivery-other.ddddddddddd0.json"
+python3 - "$pl17_live" "$pl17_other" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1])); d["command_hash"]="d"*64; d["delivery_id"]="delivery-other"
+json.dump(d, open(sys.argv[2], "w"))
+PY
+printf '{"tool_name":"Bash","tool_input":{"command":"terraform apply"}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" posttooluse >/dev/null
+{ test ! -f "$pl17_live" && ls "$R"/.dev/attention/archive/"$(basename "$pl17_live")".resolved.* >/dev/null 2>&1; } \
+  && ok "#17 posttooluse for a NON-AskUserQuestion tool (Bash) archives its wperm" || bad "#17 Bash wperm survived posttooluse"
+test -f "$pl17_other" && ok "#17 a same-pane wperm with a different command_hash is untouched" || bad "#17 resolver archived a non-matching record"
+
+# C3 — the writer sweeps superseded same-pane records: a pane has at most ONE open dialog.
+new_root pl17b
+printf '{"tool_name":"Bash","tool_input":{"command":"step one"}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null
+pl17_first="$(find "$R/.dev/attention" -name 'wperm.forge-x.p1.*.json' -print -quit)"
+printf '{"tool_name":"Bash","tool_input":{"command":"other pane"}}' | FORGE_CC_PANE_META="$(meta 3 "$R")" "$HOOK" permissionrequest >/dev/null
+pl17_p3="$(find "$R/.dev/attention" -name 'wperm.forge-x.p3.*.json' -print -quit)"
+printf '{"tool_name":"Bash","tool_input":{"command":"step two"}}' | FORGE_CC_PANE_META="$(meta 1 "$R")" "$HOOK" permissionrequest >/dev/null
+pl17_n=$(ls "$R"/.dev/attention/wperm.forge-x.p1.*.json 2>/dev/null | wc -l | tr -d ' ')
+[ "$pl17_n" -eq 1 ] && ok "#17 a second same-pane permissionrequest leaves exactly ONE live wperm" || bad "#17 got $pl17_n live p1 wperm records (pile-up)"
+{ test ! -f "$pl17_first" && ls "$R"/.dev/attention/archive/"$(basename "$pl17_first")".resolved.* >/dev/null 2>&1; } \
+  && ok "#17 the superseded same-pane wperm is archived, not deleted" || bad "#17 superseded wperm not archived"
+python3 -c 'import glob,hashlib,json,sys;p=glob.glob(sys.argv[1])[0];assert json.load(open(p))["command_hash"]==hashlib.sha256(b"step two").hexdigest()' \
+  "$R/.dev/attention/wperm.forge-x.p1.*.json" \
+  && ok "#17 the surviving p1 record is the NEWEST request" || bad "#17 sweep kept the wrong record"
+test -f "$pl17_p3" && ok "#17 the sweep is pane-scoped: another pane's wperm is untouched" || bad "#17 sweep crossed panes"
+
 echo "── forge-cc-hook: AskUserQuestion content capture (Q1-Q5) ──"
 AQ='{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Deploy to prod?","header":"Deploy","multiSelect":false,"options":[{"label":"yes"},{"label":"no"},{"label":"dry-run"}]}]}}'
 EH=$(python3 -c "import hashlib;print(hashlib.sha256(b'').hexdigest()[:8])")

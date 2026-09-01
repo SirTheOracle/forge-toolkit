@@ -331,8 +331,36 @@ if role != 'orchestrator':
                     'capability_class': delivery['capability_class'], 'source': 'hook',
                     'prompt_sha256': delivery['prompt_sha256'],
                     'permission_suggestions': data.get('permission_suggestions') or [], **question_fields(tn, ti)}
-            atomic(os.path.join(adir, f'wperm.{session}.p{pane_index}.{did}.{digest[:12]}.json'),
-                   envelope('worker-permission', body))
+            newp = os.path.join(adir, f'wperm.{session}.p{pane_index}.{did}.{digest[:12]}.json')
+            atomic(newp, envelope('worker-permission', body))
+            # A pane holds at most ONE open permission dialog, so any older wperm for this
+            # same (session, pane) is superseded: its own posttooluse can never arrive
+            # (that tool already completed), and it would otherwise survive to ZOMBIE_AGE_S
+            # as a duplicate NEEDS-PERMISSION row and a duplicate ring key (#17). Archive
+            # with the resolver's own convention — never delete. Conservative: an unreadable
+            # record, one that does not self-identify as this (session, pane), or one stamped
+            # later than this write is LEFT IN PLACE. Wrapped so a failure here can never
+            # break the INVIOLABLE fail-open exit-0 contract of permissionrequest.
+            try:
+                arch = os.path.join(adir, 'archive')
+                ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+                for pf in glob.glob(os.path.join(adir, f'wperm.{session}.p{pane_index}.*.json')):
+                    if os.path.abspath(pf) == os.path.abspath(newp):
+                        continue
+                    try:
+                        with open(pf) as f:
+                            oldrec = json.load(f)
+                    except (OSError, ValueError):
+                        continue
+                    if (oldrec.get('session') != session
+                            or str(oldrec.get('pane_index')) != str(pane_index)):
+                        continue
+                    if str(oldrec.get('emitted_at') or '') > NOW:
+                        continue
+                    os.makedirs(arch, exist_ok=True)
+                    os.replace(pf, os.path.join(arch, os.path.basename(pf) + '.resolved.' + ts))
+            except OSError:
+                pass
     elif event == 'posttooluse':
         # A completed tool RESOLVES its pending permission request: archive the
         # matching perm event so NEEDS-PERMISSION clears within a tick of the
