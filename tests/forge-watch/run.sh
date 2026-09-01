@@ -1738,6 +1738,24 @@ assert_status_has "forge-1 p1 — permission needed" "wperm → NEEDS-PERMISSION
 wstopf "$R" forge-1 1 10 ptask-after
 assert_status_missing "permission needed" "a later worker Stop supersedes the worker permission"
 
+echo "── #17 worker NEEDS-PERMISSION pile-up → ONE row + ONE ring key per pane ──"      # +3
+new_env twperm17
+R=$(mk_root proj); live_session forge-1 "$R"
+wpermf "$R" forge-1 1 aaaa1111 90
+wpermf "$R" forge-1 1 bbbb2222 60
+wpermf "$R" forge-1 1 cccc3333 30
+n=$(run_status | grep -c "forge-1 p1 — permission needed")
+[ "$n" -eq 1 ] && ok "#17 three unresolved same-pane wperm records render exactly ONE row" \
+  || bad "#17 got $n NEEDS-PERMISSION rows for a single pane"
+run_check >/dev/null
+c=$(grep -c "permission needed" "$CAP")
+[ "$c" -eq 1 ] && ok "#17 the pile-up rings exactly ONE notification (one ring key)" \
+  || bad "#17 got $c notifications for a single pane"
+wpermf "$R" forge-1 2 dddd4444 30
+n2=$(run_status | grep -c "permission needed")
+[ "$n2" -eq 2 ] && ok "#17 the collapse is per-pane: two panes still render one row each" \
+  || bad "#17 got $n2 rows across two panes"
+
 echo "── graceful degradation: everything empty → valid cc-board/1, no crash ──"        # +2
 new_env tgrace
 : > "$FORGE_WATCH_CONFIG_DIR/watch-roots"; : > "$FORGE_WATCH_TMUX_LIST"
