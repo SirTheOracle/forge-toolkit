@@ -3529,6 +3529,121 @@ else
   echo "  (skip: tmux unavailable — ACM §J)"
 fi
 
+echo "── T-CODEX-ADMIT: codex admission verdict gates classification (real tmux) ──"
+# Issue #39. The classifier used to gate every codex pane on membership in
+# `supported.codex_versions` against $FORGE_CODEX_VERSION — a variable no program ever
+# wrote — so it refused every codex pane at every version, forever, before every state
+# branch. The gate is now the ADMISSION VERDICT its launch stamped on the pane
+# (@forge-codex-admission), read pane-scoped. These cases drive REAL tmux and the REAL
+# `show-options -p -qv` reader end to end; a spec re-implemented in python is what let the
+# original defect ship, so there is deliberately no test seam and no override variable.
+#
+# Every assertion greps the capture FILE rather than piping `out_of` into grep: this suite
+# runs under `set -o pipefail`, and a `grep -q` that matches early can SIGPIPE its producer,
+# which turns a matching pipeline into a non-zero one. That flips `&& bad || ok` guards into
+# passing vacuously — measured, not hypothetical.
+if command -v tmux >/dev/null 2>&1; then
+  # BLOCK-LOCAL SESSION (see ACM §D).
+  DS="fbadm-$$"; DCA="$(mkR admit)"
+mk_session "$DS" 220 50 "$DCA"
+  sleep 1
+  CADIR="$WORK/admit-cache"; mkdir -p "$CADIR"
+  # The fixture deliberately OMITS the stamped version from supported.codex_versions. That
+  # is the point of check (a): membership must be off the classifier's critical path, which
+  # is what distinguishes this fix from appending one more version to the list. The rest of
+  # the file — including the real (?ms) codex approval_prompt — is copied verbatim.
+  sed 's/^  codex_versions: .*/  codex_versions: ["0.145.0"]/' \
+      "$ROOT/config/idle-prompts.yml" > "$WORK/ca-prompts.yml"
+  grep -q '"0.145.0"\]' "$WORK/ca-prompts.yml" \
+    || bad "T-CODEX-ADMIT fixture did not narrow supported.codex_versions"
+  printf '  gpt-5.5 · Context 90%% left · ~/repo\nCODEXADMITIDLE\n' > "$WORK/ca-idle.txt"
+  printf 'Would you like to run the following command?\n\n  npm test\n\n> 1. Yes, proceed\n  2. No\nCODEXADMITPROMPT\n' > "$WORK/ca-prompt.txt"
+  ADMTOK='schema=1 admitted=1 by=containment-probe version=0.150.0 policy=probe'
+  AENV="FORGE_WATCH_TRIGGER=0 FORGE_IDLE_PROMPTS_FILE=$WORK/ca-prompts.yml FORGE_CACHE_DIR=$CADIR"
+  # Render a fixture into a worker pane and wait for it to actually appear in the capture;
+  # a poll against an unrendered pane would decide on the wrong text.
+  adm_paint() {
+    local p="$1" f="$2" marker="$3" i=0
+    tmux send-keys -t "$p" "cat $f" Enter
+    while [ $i -lt 40 ]; do
+      tmux capture-pane -p -t "$p" -S -50 > "$WORK/ca-cap.txt" 2>/dev/null
+      grep -q "$marker" "$WORK/ca-cap.txt" && return 0
+      sleep 0.25; i=$((i+1))
+    done
+    bad "T-CODEX-ADMIT fixture never rendered in $p ($marker)"; return 1
+  }
+
+  # A1 · check (a): an ADMITTED pane whose version is in NO allowlist is classified.
+  tmux set-option -p -t "$DS:0.3" @forge-codex-admission "$ADMTOK"
+  adm_paint "$DS:0.3" "$WORK/ca-idle.txt" CODEXADMITIDLE
+  rm -f "$CADIR/$DS-pane3.snapshot" "$CADIR/$DS-pane3.last-stall-check"
+  run_in_pane "$DS:0.1" adm1a "( cd $DCA && $AENV $BRIDGE stall-check --project-root $DCA codex-a )"
+  # Poll 1 is a POSITIVE assertion, not a weak one: `UNKNOWN … baseline_pending` is emitted
+  # from the no-cache branch, which sits AFTER the guard's sys.exit(0) — observing it proves
+  # the guard was passed. A single poll asserting a non-UNKNOWN word would fail for the
+  # wrong reason. If that branch is ever legitimately changed this line must be updated;
+  # poll 2's IDLE carries the load-bearing signal.
+  grep -qx "UNKNOWN pane=codex-a baseline_pending" "$WORK/out.adm1a" \
+    && ok "T-CODEX-ADMIT/A1 poll 1 reaches the cache baseline (guard passed)" \
+    || bad "T-CODEX-ADMIT/A1 poll 1: $(out_of adm1a)"
+  run_in_pane "$DS:0.1" adm1b "( cd $DCA && $AENV $BRIDGE stall-check --project-root $DCA codex-a )"
+  grep -qx "IDLE pane=codex-a" "$WORK/out.adm1b" \
+    && ok "T-CODEX-ADMIT/A1 poll 2 reports a real state for an UNLISTED version" \
+    || bad "T-CODEX-ADMIT/A1 poll 2: $(out_of adm1b)"
+  grep -qE "classifier_unsupported|classifier_unadmitted" "$WORK/out.adm1a" "$WORK/out.adm1b" \
+    && bad "T-CODEX-ADMIT/A1 a refusal token survived" \
+    || ok "T-CODEX-ADMIT/A1 no refusal token on either poll"
+
+  # A2 · check (b): the PROMPTING branch is reachable for an admitted codex pane.
+  # No excerpt assertion: the per-line excerpt scan cannot match the multi-line (?ms)
+  # pattern, so `excerpt=none` is the correct output (out-of-scope follow-up).
+  adm_paint "$DS:0.3" "$WORK/ca-prompt.txt" CODEXADMITPROMPT
+  run_in_pane "$DS:0.1" adm2 "( cd $DCA && $AENV $BRIDGE stall-check --project-root $DCA codex-a )"
+  grep -q "^PROMPTING pane=codex-a" "$WORK/out.adm2" \
+    && ok "T-CODEX-ADMIT/A2 an admitted codex pane reaches PROMPTING" \
+    || bad "T-CODEX-ADMIT/A2: $(out_of adm2)"
+
+  # A3 · check (c): fail-closed. Identical capture to A2 on a genuinely unstamped REAL
+  # pane — same input, opposite verdict, decided solely by the stamp.
+  adm_paint "$DS:0.4" "$WORK/ca-prompt.txt" CODEXADMITPROMPT
+  rm -f "$CADIR/$DS-pane4.snapshot" "$CADIR/$DS-pane4.last-stall-check"
+  run_in_pane "$DS:0.1" adm3a "( cd $DCA && $AENV $BRIDGE stall-check --project-root $DCA codex-b )"
+  { grep -qx "UNKNOWN pane=codex-b reason=classifier_unadmitted detail=no-launch-stamp" "$WORK/out.adm3a" \
+      && ! grep -q "^PROMPTING" "$WORK/out.adm3a"; } \
+    && ok "T-CODEX-ADMIT/A3 an unstamped pane is refused, PROMPTING not reached" \
+    || bad "T-CODEX-ADMIT/A3 cell 1: $(out_of adm3a)"
+  # Defense D1, folded in: the refusal must NOT refresh the file that certifies classifier
+  # coverage. cmd_stall_check_status derives its age from this file alone and never inspects
+  # the state word, so a touching refusal reports health during a total outage — the
+  # mechanism that kept #39 silent for a month.
+  [ ! -f "$CADIR/$DS-pane4.last-stall-check" ] \
+    && ok "T-CODEX-ADMIT/A3 the refusal does not certify its own coverage (D1)" \
+    || bad "T-CODEX-ADMIT/A3 refusal touched .last-stall-check (D1 regressed)"
+  # Cell 2 · a NEGATIVE verdict is refused too, and says so differently.
+  tmux set-option -p -t "$DS:0.4" @forge-codex-admission "schema=1 admitted=0 by=none version=0.150.0 policy=refuse"
+  run_in_pane "$DS:0.1" adm3b "( cd $DCA && $AENV $BRIDGE stall-check --project-root $DCA codex-b )"
+  grep -qx "UNKNOWN pane=codex-b reason=classifier_unadmitted detail=not-admitted" "$WORK/out.adm3b" \
+    && ok "T-CODEX-ADMIT/A3 a negative verdict is refused with detail=not-admitted" \
+    || bad "T-CODEX-ADMIT/A3 cell 2: $(out_of adm3b)"
+  # Cell 3 · the scope-inheritance discriminator. `#{@name}` format lookups — including the
+  # `#{E:...}` expand form — inherit SESSION and GLOBAL scope, so a reader written that way
+  # would admit a pane that was never launched: a fail-open gate wearing a fail-closed
+  # comment. `show-options -p -qv` returns empty here and the pane stays refused.
+  # Session scope, NEVER -g: this suite runs on the DEFAULT tmux server, and a global decoy
+  # would land on the operator's live server and could mask other real-tmux groups.
+  tmux set-option -p -u -t "$DS:0.4" @forge-codex-admission
+  tmux set-option -t "$DS" @forge-codex-admission "schema=1 admitted=1 by=containment-probe version=0.150.0 policy=probe"
+  run_in_pane "$DS:0.1" adm3c "( cd $DCA && $AENV $BRIDGE stall-check --project-root $DCA codex-b )"
+  grep -qx "UNKNOWN pane=codex-b reason=classifier_unadmitted detail=no-launch-stamp" "$WORK/out.adm3c" \
+    && ok "T-CODEX-ADMIT/A3 a session-scoped decoy does not admit an unstamped pane" \
+    || bad "T-CODEX-ADMIT/A3 cell 3 (scope inheritance — reader must be show-options -p -qv): $(out_of adm3c)"
+  tmux set-option -u -t "$DS" @forge-codex-admission
+  unset -f adm_paint
+  tmux kill-session -t "$DS" 2>/dev/null
+else
+  echo "  (skip: tmux unavailable — T-CODEX-ADMIT)"
+fi
+
 echo "── ACM §V: render surfaces ──"
 AV="$WORK/acmView"; mkdir -p "$AV/.dev/forge-tmp"
 _resolve_project_root(){ printf '%s' "$AV"; }
@@ -3679,6 +3794,14 @@ PY
     && ok "$id fails at the named replica" || bad "$id rc=$rc: $out"
   rm -rf "$d"
 }
+# The unperturbed tree must pass CLEAN. `alias-self-test` otherwise appears in this suite
+# only on PERTURBED replicas asserting rc!=0, so nothing proves the real binaries pass — and
+# bin/forge-start runs it at every session start on every root. `skipped=none` is load-bearing
+# on its own: a guard that silently SKIPs because a sibling path resolved wrong would pass.
+out=$("$ROOT/bin/forge-bridge" alias-self-test --strict 2>&1); rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'skipped=none'; } \
+  && ok "alias-self-test passes clean on the real tree" \
+  || bad "alias-self-test rc=$rc: $out"
 alias_negative N-NTI nti "NAME_TO_IDX: 'claude-opus'"
 alias_negative N-BIJ bij "has no pane_name() row"
 alias_negative N-HEALTH health "cmd_health specs: 'codex-a'"
@@ -3689,7 +3812,7 @@ alias_negative N-TRANS trans "map#"
 # self-test treats a missing sibling as SKIPPED, so bin/forge's ORCH_PANE_INDEX would go
 # unproven. N-ORCH is split per sibling because the plan calls the pairing non-negotiable
 # and one perturbation cannot prove the other file is being read.
-for _case in orch orch-forge wl lit stamps; do
+for _case in orch orch-forge wl lit stamps admstamp; do
   _d="$(mktemp -d)"; cp "$ROOT/bin/forge" "$ROOT/bin/forge-"* "$_d/" 2>/dev/null || true
   case "$_case" in
     orch) perl -pi -e "s/ORCH_PANE_INDEX = '0'/ORCH_PANE_INDEX = '9'/" "$_d/forge-cc-hook"; _needle='forge-cc-hook: ORCH_PANE_INDEX=9' ;;
@@ -3697,12 +3820,20 @@ for _case in orch orch-forge wl lit stamps; do
     wl) perl -pi -e 's/case "\$idx" in 1\|2\|3\|4\)/case "\$idx" in 1\|2\|4\)/' "$_d/forge-bridge"; _needle='worker whitelist' ;;
     lit) printf '\n# fixture raw target: $WINDOW.1\n' >> "$_d/forge-bridge"; _needle='raw pane target' ;;
     stamps) perl -ni -e 'print unless /\@forge-worker/' "$_d/forge-start"; _needle='forge-start pane stamps' ;;
+    # Defense D2 (issue #39). The producer is the one component of the admission chain no
+    # test can execute — there is no codex binary in this suite and cmd_codex_launch ends in
+    # exec — so a rename or relocation of the stamp write would leave every suite green
+    # while every codex pane silently returned to classifier_unadmitted: #39's failure shape
+    # in mirror image. RENAME rather than delete: deleting the lines would leave `if`/`elif`
+    # bodies empty and the replica would fail bash syntax instead of the guard.
+    admstamp) perl -pi -e 's/\@forge-codex-admission/\@forge-worker-bogus/g' "$_d/forge"; _needle='forge never writes it' ;;
   esac
   # Anti-no-op: the perturbation must have actually changed the sibling it names.
   case "$_case" in
     orch) grep -q "ORCH_PANE_INDEX = '9'" "$_d/forge-cc-hook" || bad "N-orch fixture did not perturb forge-cc-hook" ;;
     orch-forge) grep -q "ORCH_PANE_INDEX = '9'" "$_d/forge" || bad "N-orch-forge fixture did not perturb forge" ;;
     stamps) grep -q '@forge-worker' "$_d/forge-start" && bad "N-stamps fixture left stamps in forge-start" ;;
+    admstamp) grep -q '@forge-codex-admission' "$_d/forge" && bad "N-admstamp fixture left the stamp in forge" ;;
   esac
   _out=$("$_d/forge-bridge" alias-self-test --strict 2>&1); _rc=$?
   { [ "$_rc" -ne 0 ] && printf '%s\n' "$_out" | grep -qF "$_needle"; } \

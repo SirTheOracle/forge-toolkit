@@ -40,16 +40,23 @@
    "name": "unknown-version",
    "version": "0.0.0",
    "locale": "en-US",
-   "match": false,
-   "blocked": "classifier_unsupported",
+   "match": true,
    "text": "Would you like to run the following command?\n\n  npm test\n\n› 1. Yes, proceed\n  2. No, and tell Codex what to do differently"
   },
   {
    "name": "unknown-locale",
    "version": "0.145.0",
    "locale": "fr-FR",
+   "match": true,
+   "text": "Would you like to run the following command?\n\n  npm test\n\n› 1. Yes, proceed\n  2. No, and tell Codex what to do differently"
+  },
+  {
+   "name": "unadmitted",
+   "version": "0.149.1",
+   "locale": "en-US",
+   "admitted": false,
    "match": false,
-   "blocked": "classifier_unsupported",
+   "blocked": "classifier_unadmitted",
    "text": "Would you like to run the following command?\n\n  npm test\n\n› 1. Yes, proceed\n  2. No, and tell Codex what to do differently"
   }
  ]

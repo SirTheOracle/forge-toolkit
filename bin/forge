@@ -3079,6 +3079,22 @@ cmd_codex_launch() {
         echo "$ready" >&2
         return 3
     }
+    # Stamp the admission verdict on this pane so the stall-check classifier can gate on
+    # the *verdict* rather than on version-allowlist membership. Gating the classifier on
+    # the allowlist made every upstream release a silent classifier outage (issue #39), and
+    # a version string is not a containment property — containment is MEASURED here, and
+    # $ready already holds the result, so there is no second doctor run. The ambient pane
+    # ($TMUX_PANE) cannot disagree with the pane this code is running in. Best-effort: a
+    # tmux failure must never block a launch, and its only consequence is that the
+    # classifier keeps refusing, which is today's behaviour.
+    local _adm_by="recorded-version" _adm_tok
+    if echo "$ready" | grep -q '^version_admitted_by=containment-probe$'; then _adm_by="containment-probe"; fi
+    _adm_tok="schema=1 admitted=1 by=$_adm_by version=$(echo "$ready" | sed -n 's/^codex_version=//p') policy=$(echo "$ready" | sed -n 's/^unknown_version_policy=//p')"
+    if [ -n "${TMUX_PANE:-}" ]; then
+        tmux set-option -p @forge-codex-admission "$_adm_tok" >/dev/null 2>&1 || true
+    elif [ -n "$session" ] && [ -n "$pane" ]; then
+        tmux set-option -p -t "$session:.$pane" @forge-codex-admission "$_adm_tok" >/dev/null 2>&1 || true
+    fi
     # The broker records the real Codex PID/argv immediately before it opens a
     # delivery. A pre-exec shell manifest would attest the wrong process.
     exec "$bin" -C "$root" --strict-config --sandbox workspace-write --ask-for-approval never \

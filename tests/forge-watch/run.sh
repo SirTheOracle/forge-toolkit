@@ -2817,11 +2817,20 @@ after=$(find "$R/.dev" -type f | sort | xargs shasum -a 256 2>/dev/null | shasum
 echo "── Codex approval fixture contract ──"
 python3 - "$TOOLKIT_ROOT/config/idle-prompts.yml" "$TOOLKIT_ROOT/tests/forge-watch/fixtures/codex-approval-prompts.json" <<'PY' && ok "all classifier fixtures" || bad "classifier fixture mismatch"
 import json,re,sys,yaml
+# NOTE: this block is a SPECIFICATION MIRROR with no executable coupling to
+# bin/forge-bridge — it encodes the contract in python instead of invoking the
+# classifier, so it CANNOT detect a divergence between this spec and what the
+# classifier actually does. It exists so this suite does not go red. It is NOT
+# coverage for the admission fix; that is T-CODEX-ADMIT in tests/forge-bridge/run.sh,
+# which drives real tmux and the real show-options reader end to end. Do not read a
+# green here as proof the classifier behaves this way.
+# Contract (issue #39): a codex pane matches iff it is ADMITTED — the verdict its launch
+# stamped on the pane as @forge-codex-admission — independent of version and locale.
 cfg=yaml.safe_load(open(sys.argv[1])); cases=json.load(open(sys.argv[2]))['cases']
 ansi=re.compile(r'\x1b\[[0-9;]*[A-Za-z]'); rx=re.compile(cfg['codex-a']['approval_prompt'])
 for c in cases:
- supported=c['version'] in cfg['supported']['codex_versions'] and c['locale'] in cfg['supported']['locales']
- got=supported and bool(rx.search(ansi.sub('',c['text'])))
+ admitted=c.get('admitted',True)
+ got=admitted and bool(rx.search(ansi.sub('',c['text'])))
  assert got is c['match'],(c['name'],got)
 PY
 WATCH_SOURCE_AFTER="$(shasum -a 256 "$WATCH" | awk '{print $1}')"
