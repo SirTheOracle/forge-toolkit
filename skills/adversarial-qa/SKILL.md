@@ -1,3 +1,14 @@
+---
+name: adversarial-qa
+description: Adversarial QA framework using Claude Code Agent Teams. Two isolated QA
+  testers independently test the running application from different angles with zero
+  knowledge of each other, then a QA Synthesizer cross-verifies their findings,
+  deduplicates issues, and produces a ranked issues report plus a test plan for missing
+  coverage. Catches what unit tests miss - UI regressions, broken page loads,
+  cross-stage interactions, API contract violations, integration failures. Trigger as
+  the QA stage of a build pipeline, after implementation is committed.
+---
+
 # Adversarial QA Framework
 
 ## Overview

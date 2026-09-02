@@ -1,3 +1,13 @@
+---
+name: adversarial-verify
+description: Single-agent verification skill that re-runs all tests and screenshots from
+  a QA manifest, performs pixel-diff comparisons against baselines, and produces a
+  structured verification report. This is the feedback loop that confirms fixes actually
+  work and catches regressions. Trigger after adversarial-qa produced a manifest.yaml
+  and the issues it found have been fixed, or as the verify step of an automated
+  qa -> fix -> verify loop.
+---
+
 # Adversarial Verify
 
 ## Overview
