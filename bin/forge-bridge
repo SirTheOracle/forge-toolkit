@@ -7689,8 +7689,21 @@ cmd_stall_check() {
     now=$(date +%s)
 
     # Run the classifier. Outputs: STATE: <line> [\n SIGNAL: <payload>].
+    # Admission-verdict transport for codex panes (issue #39). The reader MUST be
+    # `show-options -p … -qv`. Measured on tmux 3.6a: with the pane option unset, a
+    # format lookup of this option (the `#{@<opt>}` form, and equally the `#{E:@<opt>}`
+    # expand form) returns a session-scoped or global value, while `show-options -p -qv`
+    # returns empty. cmd_alias_self_test statically bans the lookup form for this reason,
+    # so do not write it out here even in prose — the ban is a text scan, deliberately.
+    # Since the stamp is the sole gate on codex classification, that inheritance would turn
+    # a fail-closed gate into a fail-open one. Assigned UNCONDITIONALLY, including the empty
+    # case, so an ambient export can never reach the classifier.
+    local adm=""
+    case "$canonical" in
+        codex-*) adm=$(tmux show-options -p -t "$SESSION:$WINDOW.$idx" -qv @forge-codex-admission 2>/dev/null) ;;
+    esac
     local out
-    out=$(python3 - "$raw_file" "$cache_file" "$last_check_file" "$pending" \
+    out=$(FORGE_CODEX_ADMISSION="$adm" python3 - "$raw_file" "$cache_file" "$last_check_file" "$pending" \
         "$threshold" "$now" "$canonical" "$FORGE_IDLE_PROMPTS_FILE" \
         "$SUMMARY_LOG" "$project_root" <<'PYEOF'
 import sys, os, re, hashlib, yaml
@@ -7813,14 +7826,20 @@ def touch_last_check():
     with open(last_check_file, 'w') as f:
         f.write(str(now))
 
-def emit(state, extra="", signal_payload=None):
+def emit(state, extra="", signal_payload=None, cover=True):
     line = f"{state} pane={canonical}"
     if extra:
         line += f" {extra}"
     print(f"STATE: {line}")
     if signal_payload:
         print(f"SIGNAL: {signal_payload}")
-    touch_last_check()
+    # cover=False marks an emission that did NOT classify the pane. Refreshing
+    # .last-stall-check there lets the refusal certify its own coverage to
+    # cmd_stall_check_status (which derives age from this file alone and never
+    # inspects the state word) — the mechanism that kept issue #39 silent for a
+    # month. The unadmitted branch below is the ONLY call site that passes it.
+    if cover:
+        touch_last_check()
 
 def make_payload(state, **kv):
     parts = [f"{state} pane={canonical}"]
@@ -7830,14 +7849,27 @@ def make_payload(state, **kv):
         parts.append(f"{k}={v}")
     return " ".join(parts)
 
-# 1. PROMPTING — before any threshold. Unknown version/locale is not classified.
-supported = prompts.get('supported') or {}
-runtime_version = os.environ.get('FORGE_CODEX_VERSION', '')
-runtime_locale = os.environ.get('FORGE_CODEX_LOCALE', 'en-US')
-if canonical.startswith('codex-') and (runtime_version not in (supported.get('codex_versions') or []) or
-                                       runtime_locale not in (supported.get('locales') or [])):
-    emit('UNKNOWN', f'reason=classifier_unsupported version={runtime_version or "unknown"} locale={runtime_locale}')
-    sys.exit(0)
+# 1. PROMPTING — before any threshold. A codex pane is classified only when its launch
+# stamped a positive admission verdict on the pane (@forge-codex-admission, written by
+# `forge codex-launch` from the MEASURED containment probe). Version membership is NOT a
+# gate: `supported.codex_versions` is an advisory record of reviewed versions, and gating
+# the classifier on it made every upstream release a silent classifier outage (issue #39).
+# Fails closed — absent, malformed or negative verdict refuses — and the refusal passes
+# cover=False so it does not certify its own coverage.
+admission = os.environ.get('FORGE_CODEX_ADMISSION', '').strip()
+if canonical.startswith('codex-'):
+    fields = dict(kv.split('=', 1) for kv in admission.split() if '=' in kv)
+    if not admission:
+        detail = 'no-launch-stamp'
+    elif 'schema' not in fields or 'admitted' not in fields:
+        detail = 'malformed-stamp'
+    elif fields.get('admitted') != '1':
+        detail = 'not-admitted'
+    else:
+        detail = ''
+    if detail:
+        emit('UNKNOWN', f'reason=classifier_unadmitted detail={detail}', cover=False)
+        sys.exit(0)
 if prompting_re and prompting_re.search(normalized):
     excerpt = ""
     for line in normalized.splitlines()[::-1]:
@@ -8233,6 +8265,46 @@ if start_src is not None:
         problems.append(f"forge-start pane stamps={stamps} expected={m_name}")
     elif not stamps_active:
         skipped.append('forge-start-pane-stamps')
+
+# @forge-codex-admission producer/consumer pairing. bin/forge writes the stamp at
+# codex-launch; bin/forge-bridge's classifier is its only reader. Nothing else in this repo
+# detects a broken cross-file variable pairing, and an ORPHANED READER of exactly this shape
+# is what issue #39 was — it shipped, no test noticed for a month, and every codex pane went
+# dark. `bindir` keeps both sides in the same tree, so the XOR can never compare a new
+# consumer against an old producer across checkouts. Neither side present -> PASS: every
+# checkout predating the fix has neither, and bin/forge-start runs this guard at every
+# session start on every root.
+forge_path = os.path.join(bindir, 'forge')
+try:
+    forge_src = open(forge_path).read()
+except OSError:
+    forge_src = None
+    skipped.append('forge-codex-admission')
+if forge_src is not None:
+    # The option name is ASSEMBLED, never written contiguously: this guard scans its own
+    # file, so a literal here would make every pattern below match the guard's own source
+    # and the consumer assertion would be permanently, silently satisfied. (Measured: it
+    # was, before this line.)
+    _adm_opt = re.escape('@forge-codex' + '-admission')
+    # The producer stamps the AMBIENT pane, so the regex must NOT require -t.
+    _adm_prod = bool(re.search(r'set-option -p[^\n]*' + _adm_opt, forge_src))
+    # -p is the scope property and is sufficient (measured on tmux 3.6a: `show-options -p -A
+    # -qv` also returns empty against a session-scoped value). -qv is deliberately NOT
+    # required: a missing flag fails loudly, not silently, so it is not a safety property.
+    _adm_cons = bool(re.search(r'show-options -p[^\n]*' + _adm_opt, src))
+    _adm_name = '@forge-codex' + '-admission'
+    if _adm_prod and not _adm_cons:
+        problems.append(f"{_adm_name}: forge writes the stamp, forge-bridge never reads it")
+    elif _adm_cons and not _adm_prod:
+        problems.append(f"{_adm_name}: forge-bridge reads the stamp, forge never writes it")
+    # Forbidden form, the safety property: a format lookup inherits SESSION and GLOBAL scope
+    # and would admit a pane that was never launched — a fail-open gate. Match the family,
+    # not a bare literal: the `#{E:...}` expand form evades a literal ban identically (both
+    # measured on tmux 3.6a).
+    for _adm_file, _adm_text in (('forge', forge_src), ('forge-bridge', src)):
+        if re.search(r'#\{[^}]*' + _adm_opt, _adm_text):
+            problems.append(
+                f"{_adm_file}: {_adm_name} format lookup (scope-inheriting, fail-open)")
 
 # swiftbar-stage-visibility: forge-watch carries a map for its pane→stage join.
 watch_path = os.path.join(bindir, 'forge-watch')

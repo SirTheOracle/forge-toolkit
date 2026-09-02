@@ -10,7 +10,11 @@ validation target resolved relative to the project root, not ownership.
 
 ## Contain launch
 
-The supported interactive binary is `/opt/homebrew/bin/codex` 0.148.0. Forge
+The interactive binary is the one recorded in `config/codex-forge-runtime.json`
+(`codex.binary`); admission is by MEASURED containment — `forge codex-doctor` — not by
+version. `codex.supported_interactive_versions` is an advisory record of reviewed
+versions, and an unrecorded version is admitted when every containment check passes
+(`codex.unknown_version_policy=probe`). Forge
 passes `-C <physical root> --strict-config --sandbox workspace-write
 --ask-for-approval never -c sandbox_workspace_write.network_access=false -c
 sandbox_workspace_write.writable_roots=[]`. Named doctor fields must report
