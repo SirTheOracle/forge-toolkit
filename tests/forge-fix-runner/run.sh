@@ -198,4 +198,63 @@ fi
 [ ! -f "$G/a" ] && ok "T-V1-WORKTREE bucket A's file did not leak into bucket B's worktree" \
                || bad "T-V1-WORKTREE bucket A's file leaked into bucket B"
 
+echo "== 5. Effort proportionality (#37) — four rules, two SKILL copies =="
+# WHY: nothing kept pipeline effort proportional to the fix. Measured twice (#34:
+# 4 files of prose across ~8h; #39: 265 worker-min for 123 lines, 54% of it spent
+# BEFORE any code). The four rules below are the whole fix, and each of them is
+# prose with no other guard — so assert the prose.
+#
+# Every assertion runs over WHITESPACE-NORMALISED text (the T-C1-ESTIMATE
+# precedent above): these are markdown paragraphs that soft-wrap mid-sentence, so
+# a per-line grep would assert where the line break fell, not what the SKILL says.
+ORCH="$ROOT/skills/forge-orchestrator/SKILL.md"
+flatten(){ tr '\n' ' ' < "$1" | tr -s ' '; }
+RN_FLAT="$WORK/runner.flat"; ON_FLAT="$WORK/orch.flat"
+flatten "$RUNNER" > "$RN_FLAT"; flatten "$ORCH" > "$ON_FLAT"
+
+# C1 — the re-tier checkpoint is mandatory, journalled, and present in BOTH
+# routing SKILLs (this assertion IS the lockstep check for C1).
+retier=1
+for f in "$RN_FLAT" "$ON_FLAT"; do
+  grep -qF 'TIER-CONFIRMED full: <reason>'      "$f" || retier=0
+  grep -qF 'TIER-REDUCED full -> quick: <reason>' "$f" || retier=0
+  grep -qF 'MANDATORY'                          "$f" || retier=0
+  grep -qF 'is not a reason to stay full'       "$f" || retier=0
+done
+[ "$retier" = 1 ] \
+  && ok "T-37-RETIER both routing SKILLs mandate the post-diagnosis re-tier checkpoint" \
+  || bad "T-37-RETIER the post-diagnosis re-tier checkpoint is missing/advisory in one or both SKILLs"
+
+# C2 — quick tier must not read as orchestrator-local. Positive + both retired
+# spellings, because the misroute on #34 came from the frontmatter AND the body.
+if grep -qF 'DISPATCHED to a worker pane' "$RN_FLAT" \
+   && ! grep -qF 'inside forge via a single pane' "$RN_FLAT" \
+   && ! grep -qF 'single-pane fix-code' "$RN_FLAT"; then
+  ok "T-37-QUICK-LANE quick tier reads as dispatched, not orchestrator-local"
+else
+  bad "T-37-QUICK-LANE quick tier still reads as orchestrator-local (or lost the dispatch statement)"
+fi
+
+# C3 — the budget is on the expensive PRE-CODE stages, in BOTH SKILLs (lockstep),
+# and the runner states outright that bounding the review loop is not enough.
+budget=1
+for f in "$RN_FLAT" "$ON_FLAT"; do
+  grep -qF 'effort_budget'                                       "$f" || budget=0
+  grep -qF '`fix-investigate`, `fix-plan` and `fix-plan-revise`' "$f" || budget=0
+  grep -qF 'outgrown its diagnosis'                              "$f" || budget=0
+done
+grep -qF 'does NOT satisfy this' "$RN_FLAT" || budget=0
+[ "$budget" = 1 ] \
+  && ok "T-37-BUDGET both SKILLs budget the pre-code stages and flag scope growth" \
+  || bad "T-37-BUDGET the pre-code effort budget or the scope-growth signal is missing"
+
+# C4 — a suspected regression is confirmed cheaply before a corrective dispatch.
+if grep -qF '3x on the fix branch AND at least 3x on the unmodified base' "$RN_FLAT" \
+   && grep -qF 'IDENTITY' "$RN_FLAT" \
+   && grep -qF 'never failure **counts**' "$RN_FLAT"; then
+  ok "T-37-FLAKE a suspected regression needs 3x/3x identity confirmation first"
+else
+  bad "T-37-FLAKE the cheap regression confirmation rule is missing"
+fi
+
 printf '\nPASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"; [ "$FAIL" = 0 ]

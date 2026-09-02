@@ -243,6 +243,31 @@ their condition fires:
 - `fix-scout`, `fix-investigate-solo`, `fix-plan-solo` are legal helper stages
   but are NOT part of the autonomous sequence.
 
+**Re-tier checkpoint — MANDATORY, between `fix-investigate` and `fix-plan`.**
+When `fix-investigate` returns, the pipeline does NOT auto-advance. Re-evaluate
+the tier against `diagnosis.md` first and record the outcome in the forge log:
+`TIER-CONFIRMED full: <reason>` or `TIER-REDUCED full -> quick: <reason>`. The
+tier was chosen at scout time, before any evidence existed, so it is provisional
+by definition. Full tier may continue ONLY when the diagnosis shows something the
+quick tier cannot carry: a genuinely open design decision, a multi-file blast
+radius, or an unresolved contradiction. **"The diagnosis was thorough" is not a
+reason to stay full.** A `TIER-REDUCED` outcome halts the autonomous sequence and
+surfaces to the user — what remains is a quick-tier `fix-code` against the
+diagnosis already on disk, not `fix-plan` → `fix-plan-review`.
+
+**Effort budget — it bounds the pre-code stages, not the review loop.** The
+packet (`problem-statement.md`) carries an `effort_budget`: an expected
+worker-stage count and an expected production-file count, derived from the
+evidence. It governs `fix-investigate`, `fix-plan` and `fix-plan-revise` — 132 of
+#39's 265 worker-minutes went to those three stages under no budget at all, while
+the `fix-plan-review` ↔ `fix-plan-revise` cap below held the whole time and saved
+nothing. Before dispatching a pre-code stage, compare the worker stages spent so
+far against `effort_budget.worker_stages`; a stage that would take the run past
+its budget is **not dispatched** — halt and surface both counts to the user. The
+same applies when `fix-plan.md` names more production files than the diagnosis
+implicates: the plan has **outgrown its diagnosis**, and that surfaces rather
+than advancing.
+
 **Every fix stage is dispatched to a worker pane. There are no local fix
 stages.** Fix stages are HIGH-reasoning work and route to the HIGH panes — the
 claude-opus worker (pane 1) or the codex-a worker (pane 3) — via

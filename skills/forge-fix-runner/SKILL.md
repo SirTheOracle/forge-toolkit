@@ -4,7 +4,7 @@ description: >
   Drain the GitHub `forge-fix` issue queue through the forge fix pipeline, one
   service at a time. Tallies actionable issues worst-first, scouts a service into
   a routing plan (clusters + quick/full tiers), gets human approval, then dispatches
-  fixes (quick = single-pane fix-code; full = forge-pipeline), gating every
+  fixes (quick = dispatched fix-code; full = forge-pipeline), gating every
   `Closes #N` on per-issue verification. Trigger when the user wants to fix
   triaged QA issues, "work the forge-fix queue", or "run the fix runner".
 ---
@@ -190,7 +190,7 @@ by `packet-check`), verbatim issue bodies after:
     base_branch · base_sha
     covered_issue_numbers · covered_coded_ids · current_labels
     root_cause_hypothesis (NON-AUTHORITATIVE) · confidence · anchors
-    required_tests · infra_required · close_keywords · drop_conditions
+    required_tests · infra_required · effort_budget · close_keywords · drop_conditions
     verification_targets:   # ONE ROW PER COVERED ISSUE
       - issue · coded_id · symptom · check · evidence
     ---
@@ -222,6 +222,9 @@ base_sha:                # 40-hex sha of origin/<base_branch> at grouping time
 anchors:                 # symbol anchors (function/class names), never line numbers
 depends_on:              # [] — MUST be empty (see the grouping rules above)
 infra_required:          # derived (S6); absent => treat as true
+effort_budget:           # {worker_stages: N, production_files: M} — the PRE-CODE
+                         # budget (see "Effort budget" below). Derived from the
+                         # evidence, never from the tier; absent => refuse to deal.
 weight:                  # derived: TIER_BASE[tier] + len(covered_issue_numbers)
 queue:                   # S1|S2|S3 — operator-editable BEFORE approval only
 packet:                  # packets/<group_id>.md
@@ -395,7 +398,16 @@ of a dead session automatically. Then, before re-cutting anything:
 
 For each bucket, by tier:
 
-**quick** — bounded change, inside forge via a single pane:
+**quick** — bounded change; the coder stage is **DISPATCHED to a worker pane**:
+
+> **Quick tier is not orchestrator-local, and it never was.** It dispatches
+> `fix-code` to a worker pane exactly as the full tier does; what makes it
+> "quick" is the number of worker stages (one), never where they run. Nothing in
+> this tier executes in the runner's own pane. The retired wording "inside forge
+> via a single pane" read as orchestrator-local execution, disqualified the quick
+> tier on that basis, and directly caused the documented misroute on #34. Do not
+> reintroduce it.
+
 1. Write `.dev/proposals/<slug>/problem-statement.md` (verbatim covered-issue bodies +
    the scout hypothesis labeled *non-authoritative* + `required_tests` + the per-issue
    verification targets).
@@ -437,8 +449,39 @@ For each bucket, by tier:
 **full** — murky/risky/flow-breaking, the whole pipeline:
 1. Write `.dev/proposals/<slug>/problem-statement.md` (as above; scout hypothesis is
    routing metadata only — A/B investigators must validate independently, C reconciles).
-2. Run the forge pipeline for the slug (`forge-pipeline <slug>` in a forge session via
+2. **Re-tier checkpoint — MANDATORY, not advisory.** After `fix-investigate` returns
+   and BEFORE `fix-plan` is dispatched, read `diagnosis.md`, re-evaluate the tier
+   against it, and append exactly one line to `journal/<queue>.md`:
+   `TIER-CONFIRMED full: <reason>` or `TIER-REDUCED full -> quick: <reason>`.
+   The tier chosen at scout time is **provisional by definition** — it precedes the
+   evidence, so it is the one routing decision that must be re-made once evidence
+   exists. Full tier may continue ONLY when the diagnosis shows something the quick
+   tier cannot carry: a genuinely open design decision, a multi-file blast radius, or
+   an unresolved contradiction. **"The diagnosis was thorough" is not a reason to stay
+   full.** On `TIER-REDUCED`, stop the full pipeline and finish the bucket on the quick
+   tier, writing `fix-plan.md` from the diagnosis you already have.
+3. Run the forge pipeline for the slug (`forge-pipeline <slug>` in a forge session via
    the orchestrator). It produces diagnosis → plan → code → qa on branch `fix/<slug>`.
+
+> **Effort budget — it bounds the PRE-CODE stages, not the review loop.** Every packet
+> carries `effort_budget`: an expected worker-stage count and an expected
+> production-file count, both derived from the evidence. It governs
+> `fix-investigate`, `fix-plan` and `fix-plan-revise`, because that is where the time
+> actually goes — 132 of #39's 265 worker-minutes were spent in those three stages
+> under no budget of any kind. **Bounding only the `fix-plan-review` ↔
+> `fix-plan-revise` loop does NOT satisfy this**: #39 carried that bound, the bound
+> held, and the run still cost 4.4 hours.
+>
+> Before dispatching any pre-code stage, compare the run's worker-stage count so far
+> against `effort_budget.worker_stages`. A stage that would take the run past its
+> budget is **not dispatched**: STOP and surface to the operator with the numbers —
+> budgeted vs. actual worker stages, budgeted vs. actual production files.
+>
+> **Scope-growth signal.** When `fix-plan.md` names more production files than the
+> diagnosis implicates, the plan has **outgrown its diagnosis**. Surface that with the
+> two counts; never absorb it. On #34 a single sentence demanding executable proof
+> where a text assertion was called for grew the plan from four files to seventeen,
+> and nothing flagged it.
 
 ### 5. Per-issue verification (gates the PR) — UNDER THE INFRA LOCK
 
@@ -471,6 +514,20 @@ Build the verification report — one row per covered issue:
 `issue # | coded ID | symptom | check (command/manual) | result | evidence`.
 A cluster that resolves 6 of 7 covered issues closes only the 6; the 7th is dropped
 (see Cluster abort).
+
+**Cheap confirmation before a corrective round.** Before dispatching a corrective
+worker round for a *suspected regression*, re-run the failing test **at least 3x on
+the fix branch AND at least 3x on the unmodified base**, and compare failure
+**IDENTITY** — which test, which assertion — never failure **counts**. A single run of
+each tree cannot distinguish a regression from a flake. Record all six runs (command,
+tree, failure IDs) in `journal/<queue>.md`. Only a failure present on the fix branch
+and absent from the base, by identity, across those runs justifies a corrective
+dispatch.
+
+Measured, not hypothetical: on #39 one regression call inferred from a single run of
+each tree triggered a 48-minute corrective `fix-code` round that produced no code, and
+a rising pass count (401→410 while failures went 4→5) hid the discrepancy from a
+totals comparison. The 3x re-run would have cost about six minutes.
 
 ### 6. Open the PR (you/runner own this — not the worker)
 One PR per group, from `fix/<slug>` to the default branch. The body ends with
