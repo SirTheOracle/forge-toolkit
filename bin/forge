@@ -1307,8 +1307,29 @@ cmd_worktree() {
     src="$(git -C "$from" rev-parse --show-toplevel 2>/dev/null)" \
         || { echo "forge worktree: --from is not a Git worktree: $from" >&2; return 2; }
     src="$(cd "$src" && pwd -P)"
+    # The old text here said "Run 'forge register' there first" — but
+    # cmd_register never creates this file, so following the advice left the
+    # operator exactly where they started. Print the steps that actually work.
     [ -f "$src/.claude/forge-project.yml" ] || {
-        echo "forge worktree: forge-bridge requires .claude/forge-project.yml; the source root does not have one. Run 'forge register' there first, or use 'forge-start --here'." >&2
+        local _example; _example="$(_toolkit_root)/config/forge-project.example.yml"
+        [ -f "$_example" ] || _example="$HOME/.claude/forge-toolkit/config/forge-project.example.yml"
+        {
+        echo "forge worktree: $src has no .claude/forge-project.yml, which forge-bridge requires."
+        echo "       Create one — the worktree defaults (parent $(dirname "$src"), prefix $(basename "$src"),"
+        echo "       branch forge/<session>) already resolve for this root, so a minimal file is enough:"
+        echo
+        echo "         mkdir -p '$src/.claude'"
+        echo "         printf 'project:\\n  name: \"%s\"\\n' '$(basename "$src")' > '$src/.claude/forge-project.yml'"
+        echo
+        echo "       For the full set of options (services, ports, test commands, worktree seed paths):"
+        echo "         cp '$_example' '$src/.claude/forge-project.yml'"
+        echo
+        echo "       Then register the root, which installs hooks and watch-roots but does NOT"
+        echo "       create the file above:"
+        echo "         forge register '$src'"
+        echo
+        echo "       Or skip the worktree entirely and run in this root: forge-start --here"
+        } >&2
         return 2
     }
     # The .dev/ ignore precondition used to live here. It refused before the

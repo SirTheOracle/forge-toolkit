@@ -371,4 +371,23 @@ grep -q "fix/some-real-work" "$WORK/reatt.err" \
 repo reattf; mkdir -p "$PARENT/proj-s1"; : > "$PARENT/proj-s1/stray"
 ensure s1 --print-path >/dev/null 2>"$WORK/reattf.err" && bad 'T-DEV-REATTACH adopted a foreign directory' || ok 'T-DEV-REATTACH still refuses an unregistered path'
 
+# T-DEV-NOCONFIG: the missing-config refusal must print instructions that WORK.
+# The old text said "Run 'forge register' there first" — but cmd_register never
+# creates .claude/forge-project.yml, so the advice returned the operator to the
+# same error. A refusal that names a remedy owns that remedy being real.
+repo noconf; rm -f "$SRC/.claude/forge-project.yml"
+ensure s1 --print-path >/dev/null 2>"$WORK/noconf.err"; rc=$?
+[ "$rc" = 2 ] && ok 'T-DEV-NOCONFIG refuses without a project config' || bad "T-DEV-NOCONFIG rc=$rc"
+grep -q "Run 'forge register' there first" "$WORK/noconf.err" \
+  && bad 'T-DEV-NOCONFIG still advises the register-only remedy that does not create the file' \
+  || ok 'T-DEV-NOCONFIG no longer advises a remedy that cannot work'
+grep -q 'forge-project.yml' "$WORK/noconf.err" && grep -q 'mkdir -p' "$WORK/noconf.err" \
+  && ok 'T-DEV-NOCONFIG names the file and shows how to create it' || bad 'T-DEV-NOCONFIG lacks actionable steps'
+grep -q 'does NOT' "$WORK/noconf.err" \
+  && ok 'T-DEV-NOCONFIG states that register will not create it' || bad 'T-DEV-NOCONFIG omits the register caveat'
+# The remedy it prints must actually clear the refusal.
+mkdir -p "$SRC/.claude"; printf 'project:\n  name: "t"\n' > "$SRC/.claude/forge-project.yml"
+out=$(ensure s1 --print-path 2>"$WORK/noconf2.err")
+{ [ -n "$out" ] && [ -d "$out" ]; } && ok 'T-DEV-NOCONFIG the printed minimal config unblocks provisioning' || bad "T-DEV-NOCONFIG remedy failed: $(cat "$WORK/noconf2.err")"
+
 printf '\nPASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"; [ "$FAIL" = 0 ]
