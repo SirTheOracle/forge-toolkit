@@ -11,3 +11,22 @@ services:
     working_dir: "."
 database:
   migration_system: none
+# evidence-gated-completion. Every key is OPTIONAL and every default reproduces shipped
+# behavior, so an absent block is indistinguishable from today.
+#   coding_stages            stages whose coder-report and commit claims are graded
+#   net_timeout_s            ceiling for gh calls (both `auth status` and `pr list`)
+#   probe_timeout_s          ceiling for every git probe
+#   validation_failed_blocks whether a VALIDATION_FAILED report contradicts a DONE.
+#                            Default false: skills/forge-coder/SKILL.md declares those
+#                            failures non-blocking BY DESIGN, and reversing a documented
+#                            policy must be a deliberate operator decision.
+# NO key exists for `live` or for a bridge-side test re-run. Both are documented in the
+# technical reference as future extension points only: no machine check exists for `live`, and
+# the bridge owns neither venv nor direnv activation (testing.backend.activate_venv is a
+# string the CODER SKILL interpolates into a worker shell) — plus this repo's own suite
+# creates tmux sessions, a re-entrancy hazard from a bridge subprocess.
+evidence:
+  coding_stages: [coding]
+  net_timeout_s: 8
+  probe_timeout_s: 5
+  validation_failed_blocks: false

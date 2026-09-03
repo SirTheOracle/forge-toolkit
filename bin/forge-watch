@@ -1221,19 +1221,46 @@ def _handle_event_line(root, label, line):
         add_finding('WORKER-STALL-EVENT', root, f"{slug}\t{stage}\t{st}", msg,
                     slug=slug, stage=stage)
     elif typ == 'COMPLETE' and NOTIFY_COMPLETE:
-        q = fields.get('qualifier')
-        if q == 'incomplete':
+        # evidence-gated-completion Step 7.3: `qualifier` is a COMMA-JOINED TOKEN SET, so
+        # these are MEMBERSHIP tests, not equality compares. The old `q == '...'` form was the
+        # F10 defect: any multi-token value fell through the green `else`, and because
+        # add_finding keys on (root, condition, key) that green PIPELINE-COMPLETE could NOT
+        # dedup against the context path's PIPELINE-COMPLETE-QUALIFIED (F16) — the board would
+        # carry a green completion AND a qualified one for the same slug at once.
+        qset = {t for t in (fields.get('qualifier') or '').split(',') if t}
+        dtail = _delivery_suffix(fields.get('delivery'), fields.get('branch'))
+        if 'incomplete' in qset:
             pk = fields.get('parked', '0'); bl = fields.get('blocked', '0')
-            msg = f"{label} · {slug} — complete — {pk} parked, {bl} blocked (incomplete)"
-        elif q == 'hygiene-disabled':
-            wd = fields.get('workers_dirty', '?')
-            add_finding('PIPELINE-COMPLETE-QUALIFIED', root, slug,
-                        f"{label} · {slug} — shipped, workers left dirty ({wd}) — hygiene-disabled",
-                        policy='once', slug=slug)
+            msg = f"{label} · {slug} — complete — {pk} parked, {bl} blocked (incomplete){dtail}"
+        elif qset:
+            # EVENT path: workers_dirty exists here, so keep today's '?' fallback and today's
+            # parenthetical. (The context path has no such field — see the contract
+            # in _qualifier_reason.)
+            f = add_finding('PIPELINE-COMPLETE-QUALIFIED', root, slug,
+                            f"{label} · {slug} — {_qualifier_reason(qset, fields.get('workers_dirty', '?'))}{dtail}",
+                            policy='once', slug=slug)
+            for _k in ('delivery', 'merge_state', 'branch'):
+                if fields.get(_k):
+                    f[_k] = fields[_k]
             return
         else:
-            msg = f"{label} · {slug} — pipeline COMPLETE"
-        add_finding('PIPELINE-COMPLETE', root, slug, msg, policy='once', slug=slug)
+            msg = f"{label} · {slug} — pipeline COMPLETE{dtail}"
+        f = add_finding('PIPELINE-COMPLETE', root, slug, msg, policy='once', slug=slug)
+        for _k in ('delivery', 'merge_state', 'branch'):
+            if fields.get(_k):
+                f[_k] = fields[_k]
+    elif typ == 'EVIDENCE':
+        # evidence-gated-completion Step 11.4. Sourced from the bridge's own EVIDENCE line;
+        # `EVIDENCE` is NOT on cmd_emit's whitelist, so a protocol-following worker cannot
+        # forge one. policy='daily' matches ZOMBIE-ACTIVE's cadence for a standing condition.
+        if fields.get('verdict') == 'contradicted':
+            f = add_finding('EVIDENCE-CONTRADICTED', root, f"{slug}\t{stage}",
+                            f"{label} · {slug} — evidence contradicts the {stage} completion "
+                            f"(delivery {fields.get('delivery', '?')})",
+                            policy='daily', slug=slug, stage=stage)
+            for _k in ('delivery', 'merge_state', 'branch'):
+                if fields.get(_k):
+                    f[_k] = fields[_k]
     elif typ == 'RESET_UNAVAILABLE':
         add_finding('RESET-UNAVAILABLE', root, slug,
                     f"{label} · {slug} — reset unavailable ({fields.get('family', '?')}) — actionable",
@@ -1242,6 +1269,52 @@ def _handle_event_line(root, label, line):
         add_finding('CLEANUP-ABANDONED', root, slug,
                     f"{label} · {slug} — cleanup abandoned ({fields.get('reason', '?')}) — workers unproven, NOT complete",
                     policy='once', slug=slug)
+
+def _qualifier_reason(qset, workers_dirty=None):
+    """evidence-gated-completion Step 7.4. Render a qualifier TOKEN SET as prose.
+
+    The context path used to hardcode "shipped, workers left dirty — hygiene-disabled" off
+    `next_stage == 'complete-qualified'`, so an evidence-acknowledged completion rendered a
+    factually FALSE reason. Order is stable so the message is deterministic.
+
+    BYTE-COMPATIBILITY CONTRACT — do not reword without updating BOTH:
+        tests/forge-watch/run.sh  needs "<slug> — shipped, workers left dirty"  (event path)
+        tests/forge-watch/run.sh  needs "<slug> — shipped, workers left dirty"  (context path)
+
+    THE TWO SHIPPED STRINGS DIFFER AND BOTH MUST BE REPRODUCED EXACTLY:
+        EVENT path   has workers_dirty and renders it in parentheses
+        CONTEXT path does NOT — forge-context.*.yml carries no such field — and
+                                 renders NO parenthetical at all.
+    Passing workers_dirty=None reproduces the context string verbatim. DO NOT give this
+    parameter a '?' default: a substring-match grep would still pass, while the operator's
+    board silently grows a bare "(?)" it never had.
+    """
+    wd = f" ({workers_dirty})" if workers_dirty else ""
+    parts = []
+    if 'hygiene-disabled' in qset:
+        parts.append(f"workers left dirty{wd} — hygiene-disabled")
+    if 'evidence-acknowledged' in qset:
+        parts.append("evidence contradiction acknowledged by the operator")
+    parts += sorted(qset - {'hygiene-disabled', 'evidence-acknowledged', 'incomplete'})
+    if not parts:                       # pre-token-set context: today's wording, verbatim
+        parts.append(f"workers left dirty{wd} — hygiene-disabled")
+    return "shipped, " + "; ".join(parts)
+
+
+def _delivery_suffix(delivery, branch=None):
+    """evidence-gated-completion Step 11.2. Append WHERE THE CODE LIVES to a completion
+    message. Absent delivery => empty string, so a legacy COMPLETE line renders
+    byte-identically to today."""
+    if not delivery:
+        return ''
+    if delivery == 'merged':
+        return ' — merged'
+    if delivery == 'committed-local':
+        return f" — committed on `{branch or '?'}`, unmerged"
+    if delivery == 'uncommitted':
+        return ' — UNCOMMITTED WORK'
+    return ' — delivery unknown'
+
 
 def _has_hygiene_terminal_vocab(root, slug):
     """Worker-context-hygiene: has this slug ever produced enforce-mode hygiene
@@ -1288,9 +1361,17 @@ def _eval_context(root, label, cp, embedded, is_live,
             return  # surfaced via HYGIENE_ABANDON; not a zombie, not complete
         cid = ctx.get('completion_id')
         if nxt == 'complete-qualified':
-            # P0-5: qualified (hygiene-disabled) completion is shipped-but-unclean, NEVER green.
+            # P0-5: a qualified completion is shipped-but-unclean, NEVER green.
+            # evidence-gated-completion Step 7.4: the reason comes from the qualifier TOKEN
+            # SET cmd_finalize persisted into the context file (written in the same atomic
+            # write as next_stage/completion_id, because update_context would otherwise
+            # destroy it, F5). An absent qualifier — every pre-token-set context — yields
+            # today's exact wording.
+            # workers_dirty is NOT passed: forge-context.*.yml carries no such field, and the
+            # shipped context-path string has no parenthetical. See _qualifier_reason.
+            _qset = {t for t in str(ctx.get('qualifier') or '').split(',') if t}
             add_finding('PIPELINE-COMPLETE-QUALIFIED', root, slug,
-                        f"{label} · {slug} — shipped, workers left dirty — hygiene-disabled",
+                        f"{label} · {slug} — {_qualifier_reason(_qset)}",
                         policy='once', slug=slug)
             return
         # P0-5: an enforce completion is green ONLY with a published completion_id in context.
@@ -2190,7 +2271,7 @@ NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'WORKTREE-DIRTY-SOURCE', 'STATE-UNPARSEABLE',
           'RECOVER-PENDING',
           'RESET-UNAVAILABLE', 'PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED',
-          'HYGIENE-CLEANUP']
+          'HYGIENE-CLEANUP', 'EVIDENCE-CONTRADICTED']
 order = {c: i for i, c in enumerate(
     # NOTE: NOTIFY is used ONLY to build this sort map. The three active-context-management
     # conditions belong in `order` and in HOT, but NOT in NOTIFY (which would say nothing) and
@@ -2219,9 +2300,27 @@ HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH', 'WOR
        'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
        'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING', 'RESET-UNAVAILABLE',
-       'WORKER-LOW-CONTEXT', 'ORCHESTRATOR-LOW-CONTEXT', 'RESET-PROOF-DIVERGENT'}
+       'WORKER-LOW-CONTEXT', 'ORCHESTRATOR-LOW-CONTEXT', 'RESET-PROOF-DIVERGENT',
+       # PRE-EXISTING DEFECT (F15), fixed here independently of evidence-gated completion:
+       # both were in NOTIFY but in NEITHER HOT nor ACTIVE, so _cls returned 'maintenance',
+       # maintenance rows collapse in cc-board/1 (:2053), and SwiftBar reads only
+       # hot|tasks|parked|episodes — a shipped-but-unclean or abandoned run reached NEITHER
+       # surface. They survived only because the PRETTY renderer special-cases them outside
+       # _cls (:2219-2229). Ships as its own revertible commit; this feature depends on it but
+       # did not cause it.
+       # Two intended downstream effects beyond board/SwiftBar visibility:
+       #   1. they leave maintenance.rows;
+       #   2. a session whose ONLY finding is a qualified completion flips from '- idle' to
+       #      the hot glyph at :2146 — correct, a shipped-but-unclean run wants a look.
+       'PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED'}
+# EVIDENCE-CONTRADICTED is ACTIVE, NOT HOT, for the duration of the observe soak. A red
+# menubar alert from a brand-new, unvalidated grader during exactly the phase designed to
+# MEASURE its false-positive rate would train the operator to ignore the channel. ACTIVE still
+# reaches cc-board/1 and NOTIFY still drives terminal-notifier, so the soak is fully observable
+# without a red count. PROMOTE TO HOT IN THE SAME COMMIT THAT FLIPS
+# FORGE_EVIDENCE_MODE=enforce — not before.
 ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE',
-          'EPISODE-ACTIVE', 'EPISODE-SETTLED'}
+          'EPISODE-ACTIVE', 'EPISODE-SETTLED', 'EVIDENCE-CONTRADICTED'}
 STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
             'SESSION-DONE': 'done', 'EPISODE-ACTIVE': 'working', 'EPISODE-SETTLED': 'done',
             'EPISODE-STUCK': 'needs-input', 'NEEDS-PERMISSION': 'needs-input',
@@ -2372,10 +2471,15 @@ if BOARD:
              'acked': bool(conds.get(f['key'], {}).get('acked'))}
         # Episode metadata must be copied EXPLICITLY (R1c) — _row emits a fixed field set
         # and would otherwise silently drop it from board rows.
+        # R1c: `delivery`, `merge_state`, `branch` are the evidence row fields, attached at
+        # the add_finding sites that know them (the COMPLETE handler and the EVIDENCE
+        # handler); findings without them are byte-identical, because each key is copied
+        # only `if kx in f`.
         for kx in ('pane', 'episode_id', 'first_at', 'last_at', 'turn_count',
                    'mid_turn', 'earlier',
                    'reason', 'parked_at', 'uncommitted', 'worker', 'entry_ts',
-                   'duplicates', 'blocked_at', 'incarnation', 'callback_shape'):
+                   'duplicates', 'blocked_at', 'incarnation', 'callback_shape',
+                   'delivery', 'merge_state', 'branch'):
             if kx in f:
                 v = f[kx]
                 # Board rows are JSON — coerce any datetime (unquoted YAML timestamps,
@@ -2578,8 +2682,15 @@ if PRETTY:
             print(paint('2', f"  … {older} older task(s) in maintenance"))
 
     pipes = [f for f in active if f['condition'] == 'PIPELINE-COMPLETE']
+    # Now that both are HOT they already render in NEEDS YOU (:2065 + :2090-2096); re-listing
+    # them here would print the same completion twice. The non-hot filter also keeps this
+    # section correct if the HOT promotion is reverted — it ships as its own commit,
+    # deliberately revertible, and this line must survive that revert unchanged.
+    # Visual consequence (say so in the promotion commit message): a qualified completion now
+    # renders once in NEEDS YOU with the red '!' instead of in PIPELINES with the yellow '!'.
     qpipes = [f for f in findings
-              if f['condition'] in ('PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED')]
+              if f['condition'] in ('PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED')
+              and _cls(f['condition']) != 'hot']
     if pipes or qpipes:
         print()
         print(sect('PIPELINES'))

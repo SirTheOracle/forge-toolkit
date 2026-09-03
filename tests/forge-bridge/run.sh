@@ -1409,6 +1409,13 @@ if [ -s "$WORK/usage-skill.txt" ] && diff -q "$WORK/usage-skill.txt" "$WORK/usag
 else
   bad "T-USAGE-DOC-LOCKSTEP skill and agent Usage Awareness drifted"
 fi
+sed -n '/^24\. \*\*Evidence is bridge-owned/,/^---$/p' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/ev-skill.txt"
+sed -n '/^24\. \*\*Evidence is bridge-owned/,/^---$/p' "$ROOT/agents/forge-orchestrator.md"        > "$WORK/ev-agent.txt"
+if [ -s "$WORK/ev-skill.txt" ] && diff -q "$WORK/ev-skill.txt" "$WORK/ev-agent.txt" >/dev/null; then
+  ok "T-EV-DOC-LOCKSTEP Hard Rule 24 agrees across the skill and agent copies"
+else
+  bad "T-EV-DOC-LOCKSTEP Hard Rule 24 drifted"
+fi
 grep -F 'Fallback to the other HIGH pane is an availability decision (Hard Rule 9), not a usage-threshold decision; the bridge owns context hygiene' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/usage-route-skill.txt"
 grep -F 'Fallback to the other HIGH pane is an availability decision (Hard Rule 9), not a usage-threshold decision; the bridge owns context hygiene' "$ROOT/agents/forge-orchestrator.md" > "$WORK/usage-route-agent.txt"
 if [ -s "$WORK/usage-route-skill.txt" ] && diff -q "$WORK/usage-route-skill.txt" "$WORK/usage-route-agent.txt" >/dev/null; then
@@ -2814,6 +2821,11 @@ PY
   else
     bad "T-HYG-F degraded: rc=$(rc_of hff13) $(out_of hff13 | tail -1)"
   fi
+  # T-EV-QUAL-PERSIST: a hygiene-disabled finalize must persist the token set into the context
+  # file. Runs with FORGE_EVIDENCE_MODE unset, so it proves P25 independently of Steps 1-6/8-10.
+  grep -q '^qualifier: hygiene-disabled$' "$FCTX" \
+    && ok "T-EV-QUAL-PERSIST qualifier token set persisted in the final context write (F5)" \
+    || bad "T-EV-QUAL-PERSIST qualifier not persisted"
   # D. hygiene-abandon lifecycle.
   fclean
   fsetup f8 || bad "T-HYG-F f8 setup failed"
@@ -3905,6 +3917,448 @@ for row in rows:
     assert re.fullmatch(r'[0-9a-f]{64}',str(row.get('callback_sha256') or '')), row
 assert not any(row.get('action')=='terminalize-delivery' for row in all_rows), all_rows
 PY
+
+echo "── EV: evidence-gated completion ──"
+# Pure-helper extraction: source only the evidence functions, so probe/shim units run without
+# a tmux session. Mirrors the suite's existing extraction idiom.
+EVFNS="$WORK/ev-fns.sh"
+sed -n '/^_evidence_mode()/,/^}$/p;/^_evidence_enforcing()/,/^}$/p;/^_ev_timed()/,/^}$/p;
+        /^_ev_is_timeout() {.*}$/p;/^_evidence_cfg()/,/^}$/p;
+        /^_evidence_probe_timeout()/,/^}$/p;/^_evidence_net_timeout()/,/^}$/p;
+        /^_ev_pt() {.*}$/p;/^_ev_nt() {.*}$/p;
+        /^_ev_emit()[[:space:]]*{.*}/p;/^_ev_grade()[[:space:]]*{.*}/p;/^_ev_detail()[[:space:]]*{.*}/p;
+        /^_ev_probe_/,/^}$/p;/^_evidence_baseline()/,/^}$/p;
+        /^_evidence_stage_record()/,/^}$/p;/^_ev_verdict()/,/^}$/p;
+        /^_merge_state_probe()/,/^}$/p;/^_ms_field()/,/^}$/p' "$BRIDGE" > "$EVFNS"
+# shellcheck disable=SC1090
+. "$EVFNS"
+
+# mkG <name>  -> a git-backed project root with one seeded commit; echoes the path
+mkG() {
+  local d; d="$(mkR "$1")"
+  git -C "$d" init -q 2>/dev/null
+  git -C "$d" config user.email t@t; git -C "$d" config user.name t
+  printf 'seed\n' > "$d/seed.txt"; git -C "$d" add -A; git -C "$d" commit -qm seed
+  printf '%s' "$d"
+}
+# ev_shim <dir> <binname> <body> -> a PATH shim that shadows the real binary
+ev_shim() { mkdir -p "$1"; printf '#!/bin/sh\n%s\n' "$3" > "$1/$2"; chmod +x "$1/$2"; }
+# ev_report <root> <slug> <status> [extra]
+ev_report() {
+  mkdir -p "$2/.dev/proposals/$3" 2>/dev/null
+  mkdir -p "$1/.dev/proposals/$2" 2>/dev/null
+  printf '# Coder Report\n\n**Status**: %s\n\n%s\n' "$3" "${4:-}" > "$1/.dev/proposals/$2/coder-report.md"
+}
+# ev_dispatch_event <root> <slug> <stage> <head> <branch> <pending_ts>
+ev_dispatch_event() {
+  mkdir -p "$1/.dev/forge-tmp"
+  printf 'DISPATCH: pipeline=%s stage=%s worker=codex-a head=%s branch=%s pending_timestamp=%s\n' \
+    "$2" "$3" "$4" "$5" "$6" >> "$1/.dev/forge-tmp/orchestrator-events.log"
+}
+
+# T-EV-TIMEOUT-SHIM — the highest-value addition: without it, every other probe test passes
+# for the wrong reason if the bounded-exec primitive silently degrades, and the plan mandates
+# a binary (timeout(1)) that does not exist on this machine.
+t0=$(date +%s); _ev_timed 1 sleep 5 >/dev/null 2>&1; trc=$?; t1=$(date +%s)
+{ [ $((t1-t0)) -lt 4 ] && _ev_is_timeout "$trc"; } \
+  && ok "T-EV-TIMEOUT-SHIM bounded exec kills a 5s child under a 1s budget (rc=$trc)" \
+  || bad "T-EV-TIMEOUT-SHIM elapsed=$((t1-t0))s rc=$trc"
+_ev_timed 5 false >/dev/null 2>&1; prc=$?
+[ "$prc" = 1 ] && ok "T-EV-TIMEOUT-SHIM passes the child rc through (false -> 1)" \
+                || bad "T-EV-TIMEOUT-SHIM passthrough rc=$prc"
+_ev_timed 5 /nonexistent-binary-xyz >/dev/null 2>&1; erc=$?
+{ [ "$erc" != 0 ] && ! _ev_is_timeout "$erc"; } \
+  && ok "T-EV-TIMEOUT-SHIM exec failure is non-zero and NOT a timeout (rc=$erc)" \
+  || bad "T-EV-TIMEOUT-SHIM exec-failure rc=$erc misreads as a grade"
+
+# T-EV-MODE-BOGUS
+o=$(FORGE_EVIDENCE_MODE=bogus bash -c ". '$EVFNS'; _evidence_mode" 2>&1); rc=$?
+{ [ "$rc" = 1 ] && printf '%s' "$o" | grep -q CONFIG_ERROR; } \
+  && ok "T-EV-MODE-BOGUS invalid mode is a HARD config error" || bad "T-EV-MODE-BOGUS rc=$rc o=$o"
+FORGE_EVIDENCE_MODE=bogus bash -c ". '$EVFNS'; _evidence_enforcing" >/dev/null 2>&1
+[ $? = 2 ] && ok "T-EV-MODE-BOGUS _evidence_enforcing returns rc2 on an invalid mode" \
+           || bad "T-EV-MODE-BOGUS enforcing rc"
+FORGE_EVIDENCE_MODE=observe bash -c ". '$EVFNS'; _evidence_enforcing" >/dev/null 2>&1
+[ $? = 1 ] && ok "T-EV-MODE-BOGUS observe is not enforcing" || bad "T-EV-MODE-BOGUS observe rc"
+
+# T-EV-PREFLIGHT-PARITY — 4 arms (arms 3 and 4 are what catch a sanitized-detail regression)
+EPF="$(mkG evpf)"
+pf="$( cd "$EPF" && "$BRIDGE" preflight 2>&1 )"
+probe="$(_merge_state_probe "$EPF")"
+p_br="$(_ms_field "$probe" 1)"; p_base="$(_ms_field "$probe" 2)"
+p_st="$(_ms_field "$probe" 3)"; p_det="$(_ms_field "$probe" 5)"
+printf '%s' "$pf" | grep -q "^branch: *$p_br\$"       && ok "T-EV-PREFLIGHT-PARITY branch"      || bad "T-EV-PREFLIGHT-PARITY branch '$p_br'"
+printf '%s' "$pf" | grep -q "^base_ref: *$p_base\$"   && ok "T-EV-PREFLIGHT-PARITY base_ref"    || bad "T-EV-PREFLIGHT-PARITY base_ref '$p_base'"
+printf '%s' "$pf" | grep -q "^merge_state: *$p_st\$"  && ok "T-EV-PREFLIGHT-PARITY merge_state" || bad "T-EV-PREFLIGHT-PARITY merge_state '$p_st'"
+# ARM 3: the oracle's detail must reach preflight VERBATIM. This is the assertion that would
+# have caught sanitizing `detail` inside the helper.
+printf '%s' "$pf" | grep -q "^merge_check_detail: *$p_det\$" \
+  && ok "T-EV-PREFLIGHT-PARITY merge_check_detail renders the oracle's detail VERBATIM" \
+  || bad "T-EV-PREFLIGHT-PARITY detail drift: probe='$p_det'"
+# ARM 4: the sanitizer's own signature must never appear in preflight output.
+printf '%s' "$pf" | grep -qE '^merge_check_detail:.*[a-z0-9]_[a-z0-9]+_[a-z0-9]' \
+  && bad "T-EV-PREFLIGHT-PARITY detail was whitespace-collapsed (R1 regression)" \
+  || ok "T-EV-PREFLIGHT-PARITY detail is not whitespace-collapsed"
+
+# T-EV-GH-TIMEOUT — 2 arms (N4; one per bounded gh call)
+EGH="$(mkG evgh)"
+ev_shim "$WORK/gh-auth" gh 'case "$1" in auth) sleep 30 ;; *) echo "[]" ;; esac'
+ev_shim "$WORK/gh-list" gh 'case "$1" in auth) exit 0 ;; *) sleep 30 ;; esac'
+for arm in gh-auth gh-list; do
+  t0=$(date +%s)
+  line="$(PATH="$WORK/$arm:$PATH" FORGE_EVIDENCE_NET_TIMEOUT_S=1 _merge_state_probe "$EGH")"
+  t1=$(date +%s)
+  st="$(_ms_field "$line" 3)"; meth="$(_ms_field "$line" 4)"
+  { [ "$st" = BRANCH_UNCLEAR ] && [ "$meth" = gh-timeout ] && [ $((t1-t0)) -lt 15 ]; } \
+    && ok "T-EV-GH-TIMEOUT $arm hung gh -> BRANCH_UNCLEAR/gh-timeout in $((t1-t0))s" \
+    || bad "T-EV-GH-TIMEOUT $arm state=$st method=$meth elapsed=$((t1-t0))s"
+done
+g="$(PATH="$WORK/gh-list:$PATH" FORGE_EVIDENCE_NET_TIMEOUT_S=1 _ev_probe_merge_state "$EGH")"
+[ "$(_ev_grade "$g")" = UNKNOWN ] \
+  && ok "T-EV-GH-TIMEOUT merge-state grades UNKNOWN (never a refusal)" || bad "T-EV-GH-TIMEOUT grade $g"
+
+# T-EV-PROBE-TIMEOUT — incl. the config-spawn-count arm (N11)
+ETO="$(mkG evto)"
+ev_shim "$WORK/slowgit" git 'sleep 60'
+t0=$(date +%s)
+tor="$(FORGE_EVIDENCE_PROBE_TIMEOUT_S=1 PATH="$WORK/slowgit:$PATH" _ev_probe_clean_tree "$ETO")"
+t1=$(date +%s)
+{ [ "$(_ev_grade "$tor")" = UNKNOWN ] && [ "$(_ev_detail "$tor")" = timeout ] && [ $((t1-t0)) -lt 10 ]; } \
+  && ok "T-EV-PROBE-TIMEOUT hung git -> UNKNOWN:timeout in $((t1-t0))s (bounded, no stall)" \
+  || bad "T-EV-PROBE-TIMEOUT out=$tor elapsed=$((t1-t0))s"
+# A probe NEVER fails its caller.
+_ev_probe_clean_tree "$ETO" >/dev/null 2>&1
+[ $? = 0 ] && ok "T-EV-PROBE-TIMEOUT probes always return rc 0" || bad "T-EV-PROBE-TIMEOUT probe rc"
+# N11: one config parse per recording pass, not one per child. Count python3 invocations that
+# read forge-project.yml via a counting shim.
+CNT="$WORK/py-count"; : > "$CNT"
+ev_shim "$WORK/pyshim" python3 "echo \$@ >> '$CNT'; exec /opt/homebrew/bin/python3 \"\$@\""
+EPC="$(mkG evpc)"; mkdir -p "$EPC/.claude"
+printf 'evidence:\n  probe_timeout_s: 4\n' > "$EPC/.claude/forge-project.yml"
+_EV_T="$(_evidence_probe_timeout "$EPC")"
+: > "$CNT"
+PATH="$WORK/pyshim:$PATH" _ev_probe_clean_tree "$EPC" >/dev/null 2>&1
+PATH="$WORK/pyshim:$PATH" _ev_probe_git_state  "$EPC" >/dev/null 2>&1
+[ "$(grep -c 'forge-project.yml' "$CNT" 2>/dev/null)" = 0 ] \
+  && ok "T-EV-PROBE-TIMEOUT primed budget: probes re-parse no config (N11)" \
+  || bad "T-EV-PROBE-TIMEOUT config re-parsed per child: $(grep -c 'forge-project.yml' "$CNT")"
+_EV_T=""
+
+# T-EV-COMMITTED / T-EV-NOBASE / T-EV-ANCESTRY-WRONGBRANCH / T-EV-ANCESTRY-RENAME
+EC="$(mkG evc)"; BASE="$(git -C "$EC" rev-parse HEAD)"
+anc="$(_ev_probe_baseline_ancestry "$EC" "$BASE")"
+[ "$(_ev_grade "$anc")" = PASS ] || bad "T-EV-COMMITTED setup ancestry"
+# no commit yet
+[ "$(_ev_grade "$(_ev_probe_committed "$EC" "$BASE" PASS)")" = FAIL ] \
+  && ok "T-EV-COMMITTED no commit -> FAIL" || bad "T-EV-COMMITTED no-commit"
+# real commit
+printf 'x\n' >> "$EC/seed.txt"; git -C "$EC" commit -aqm real
+[ "$(_ev_grade "$(_ev_probe_committed "$EC" "$BASE" PASS)")" = PASS ] \
+  && ok "T-EV-COMMITTED real commit -> PASS" || bad "T-EV-COMMITTED real"
+# empty commit: >=1 commit but ZERO files (R12)
+EE="$(mkG eve)"; EB="$(git -C "$EE" rev-parse HEAD)"
+git -C "$EE" commit -q --allow-empty -m empty
+r="$(_ev_probe_committed "$EE" "$EB" PASS)"
+{ [ "$(_ev_grade "$r")" = FAIL ] && printf '%s' "$r" | grep -q 'files=0'; } \
+  && ok "T-EV-COMMITTED --allow-empty -> FAIL (>=1 file required, R12)" || bad "T-EV-COMMITTED empty: $r"
+# no baseline
+[ "$(_ev_detail "$(_ev_probe_baseline_ancestry "$EC" '')")" = no-baseline ] \
+  && ok "T-EV-NOBASE missing DISPATCH baseline -> UNKNOWN:no-baseline" || bad "T-EV-NOBASE"
+# wrong branch: commit on a DIVERGED branch. `committed` alone would grade PASS (count=3 with
+# a real delta) — ancestry is what catches it, and it POISONS committed to UNKNOWN.
+EW="$(mkG evw)"; WB="$(git -C "$EW" rev-parse HEAD)"
+git -C "$EW" checkout -q -b other "$WB~0"; git -C "$EW" checkout -q --detach "$WB"
+git -C "$EW" checkout -q -B diverged "$WB"; git -C "$EW" commit -q --allow-empty -m d1
+git -C "$EW" checkout -q -B main "$WB"; printf 'a\n' >> "$EW/seed.txt"; git -C "$EW" commit -aqm mainline
+git -C "$EW" checkout -q diverged; printf 'b\n' >> "$EW/seed.txt"; git -C "$EW" commit -aqm div
+WBASE="$(git -C "$EW" rev-parse main)"
+wanc="$(_ev_probe_baseline_ancestry "$EW" "$WBASE")"
+wcom="$(_ev_probe_committed "$EW" "$WBASE" "$(_ev_grade "$wanc")")"
+{ [ "$(_ev_grade "$wanc")" = FAIL ] && [ "$(_ev_grade "$wcom")" = UNKNOWN ]; } \
+  && ok "T-EV-ANCESTRY-WRONGBRANCH ancestry FAIL poisons committed to UNKNOWN (never green)" \
+  || bad "T-EV-ANCESTRY-WRONGBRANCH anc=$wanc com=$wcom"
+# benign RENAME: commits preserved, name changed -> ancestry PASS, committed PASS
+ER="$(mkG evr)"; RB="$(git -C "$ER" rev-parse HEAD)"
+printf 'c\n' >> "$ER/seed.txt"; git -C "$ER" commit -aqm work
+git -C "$ER" branch -m renamed-branch
+ranc="$(_ev_probe_baseline_ancestry "$ER" "$RB")"
+rcom="$(_ev_probe_committed "$ER" "$RB" "$(_ev_grade "$ranc")")"
+{ [ "$(_ev_grade "$ranc")" = PASS ] && [ "$(_ev_grade "$rcom")" = PASS ]; } \
+  && ok "T-EV-ANCESTRY-RENAME rename preserves ancestry (no false positive)" \
+  || bad "T-EV-ANCESTRY-RENAME anc=$ranc com=$rcom"
+
+# T-EV-REPORT / T-EV-STALE-REPORT
+EP="$(mkR evrep)"
+for pair in "COMPLETE PASS" "FAILED FAIL" "PARTIAL FAIL" "VALIDATION_FAILED FAIL"; do
+  set -- $pair
+  ev_report "$EP" rp "$1"
+  [ "$(_ev_grade "$(_ev_probe_report_consistent "$EP" rp '')")" = "$2" ] \
+    && ok "T-EV-REPORT status=$1 -> $2" || bad "T-EV-REPORT $1"
+done
+ev_report "$EP" rp COMPLETE "Group 2: NOT COMMITTED"
+r="$(_ev_probe_report_consistent "$EP" rp '')"
+{ [ "$(_ev_grade "$r")" = FAIL ] && printf '%s' "$r" | grep -q not-committed-marker; } \
+  && ok "T-EV-REPORT 'NOT COMMITTED' marker -> FAIL even with status COMPLETE" || bad "T-EV-REPORT marker: $r"
+rm -f "$EP/.dev/proposals/rp/coder-report.md"
+[ "$(_ev_detail "$(_ev_probe_report_consistent "$EP" rp '')")" = no-report ] \
+  && ok "T-EV-REPORT missing report -> UNKNOWN:no-report" || bad "T-EV-REPORT missing"
+# staleness: mtime strictly older than the stage's dispatch pending ts -> UNKNOWN, NEVER FAIL
+ev_report "$EP" rp FAILED
+touch -t 202001010000 "$EP/.dev/proposals/rp/coder-report.md"
+[ "$(_ev_detail "$(_ev_probe_report_consistent "$EP" rp '2026-07-26T00:00:00Z')")" = stale-report ] \
+  && ok "T-EV-STALE-REPORT report older than dispatch -> UNKNOWN:stale-report, never FAIL" \
+  || bad "T-EV-STALE-REPORT"
+
+# T-EV-CLEAN-TREE-UNTRACKED / T-EV-NONGIT (first assertion only; the observe-grade arm
+# needs _ev_observe_grade, added in Group 5 — see coder-report.md)
+ECT="$(mkG evct)"; printf 'stray\n' > "$ECT/stray.swp"
+[ "$(_ev_probe_clean_tree "$ECT")" != "" ] && \
+[ "$(_ev_detail "$(_ev_probe_clean_tree "$ECT")")" = tracked-clean ] \
+  && ok "T-EV-CLEAN-TREE-UNTRACKED stray untracked file does NOT grade dirty" \
+  || bad "T-EV-CLEAN-TREE-UNTRACKED untracked: $(_ev_probe_clean_tree "$ECT")"
+printf 'edit\n' >> "$ECT/seed.txt"
+[ "$(_ev_grade "$(_ev_probe_clean_tree "$ECT")")" = FAIL ] \
+  && ok "T-EV-CLEAN-TREE-UNTRACKED a TRACKED edit does grade dirty" || bad "T-EV-CLEAN-TREE-UNTRACKED tracked"
+# evidence-gated-completion Group 4 fix: mkR (tests/forge-bridge/run.sh:59) runs
+# `git -C "$d" init -q`, so it is NOT a non-git root — a real non-git-repo probe here
+# needs a directory outside any git work tree, which $WORK already is.
+ENG="$WORK/evng-plain"; mkdir -p "$ENG"
+[ "$(_ev_detail "$(_ev_probe_git_state "$ENG")")" = not-a-git-repo ] \
+  && ok "T-EV-NONGIT non-git root -> UNKNOWN:not-a-git-repo" || bad "T-EV-NONGIT"
+
+# T-EV-DISPATCH-BASELINE
+EDB="$(mkG evdb)"
+ev_dispatch_event "$EDB" db coding deadbeefcafe feat/x '2026-07-26T10:00:00Z'
+b="$(_evidence_baseline "$EDB" db coding '2026-07-26T10:00:00Z')"
+[ "$b" = "deadbeefcafe|feat/x" ] \
+  && ok "T-EV-DISPATCH-BASELINE head/branch/pending_timestamp round-trip" || bad "T-EV-DISPATCH-BASELINE '$b'"
+[ -z "$(_evidence_baseline "$EDB" db coding '2026-07-26T11:11:11Z')" ] \
+  && ok "T-EV-DISPATCH-BASELINE a non-matching pending ts selects nothing (exact match only)" \
+  || bad "T-EV-DISPATCH-BASELINE fuzzy match"
+
+# T-EV-RERUN / T-EV-REDISPATCH-OPEN (+ the shared-fold standing guard)
+ERR="$(mkR evrr)"; mkdir -p "$ERR/.dev/proposals/rr" "$ERR/.dev/forge-tmp"
+cat > "$ERR/.dev/proposals/rr/forge-log.yml" <<'YML'
+entries:
+  - timestamp: "2026-07-26T09:00:00Z"
+    stage: coding
+    response: "FORGE_DONE: coding"
+  - timestamp: "2026-07-26T10:00:00Z"
+    stage: coding
+    response: "FORGE_DONE: coding"
+YML
+printf 'EVIDENCE: pipeline=rr stage=coding pending_timestamp=2026-07-26T09:00:00Z committed=FAIL verdict=contradicted\n' >> "$ERR/.dev/forge-tmp/orchestrator-events.log"
+printf 'EVIDENCE: pipeline=rr stage=coding pending_timestamp=2026-07-26T10:00:00Z committed=PASS verdict=ok\n'          >> "$ERR/.dev/forge-tmp/orchestrator-events.log"
+_evidence_stage_record "$ERR" rr coding | grep -q 'pending_timestamp=2026-07-26T10:00:00Z' \
+  && ok "T-EV-RERUN latest CLOSED entry by dispatch ts wins -> the clean re-run is selected" \
+  || bad "T-EV-RERUN selected the wrong record"
+# latest entry still OPEN -> UNKNOWN:stage-in-flight, no refusal
+awk '/response: "FORGE_DONE: coding"/{n++} n==2{sub(/response: "FORGE_DONE: coding"/,"response: null")} {print}' \
+  "$ERR/.dev/proposals/rr/forge-log.yml" > "$ERR/.dev/proposals/rr/forge-log.yml.new" \
+  && mv "$ERR/.dev/proposals/rr/forge-log.yml.new" "$ERR/.dev/proposals/rr/forge-log.yml"
+[ "$(_evidence_stage_record "$ERR" rr coding)" = "UNKNOWN:stage-in-flight" ] \
+  && ok "T-EV-REDISPATCH-OPEN latest entry open -> UNKNOWN:stage-in-flight (no refusal)" \
+  || bad "T-EV-REDISPATCH-OPEN: $(_evidence_stage_record "$ERR" rr coding)"
+# Standing guard: the watcher-side fold this deliberately DIFFERS from must still exist.
+grep -q 'closed_max_ts' "$ROOT/bin/forge-watch" \
+  && ok "T-EV-RERUN watcher closed_max_ts fold still present (shared-spec obligation, 698eaea)" \
+  || bad "T-EV-RERUN watcher fold refactored away — re-read _evidence_stage_record's contract"
+
+echo "── EV Group 8: status Delivery section (T-EV-STATUS-LEGACY / T-EV-STATUS-SECTIONS) ──"
+# _terminal_field's only dependency is _hygiene_file; _hygiene_write seeds the journal entry
+# the renderer reads. Mirrors the suite's existing extraction idiom ($EVFNS above, $AVFNS at
+# ACM §V) rather than widening either.
+SFFNS="$WORK/sf-fns.sh"
+sed -n '/^_hygiene_file()/,/^}$/p;/^_hygiene_write()/,/^}$/p;/^_terminal_field()/,/^}$/p;
+        /^_context_file()/p;/^_status_file_name()/p;/^_render_status_file()/,/^}$/p' "$BRIDGE" > "$SFFNS"
+# shellcheck disable=SC1090
+. "$SFFNS"
+cmd_infra_lock(){ :; }
+SFR="$(mkR sfstatus)"
+_resolve_project_root(){ printf '%s' "$SFR"; }
+_session_or_sentinel(){ printf 'sfS'; }
+SF="$SFR/.dev/forge-status.sfS.md"
+
+# LEGACY: no terminal decision in the journal -> the Delivery section is entirely absent, and
+# every pre-existing section still renders (nothing else about the legacy path is disturbed).
+# (A literal pre-/post-diff byte comparison would need a frozen copy of the prior renderer
+# embedded in this file to stay reproducible on a future checkout — brittle against any
+# unrelated future edit to the same function — so this proves the same invariant structurally:
+# the ONLY diff a no-evidence render can have from a legacy one is the Delivery section, and
+# that section is verified fully absent below.)
+_render_status_file
+[ -s "$SF" ] || bad "T-EV-STATUS-LEGACY the renderer produced no status file (later assertions would be vacuous)"
+grep -q '^## Delivery' "$SF" \
+  && bad "T-EV-STATUS-LEGACY Delivery section emitted with no evidence" \
+  || ok "T-EV-STATUS-LEGACY Delivery section omitted entirely when absent"
+_sf_missing=""
+for h in '# Forge Pipeline Status' '## Recent activity' '## Pending callbacks' '## Artifacts' '## Notes'; do
+  grep -qF "$h" "$SF" || _sf_missing="$_sf_missing|$h"
+done
+[ -z "$_sf_missing" ] \
+  && ok "T-EV-STATUS-LEGACY all pre-existing sections still render with no evidence present" \
+  || bad "T-EV-STATUS-LEGACY missing sections: $_sf_missing"
+
+# SECTIONS: seed a terminal decision, then confirm the documented headings appear in order as
+# an ORDERED SUBSEQUENCE (not exact-list equality) — active-context-management's S1 inserts
+# sections into this same renderer; an exact pin would go red on a legitimate insertion, and
+# the cheapest fix would be to rewrite the assertion, destroying the property. A subsequence
+# still proves "## Delivery" comes last, which is the invariant that matters.
+export ID_target_session=sfS ID_target_incarnation=1
+_hygiene_write "$SFR" terminal "" \
+  "delivery_grade=committed-local merge_state=BRANCH_UNMERGED branch=feat/x head_sha=abc123def dirty_tracked=0 evidence_ack= evidence_at=2026-09-03T00:00:00Z" \
+  >/dev/null 2>&1
+_render_status_file
+grep -q '^## Delivery' "$SF" && grep -q 'Delivery:  committed-local' "$SF" \
+  && ok "T-EV-STATUS-SECTIONS Delivery section renders once a terminal decision exists" \
+  || bad "T-EV-STATUS-SECTIONS Delivery section missing/wrong: $(grep -A2 '^## Delivery' "$SF")"
+python3 - "$SF" <<'PY' && ok "T-EV-STATUS-SECTIONS documented headings appear in order (insertions allowed)" || bad "T-EV-STATUS-SECTIONS order violated"
+import re,sys
+# want[] reconciled against the renderer's ACTUAL headings (applier note, implementation.md
+# Diff 11a): active-context-management's S4.1 already inserted 'Worker context' and 'Recent
+# hygiene decisions' ahead of this feature; only the trailing 'Delivery' is contributed here.
+want=['# Forge Pipeline Status','## Recent activity','## Pending callbacks',
+      '## Worker context','## Recent hygiene decisions','## Artifacts','## Notes','## Delivery']
+got=[l.rstrip() for l in open(sys.argv[1]) if re.match(r'^(# Forge Pipeline Status|## )',l)]
+i=0
+for h in got:
+    if i < len(want) and h == want[i]: i += 1
+assert i == len(want), "missing/out-of-order: got=%r want=%r stopped at %r" % (got, want, want[i:i+1])
+PY
+unset -f cmd_infra_lock
+unset ID_target_session ID_target_incarnation
+
+echo "── EV Group 9: EVIDENCE_ACK emit whitelist (T-EV-EMIT-BLOCKED) ──"
+EVMR="$(mkR ev9emit)"
+o=$( cd "$EVMR" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" emit EVIDENCE --slug x 2>&1 ); rc=$?
+{ [ "$rc" != 0 ] && printf '%s' "$o" | grep -q 'emit TYPE must be one of'; } \
+  && ok "T-EV-EMIT-BLOCKED 'emit EVIDENCE' is refused (bridge-authored only, not on the whitelist)" \
+  || bad "T-EV-EMIT-BLOCKED EVIDENCE rc=$rc o=$o"
+( cd "$EVMR" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" emit EVIDENCE_ACK --slug m1 reason=ok ) >/dev/null 2>&1 \
+  && grep -q '^EVIDENCE_ACK: pipeline=m1 ' "$EVMR/.dev/forge-tmp/orchestrator-events.log" \
+  && ok "T-EV-EMIT-BLOCKED EVIDENCE_ACK round-trips cmd_emit" || bad "T-EV-EMIT-BLOCKED ack"
+# Standing guard: EVIDENCE_ACK must still be membership-testable in the whitelist source, and
+# the BOGUS-rejection message must still name it.
+grep -qE "(\||^| )EVIDENCE_ACK(\||\)| )" "$BRIDGE" \
+  && ok "T-EV-EMIT-BLOCKED EVIDENCE_ACK present in the whitelist source" \
+  || bad "T-EV-EMIT-BLOCKED EVIDENCE_ACK missing from whitelist source"
+o=$( cd "$EVMR" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" emit BOGUS --slug m1 2>&1 ); rc=$?
+{ [ "$rc" != 0 ] && printf '%s' "$o" | grep -q 'EVIDENCE_ACK' && printf '%s' "$o" | grep -q "; got 'BOGUS'"; } \
+  && ok "T-EV-EMIT-BLOCKED BOGUS rejection message names EVIDENCE_ACK" \
+  || bad "T-EV-EMIT-BLOCKED bogus message: $o"
+
+echo "── EV Group 9: gate + acknowledge (real tmux) ──"
+# implementation.md §6.1's T-EV-ENFORCE-REFUSE/-OBSERVE-INERT/-ACK* read fixtures
+# ($EOB/$EEN/$EACK/$EAS/$ENOOP/$ENS/$EBEV) that are never assigned anywhere in the document —
+# the same "fixtures never defined" plan-authoring defect already recorded for
+# T-EV-CB-NEUTRAL/T-EV-ARTIFACT (coder-report.md, Group 5/7). Rather than guess the intended
+# shape, this reuses two ALREADY-ESTABLISHED, in-file idioms instead: the manual
+# forge-log.yml + EVIDENCE-line construction T-EV-RERUN already uses to drive
+# _evidence_stage_record without a real coding dispatch+callback cycle, and the real-tmux
+# verify/DONE + verify-decision flow HYG §V already uses (vclean/hygv1-log/hygv1-cb). Each
+# slug below is independent and journal-isolated by a full `.dev` wipe between them, mirroring
+# HYG §V's `vclean`, because the hygiene journal is one file PER SESSION+INCARNATION, shared
+# across every slug run in it.
+if command -v tmux >/dev/null 2>&1; then
+  GV9S="fbev9-$$"
+  GV9C="$(mkR ev9)"
+  git -C "$GV9C" config user.email t@t; git -C "$GV9C" config user.name t
+  git -C "$GV9C" branch -M main 2>/dev/null
+  printf 'seed\n' > "$GV9C/seed.txt"; git -C "$GV9C" add -A; git -C "$GV9C" commit -qm seed
+mk_session "$GV9S" 220 50 "$GV9C"
+  GV9INC="$(tmux display-message -p -t "$GV9S:0.0" '#{session_created}')"
+  sleep 1
+  GV9EV="$GV9C/.dev/forge-tmp/orchestrator-events.log"
+  GV9ENF="FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=enforce"
+  gv9clean(){ rm -rf "$GV9C/.dev"; mkdir -p "$GV9C/.dev/proposals" "$GV9C/.dev/forge-tmp/callbacks"; GV9EV="$GV9C/.dev/forge-tmp/orchestrator-events.log"; }
+  gv9term(){ ID_target_session="$GV9S" ID_target_incarnation="$GV9INC" _terminal_state "$GV9C"; }
+  gv9field(){ ID_target_session="$GV9S" ID_target_incarnation="$GV9INC" _terminal_field "$GV9C" "$1"; }
+  # Seed a coding-stage EVIDENCE record with committed=FAIL/verdict=contradicted, then a real
+  # verify/DONE callback + CLEAR report for <slug>, and print "<callback_id> <pending_ts>".
+  gv9_seed_contradiction() {   # <slug>
+    local slug="$1"
+    mkdir -p "$GV9C/.dev/proposals/$slug"
+    printf 'entries:\n  - timestamp: "2026-09-03T00:00:00Z"\n    stage: coding\n    response: "FORGE_DONE: coding"\n' \
+      > "$GV9C/.dev/proposals/$slug/forge-log.yml"
+    printf 'EVIDENCE: pipeline=%s stage=coding worker=codex-a callback_id=cb-seed pending_timestamp=2026-09-03T00:00:00Z session=%s incarnation=%s git-state=PASS baseline-ancestry=PASS committed=FAIL clean-tree=PASS report-consistent=UNKNOWN tests=claim:UNKNOWN verdict=contradicted artifact=seed.yaml\n' \
+      "$slug" "$GV9S" "$GV9INC" >> "$GV9EV"
+  }
+  gv9_verify_callback() {   # <slug> -> sets gv9_cbid / gv9_pt
+    local slug="$1"
+    run_in_pane "$GV9S:0.1" "gv9-$slug-log" "( cd $GV9C && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug $slug --stage verify --from claude --to codex-a --prompt p )"
+    tmux send-keys -t "$GV9S:0.2" C-c 2>/dev/null; sleep 0.3
+    run_in_pane "$GV9S:0.3" "gv9-$slug-cb" "( cd $GV9C && $GV9ENF $BRIDGE callback --slug $slug --stage verify --status DONE --worker codex-a --message ok --quiet )"
+    local cb="$GV9C/.dev/forge-tmp/callbacks/$slug-verify.$GV9S.$GV9INC.callback"
+    gv9_cbid="$(grep '^callback_id:' "$cb" 2>/dev/null | awk '{print $2}')"
+    gv9_pt="$(grep '^selected_pending_timestamp:' "$cb" 2>/dev/null | sed 's/^selected_pending_timestamp:[[:space:]]*//; s/^\"//; s/\"$//')"
+    [ -n "$gv9_cbid" ] && [ -n "$gv9_pt" ] || bad "EV Group 9 setup: callback id/ts extraction failed for $slug"
+    mkdir -p "$GV9C/.dev/qa/$slug"
+    printf 'verdict: CLEAR\nsummary: ok\n' > "$GV9C/.dev/qa/$slug/verification-report.yaml"
+  }
+
+  # ── T-EV-OBSERVE-INERT: FORGE_EVIDENCE_MODE unset (default observe) — records +
+  # renders, refuses NOTHING, even with a real committed=FAIL contradiction present. ──
+  gv9clean; gv9_seed_contradiction ev9o; gv9_verify_callback ev9o
+  run_in_pane "$GV9S:0.1" gv9-obs "( cd $GV9C && $GV9ENF $BRIDGE verify-decision --slug ev9o --callback-id $gv9_cbid --pending-timestamp \"$gv9_pt\" )"
+  { [ "$(rc_of gv9-obs)" = 0 ] && out_of gv9-obs | grep -q '^EVIDENCE_OBSERVED slug=ev9o' \
+      && out_of gv9-obs | grep -q 'verdict=contradicted' \
+      && grep -q '^EVIDENCE: .*pipeline=ev9o stage=verify.*verdict=contradicted' "$GV9EV"; } \
+    && ok "T-EV-OBSERVE-INERT observe records verdict=contradicted and refuses NOTHING" \
+    || bad "T-EV-OBSERVE-INERT rc=$(rc_of gv9-obs) $(out_of gv9-obs | tail -3)"
+
+  # ── T-EV-ENFORCE-REFUSE + T-EV-ACK-EMPTY + T-EV-ACK + T-EV-JOURNAL-WS: same shape,
+  # FORGE_EVIDENCE_MODE=enforce this time, on a fresh slug. ──
+  gv9clean; gv9_seed_contradiction ev9r; gv9_verify_callback ev9r
+  GV9TERM_BEFORE="$(gv9term)"
+  GV9J="$GV9C/.dev/forge-hygiene.$GV9S.$GV9INC.yml"
+  GV9J_BEFORE="$(shasum -a 256 "$GV9J" 2>/dev/null | awk '{print $1}')"
+  run_in_pane "$GV9S:0.1" gv9-enf "( cd $GV9C && $GV9ENF FORGE_EVIDENCE_MODE=enforce $BRIDGE verify-decision --slug ev9r --callback-id $gv9_cbid --pending-timestamp \"$gv9_pt\" )"
+  { [ "$(rc_of gv9-enf)" = 1 ] && out_of gv9-enf | grep -q 'REFUSED: evidence contradicts' \
+      && [ "$(gv9term)" = "$GV9TERM_BEFORE" ] \
+      && [ "$(shasum -a 256 "$GV9J" 2>/dev/null | awk '{print $1}')" = "$GV9J_BEFORE" ]; } \
+    && ok "T-EV-ENFORCE-REFUSE enforce refuses; terminal state AND journal unchanged" \
+    || bad "T-EV-ENFORCE-REFUSE rc=$(rc_of gv9-enf) $(out_of gv9-enf | tail -3)"
+  o="$(out_of gv9-enf)"
+  { printf '%s' "$o" | grep -q 'contradiction:' && printf '%s' "$o" | grep -q 'command run:' \
+      && printf '%s' "$o" | grep -q 'remedy:'; } \
+    && ok "T-EV-ENFORCE-REFUSE names the class, the command run, and the remedy" \
+    || bad "T-EV-ENFORCE-REFUSE message incomplete: $o"
+  run_in_pane "$GV9S:0.1" gv9-ackempty "( cd $GV9C && $GV9ENF FORGE_EVIDENCE_MODE=enforce $BRIDGE verify-decision --slug ev9r --callback-id $gv9_cbid --pending-timestamp \"$gv9_pt\" --acknowledge-evidence '' )"
+  [ "$(rc_of gv9-ackempty)" = 1 ] \
+    && ok "T-EV-ACK-EMPTY empty reason is rc 1" || bad "T-EV-ACK-EMPTY rc=$(rc_of gv9-ackempty)"
+  run_in_pane "$GV9S:0.1" gv9-ack "( cd $GV9C && $GV9ENF FORGE_EVIDENCE_MODE=enforce $BRIDGE verify-decision --slug ev9r --callback-id $gv9_cbid --pending-timestamp \"$gv9_pt\" --acknowledge-evidence 'operator accepts this run' )"
+  { [ "$(rc_of gv9-ack)" = 0 ] && out_of gv9-ack | grep -q '^EVIDENCE_ACKNOWLEDGED slug=ev9r' \
+      && [ "$(gv9field evidence_ack)" = 1 ] \
+      && grep -q '^EVIDENCE_ACK: pipeline=ev9r ' "$GV9EV" \
+      && [ "$(gv9term)" = terminal-cleanup ]; } \
+    && ok "T-EV-ACK acknowledged contradiction proceeds; evidence_ack=1 + EVIDENCE_ACK recorded" \
+    || bad "T-EV-ACK rc=$(rc_of gv9-ack) term=$(gv9term) ack=$(gv9field evidence_ack) $(out_of gv9-ack | tail -3)"
+  { [ -n "$(gv9field evidence_ack_reason)" ] && printf '%s' "$(gv9field evidence_ack_reason)" | grep -q '_' \
+      && [ -n "$(gv9field delivery_grade)" ] && [ -n "$(gv9field evidence_at)" ]; } \
+    && ok "T-EV-JOURNAL-WS spaced ack reason is sanitized; delivery_grade/evidence_at round-trip" \
+    || bad "T-EV-JOURNAL-WS reason=$(gv9field evidence_ack_reason)"
+
+  # ── T-EV-ACK-NOOP: a CLEAN slug (no seeded contradiction) — the escape is inert and
+  # cannot downgrade a clean run. ──
+  gv9clean
+  run_in_pane "$GV9S:0.1" gv9c-log "( cd $GV9C && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug ev9c --stage verify --from claude --to codex-a --prompt p )"
+  tmux send-keys -t "$GV9S:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$GV9S:0.3" gv9c-cb "( cd $GV9C && $GV9ENF $BRIDGE callback --slug ev9c --stage verify --status DONE --worker codex-a --message ok --quiet )"
+  GV9CCB="$GV9C/.dev/forge-tmp/callbacks/ev9c-verify.$GV9S.$GV9INC.callback"
+  gv9c_cbid="$(grep '^callback_id:' "$GV9CCB" | awk '{print $2}')"
+  gv9c_pt="$(grep '^selected_pending_timestamp:' "$GV9CCB" | sed 's/^selected_pending_timestamp:[[:space:]]*//; s/^\"//; s/\"$//')"
+  mkdir -p "$GV9C/.dev/qa/ev9c"; printf 'verdict: CLEAR\nsummary: ok\n' > "$GV9C/.dev/qa/ev9c/verification-report.yaml"
+  run_in_pane "$GV9S:0.1" gv9c-noop "( cd $GV9C && $GV9ENF FORGE_EVIDENCE_MODE=enforce $BRIDGE verify-decision --slug ev9c --callback-id $gv9c_cbid --pending-timestamp \"$gv9c_pt\" --acknowledge-evidence 'nothing to see' )"
+  { [ "$(rc_of gv9c-noop)" = 0 ] && out_of gv9c-noop | grep -q 'NOTE: --acknowledge-evidence ignored' \
+      && [ -z "$(gv9field evidence_ack)" ] && [ "$(gv9term)" = terminal-cleanup ]; } \
+    && ok "T-EV-ACK-NOOP no contradiction -> ack is inert, no evidence_ack recorded" \
+    || bad "T-EV-ACK-NOOP rc=$(rc_of gv9c-noop) $(out_of gv9c-noop | tail -3)"
+
+  tmux kill-session -t "$GV9S" 2>/dev/null
+else
+  echo "  (skip EV Group 9: tmux unavailable)"
+fi
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

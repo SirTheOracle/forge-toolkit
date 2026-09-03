@@ -47,6 +47,10 @@ new_env() {
     # quiet-unchanged OFF here; the dedicated hardening tests opt in inline.
     export FORGE_WATCH_QUIET_UNCHANGED=0
     unset FORGE_WATCH_CHECK_TIMEOUT_S FORGE_WATCH_NOTIFY_TIMEOUT_S 2>/dev/null || true
+    # The lifecycle-terminalization fixture `export`s these two for its own stub broker; since
+    # export persists for the rest of this process, any LATER env that never sets its own copy
+    # would otherwise inherit that env's now-stale $TDIR/broker-paths and protected dir.
+    unset FORGE_BROKER_BIN FORGE_WATCH_TEST_PROTECTED 2>/dev/null || true
 }
 
 mk_root() {  # mk_root <name>  -> echoes path; registers in watch-roots
@@ -149,6 +153,9 @@ message: |
 EOF
 }
 board_parked() { run_status --board | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin).get("parked") or []))'; }
+# board_json -> path to a file holding the current cc-board/1 JSON (for `python3 - "$(board_json)"`)
+board_json() { local f="$TDIR/board.json"; run_status --board > "$f"; printf '%s' "$f"; }
+run_pretty() { run_status --pretty; }
 
 evlog() { echo "$1/.dev/forge-tmp/orchestrator-events.log"; }
 evlog_touch() { : > "$(evlog "$1")"; }        # empty file to baseline against
@@ -157,6 +164,10 @@ evlog_append() { echo "$2" >> "$(evlog "$1")"; }
 run_check()  { "$WATCH" check  2>&1; }
 run_status() { "$WATCH" status "$@" 2>&1; }
 notified()   { grep -q "$1" "$CAP"; }
+# evidence-gated-completion Group 8 (W-EV-LEGACY-COMPLETE): ANCHORED match on the body
+# column, not a substring test — `notified` would still pass if a delivery suffix got
+# appended to the message; this is the check that proves it did NOT.
+notified_exact() { awk -F'\t' -v want="$1" '$2==want{f=1} END{exit !f}' "$CAP"; }
 
 assert_notified()     { if notified "$1"; then ok "notified: $2"; else bad "expected notify [$1]: $2"; fi; }
 assert_not_notified() { if notified "$1"; then bad "unexpected notify [$1]: $2"; else ok "silent: $2"; fi; }
@@ -2885,6 +2896,139 @@ assert_status_has "TERMINALIZE-REFUSED" "deleting the response cannot suppress a
 printf '{"status":"ok","intent_id":"lci-forged","delivery_id":"delivery-11111111111111111111111111111111"}\n' > "$R/.dev/forge-broker/lifecycle/responses/lci-forged.json"
 run_check >/dev/null
 assert_status_has "TERMINALIZE-REFUSED" "rewriting the response to ok cannot suppress it either"
+
+echo "── EV: evidence-gated completion (qualifier token set + honest watcher reasons) ──"
+
+# ── W-EV-QUALIFIED-HOT + W-EV-NO-DOUBLE-COMPLETE (F16) + W-EV-NO-DOUBLE-RENDER (N7) ──
+# A real cmd_finalize writes BOTH the event line (immediate notification, this process only —
+# see the twelfth plan-authoring defect note in coder-report.md: the event log's read offset
+# is consumed by the FIRST `check` that sees it, so a LATER separate process, exactly what
+# `board_json`/`run_pretty` are, can never observe the event path's own rendering) AND the
+# context file (`next_stage: complete-qualified` + `qualifier:`, durable across processes
+# because contexts are re-scanned from current content every invocation, not offset-consumed).
+# Mirror both so this fixture matches what a real finalize produces and what a later, separate
+# `forge board`/SwiftBar query actually reads.
+new_env wev2
+R=$(mk_root proj); live_session forge-1 "$R"; evlog_touch "$R"; run_check >/dev/null
+ctx "$R" forge-1 <<EOF
+active_pipeline: e2
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete-qualified
+qualifier: hygiene-disabled,evidence-acknowledged
+completion_id: beef
+updated_at: "$(iso_ago 5)"
+EOF
+evlog_append "$R" "COMPLETE: pipeline=e2 completion_id=beef qualifier=hygiene-disabled,evidence-acknowledged workers_dirty=codex-a"
+run_check >/dev/null
+# The workers_dirty detail is event-path-only (forge-context.*.yml carries no such field, by
+# design — see _qualifier_reason's docstring), so it is observable ONLY via the notification
+# this same `check` call captured, not via a later separate board/pretty query.
+assert_notified "workers left dirty (codex-a)" "W-EV-QUALIFIED-HOT event-path message carries the dirty worker list"
+python3 - "$(board_json)" <<'PY' && ok "W-EV-QUALIFIED-HOT qualified completion is class=='hot'" || bad "W-EV-QUALIFIED-HOT"
+import json,sys
+b=json.load(open(sys.argv[1]))
+q=[r for r in b['hot'] if r['condition']=='PIPELINE-COMPLETE-QUALIFIED' and r['slug']=='e2']
+assert q, "not hot: %r" % [(r['condition'],r['class']) for r in b['hot']+b['active']+b['maintenance']['rows']]
+assert 'evidence contradiction acknowledged' in q[0]['msg'], q[0]['msg']
+PY
+assert_not_notified "e2 — pipeline COMPLETE" "W-EV-NO-DOUBLE-COMPLETE no green PIPELINE-COMPLETE for the same slug (F16)"
+# N7 count-not-presence check: neither add_finding call for this condition passes session=/
+# stage=, so the pretty renderer's header falls back to the root label (never the bare slug)
+# and its detail line strips the "label · slug —" prefix entirely (see detail_of()) — 'e2'
+# itself never appears in pretty output for ANY finding of this shape, condition name included
+# or not. Counting the CONDITION NAME instead still proves the real invariant Diff 7h protects:
+# this finding renders in NEEDS YOU once and is not ALSO re-listed in PIPELINES.
+n="$(run_pretty | grep -c 'PIPELINE-COMPLETE-QUALIFIED')"
+[ "$n" = 1 ] && ok "W-EV-NO-DOUBLE-RENDER qualified completion renders exactly once on the pretty board" \
+             || bad "W-EV-NO-DOUBLE-RENDER condition rendered $n times (NEEDS YOU + PIPELINES)"
+
+# ── W-EV-CONTEXT-REASON: the reason is derived, and the legacy string is preserved ──
+new_env wev3
+R=$(mk_root proj); live_session forge-1 "$R"
+ctx "$R" forge-1 <<EOF
+active_pipeline: e3
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete-qualified
+qualifier: evidence-acknowledged
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_notified "e3 — shipped, evidence contradiction acknowledged" "W-EV-CONTEXT-REASON names the CORRECT reason"
+assert_not_notified "e3 — shipped, workers left dirty" "W-EV-CONTEXT-REASON does not claim workers were dirty"
+# ...and a context with NO qualifier keeps today's exact wording, WITHOUT a bare "(?)".
+new_env wev3b
+R=$(mk_root proj); live_session forge-1 "$R"
+ctx "$R" forge-1 <<EOF
+active_pipeline: e3b
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete-qualified
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_notified "e3b — shipped, workers left dirty — hygiene-disabled" "W-EV-CONTEXT-REASON legacy context wording preserved"
+assert_not_notified "e3b — shipped, workers left dirty (?)" "W-EV-CONTEXT-REASON context path grows NO bare '(?)'"
+
+echo "── EV Group 8: surfaces (EVIDENCE-CONTRADICTED, delivery suffix, legacy byte-identity) ──"
+
+# ── W-EV-CONTRADICTED: ACTIVE during the observe soak, never HOT before the flip ──
+# NOTE (thirteenth plan-authoring defect, same class as the twelfth in coder-report.md):
+# implementation.md's own §6.2 spec checks this via `board_json()` — a SEPARATE `status
+# --board` process — immediately after the ONE `run_check` that consumed the EVIDENCE event
+# line. The event-log reader baselines its read offset to EOF on first sight and advances it
+# past every line it consumes (bin/forge-watch:~1126-1156); only `check` persists that
+# advance, and `board_json` here is exactly the later, separate, offset-already-past process
+# real SwiftBar polling is. Unlike the qualified-completion path (which the previous group's
+# fixture mirrors into `ctx()` — a durable, re-scanned-every-tick source), EVIDENCE-CONTRADICTED
+# has no context echo, so its row can never appear on a `status --board` query as literally
+# specified — this is a real residual gap (see coder-report.md), not a fixture bug. Verified
+# instead via the two properties that ARE deterministically checkable: the classification the
+# diff actually wires (ACTIVE, never HOT, via a direct registry-source check — grepping, not
+# executing, the same idiom `T-EV-RERUN`'s standing guard already uses in the sibling suite),
+# and that the delivery detail this diff attaches to the finding is visible in the one place
+# it IS observable — the notified message body itself.
+new_env wev6
+R=$(mk_root proj); live_session forge-1 "$R"; evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "EVIDENCE: pipeline=e6 stage=verify delivery=uncommitted branch=feat/x merge_state=BRANCH_UNMERGED verdict=contradicted"
+run_check >/dev/null
+assert_notified "e6 — evidence contradicts the verify completion (delivery uncommitted)" \
+  "W-EV-CONTRADICTED fires on verdict=contradicted and names the delivery grade"
+_activeline="$(sed -n "/^ACTIVE = {/,/^STATE_OF/p" "$WATCH" | sed '$d')"
+echo "$_activeline" | grep -q "'EVIDENCE-CONTRADICTED'" \
+  && ok "W-EV-CONTRADICTED registered in ACTIVE (source guard)" \
+  || bad "W-EV-CONTRADICTED not in ACTIVE: $_activeline"
+_hotline="$(sed -n '/^HOT = {/,/^ACTIVE = {/p' "$WATCH" | sed '$d')"
+echo "$_hotline" | grep -q "'EVIDENCE-CONTRADICTED'" \
+  && bad "W-EV-CONTRADICTED registered in HOT before the enforce flip: $_hotline" \
+  || ok "W-EV-CONTRADICTED NOT in HOT during the observe soak (source guard)"
+
+# ── W-EV-DELIVERY-SUFFIX ──
+# Same thirteenth-defect-class limitation as W-EV-CONTRADICTED above: the plain (unqualified)
+# COMPLETE path has no context echo of `delivery`/`branch` either (only the event path sets
+# them, at bin/forge-watch's COMPLETE handler), so a separate later `status --board` process
+# cannot observe the row. P44 (the message names where the code lives) IS fully observable in
+# the notification the SAME `run_check` produces, and P45 (the `_row` copy-list widened in
+# this group's own Diff 11c) is verified by direct source inspection.
+new_env wev7
+R=$(mk_root proj); live_session forge-1 "$R"; evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "COMPLETE: pipeline=e7 completion_id=c7 delivery=committed-local branch=feat/y"
+run_check >/dev/null
+assert_notified "e7 — pipeline COMPLETE — committed on .feat/y., unmerged" "W-EV-DELIVERY-SUFFIX message names where the code lives"
+grep -q "'duplicates', 'blocked_at', 'incarnation', 'callback_shape',$" "$WATCH" \
+  && grep -A1 "'duplicates', 'blocked_at', 'incarnation', 'callback_shape',$" "$WATCH" | grep -q "'delivery', 'merge_state', 'branch'" \
+  && ok "W-EV-DELIVERY-SUFFIX _row copy-list widened to delivery/merge_state/branch (source guard, P45)" \
+  || bad "W-EV-DELIVERY-SUFFIX _row copy-list missing the evidence fields"
+
+# ── W-EV-LEGACY-COMPLETE: no evidence fields => byte-identical to today ──
+new_env wev8
+R=$(mk_root proj); live_session forge-1 "$R"; evlog_touch "$R"; run_check >/dev/null
+evlog_append "$R" "COMPLETE: pipeline=e8 completion_id=c8"
+run_check >/dev/null
+notified_exact "proj · e8 — pipeline COMPLETE" \
+  && ok "W-EV-LEGACY-COMPLETE legacy COMPLETE message byte-identical (anchored match)" \
+  || bad "W-EV-LEGACY-COMPLETE message changed"
 
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"

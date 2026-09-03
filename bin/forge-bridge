@@ -85,6 +85,23 @@ FORGE_HYGIENE_LOCK_WAIT_S="${FORGE_HYGIENE_LOCK_WAIT_S:-5}"
 FORGE_WORKER_MIN_HEADROOM="${FORGE_WORKER_MIN_HEADROOM:-75}"
 # Capability/anchor fixture path (data-driven; never hard-coded).
 FORGE_RESET_CAPABILITY_FILE="${FORGE_RESET_CAPABILITY_FILE:-$HOME/.config/forge/reset-capability.yml}"
+
+# ---- Evidence-gated completion (evidence-gated-completion feature) ----
+# observe = compute + record + render, refuse nothing. This is the SHIPPED default and the
+# runtime kill switch: bin/* is deployed live by symlink, so reverting a binary mid-incident
+# is a poor kill switch. enforce = verify-decision may refuse a contradicted completion.
+FORGE_EVIDENCE_MODE="${FORGE_EVIDENCE_MODE:-observe}"
+# Per-pass scratch. These are ORDINARY shell variables, deliberately NOT exported and
+# deliberately RESET here: update_context is reached from three call sites (cmd_callback
+# :3900, cmd_set_context :2919, and the park-resolve path :2737), and only the first one
+# sets _EV_OBSERVE_DELIVERY. Initialising at script level means a same-named value inherited
+# from the operator's environment can never append a bogus `delivery=` on the other two.
+# _EV_T / _EV_NT memoize the probe budgets for one recording pass (N11): _evidence_cfg
+# spawns python3 + PyYAML (~21ms measured), and a probe cannot memoize for its caller
+# because probes run inside command substitution.
+_EV_OBSERVE_DELIVERY=""
+_EV_T=""
+_EV_NT=""
 FORGE_BROKER_BIN="${FORGE_BROKER_BIN:-forge-broker}"
 
 # ---- Active-context-management controls (S11) ----
@@ -675,6 +692,161 @@ _hygiene_enforcing() {
     local m; m="$(_hygiene_mode)" || return 2
     [ "$m" = enforce ]
 }
+
+# ---- Evidence mode (evidence-gated-completion Step 2) ----
+# Exact structural mirror of _hygiene_mode/_hygiene_enforcing, including the CONFIG_ERROR
+# hard-fail, so a typo (e.g. `enforc`) can NEVER silently fall through to observe in a
+# gating path.
+_evidence_mode() {
+    case "${FORGE_EVIDENCE_MODE:-observe}" in
+        observe|enforce) printf '%s' "${FORGE_EVIDENCE_MODE:-observe}" ;;
+        *) echo "CONFIG_ERROR: FORGE_EVIDENCE_MODE='$FORGE_EVIDENCE_MODE' must be observe|enforce" >&2; return 1 ;;
+    esac
+}
+# rc0 iff the resolved mode is enforce; rc2 on invalid mode (caller aborts).
+_evidence_enforcing() {
+    local m; m="$(_evidence_mode)" || return 2
+    [ "$m" = enforce ]
+}
+
+# ---- Bounded exec (evidence-gated-completion Step 4; plan invariant §2.4) ----
+# The plan says `timeout "${FORGE_EVIDENCE_PROBE_TIMEOUT_S:-5}" …`. THERE IS NO timeout(1) ON
+# THIS PLATFORM — verified: neither `timeout` nor `gtimeout` is on PATH, macOS ships no
+# coreutils, and no existing bin/ code invokes it. A literal `timeout 5 git …` would exit 127
+# for every probe, grading the whole feature UNKNOWN forever AND making every probe test pass
+# for the wrong reason. The bound is enforced here, three ways, in preference order, and it
+# NEVER degrades to an unbounded exec:
+#   1. real timeout(1) if one is ever installed (Linux / brew coreutils) — rc 124
+#   2. perl, forking into its OWN PROCESS GROUP and killing that whole group on the alarm — rc
+#      142. /usr/bin/perl is part of the base macOS install.
+#   3. python3 subprocess.Popen(start_new_session=True) + os.killpg on timeout — python3 is
+#      ALREADY a hard dependency of this script (_hygiene_write, _hygiene_decide,
+#      _terminal_state, _callback_pending_select_exact and others shell to it unconditionally),
+#      so this arm can never be missing. Degrading to an unbounded exec here would run
+#      `git status --porcelain` unbounded on the CALLBACK LATENCY PATH with no UNKNOWN and no
+#      ceiling — verbatim the stall R7 names.
+#
+# BOTH the perl and python3 arms below put the exec'd command in its OWN process group and kill
+# THE WHOLE GROUP on timeout, not just the immediate process. This corrects a defect in the
+# original (bare `alarm(); exec()` / bare `subprocess.run(timeout=)`) shape, found live on this
+# machine (evidence-gated-completion, corrective commit after 40d8e21):
+#   PERL ARM, bare form: `alarm()` correctly survives `exec()` and kills the exec'd process at
+#   the budget — but if that process is a SCRIPT (as `git`/`gh` can invoke internally for a
+#   credential helper, ssh, or similar) and it has already forked a CHILD of its own (e.g. a
+#   shell script's last command, which is a real fork on this platform — verified with `ps`
+#   showing a distinct child PID, not a tail-call exec), the alarm only kills the exec'd
+#   process, never its child. If the caller captures output via `$(...)` (a pipe), the orphaned
+#   grandchild still holds the pipe's write end open, so the caller's read-to-EOF cannot
+#   complete until the grandchild's OWN natural duration elapses — the bound fires (correct rc)
+#   but the CALLER still blocks for the unbounded duration. Reproduced directly: bare
+#   `_ev_timed 1 <script that forks `sleep 5`>`, captured via `$()`, returned rc=142 but only
+#   after 5s, not 1s.
+#   PYTHON3 ARM, bare form: `subprocess.run(timeout=)` DOES bound the caller's wait correctly
+#   (it does not rely on pipe EOF, so it isn't vulnerable to the same caller-blocking failure) —
+#   but on timeout it kills only the immediate child, not any grandchild, leaving an orphaned
+#   process running in the background indefinitely (verified with `ps`). Hardened for the same
+#   reason even though this arm is unreachable while perl is present, so it does not become the
+#   same latent gap if perl is ever removed.
+# Every arm runs argv DIRECTLY (no shell), so a worker-supplied string can never be re-parsed
+# as shell, and stdout passes through verbatim. NOTE the one non-parity between arms: the
+# python3 arm pipes stdout only and leaves stderr inherited, matching timeout/perl; a future
+# caller that wants stderr captured must do it itself, on every arm.
+_ev_timed() {   # <seconds> <cmd> [args...]
+    local s="$1"; shift
+    case "$s" in ''|*[!0-9]*) s=5 ;; esac
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$s" "$@"
+    elif command -v perl >/dev/null 2>&1; then
+        perl -e '
+use POSIX ();
+my $s = shift @ARGV;
+my $pid = fork();
+if (!defined $pid) { exit 125; }
+if ($pid == 0) { POSIX::setpgid(0, 0); exec @ARGV; exit 127; }
+POSIX::setpgid($pid, $pid);
+my $timed_out = 0;
+local $SIG{ALRM} = sub { $timed_out = 1; kill 9, -$pid; };
+alarm($s);
+waitpid($pid, 0);
+alarm(0);
+if ($timed_out) { exit 142; }
+my $rc = $?;
+exit(($rc & 127) ? 128 + ($rc & 127) : ($rc >> 8));
+' "$s" "$@"
+    else
+        FORGE_EV_TMO="$s" python3 - "$@" <<'PY'
+import os,signal,subprocess,sys
+if len(sys.argv)<2: sys.exit(125)
+try:
+    p=subprocess.Popen(sys.argv[1:],stdout=subprocess.PIPE,start_new_session=True)
+except Exception: sys.exit(125)
+try:
+    out,_=p.communicate(timeout=float(os.environ.get("FORGE_EV_TMO") or 5))
+except subprocess.TimeoutExpired:
+    try: os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except Exception: pass
+    try: p.communicate(timeout=2)
+    except Exception: pass
+    sys.exit(124)
+except Exception: sys.exit(125)
+sys.stdout.write(out.decode("utf-8","replace"))
+rc=p.returncode
+# A signal death is negative here and 128+N on the perl arm; both are non-zero and neither
+# is 124/142, so _ev_is_timeout agrees across arms and every probe grades UNKNOWN either way.
+sys.exit(rc if isinstance(rc,int) and 0 <= rc < 256 else 125)
+PY
+    fi
+}
+# rc0 iff the rc names a timeout kill: 124 = GNU timeout / python3 arm, 142 = 128+SIGALRM.
+_ev_is_timeout() { [ "$1" = 124 ] || [ "$1" = 142 ]; }
+
+# Optional `evidence:` block in .claude/forge-project.yml (Step 12). Echoes the value or the
+# supplied default; never fails, never blocks. Lists space-join; booleans normalize to
+# true/false. Precedence at every call site: env > this > shipped default. The project root
+# is passed EXPLICITLY — no hidden _resolve_project_root call on the probe path, and the
+# helper is unit-testable against a path.
+_evidence_cfg() {   # <project_root> <key> <default>
+    local yml="$1/.claude/forge-project.yml"
+    [ -f "$yml" ] || { printf '%s' "$3"; return 0; }
+    local out
+    out="$(FORGE_EVC_KEY="$2" FORGE_EVC_DEF="$3" python3 - "$yml" 2>/dev/null <<'PY'
+import os,sys,yaml
+k=os.environ["FORGE_EVC_KEY"]; dflt=os.environ["FORGE_EVC_DEF"]
+try: d=yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: print(dflt); raise SystemExit(0)
+e=(d.get("evidence") or {}) if isinstance(d,dict) else {}
+v=e.get(k)
+if v is None: print(dflt)
+elif isinstance(v,bool): print("true" if v else "false")
+elif isinstance(v,(list,tuple)): print(" ".join(str(x) for x in v))
+else: print(v)
+PY
+)"
+    printf '%s' "${out:-$3}"
+}
+
+# Effective ceilings. env > evidence.<key> > shipped default, clamped the way
+# _reset_proof_timeout clamps. Each call costs a python3 + PyYAML startup (~21ms measured),
+# so a recording pass resolves them ONCE into _EV_T/_EV_NT and the probes read those.
+_evidence_probe_timeout() {   # [project_root]
+    local t="${FORGE_EVIDENCE_PROBE_TIMEOUT_S:-}"
+    [ -n "$t" ] || t="$(_evidence_cfg "${1:-.}" probe_timeout_s 5)"
+    case "$t" in ''|*[!0-9]*) t=5 ;; esac
+    [ "$t" -lt 1 ] && t=1; [ "$t" -gt 60 ] && t=60
+    printf '%s' "$t"
+}
+_evidence_net_timeout() {   # [project_root]
+    local t="${FORGE_EVIDENCE_NET_TIMEOUT_S:-}"
+    [ -n "$t" ] || t="$(_evidence_cfg "${1:-.}" net_timeout_s 8)"
+    case "$t" in ''|*[!0-9]*) t=8 ;; esac
+    [ "$t" -lt 1 ] && t=1; [ "$t" -gt 120 ] && t=120
+    printf '%s' "$t"
+}
+# Per-pass budget accessors. A probe runs inside command substitution, so it CANNOT memoize
+# for its caller — the caller primes _EV_T/_EV_NT once and the probe's subshell inherits them.
+# Unprimed (a direct unit-test call) falls back to a full resolve, so probes stay standalone.
+_ev_pt() { [ -n "${_EV_T:-}" ]  && { printf '%s' "$_EV_T";  return 0; }; _evidence_probe_timeout "${1:-.}"; }
+_ev_nt() { [ -n "${_EV_NT:-}" ] && { printf '%s' "$_EV_NT"; return 0; }; _evidence_net_timeout  "${1:-.}"; }
 # Test-only crash injector (P0-5). NO-OP unless BOTH FORGE_HYGIENE_TEST=1 AND
 # FORGE_HYGIENE_CRASH_AT names <phase>. Neither is ever set in production, so it cannot
 # fire accidentally. On a match it `exit 99`s, simulating a hard crash at that exact point.
@@ -883,6 +1055,467 @@ PY
     rm -f "$cap_file" 2>/dev/null
     case "$result" in PROVEN*) printf '%s' "$result"; return 0 ;; esac
     printf '%s' "$result"; return 1
+}
+
+# ═══ Evidence probes + selectors (evidence-gated-completion Step 4) ═══════════
+#
+# CONTRACT, identical for every probe:
+#   * prints EXACTLY ONE line, TAB-separated:
+#       <PASS|FAIL|UNKNOWN>:<token-detail>\t<verbatim cmd>\t<exit status>
+#     (Plan-deviation N9: the plan specifies a bare `PASS:<detail>`. The cmd + exit trailer is
+#     what In-Scope item 5 requires the ARTIFACT to carry; it cannot ride the EVENT line
+#     because _sanitize_event_value collapses whitespace runs to `_` and truncates at 200
+#     bytes — the same conclusion forge-watch:999-1001 already records as the reason BLOCKED
+#     emission was removed from the event path. Carrying it on the probe's own line instead of
+#     a side-channel temp file is deliberate: cmd_callback and cmd_verify_decision ALREADY
+#     install `trap _hygiene_release_all RETURN` (:3848, :4581), and a second `trap … RETURN`
+#     REPLACES the first, so a temp file allocated there could not be cleaned up safely.)
+#   * A MULTI-CHILD PROBE REPORTS THE CHILD WHOSE RESULT DETERMINED THE GRADE — not the last
+#     one it happened to run. `_ev_probe_git_state` runs up to three children and
+#     `_ev_probe_committed` two; each returns the decisive command explicitly.
+#   * runs `git -C "$project_root"` — A WORKER-SUPPLIED PATH IS NEVER A WORKING DIRECTORY.
+#   * every external command goes through _ev_timed; a timeout is UNKNOWN:timeout, never PASS
+#     and never FAIL.
+#   * rc is ALWAYS 0. A probe reports; it never fails its caller (design invariant §2.1).
+#   * UNKNOWN never passes and never contradicts (design invariant §2.4).
+#
+# bin/forge-bridge runs WITHOUT `set -e` (verified). The whole tri-state design depends on
+# that: a non-zero child rc must not abort the caller.
+
+_ev_emit()   { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }   # <grade:detail> <cmd> <rc>
+_ev_grade()  { printf '%s' "${1%%:*}"; }
+_ev_detail() { local d="${1#*:}"; printf '%s' "${d%%$(printf '\t')*}"; }
+
+# Tier 0 — repo identity. `--is-inside-work-tree` FIRST so a non-git / bare / shallow checkout
+# grades UNKNOWN instead of being rendered clean (R13).
+_ev_probe_git_state() {   # <project_root> -> PASS:<head>,<branch>
+    local pr="$1" t; t="$(_ev_pt "$pr")"
+    local out rc=0
+    out="$(_ev_timed "$t" git -C "$pr" rev-parse --is-inside-work-tree 2>/dev/null)"; rc=$?
+    _ev_is_timeout "$rc" && { _ev_emit "UNKNOWN:timeout" "git -C $pr rev-parse --is-inside-work-tree" "$rc"; return 0; }
+    if [ "$rc" != 0 ] || [ "$(printf '%s' "$out" | tr -d '[:space:]')" != true ]; then
+        _ev_emit "UNKNOWN:not-a-git-repo" "git -C $pr rev-parse --is-inside-work-tree" "$rc"; return 0
+    fi
+    local head branch
+    head="$(_ev_timed "$t" git -C "$pr" rev-parse HEAD 2>/dev/null)"; rc=$?
+    _ev_is_timeout "$rc" && { _ev_emit "UNKNOWN:timeout" "git -C $pr rev-parse HEAD" "$rc"; return 0; }
+    head="$(printf '%s' "$head" | tr -d '[:space:]')"
+    [ -n "$head" ] || { _ev_emit "UNKNOWN:no-head" "git -C $pr rev-parse HEAD" "$rc"; return 0; }
+    branch="$(_ev_timed "$t" git -C "$pr" rev-parse --abbrev-ref HEAD 2>/dev/null)"; rc=$?
+    _ev_is_timeout "$rc" && { _ev_emit "UNKNOWN:timeout" "git -C $pr rev-parse --abbrev-ref HEAD" "$rc"; return 0; }
+    branch="$(printf '%s' "$branch" | tr -d '[:space:]')"; [ -n "$branch" ] || branch=unknown
+    # Decisive child for a PASS is the HEAD read: it is what the grade's payload comes from.
+    _ev_emit "PASS:$head,$branch" "git -C $pr rev-parse HEAD" 0
+}
+
+# Tier 0 — ancestry. REPLACES a branch-NAME comparison. Empirically (final-plan §5 R3): a
+# worker committing on a diverged branch yields `rev-list --count baseline..HEAD` = 3 WITH a
+# real file delta, so `committed` alone grades the wrong-branch case PASS and it escapes
+# entirely. A benign branch RENAME preserves ancestry but fails a name compare. Ancestry
+# catches the harmful case and clears the benign one.
+_ev_probe_baseline_ancestry() {   # <project_root> <baseline_head>
+    local pr="$1" base="$2" t; t="$(_ev_pt "$pr")"
+    local c="git -C $pr merge-base --is-ancestor $base HEAD"
+    if [ -z "$base" ] || [ "$base" = unknown ]; then _ev_emit "UNKNOWN:no-baseline" "$c" ""; return 0; fi
+    local rc=0
+    _ev_timed "$t" git -C "$pr" cat-file -e "$base^{commit}" >/dev/null 2>&1; rc=$?
+    _ev_is_timeout "$rc" && { _ev_emit "UNKNOWN:timeout" "$c" "$rc"; return 0; }
+    [ "$rc" = 0 ] || { _ev_emit "UNKNOWN:baseline-missing" "git -C $pr cat-file -e $base^{commit}" "$rc"; return 0; }
+    _ev_timed "$t" git -C "$pr" merge-base --is-ancestor "$base" HEAD >/dev/null 2>&1; rc=$?
+    if _ev_is_timeout "$rc"; then _ev_emit "UNKNOWN:timeout" "$c" "$rc"; return 0; fi
+    case "$rc" in
+        0) _ev_emit "PASS:baseline-is-ancestor" "$c" 0 ;;
+        1) _ev_emit "FAIL:baseline-not-ancestor" "$c" 1 ;;
+        *) _ev_emit "UNKNOWN:git-rc-$rc" "$c" "$rc" ;;
+    esac
+}
+
+# Tier 0 — committed. Requires BOTH >=1 commit AND >=1 changed file, so `--allow-empty` cannot
+# satisfy it (R12). Ancestry FAIL POISONS this to UNKNOWN rather than contradicting: across a
+# diverged or rewritten history the count is meaningless, which also covers a mid-stage
+# operator rebase without a false refusal (R6). Never PASS, never FAIL there.
+_ev_probe_committed() {   # <project_root> <baseline_head> <ancestry_grade>
+    local pr="$1" base="$2" anc="$3" t; t="$(_ev_pt "$pr")"
+    local c1="git -C $pr rev-list --count $base..HEAD"
+    local c2="git -C $pr diff --shortstat $base..HEAD"
+    case "$anc" in
+        FAIL*)    _ev_emit "UNKNOWN:baseline-not-ancestor" "$c1" "" ; return 0 ;;
+        UNKNOWN*) _ev_emit "UNKNOWN:ancestry-unknown"      "$c1" "" ; return 0 ;;
+    esac
+    [ -n "$base" ] || { _ev_emit "UNKNOWN:no-baseline" "$c1" ""; return 0; }
+    local n rc=0
+    n="$(_ev_timed "$t" git -C "$pr" rev-list --count "$base..HEAD" 2>/dev/null)"; rc=$?
+    _ev_is_timeout "$rc" && { _ev_emit "UNKNOWN:timeout" "$c1" "$rc"; return 0; }
+    n="$(printf '%s' "$n" | tr -d '[:space:]')"
+    case "$n" in ''|*[!0-9]*) _ev_emit "UNKNOWN:rev-list-failed" "$c1" "$rc"; return 0 ;; esac
+    # Decisive child: the count, when it is zero.
+    [ "$n" -gt 0 ] || { _ev_emit "FAIL:commits=0" "$c1" 0; return 0; }
+    local ss
+    ss="$(_ev_timed "$t" git -C "$pr" diff --shortstat "$base..HEAD" 2>/dev/null)"; rc=$?
+    _ev_is_timeout "$rc" && { _ev_emit "UNKNOWN:timeout" "$c2" "$rc"; return 0; }
+    local files; files="$(printf '%s' "$ss" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\)[[:space:]]*file.*/\1/p')"
+    # Decisive child from here on: the shortstat, which is what distinguishes an empty commit.
+    case "${files:-0}" in
+        ''|0) _ev_emit "FAIL:commits=$n,files=0" "$c2" "$rc" ;;
+        *)    _ev_emit "PASS:commits=$n,files=$files" "$c2" "$rc" ;;
+    esac
+}
+
+# Tier 0 — working tree. TRACKED CHANGES ONLY (`--untracked-files=no`): a stray swapfile or an
+# untracked scratch note must not grade a completion dirty.
+_ev_probe_clean_tree() {   # <project_root>
+    local pr="$1" t; t="$(_ev_pt "$pr")"
+    local c="git -C $pr status --porcelain --untracked-files=no"
+    local out rc=0
+    out="$(_ev_timed "$t" git -C "$pr" status --porcelain --untracked-files=no 2>/dev/null)"; rc=$?
+    _ev_is_timeout "$rc" && { _ev_emit "UNKNOWN:timeout" "$c" "$rc"; return 0; }
+    [ "$rc" = 0 ] || { _ev_emit "UNKNOWN:git-rc-$rc" "$c" "$rc"; return 0; }
+    local n; n="$(printf '%s' "$out" | grep -c '[^[:space:]]')"
+    if [ "${n:-0}" -eq 0 ]; then _ev_emit "PASS:tracked-clean" "$c" 0
+    else _ev_emit "FAIL:tracked-dirty=$n" "$c" 0; fi
+}
+
+# Tier 1 — callback <-> coder-report consistency. coder-report.md is slug-scoped and
+# OVERWRITTEN by every coding-class stage (F13), so a report older than this stage's own
+# dispatch cannot describe it: UNKNOWN:stale-report, NEVER FAIL.
+_ev_probe_report_consistent() {   # <project_root> <slug> <dispatch_pending_ts>
+    local pr="$1" slug="$2" pts="$3"
+    local f="$pr/.dev/proposals/$slug/coder-report.md"
+    local c="parse $f ^\\*\\*Status\\*\\*: + 'NOT COMMITTED'"
+    [ -f "$f" ] || { _ev_emit "UNKNOWN:no-report" "$c" ""; return 0; }
+    local g
+    g="$(FORGE_EVR_PTS="$pts" python3 - "$f" 2>/dev/null <<'PY'
+import calendar,os,re,sys,time
+p=sys.argv[1]; pts=os.environ.get("FORGE_EVR_PTS") or ""
+if pts:
+    try: want=calendar.timegm(time.strptime(pts,"%Y-%m-%dT%H:%M:%SZ"))
+    except Exception: want=None
+    try: mt=os.path.getmtime(p)
+    except Exception: mt=None
+    if want is not None and mt is not None and mt < want:
+        print("UNKNOWN:stale-report"); raise SystemExit(0)
+try: txt=open(p,encoding="utf-8",errors="replace").read()
+except Exception: print("UNKNOWN:report-unreadable"); raise SystemExit(0)
+m=re.search(r'(?m)^\*\*Status\*\*:\s*(\S+)', txt)
+st=(m.group(1) if m else "").strip().upper()
+if not st: print("UNKNOWN:no-status"); raise SystemExit(0)
+if re.search(r'NOT COMMITTED', txt): print("FAIL:not-committed-marker,status=%s"%st); raise SystemExit(0)
+if st=="COMPLETE": print("PASS:status=COMPLETE")
+elif st in ("FAILED","PARTIAL","VALIDATION_FAILED"): print("FAIL:status=%s"%st)
+else: print("UNKNOWN:status=%s"%st)
+PY
+)"
+    _ev_emit "${g:-UNKNOWN:report-unreadable}" "$c" 0
+}
+
+# Tier 2 — merge state (network). Its FAIL means "definitively not merged", which is a GRADE
+# INPUT, never a contradiction: the contradiction set is closed at three cases (Step 9) and
+# `committed-local` is GREEN because the orchestrator is FORBIDDEN to push
+# (skills/forge-orchestrator/SKILL.md :125-129).
+#
+# <oracle_output> is OPTIONAL and exists so the caller can hold the RAW merge_detail (plan
+# Step 8.4: "merge_detail stays out of the journal and lives in the artifact"). A
+# module-level variable cannot carry it out of here: this probe is invoked in command
+# substitution, and an assignment inside `$( )` never reaches the parent shell. Passing the
+# oracle line in ALSO guarantees exactly ONE network call per decision.
+_ev_probe_merge_state() {   # <project_root> [oracle_output]
+    local pr="$1" line="${2:-}"; local c="_merge_state_probe $pr"
+    [ -n "$line" ] || line="$(_merge_state_probe "$pr" 2>/dev/null)"
+    local br base st meth
+    br="$(_ms_field "$line" 1)"; base="$(_ms_field "$line" 2)"
+    st="$(_ms_field "$line" 3)"; meth="$(_ms_field "$line" 4)"
+    case "$st" in
+        BRANCH_MERGED_CLEAN|BRANCH_MERGED_WITH_DRIFT) _ev_emit "PASS:$st,branch=$br,base=$base,method=$meth" "$c" 0 ;;
+        BRANCH_UNMERGED)                              _ev_emit "FAIL:$st,branch=$br,base=$base,method=$meth" "$c" 0 ;;
+        *)                                            _ev_emit "UNKNOWN:${st:-no-state},method=${meth:-none}" "$c" 0 ;;
+    esac
+}
+
+# Tier 2 — pushed. DETAIL ONLY: refs/remotes/origin/<branch> is a possibly-stale LOCAL ref and
+# `git ls-remote` is a network call under the terminal mutex, so a `pushed` GRADE would rest
+# on an unverified assertion — the exact thing this feature exists to eliminate. Recorded with
+# provenance=local-ref; it NEVER grades a delivery tier.
+_ev_probe_pushed() {   # <project_root> <branch>
+    local pr="$1" br="$2" t; t="$(_ev_pt "$pr")"
+    local c="git -C $pr rev-list --count refs/remotes/origin/$br..HEAD"
+    if [ -z "$br" ] || [ "$br" = unknown ] || [ "$br" = HEAD ]; then _ev_emit "UNKNOWN:no-branch" "$c" ""; return 0; fi
+    local rc=0
+    _ev_timed "$t" git -C "$pr" rev-parse --verify --quiet "refs/remotes/origin/$br" >/dev/null 2>&1; rc=$?
+    _ev_is_timeout "$rc" && { _ev_emit "UNKNOWN:timeout" "$c" "$rc"; return 0; }
+    [ "$rc" = 0 ] || { _ev_emit "UNKNOWN:no-remote-ref" "git -C $pr rev-parse --verify refs/remotes/origin/$br" "$rc"; return 0; }
+    local n
+    n="$(_ev_timed "$t" git -C "$pr" rev-list --count "refs/remotes/origin/$br..HEAD" 2>/dev/null)"; rc=$?
+    _ev_is_timeout "$rc" && { _ev_emit "UNKNOWN:timeout" "$c" "$rc"; return 0; }
+    n="$(printf '%s' "$n" | tr -d '[:space:]')"
+    case "$n" in
+        ''|*[!0-9]*) _ev_emit "UNKNOWN:rev-list-failed" "$c" "$rc" ;;
+        0)           _ev_emit "PASS:ahead=0" "$c" 0 ;;
+        *)           _ev_emit "FAIL:ahead=$n" "$c" 0 ;;
+    esac
+}
+
+# Tier 1 — test results. provenance=claim: this is the WORKER's report of its own test run,
+# not a bridge re-execution. Bridge-side re-running was dropped DELIBERATELY (convergent
+# ruling in reconciliation-notes): testing.backend.activate_venv is a string the CODER SKILL
+# interpolates into a worker shell — the bridge owns neither venv nor direnv activation — and
+# this repo's own suite creates tmux sessions, a re-entrancy hazard from a bridge subprocess.
+# No config key exists for it; the technical reference documents it as a future extension only.
+_ev_probe_tests() {   # <project_root> <slug>
+    local pr="$1" slug="$2" f="$pr/.dev/proposals/$slug/coder-report.md"
+    local c="parse $f '## Full Validation' table"
+    [ -f "$f" ] || { _ev_emit "UNKNOWN:no-report" "$c" ""; return 0; }
+    local g
+    g="$(python3 - "$f" 2>/dev/null <<'PY'
+import re,sys
+try: txt=open(sys.argv[1],encoding="utf-8",errors="replace").read()
+except Exception: print("UNKNOWN:report-unreadable"); raise SystemExit(0)
+m=re.search(r'(?ms)^#+\s*Full Validation.*?(?=^#+\s|\Z)', txt)
+if not m: print("UNKNOWN:no-validation-table"); raise SystemExit(0)
+blk=m.group(0)
+fails=len(re.findall(r'\bFAIL\b', blk)); passes=len(re.findall(r'\bPASS\b', blk))
+if fails: print("FAIL:reported-fail=%d,pass=%d"%(fails,passes))
+elif passes: print("PASS:reported-pass=%d"%passes)
+else: print("UNKNOWN:no-results")
+PY
+)"
+    _ev_emit "${g:-UNKNOWN:no-results}" "$c" 0
+}
+
+# ── Selectors ────────────────────────────────────────────────────────────────
+# EXACT DISPATCH-event lookup by pending_timestamp. No match -> empty (callers grade
+# UNKNOWN:no-baseline). Exact match, never a substring grep — the same discipline
+# _event_has_completion (:4655) applies to completion ids.
+_evidence_baseline() {   # <root> <slug> <stage> <pending_ts> -> "head|branch"
+    local ev="$1/.dev/forge-tmp/orchestrator-events.log"
+    [ -f "$ev" ] || { printf ''; return 0; }
+    FORGE_EVB_SLUG="$2" FORGE_EVB_STAGE="$3" FORGE_EVB_PT="$4" python3 - "$ev" <<'PY'
+import os,sys
+slug=os.environ["FORGE_EVB_SLUG"]; stage=os.environ["FORGE_EVB_STAGE"]; pt=os.environ["FORGE_EVB_PT"]
+if not pt: raise SystemExit(0)
+hit=None
+for ln in open(sys.argv[1],errors="replace"):
+    if not ln.startswith("DISPATCH:"): continue
+    f=dict(t.split("=",1) for t in ln.split() if "=" in t)
+    if f.get("pipeline")==slug and f.get("stage")==stage and f.get("pending_timestamp")==pt:
+        hit=f          # last exact match wins (a re-emit for the same pending is the newer)
+if hit: print("%s|%s" % (hit.get("head","unknown"), hit.get("branch","unknown")))
+PY
+}
+
+# For (slug, stage): take the forge-log entry with the LATEST dispatch `timestamp:`,
+# REGARDLESS of open/closed.
+#   - entry still open (response: null) -> "UNKNOWN:stage-in-flight"
+#   - entry closed -> the EVIDENCE record whose pending_timestamp equals that timestamp
+#
+# WHY THIS SHAPE: log entries carry a DISPATCH timestamp only — _patch_response_by_ts
+# (:1801-1849) replaces `response: null` without adding any close timestamp (F14) — so "most
+# recently closed" is not derivable and ordering must be by dispatch time. If the latest entry
+# is still open (a re-dispatch in flight), selecting the older CLOSED entry would refuse
+# against work already superseded (R3).
+#
+# SHARED SPEC with stale-alert-lifecycle C2's `closed_max_ts`, which is ALREADY SHIPPED
+# (commit 698eaea; bin/forge-watch:626, :657, :668-676, :911). That fold keeps the newest
+# CLOSED dispatch ts per (slug, stage) to detect superseded stall orphans.
+#
+#   DO NOT UNIFY THESE TWO FOLDS. Collapsing this selector to closed-only reintroduces R3: a
+#   stage that was contradicted, re-dispatched, and is still running would be graded against
+#   its OLD closed entry and would refuse FOREVER. The two predicates are deliberately
+#   different because they answer different questions.
+_evidence_stage_record() {   # <root> <slug> <stage>
+    local root="$1" slug="$2" stage="$3"
+    local plog="$root/.dev/proposals/$slug/forge-log.yml"
+    local ev="$root/.dev/forge-tmp/orchestrator-events.log"
+    [ -f "$plog" ] || { printf 'UNKNOWN:no-log'; return 0; }
+    FORGE_EVS_STAGE="$stage" FORGE_EVS_SLUG="$slug" FORGE_EVS_EV="$ev" python3 - "$plog" <<'PY'
+import os,re,sys
+stage=os.environ["FORGE_EVS_STAGE"]; slug=os.environ["FORGE_EVS_SLUG"]; ev=os.environ["FORGE_EVS_EV"]
+raw=open(sys.argv[1],errors="replace").read()
+# Defensive regex parse, not yaml.safe_load: legacy log-response emissions produced bad
+# `files:` indentation and yaml raises on them (the same fallback _render_status_file uses).
+starts=[(m.start(), m.group(1)) for m in re.finditer(r'^\s*-\s+timestamp:\s*"([^"]+)"', raw, re.M)]
+best=None
+for i,(off,ts) in enumerate(starts):
+    blk=raw[off:(starts[i+1][0] if i+1<len(starts) else len(raw))]
+    m=re.search(r'^\s+stage:\s*(\S+)\s*$', blk, re.M)
+    if not m or m.group(1)!=stage: continue
+    closed = re.search(r'^\s+response:\s*null\s*$', blk, re.M) is None
+    if best is None or ts>best[0]: best=(ts,closed)
+if best is None: print("UNKNOWN:no-entry"); raise SystemExit(0)
+ts,closed=best
+if not closed: print("UNKNOWN:stage-in-flight"); raise SystemExit(0)
+rec=None
+try:
+    for ln in open(ev,errors="replace"):
+        if not ln.startswith("EVIDENCE:"): continue
+        f=dict(t.split("=",1) for t in ln.split() if "=" in t)
+        if f.get("pipeline")==slug and f.get("stage")==stage and f.get("pending_timestamp")==ts:
+            rec=ln.strip()
+except Exception: pass
+print(rec if rec else "UNKNOWN:no-evidence-record")
+PY
+}
+
+# ── Verdict rollup. Token-shaped, four values, monotone in severity. ─────────
+#   contradicted : an evidence-provenance class read FAIL
+#   suspect      : only claim-provenance (tests) read FAIL
+#   unchecked    : nothing gradable (all UNKNOWN)
+#   ok           : at least one PASS and no FAIL
+# `pushed` never grades (provenance=local-ref) and `merge-detail` is INFO, so neither can
+# move the verdict.
+_ev_verdict() {   # <class>=<grade:detail…> ...
+    local any_pass=0 any_fail=0 claim_fail=0 tok k v
+    for tok in "$@"; do
+        k="${tok%%=*}"; v="${tok#*=}"; v="${v%%:*}"
+        case "$v" in
+            PASS) any_pass=1 ;;
+            FAIL) case "$k" in tests) claim_fail=1 ;; pushed|merge-detail) : ;; *) any_fail=1 ;; esac ;;
+        esac
+    done
+    if   [ "$any_fail"   = 1 ]; then printf 'contradicted'
+    elif [ "$claim_fail" = 1 ]; then printf 'suspect'
+    elif [ "$any_pass"   = 1 ]; then printf 'ok'
+    else                             printf 'unchecked'; fi
+}
+
+# ── Detail artifact ─────────────────────────────────────────────────────────
+# .dev/qa/<slug>/evidence-<stage>-<callback_id>.yaml, fsync'd temp-rename (the same durability
+# idiom as _hygiene_write:783-798). tier and provenance are FIXED PROPERTIES of the class,
+# never supplied by a caller and never derived from anything a worker wrote.
+# Echoes the artifact path. ALWAYS returns 0: a failed artifact write must never affect a
+# callback (design invariant §2.1).
+#
+# `merge-detail` is an INFO-only class carrying the merge oracle's RAW prose (plan Step 8.4:
+# "merge_detail stays out of the journal and lives in the artifact"). YAML round-trips
+# whitespace, which is precisely why the two-sink split exists.
+_ev_artifact_write() {   # <root> <slug> <stage> <cb_id> <kind> <class>=<line> ...
+    local root="$1" slug="$2" stage="$3" cbid="$4" kind="$5"; shift 5
+    local dir="$root/.dev/qa/$slug"; local out="$dir/evidence-${stage}-${cbid}.yaml"
+    mkdir -p "$dir" 2>/dev/null || { printf ''; return 0; }
+    FORGE_EVA_OUT="$out" FORGE_EVA_KIND="$kind" FORGE_EVA_SLUG="$slug" \
+    FORGE_EVA_STAGE="$stage" FORGE_EVA_CBID="$cbid" \
+    python3 - "$@" 2>/dev/null <<'PY' || { printf ''; return 0; }
+import os,sys,time,yaml
+out=os.environ["FORGE_EVA_OUT"]
+META={"git-state":(0,"evidence"),"baseline-ancestry":(0,"evidence"),
+      "committed":(0,"evidence"),"clean-tree":(0,"evidence"),
+      "report-consistent":(1,"evidence"),"tests":(1,"claim"),
+      "merge-state":(2,"evidence"),"pushed":(2,"local-ref"),
+      "merge-detail":(2,"evidence")}
+now=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
+checks=[]
+for arg in sys.argv[1:]:
+    if "=" not in arg: continue
+    cls,line=arg.split("=",1)
+    if cls not in META: continue
+    parts=line.split("\t")
+    grade=parts[0] if parts else ""
+    res,_,detail=grade.partition(":")
+    cmd  = parts[1] if len(parts)>1 else None
+    ex   = parts[2] if len(parts)>2 else None
+    tier,prov=META[cls]
+    checks.append({"class":cls,"tier":tier,"provenance":prov,"result":res,
+                   "detail":detail or None,"cmd":cmd or None,
+                   "exit":(int(ex) if (ex or "").strip().isdigit() else None),"at":now})
+doc={"schema":"forge-evidence/1","kind":os.environ["FORGE_EVA_KIND"],
+     "slug":os.environ["FORGE_EVA_SLUG"],"stage":os.environ["FORGE_EVA_STAGE"],
+     "callback_id":os.environ["FORGE_EVA_CBID"],"at":now,"checks":checks}
+tmp=out+".tmp.%d"%os.getpid()
+try:
+    with open(tmp,"w") as f:
+        yaml.safe_dump(doc,f,default_flow_style=False,sort_keys=False)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,out)
+    d=os.open(os.path.dirname(out) or ".", os.O_RDONLY)
+    try: os.fsync(d)
+    finally: os.close(d)
+except Exception:
+    try: os.remove(tmp)
+    except Exception: pass
+    raise SystemExit(1)
+print(out)
+PY
+}
+
+# _ev_record_callback <root> <slug> <stage> <worker> <cb_id> <pending_ts> <session> <inc>
+# Tier 0 + Tier 1 ONLY — no network on the callback path. Always returns 0.
+# Primes the per-pass budgets ONCE (N11): _evidence_cfg spawns python3 + PyYAML (~21ms), and a
+# probe running in command substitution cannot memoize for its caller.
+# NOTE: NO `trap … RETURN` here or in its callers — cmd_callback already installs
+# `trap _hygiene_release_all RETURN` at :3848 and a second would REPLACE it. This function
+# allocates no temp files precisely so it needs none.
+_ev_record_callback() {
+    local root="$1" slug="$2" stage="$3" worker="$4" cbid="$5" pt="$6" sess="$7" inc="$8"
+    _EV_T="$(_evidence_probe_timeout "$root")"
+    local gs base bh anc com clean rep tst art verdict
+    gs="$(_ev_probe_git_state "$root")"
+    base="$(_evidence_baseline "$root" "$slug" "$stage" "$pt")"
+    bh="${base%%|*}"
+    anc="$(_ev_probe_baseline_ancestry "$root" "$bh")"
+    com="$(_ev_probe_committed "$root" "$bh" "$(_ev_grade "$anc")")"
+    clean="$(_ev_probe_clean_tree "$root")"
+    rep="$(_ev_probe_report_consistent "$root" "$slug" "$pt")"
+    tst="$(_ev_probe_tests "$root" "$slug")"
+    verdict="$(_ev_verdict "git-state=$gs" "baseline-ancestry=$anc" "committed=$com" \
+                           "clean-tree=$clean" "report-consistent=$rep" "tests=$tst")"
+    art="$(_ev_artifact_write "$root" "$slug" "$stage" "$cbid" callback \
+               "git-state=$gs" "baseline-ancestry=$anc" "committed=$com" \
+               "clean-tree=$clean" "report-consistent=$rep" "tests=$tst")"
+    _emit_event EVIDENCE "$slug" \
+        "stage=$stage worker=$worker callback_id=$cbid pending_timestamp=$pt session=$sess incarnation=$inc git-state=$(_ev_grade "$gs") baseline-ancestry=$(_ev_grade "$anc") committed=$(_ev_grade "$com") clean-tree=$(_ev_grade "$clean") report-consistent=$(_ev_grade "$rep") tests=claim:$(_ev_grade "$tst") verdict=$verdict artifact=${art##*/}"
+    _EV_T=""
+    return 0
+}
+
+# Tier-0-only delivery grade for the observe-mode COMPLETE line (Step 11 item 5).
+# NO network, no writes, no side effects. Always prints exactly one of
+# unknown|uncommitted|committed-local.
+_ev_observe_grade() {   # <root> <slug> <stage> <pending_ts>
+    local root="$1" base bh anc com clean
+    _EV_T="$(_evidence_probe_timeout "$root")"
+    base="$(_evidence_baseline "$root" "$2" "$3" "$4")"
+    bh="${base%%|*}"
+    anc="$(_ev_probe_baseline_ancestry "$root" "$bh")"
+    com="$(_ev_probe_committed "$root" "$bh" "$(_ev_grade "$anc")")"
+    clean="$(_ev_probe_clean_tree "$root")"
+    _EV_T=""
+    case "$(_ev_grade "$com")" in
+        FAIL) printf 'uncommitted'; return 0 ;;
+        PASS) case "$(_ev_grade "$clean")" in
+                  FAIL) printf 'uncommitted' ;;
+                  PASS) printf 'committed-local' ;;
+                  *)    printf 'unknown' ;;
+              esac; return 0 ;;
+    esac
+    printf 'unknown'
+}
+
+# _ev_finalize_basis <root> <slug> -> "ok" | "REFUSE:<reason>" | "drift:<new_head>"
+# Called at BOTH of cmd_finalize's revalidation points. REFUSE only when the decision BASIS IS
+# DESTROYED: the bound head_sha is no longer an ancestor of HEAD (history was rewritten under
+# the decision) or the artifact digest no longer matches.
+# Benign FORWARD drift — HEAD merely advanced, or merge_state changed — is RECORDED, never
+# refused: under enforce, terminal-cleanup blocks worker sends but NOT the operator committing
+# in another pane, so forward drift is routine. Stranding a completed pipeline over it is
+# worse than a stale grade. A TIMEOUT grades ok — UNKNOWN never refuses.
+# No `trap … RETURN`: cmd_finalize already installs one at :4707.
+_ev_finalize_basis() {
+    local pr="$1" slug="$2" bound_head bound_sha art rc=0 t
+    bound_head="$(_terminal_field "$pr" head_sha)"
+    bound_sha="$(_terminal_field "$pr" evidence_sha256)"
+    [ -n "$bound_head" ] || { printf 'ok'; return 0; }          # legacy / no decision bound
+    [ "$bound_head" = unknown ] && { printf 'ok'; return 0; }
+    t="$(_evidence_probe_timeout "$pr")"
+    _ev_timed "$t" git -C "$pr" merge-base --is-ancestor "$bound_head" HEAD >/dev/null 2>&1; rc=$?
+    _ev_is_timeout "$rc" && { printf 'ok'; return 0; }
+    [ "$rc" = 1 ] && { printf 'REFUSE:head-rewritten (bound head_sha %s is no longer an ancestor of HEAD)' "$bound_head"; return 0; }
+    if [ -n "$bound_sha" ] && [ "$bound_sha" != none ]; then
+        art="$pr/.dev/qa/$slug/evidence-verify-$(_terminal_field "$pr" verify_callback_id).yaml"
+        local now; now="$(shasum -a 256 "$art" 2>/dev/null | awk '{print $1}')"
+        [ "$now" = "$bound_sha" ] || { printf 'REFUSE:evidence-digest-mismatch (artifact %s)' "$art"; return 0; }
+    fi
+    local cur; cur="$(_ev_timed "$t" git -C "$pr" rev-parse HEAD 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$cur" ] && [ "$cur" != "$bound_head" ]; then printf 'drift:%s' "$cur"; return 0; fi
+    printf 'ok'
 }
 
 # Per-session/incarnation hygiene journal path. Separate from forge-context/forge-usage.
@@ -1252,6 +1885,21 @@ ng=d.get("next_generation",1)
 if not (isinstance(ng,int) and not isinstance(ng,bool) and ng>=1):
     sys.stderr.write("JOURNAL_NEXTGEN_INVALID\n"); sys.exit(1)
 sys.exit(0)
+PY
+}
+
+# Read a `terminal.<field>` value from the hygiene journal. Empty if absent.
+# Exact structural mirror of _hygiene_finalization_field below, one level shallower. A NEW
+# helper rather than an extension of the existing one, so no current caller's semantic moves.
+# Consumers: cmd_finalize's evidence re-check (Step 10), _render_status_file (Step 11), and
+# cmd_finalize's evidence_ack read (Step 9d).
+_terminal_field() {   # <project_root> <field>
+    python3 - "$1/$(_hygiene_file)" "$2" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+print((d.get("terminal") or {}).get(sys.argv[2]) or "")
 PY
 }
 
@@ -2121,7 +2769,16 @@ EOF
                 *) _cq=" qualifier=incomplete $_cu" ;;
             esac
         fi
-        _emit_event COMPLETE "$slug" "last_stage=$stage worker=$worker$_cq"
+        # evidence-gated-completion Step 11.5: in OBSERVE there is no terminal gate at all
+        # (F12) — this emit IS the completion. It carries the Tier-0 delivery grade the
+        # callback computed before update_context ran (Step 6b). Tier 0 only, NO network:
+        # this is the callback close path.
+        # `_EV_OBSERVE_DELIVERY` is set ONLY by cmd_callback's verify/DONE/observe branch and
+        # is reset to "" at script level, so update_context's other two callers
+        # (cmd_set_context :2919, park-resolve :2737) can never append a stale or inherited
+        # token. Empty => the line is byte-identical to today (W-EV-LEGACY-COMPLETE).
+        local _cd=""; [ -n "${_EV_OBSERVE_DELIVERY:-}" ] && _cd=" delivery=$_EV_OBSERVE_DELIVERY"
+        _emit_event COMPLETE "$slug" "last_stage=$stage worker=$worker$_cq$_cd"
         [ "$FORGE_WORKER_HYGIENE_MODE" != enforce ] && _emit_event HYGIENE_BYPASSED "$slug" "reason=observe-mode last_stage=$stage worker=$worker"
     fi
 }
@@ -3720,9 +4377,23 @@ _render_status_file() {
     # `infra-lock status` does not call _render_status_file, so no recursion.
     local il_line=""
     il_line=$(cmd_infra_lock status 2>/dev/null | sed 's/^INFRA_LOCK: //')
+    # evidence-gated-completion Step 11.1. Space-free tokens only. Empty when the journal
+    # carries no decision, in which case the renderer omits the section ENTIRELY and the
+    # status file is byte-identical to today (T-EV-STATUS-LEGACY).
+    local ev_line=""
+    if [ -n "$(_terminal_field "$project_root" delivery_grade)" ]; then
+        ev_line="$(printf 'delivery=%s merge_state=%s branch=%s head=%s dirty_tracked=%s ack=%s at=%s' \
+            "$(_terminal_field "$project_root" delivery_grade)" \
+            "$(_terminal_field "$project_root" merge_state)" \
+            "$(_terminal_field "$project_root" branch)" \
+            "$(_terminal_field "$project_root" head_sha)" \
+            "$(_terminal_field "$project_root" dirty_tracked)" \
+            "$(_terminal_field "$project_root" evidence_ack)" \
+            "$(_terminal_field "$project_root" evidence_at)")"
+    fi
     python3 - "$project_root/$CONTEXT_FILE" "$project_root/$DEV_DIR" "$out_file" "$il_line" \
               "$project_root/$(_usage_file)" "$project_root/$DEV_DIR/forge-tmp/orchestrator-events.log" \
-              "$(_usage_max_age_s)" <<'PYEOF'
+              "$(_usage_max_age_s)" "$ev_line" <<'PYEOF'
 import sys, os, yaml, datetime
 
 context_file, dev_dir, out_file = sys.argv[1:4]
@@ -3736,6 +4407,15 @@ try:
     usage_max_age = int(sys.argv[7]) if len(sys.argv) > 7 else 900
 except ValueError:
     usage_max_age = 900
+# evidence-gated-completion Step 11.1. Absent => the Delivery section is omitted entirely and
+# the rendered file is byte-identical to a pre-evidence pipeline.
+_ev_raw = sys.argv[8] if len(sys.argv) > 8 else ''
+evidence = {}
+for _t in _ev_raw.split():
+    if '=' in _t:
+        _k, _v = _t.split('=', 1)
+        if _v:
+            evidence[_k] = _v
 
 # Worker callback responses (and notes) arrive as raw markdown source; the
 # status file is a plain-text surface, so `**bold**`/backticks/[x](url) would
@@ -4020,6 +4700,18 @@ if notes:
 else:
     L.append("  (none)")
 L.append("")
+
+# evidence-gated-completion Step 11.1: LAST section, omitted entirely when there is no
+# terminal decision for this pipeline (T-EV-STATUS-LEGACY / T-EV-STATUS-SECTIONS).
+if evidence:
+    L.append("## Delivery")
+    L.append("")
+    L.append('Delivery:  %s  (branch %s, merge_state %s, head %s)' % (
+        evidence.get('delivery', '?'), evidence.get('branch', '?'),
+        evidence.get('merge_state', '?'), (evidence.get('head', '') or '?')[:12]))
+    L.append('Evidence:  dirty_tracked=%s ack=%s at=%s' % (
+        evidence.get('dirty_tracked', '?'), evidence.get('ack', '0'),
+        evidence.get('at', '?')))
 
 with open(out_file, 'w') as f:
     f.write("\n".join(L))
@@ -4805,7 +5497,18 @@ PY
     _hygiene_crash_at delivered     # P2-1: after the delivered write — benign (a later callback confirms)
 
     _worker_unlock "$worker_canonical"
-    _emit_event DISPATCH "$slug" "stage=$stage worker=$worker_canonical"
+    # evidence-gated-completion Step 3: the DISPATCH baseline. `$_pend_ts` (set at :3682-3683)
+    # comes from _callback_pending_select_exact — the SAME selector cmd_callback binds with at
+    # :3806 — so the baseline inherits the callback path's anti-spoof identity for free.
+    # forge-watch:1012-1017 reads only `pipeline` from DISPATCH lines, so all three tokens are
+    # inert to every existing consumer.
+    # Deliberately NOT _ev_timed-wrapped: these run on the DISPATCH path, not the callback
+    # latency path R7 protects; they are the cheapest git commands that exist; and each already
+    # degrades to `unknown`, which grades UNKNOWN:no-baseline and never refuses.
+    local _ev_head _ev_branch
+    _ev_head=$(git -C "$project_root" rev-parse HEAD 2>/dev/null || echo unknown)
+    _ev_branch=$(git -C "$project_root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+    _emit_event DISPATCH "$slug" "stage=$stage worker=$worker_canonical head=$_ev_head branch=$_ev_branch pending_timestamp=${_pend_ts:-}"
     _render_status_file
     echo "DISPATCHED stage=$stage worker=$worker_canonical slug=$slug prompt=$prompt_file"
 }
@@ -5057,6 +5760,31 @@ EOF
         _hygiene_write "$project_root" observe-unknown "$worker_canonical" && _cb_invalidated=1
         [ "$_cb_invalidated" = 1 ] || _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=observation-invalidation-unpersisted (journal unwritable) — prior evidence may be stale"
     fi
+    # evidence-gated-completion Step 6, SECOND placement — deliberately narrow.
+    # update_context runs at :3899-3900, INSIDE the terminal-close block and BEFORE the
+    # evidence tail, so in OBSERVE the COMPLETE: emit at :1442-1454 fires before any
+    # tail-placed evidence exists (F12). Scoping this to the single verify/DONE callback that
+    # can emit COMPLETE in observe bounds the exposure to ONE CALLBACK PER PIPELINE.
+    # Read-only, Tier 0 only (no network), timeout-bounded; _observe_usage already runs
+    # capture-pane under this same worker lock at :3966.
+    #
+    # The grade rides a PLAIN shell variable: update_context runs in a `( cd … && … )`
+    # SUBSHELL, which inherits non-exported variables. It is deliberately NOT exported —
+    # exporting would leak it into every child process for the rest of the callback. The
+    # script-level `_EV_OBSERVE_DELIVERY=""` at :~90 is what keeps a same-named value
+    # inherited from the operator's environment out of update_context's OTHER two callers
+    # (cmd_set_context :2919 and the park-resolve path :2737).
+    #
+    # `unknown` fallback: inside this guard a grade WAS meant to be reported, and
+    # _ev_observe_grade always prints one of unknown|uncommitted|committed-local — so the
+    # fallback fires only if the helper itself failed, where `unknown` is the honest answer
+    # and is exactly what design invariant §2.4 requires. Byte-identity for legacy pipelines
+    # is unaffected: they never enter this block, so the token is never appended.
+    _EV_OBSERVE_DELIVERY=""
+    if [ "$status" = DONE ] && [ "$stage" = verify ] && [ "$FORGE_WORKER_HYGIENE_MODE" != enforce ]; then
+        _EV_OBSERVE_DELIVERY="$(_ev_observe_grade "$project_root" "$slug" "$stage" "$selected_pending_timestamp" 2>/dev/null)"
+        [ -n "$_EV_OBSERVE_DELIVERY" ] || _EV_OBSERVE_DELIVERY=unknown
+    fi
     # §3.3: serialize publication against park/resolve/supersede/consume on the same
     # (slug,stage). Acquire before close-then-publish; release after the mv.
     _callback_prelock_barrier
@@ -5218,6 +5946,17 @@ PY
         fi
         _hygiene_write "$project_root" promote "$worker_canonical" "pending_timestamp=$selected_pending_timestamp" 2>/dev/null || true
         _worker_unlock "$worker_canonical"
+    fi
+
+    # evidence-gated-completion Step 6, FIRST placement (all stages).
+    # DESIGN INVARIANT §2.1: the callback NEVER fails on evidence — rc, stdout, and the
+    # callback file's bytes are unchanged. Placed AFTER _worker_unlock so git subprocesses
+    # never sit inside the held worker lock (R7), and run in a subshell with `|| true` so no
+    # probe, write, or emit can alter rc or stdout. DONE only: BLOCKED keeps its pending open
+    # (it is not a completion claim) and ERROR makes no work claim at all.
+    if [ "$status" = DONE ]; then
+        ( _ev_record_callback "$project_root" "$slug" "$stage" "$worker_canonical" \
+              "$cb_id" "$selected_pending_timestamp" "$cb_session" "$cb_incarnation" ) >/dev/null 2>&1 || true
     fi
 
     _render_status_file
@@ -5995,13 +6734,21 @@ cmd_verify_decision() {
     # P0-9: enforce-only terminal command. In observe it must NOT persist the new terminal
     # vocabulary; an invalid mode is a hard error, never a silent observe fall-through.
     _hygiene_enforcing || { echo "ERROR: verify-decision is an enforce-mode command (mode=$FORGE_WORKER_HYGIENE_MODE); in observe, verify/DONE closes via legacy completion." >&2; return 1; }
-    local slug="" callback_id="" pending_ts=""
+    # --acknowledge-evidence: the ONE audited escape, modelled on hygiene-abandon's --reason
+    # (:4861-4862). Operator-only by convention and by documentation (Hard Rule 24); an empty
+    # reason is rc 1. It is honoured ONLY when a contradiction is actually present under
+    # enforce — it is an escape FROM A REFUSAL, never a way to downgrade a clean completion.
+    local slug="" callback_id="" pending_ts="" ack_seen=0 ack_reason=""
     while [ $# -gt 0 ]; do case "$1" in
         --slug) slug="$2"; shift 2 ;;
         --callback-id) callback_id="$2"; shift 2 ;;
         --pending-timestamp) pending_ts="$2"; shift 2 ;;
+        --acknowledge-evidence) ack_seen=1; ack_reason="$2"; shift 2 ;;
         *) shift ;;
     esac; done
+    if [ "$ack_seen" = 1 ] && [ -z "$(printf '%s' "$ack_reason" | tr -d '[:space:]')" ]; then
+        echo "ERROR: --acknowledge-evidence requires a non-empty reason" >&2; return 1
+    fi
     [ -n "$slug" ] && [ -n "$callback_id" ] && [ -n "$pending_ts" ] || {
         echo "Usage: forge-bridge verify-decision --slug <s> --callback-id <id> --pending-timestamp <ts>" >&2; return 1; }
     local pr; pr="$(_resolve_project_root "")"; [ -n "$pr" ] || { echo "ERROR: no project root" >&2; return 1; }
@@ -6043,10 +6790,157 @@ PY
     case "$_verdict" in CLEAR) ;; *) _lifecycle_unlock; echo "REFUSED: verdict='$_verdict' (not CLEAR) — no cleanup." >&2; return 1 ;; esac
     local _rhash2; _rhash2="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
     [ "$_rhash" = "$_rhash2" ] || { _lifecycle_unlock; echo "REFUSED: report changed during decision" >&2; return 1; }
+
+    # ═══ evidence-gated-completion Step 8: decide and bind (NO GATE YET) ══════════
+    # NO `trap … RETURN` in this block: cmd_verify_decision already installs
+    # `trap _hygiene_release_all RETURN` at :4581 and a second would REPLACE it, silently
+    # disabling every lock release. Nothing here allocates a temp file.
+    # Per-pass budgets, resolved ONCE (N11).
+    _EV_T="$(_evidence_probe_timeout "$pr")"; _EV_NT="$(_evidence_net_timeout "$pr")"
+
+    # Tier 0 re-run against CURRENT HEAD plus Tier 2 (network). The bridge RE-CHECKS STATE;
+    # it never re-runs work. The oracle is invoked EXACTLY ONCE and its output is threaded
+    # through, so there is one network round-trip and the caller holds the RAW merge_detail
+    # (plan Step 8.4) — which a module-level variable could not carry out of a probe running
+    # in command substitution.
+    local _ev_gs _ev_tree _ev_merge _ev_push _ev_head _ev_branch
+    local _ev_ms_line _ev_ms_state _ev_ms_base _ev_ms_detail
+    _ev_gs="$(_ev_probe_git_state "$pr")"
+    _ev_head="$(_ev_detail "$_ev_gs")"; _ev_branch="${_ev_head#*,}"; _ev_head="${_ev_head%%,*}"
+    case "$(_ev_grade "$_ev_gs")" in PASS) ;; *) _ev_head=unknown; _ev_branch=unknown ;; esac
+    _ev_tree="$(_ev_probe_clean_tree "$pr")"
+    _ev_ms_line="$(_merge_state_probe "$pr" 2>/dev/null)"
+    _ev_merge="$(_ev_probe_merge_state "$pr" "$_ev_ms_line")"
+    _ev_ms_base="$(_ms_field "$_ev_ms_line" 2)"
+    _ev_ms_state="$(_ms_field "$_ev_ms_line" 3)"
+    _ev_ms_detail="$(_ms_field "$_ev_ms_line" 5)"
+    _ev_push="$(_ev_probe_pushed "$pr" "$_ev_branch")"
+
+    # Decision set: one _evidence_stage_record per coding-class stage of this slug.
+    # `coding_stages` is config-driven (Step 12) and defaults to the shipped single stage.
+    # UNKNOWN records are SKIPPED — UNKNOWN never contradicts (design invariant §2.4).
+    local _ev_stages; _ev_stages="$(_evidence_cfg "$pr" coding_stages coding)"
+    local _ev_vfb; _ev_vfb="$(_evidence_cfg "$pr" validation_failed_blocks false)"
+    local _ev_block="" _ev_cmd="" _ev_st _ev_rec _ev_fresh
+    local _ev_committed_seen=0 _ev_committed_bad=0
+    for _ev_st in $_ev_stages; do
+        _ev_rec="$(_evidence_stage_record "$pr" "$slug" "$_ev_st")"
+        case "$_ev_rec" in UNKNOWN:*) continue ;; esac
+        # Case 1 — report-consistent. The record's grade is advisory; the CONTRADICTION is
+        # decided on a FRESH read (plan: "whose FRESH report-consistent read"), so a stage
+        # fixed and re-run since the callback is not held against it.
+        case "$_ev_rec" in *" report-consistent=FAIL"*)
+            _ev_fresh="$(_ev_probe_report_consistent "$pr" "$slug" "")"
+            case "$_ev_fresh" in
+                FAIL:status=VALIDATION_FAILED*)
+                    # skills/forge-coder/SKILL.md:241-244 declares full-validation failures
+                    # NON-BLOCKING BY DESIGN. Reversing a documented policy must be a
+                    # deliberate operator decision, so it is config-gated, default false.
+                    if [ "$_ev_vfb" = true ]; then
+                        _ev_block="$_ev_block report-consistent($_ev_st)=$(_ev_detail "$_ev_fresh")"
+                        _ev_cmd="grep '^\\*\\*Status\\*\\*:' .dev/proposals/$slug/coder-report.md"
+                    fi ;;
+                FAIL*)
+                    _ev_block="$_ev_block report-consistent($_ev_st)=$(_ev_detail "$_ev_fresh")"
+                    _ev_cmd="grep '^\\*\\*Status\\*\\*:' .dev/proposals/$slug/coder-report.md" ;;
+            esac ;;
+        esac
+        # Case 2 — committed=FAIL. Ancestry failure POISONS committed to UNKNOWN upstream, so
+        # this can never fire on a diverged history or a mid-stage operator rebase (R6).
+        case "$_ev_rec" in
+            *" committed=FAIL"*)
+                _ev_block="$_ev_block committed($_ev_st)=FAIL"
+                _ev_cmd="git rev-list --count <baseline>..HEAD && git diff --shortstat <baseline>..HEAD"
+                _ev_committed_bad=1 ;;
+            *" committed=PASS"*) _ev_committed_seen=1 ;;
+            *)                   _ev_committed_bad=1 ;;   # UNKNOWN committed: not green
+        esac
+    done
+
+    # Delivery grade. `committed-local` is GREEN: the orchestrator is FORBIDDEN to push, so it
+    # is the highest machine-reachable state for most pipelines. There is deliberately NO
+    # `pushed-unmerged` tier — refs/remotes/origin/<branch> is a possibly-stale local ref and
+    # `git ls-remote` is a network call under the terminal mutex, so a `pushed` GRADE would
+    # rest on an unverified assertion, the exact thing this feature eliminates.
+    local _ev_dirty=false _ev_delivery=unknown
+    case "$(_ev_grade "$_ev_tree")" in FAIL) _ev_dirty=true ;; esac
+    case "$_ev_ms_state" in
+        BRANCH_MERGED_CLEAN|BRANCH_MERGED_WITH_DRIFT) _ev_delivery=merged ;;
+        *)
+            if [ "$_ev_dirty" = true ] || [ "$_ev_committed_bad" = 1 ]; then
+                [ "$_ev_dirty" = true ] && _ev_delivery=uncommitted
+                [ "$_ev_committed_bad" = 1 ] && [ "$_ev_dirty" != true ] && _ev_delivery=unknown
+                [ "$_ev_committed_bad" = 1 ] && case "$_ev_rec" in *" committed=FAIL"*) _ev_delivery=uncommitted ;; esac
+            elif [ "$_ev_committed_seen" = 1 ]; then
+                _ev_delivery=committed-local
+            fi ;;
+    esac
+
+    # Decision artifact + digest. Same shasum idiom as report_sha256 (:4614). The RAW
+    # merge_detail rides the artifact as an INFO-only `merge-detail` class: it cannot go on
+    # the EVIDENCE: event line (_sanitize_event_value collapses whitespace, truncates at 200
+    # bytes) and it cannot go in the hygiene journal (values split on whitespace, F7) — which
+    # is exactly the two-sink split's reason for existing (plan Step 8.4).
+    local _ev_art _ev_sha _ev_verd
+    _ev_art="$(_ev_artifact_write "$pr" "$slug" verify "$callback_id" decision \
+                   "git-state=$_ev_gs" "clean-tree=$_ev_tree" "merge-state=$_ev_merge" \
+                   "pushed=$_ev_push" "merge-detail=INFO:${_ev_ms_detail}	_merge_state_probe $pr	0")"
+    _ev_sha="$(shasum -a 256 "$_ev_art" 2>/dev/null | awk '{print $1}')"
+    _ev_verd="$(_ev_verdict "git-state=$_ev_gs" "clean-tree=$_ev_tree" "merge-state=$_ev_merge")"
+    [ -n "$(printf '%s' "$_ev_block" | tr -d '[:space:]')" ] && _ev_verd=contradicted
+    _emit_event EVIDENCE "$slug" \
+        "stage=verify worker=$_cbwk callback_id=$callback_id pending_timestamp=$pending_ts session=${ID_target_session:-} incarnation=${ID_target_incarnation:-} delivery=$_ev_delivery merge_state=${_ev_ms_state:-unknown} branch=${_ev_branch:-unknown} head=${_ev_head:-unknown} dirty_tracked=$_ev_dirty clean-tree=$(_ev_grade "$_ev_tree") merge-state=$(_ev_grade "$_ev_merge") pushed=local-ref:$(_ev_grade "$_ev_push") evidence_sha256=${_ev_sha:-none} verdict=$_ev_verd"
+    _EV_T=""; _EV_NT=""
+
+    # ═══ evidence-gated-completion Step 9: THE GATE ═══════════════════════════════
+    # The contradiction set was computed UNCONDITIONALLY in Step 8, in BOTH modes. That is a
+    # re-read of records the probes already produced, not new work, and computing it in
+    # observe too is what lets the acknowledge path verify there is SOMETHING to acknowledge.
+    #
+    # The set is CLOSED and EXHAUSTIVE — three cases:
+    #   1. a coding-class stage whose FRESH report-consistent read said FAILED / PARTIAL, or
+    #      carried a NOT COMMITTED marker, while its callback said DONE;
+    #   2. a coding-class stage with committed=FAIL (baseline present AND an ancestor, zero
+    #      commits or no file delta);
+    #   3. evidence_sha256 mismatch / destroyed basis at finalize (Step 10).
+    # UNKNOWN NEVER REFUSES and never contradicts. VALIDATION_FAILED never refuses in v1 (the
+    # config gate lives in Step 8). A refusal returns BEFORE the _hygiene_write below, so the
+    # terminal state is UNTOUCHED.
+    local _ev_ack_kv=""
+    if [ -n "$(printf '%s' "$_ev_block" | tr -d '[:space:]')" ] && _evidence_enforcing; then
+        if [ "$ack_seen" = 1 ]; then
+            _ev_ack_kv=" evidence_ack=1 evidence_ack_reason=$(_sanitize_event_value "$ack_reason") evidence_ack_at=$(timestamp)"
+            _emit_event EVIDENCE_ACK "$slug" "stage=verify worker=$_cbwk callback_id=$callback_id classes=$(_sanitize_event_value "$_ev_block") delivery=$_ev_delivery reason=$(_sanitize_event_value "$ack_reason")"
+            echo "EVIDENCE_ACKNOWLEDGED slug=$slug classes=$_ev_block — completion will publish as complete-qualified."
+        else
+            _lifecycle_unlock
+            {
+              echo "REFUSED: evidence contradicts the DONE claim for '$slug' (delivery=$_ev_delivery). Terminal state UNCHANGED."
+              echo "  contradiction:$_ev_block"
+              echo "  command run:  ${_ev_cmd:-see $_ev_art}"
+              echo "  evidence:     $_ev_art"
+              echo "  remedy:       fix the work and re-dispatch the stage (a clean re-run allows), OR"
+              echo "                forge-bridge verify-decision --slug $slug --callback-id $callback_id \\"
+              echo "                    --pending-timestamp \"$pending_ts\" --acknowledge-evidence \"<why this is acceptable>\""
+              echo "  kill switch:  FORGE_EVIDENCE_MODE=observe restores pre-evidence behavior exactly."
+            } >&2
+            return 1
+        fi
+    elif [ -n "$(printf '%s' "$_ev_block" | tr -d '[:space:]')" ]; then
+        # OBSERVE: record and render, refuse nothing (R9). The EVIDENCE line above already
+        # carries verdict=contradicted, which the watcher surfaces as EVIDENCE-CONTRADICTED.
+        echo "EVIDENCE_OBSERVED slug=$slug verdict=$_ev_verd contradicted=$_ev_block (mode=observe — NOT gated)"
+    elif [ "$ack_seen" = 1 ]; then
+        # The flag is an escape FROM a refusal. With nothing to escape, honouring it would
+        # downgrade a clean run to complete-qualified (Step 9d ORs evidence_ack into
+        # `qualified`, and :4808 turns that into complete-qualified).
+        echo "NOTE: --acknowledge-evidence ignored — no contradiction to acknowledge (evidence mode=$(_evidence_mode)). Publishing an unqualified completion." >&2
+    fi
+
     # P0-3/P1-7: the decision + terminal transition are HARD — a silent journal failure must
     # not leave the caller believing the decision was recorded. Written under the verify
     # lifecycle lock (serializes against callback publication / park-resolve on this stage).
-    _hygiene_write "$pr" terminal "" "slug=$slug verify_callback_id=$callback_id verify_pending_ts=$pending_ts report_sha256=$_rhash verdict=CLEAR worker=$_cbwk decided_at=$(timestamp)" \
+    _hygiene_write "$pr" terminal "" "slug=$slug verify_callback_id=$callback_id verify_pending_ts=$pending_ts report_sha256=$_rhash verdict=CLEAR worker=$_cbwk decided_at=$(timestamp) delivery_grade=$_ev_delivery evidence_sha256=${_ev_sha:-none} merge_state=${_ev_ms_state:-unknown} branch=${_ev_branch:-unknown} head_sha=${_ev_head:-unknown} base_ref=${_ev_ms_base:-unknown} dirty_tracked=$_ev_dirty evidence_at=$(timestamp)${_ev_ack_kv:-}" \
         || { _lifecycle_unlock; echo "ERROR: verify-decision: could not persist the CLEAR decision (journal write failed) — no transition." >&2; return 1; }
     local _cu; _cu="$(_completion_unresolved "$pr")"
     case "$_cu" in
@@ -6175,6 +7069,15 @@ PY
     local report="$pr/.dev/qa/$slug/verification-report.yaml" _rh2
     _rh2="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
     [ "$_rh2" = "$_trh" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: report hash changed since decision" >&2; return 1; }
+    # evidence-gated-completion Step 10: refuse ONLY on a destroyed decision basis.
+    local _ev_basis; _ev_basis="$(_ev_finalize_basis "$pr" "$slug")"
+    case "$_ev_basis" in
+        REFUSE:*) for w in $order; do _worker_unlock "$w"; done
+                  echo "REFUSED: evidence basis destroyed since verify-decision — ${_ev_basis#REFUSE:}" >&2
+                  echo "         Re-run verify-decision to re-bind, or FORGE_EVIDENCE_MODE=observe." >&2
+                  return 1 ;;
+        drift:*)  _hygiene_write "$pr" terminal "" "head_moved=true head_sha_at_finalize=${_ev_basis#drift:}" 2>/dev/null || true ;;
+    esac
     local _cu; _cu="$(_completion_unresolved "$pr")"
     [ "$_cu" = "parked=0 blocked=0" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: unresolved residue $_cu" >&2; return 1; }
     local _cid; _cid="$(_completion_id "${ID_target_session}" "${ID_target_incarnation}" "$slug" "$_tcb" "$_tpt" "$_trh")"
@@ -6200,6 +7103,25 @@ PY
             to_clear="$to_clear $w"; echo "  $w: needs reset (decision=$_dec)"
         fi
     done
+    # evidence-gated-completion Step 7.1: `qualifier` becomes a COMMA-JOINED TOKEN SET, so a
+    # completion can be qualified for more than one reason at once. Order is FIXED so the
+    # string is deterministic. Computed HERE — after the preflight loop that populates `dirty`
+    # and `qualified` and BEFORE the context write below that persists it.
+    # (Computing it at the `_extra` line would be too late: the context write runs first and
+    # would persist an empty qualifier, silently not delivering P25.)
+    # Step 9d extends this block with the evidence-acknowledged token.
+    local _qtok=""
+    [ -n "${dirty%,}" ] && _qtok="hygiene-disabled"
+    # evidence-gated-completion Step 9: an acknowledged evidence contradiction is OR-ed into
+    # the EXISTING `qualified` flag, so _final_state becomes complete-qualified through the
+    # ALREADY-TESTED path. cmd_verify_decision cannot publish a terminal state of any kind
+    # (F11 discipline); it only records the acknowledgement in the journal, and this is where
+    # that record is consumed.
+    local _ev_ack; _ev_ack="$(_terminal_field "$pr" evidence_ack)"
+    if [ "$_ev_ack" = 1 ]; then
+        qualified=1
+        _qtok="${_qtok:+$_qtok,}evidence-acknowledged"
+    fi
     if [ "$any_bad" = 1 ]; then
         for w in $order; do _worker_unlock "$w"; done
         echo "FINALIZE_UNCONFIRMED — a pane is not idle / config error; left terminal-cleanup, no COMPLETE." >&2; return 1; fi
@@ -6223,6 +7145,15 @@ PY
         *) for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: terminal state changed to '$_rev' during finalize — no COMPLETE." >&2; return 1 ;; esac
     _rh2="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
     [ "$_rh2" = "$_trh" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: report hash changed during finalize — no COMPLETE." >&2; return 1; }
+    # evidence-gated-completion Step 10, second revalidation point — immediately before the
+    # irreversible publication, under the held worker locks.
+    _ev_basis="$(_ev_finalize_basis "$pr" "$slug")"
+    case "$_ev_basis" in
+        REFUSE:*) for w in $order; do _worker_unlock "$w"; done
+                  echo "REFUSED: evidence basis destroyed during finalize — ${_ev_basis#REFUSE:} — no COMPLETE." >&2
+                  return 1 ;;
+        drift:*)  _hygiene_write "$pr" terminal "" "head_moved=true head_sha_at_finalize=${_ev_basis#drift:}" 2>/dev/null || true ;;
+    esac
     _cu="$(_completion_unresolved "$pr")"
     [ "$_cu" = "parked=0 blocked=0" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: residue appeared during finalize ($_cu) — no COMPLETE." >&2; return 1; }
     # ---- Durable outbox publication (plan Step 9). Pre-COMPLETE writes are HARD. P0-8:
@@ -6235,9 +7166,10 @@ PY
     # conflicting pre-existing completion_id, and fsyncs a temp-rename.
     local _final_state; _final_state=$([ "$qualified" = 1 ] && echo complete-qualified || echo complete)
     local ctx; ctx="$pr/$(_context_file)"
-    if ! FORGE_FC_NEXT="$_final_state" FORGE_FC_CID="$_cid" python3 - "$ctx" <<'PY'
+    if ! FORGE_FC_NEXT="$_final_state" FORGE_FC_CID="$_cid" FORGE_FC_QUAL="${_qtok:-}" python3 - "$ctx" <<'PY'
 import os,sys,re
 ctx=sys.argv[1]; nxt=os.environ["FORGE_FC_NEXT"]; cid=os.environ["FORGE_FC_CID"]
+qual=os.environ.get("FORGE_FC_QUAL") or ""
 try: txt=open(ctx).read()
 except Exception: sys.exit(1)
 m=re.search(r'(?m)^completion_id:\s*(\S+)\s*$', txt)
@@ -6245,13 +7177,21 @@ if m and m.group(1)!=cid: sys.stderr.write("CONTEXT_CID_CONFLICT\n"); sys.exit(2
 if re.search(r'(?m)^next_stage:', txt): txt=re.sub(r'(?m)^next_stage:.*$','next_stage: '+nxt,txt)
 else: txt=txt.rstrip('\n')+'\nnext_stage: '+nxt+'\n'
 if not m: txt=txt.rstrip('\n')+'\ncompletion_id: '+cid+'\n'
+# Persisted qualifier token set (plan Step 7 item 2). Written HERE and nowhere earlier:
+# update_context rewrites the context file wholesale (F5), destroying any earlier write.
+# Absent when nothing qualified => legacy contexts stay byte-identical.
+if qual:
+    if re.search(r'(?m)^qualifier:', txt): txt=re.sub(r'(?m)^qualifier:.*$','qualifier: '+qual,txt)
+    else: txt=txt.rstrip('\n')+'\nqualifier: '+qual+'\n'
 tmp=ctx+'.tmp.%d'%os.getpid()
 try:
     with open(tmp,'w') as f: f.write(txt); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,ctx)
 except Exception: sys.exit(1)
 v=open(ctx).read()
-sys.exit(0 if (('next_stage: '+nxt) in v and ('completion_id: '+cid) in v) else 3)
+ok=('next_stage: '+nxt) in v and ('completion_id: '+cid) in v
+if qual: ok = ok and ('qualifier: '+qual) in v
+sys.exit(0 if ok else 3)
 PY
     then echo "FINALIZE_CONTEXT_WRITE_FAILED — outbox stays resets-confirmed, no COMPLETE." >&2; return 1; fi
     _hygiene_crash_at fin-context
@@ -6264,7 +7204,10 @@ PY
     # (idempotent by exact match), so it publishes exactly once and is never spoofable by an
     # unrelated event carrying the id.
     local evlog="$pr/.dev/forge-tmp/orchestrator-events.log"
-    local _extra=""; [ "$qualified" = 1 ] && _extra=" qualifier=hygiene-disabled workers_dirty=${dirty%,}"
+    # With only hygiene qualifying, `_qtok` is exactly `hygiene-disabled` and this line is
+    # byte-identical to the previous single-literal form — tests/forge-bridge/run.sh pins that
+    # exact string and must stay green UNEDITED.
+    local _extra=""; [ -n "$_qtok" ] && _extra=" qualifier=$_qtok workers_dirty=${dirty%,}"
     _append_complete_event "$pr" "$slug" "$_cid" "$_extra" || {
         echo "FINALIZE_EVENT_UNCONFIRMED — COMPLETE not durably appended; outbox stays event-pending, retry finalize." >&2; return 1; }
     _hygiene_crash_at fin-event
@@ -7051,12 +7994,17 @@ cmd_emit() {
         return 1
     fi
     local type="$1"; shift
+    # EVIDENCE is deliberately ABSENT: evidence lines are bridge-authored only, so a
+    # protocol-following worker cannot forge one via the CLI. EVIDENCE_ACK is present so the
+    # orchestrator can surface an operator acknowledgement. Placed on the first
+    # case-alternative line (unpinned by any literal-substring test) and, in the message,
+    # immediately after USAGE.
     case "$type" in
-        DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE) ;;
+        DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|EVIDENCE_ACK) ;;
         RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY) ;;
         WORKER_LOW_CONTEXT|ORCHESTRATOR_LOW_CONTEXT) ;;
         *)
-            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY|WORKER_LOW_CONTEXT|ORCHESTRATOR_LOW_CONTEXT; got '$type'" >&2
+            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|EVIDENCE_ACK|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY|WORKER_LOW_CONTEXT|ORCHESTRATOR_LOW_CONTEXT; got '$type'" >&2
             return 1
             ;;
     esac
@@ -7359,6 +8307,151 @@ PYEOF
     return 0
 }
 
+# ---- Merge-state oracle (evidence-gated-completion Step 1) ----
+# THE one merge-state oracle, lifted VERBATIM out of cmd_preflight so both preflight and the
+# Tier-2 evidence probe run the same code.
+#
+# Prints EXACTLY SEVEN LINES, newline-delimited:
+#   1 branch  2 base_ref  3 merge_state  4 merge_method  5 merge_detail  6 head_sha  7 pr
+# Newline-delimited, NOT the "|"-joined form the plan sketched: merge_detail is free prose
+# ("PR #12 merged 2026-01-01; 3 commits since merge (vs origin/main)") and base_ref comes from
+# an UNVALIDATED forge.base_ref key in .claude/forge-project.yml which is itself interpolated
+# into merge_detail at :5798/:5817 — so one stray "|" would shift head_sha into pr, bind a
+# wrong head_sha into the journal, and strand finalize on a bad ancestry check FOREVER. A git
+# refname cannot contain a newline and detail is single-line by construction.
+#
+# `detail` is emitted RAW. The plan's Step-1 bullet says to sanitize it here; that would
+# rewrite preflight's `merge_check_detail:` line (:5872) AND the BRANCH_MERGED_WITH_DRIFT
+# status string (:5847), breaking R1 and T-EV-PREFLIGHT-PARITY. The two evidence consumers
+# (event line, hygiene journal) sanitize at their own boundary instead, which is where F7/R8
+# actually bite; merge_detail never enters the journal at all — it rides the artifact.
+#
+# <workdir> only, as the plan specifies. The forge-project.yml walk-up is repeated INSIDE
+# because base_ref's override is read from that file and cmd_preflight resolved it at
+# :5702-5710, outside the lifted range; dropping it would change preflight's `base_ref:` line
+# on any project that configures one. cmd_preflight passes "$cur_pwd", NOT the project root —
+# that is what preserves WRONG_DIRECTORY detection, the exact condition preflight exists for,
+# which a naive `git -C "$root"` conversion would break.
+#
+# BOTH gh invocations are bounded (the plan bounds only `gh pr list`, but `gh auth status`
+# validates the token against api.github.com and is a network call too), EACH WITH ITS OWN RC
+# CAPTURE — an inline `if command -v gh && _ev_timed … gh auth status` would treat a TIMEOUT
+# as "not authenticated" and fall silently to the git-only method instead of reporting
+# BRANCH_UNCLEAR/gh-timeout. Both run inside `( cd "$w" … )` so gh resolves the intended
+# repository rather than the bridge's cwd (the evidence path calls this with $project_root
+# from cmd_verify_decision, which never cds).
+_merge_state_probe() {   # <workdir>
+    local w="$1"
+    local branch detached="false" sha base_ref="" project_yml="" _dir
+    local merge_state="" merge_method="" merge_detail="" head_sha="" pr_num=""
+
+    branch=$(git -C "$w" branch --show-current 2>/dev/null)
+    if [ -z "$branch" ]; then
+        sha=$(git -C "$w" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        branch="(detached: $sha)"
+        detached="true"
+    fi
+    head_sha=$(git -C "$w" rev-parse HEAD 2>/dev/null || echo "")
+
+    _dir="$w"
+    while [ "$_dir" != "/" ] && [ -n "$_dir" ]; do
+        if [ -f "$_dir/.claude/forge-project.yml" ]; then project_yml="$_dir/.claude/forge-project.yml"; break; fi
+        _dir=$(dirname "$_dir")
+    done
+    if [ -n "$project_yml" ]; then
+        base_ref=$(python3 -c "
+import yaml
+try:
+    with open('$project_yml') as f:
+        data = yaml.safe_load(f) or {}
+    print(data.get('forge', {}).get('base_ref', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+    fi
+    if [ -z "$base_ref" ]; then
+        base_ref=$(git -C "$w" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/@@')
+    fi
+    if [ -z "$base_ref" ] && git -C "$w" rev-parse --verify origin/main >/dev/null 2>&1; then
+        base_ref="origin/main"
+    fi
+    if [ -z "$base_ref" ]; then
+        base_ref="main"
+    fi
+
+    if [ "$detached" = "true" ]; then
+        merge_state="DETACHED_HEAD"
+        merge_method="n/a"
+        merge_detail="HEAD is detached at $branch"
+    else
+        # Method 1: gh-aware (both calls bounded, each with its own rc).
+        local _nt; _nt="$(_ev_nt "$w")"
+        if command -v gh >/dev/null; then
+            local _auth_rc=0
+            ( cd "$w" 2>/dev/null && _ev_timed "$_nt" gh auth status >/dev/null 2>&1 ) || _auth_rc=$?
+            if _ev_is_timeout "$_auth_rc"; then
+                merge_state="BRANCH_UNCLEAR"; merge_method="gh-timeout"
+                merge_detail="gh auth status exceeded ${_nt}s"
+            elif [ "$_auth_rc" = 0 ]; then
+                local pr_json _pl_rc=0
+                pr_json=$( cd "$w" 2>/dev/null && _ev_timed "$_nt" gh pr list --state merged --head "$branch" --limit 1 --json number,mergedAt 2>/dev/null ) || _pl_rc=$?
+                if _ev_is_timeout "$_pl_rc"; then
+                    merge_state="BRANCH_UNCLEAR"; merge_method="gh-timeout"
+                    merge_detail="gh pr list exceeded ${_nt}s"
+                else
+                    pr_num=$(echo "$pr_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['number']) if d else None" 2>/dev/null)
+                    if [ -n "$pr_num" ] && [ "$pr_num" != "None" ]; then
+                        local pr_merged_at
+                        pr_merged_at=$(echo "$pr_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['mergedAt'][:10]) if d else None" 2>/dev/null)
+                        local cherry_count
+                        cherry_count=$(git -C "$w" rev-list --cherry-pick --right-only --count "$base_ref...$branch" 2>/dev/null || echo "?")
+                        merge_method="gh"
+                        if [ "$cherry_count" = "0" ]; then
+                            merge_state="BRANCH_MERGED_CLEAN"
+                            merge_detail="PR #$pr_num merged $pr_merged_at; no drift"
+                        elif [ "$cherry_count" = "?" ]; then
+                            merge_state="BRANCH_UNCLEAR"
+                            merge_detail="PR #$pr_num merged $pr_merged_at; cherry-pick count failed"
+                        else
+                            merge_state="BRANCH_MERGED_WITH_DRIFT"
+                            merge_detail="PR #$pr_num merged $pr_merged_at; $cherry_count commits since merge (vs $base_ref)"
+                        fi
+                    else
+                        pr_num=""
+                    fi
+                fi
+            fi
+        fi
+
+        # Method 2: git-only fallback
+        if [ -z "$merge_state" ]; then
+            merge_method="git-only"
+            if git -C "$w" merge-base --is-ancestor HEAD "$base_ref" 2>/dev/null; then
+                merge_state="BRANCH_MERGED_CLEAN"
+                merge_detail="HEAD is an ancestor of $base_ref"
+            else
+                local cherry_count
+                cherry_count=$(git -C "$w" rev-list --cherry-pick --right-only --count "$base_ref...$branch" 2>/dev/null)
+                if [ "$cherry_count" = "0" ]; then
+                    merge_state="BRANCH_MERGED_CLEAN"
+                    merge_detail="cherry-pick count vs $base_ref is 0"
+                else
+                    merge_state="BRANCH_UNMERGED"
+                    merge_detail="${cherry_count:-?} unique commits vs $base_ref"
+                fi
+            fi
+        fi
+    fi
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$branch" "$base_ref" "$merge_state" "$merge_method" "$merge_detail" "$head_sha" "$pr_num"
+}
+
+# Field accessor for _merge_state_probe's newline-delimited output.
+#   1 branch  2 base_ref  3 merge_state  4 method  5 detail  6 head_sha  7 pr
+_ms_field() {   # <probe_output> <n>
+    printf '%s\n' "$1" | sed -n "${2}p"
+}
+
 cmd_preflight() {
     # Pre-flight discipline (Phase 1a). Prints a kickoff snapshot and a
     # final status_code line. Does NOT require a tmux session. Always
@@ -7407,91 +8500,22 @@ except Exception:
         directory_state="WRONG_DIRECTORY"
     fi
 
-    # Branch detection
-    local branch
-    branch=$(git branch --show-current 2>/dev/null)
-    local detached="false"
-    if [ -z "$branch" ]; then
-        local sha
-        sha=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-        branch="(detached: $sha)"
-        detached="true"
-    fi
-
-    # Resolve base_ref: forge-project.yml override, else origin/HEAD, else origin/main, else main
-    local base_ref=""
-    if [ -n "$project_yml" ]; then
-        base_ref=$(python3 -c "
-import yaml
-try:
-    with open('$project_yml') as f:
-        data = yaml.safe_load(f) or {}
-    print(data.get('forge', {}).get('base_ref', ''))
-except Exception:
-    pass
-" 2>/dev/null)
-    fi
-    if [ -z "$base_ref" ]; then
-        base_ref=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/@@')
-    fi
-    if [ -z "$base_ref" ] && git rev-parse --verify origin/main >/dev/null 2>&1; then
-        base_ref="origin/main"
-    fi
-    if [ -z "$base_ref" ]; then
-        base_ref="main"
-    fi
-
-    # Merge state detection — see check_merge_state() below
-    local merge_state="" merge_method="" merge_detail=""
-    if [ "$detached" = "true" ]; then
-        merge_state="DETACHED_HEAD"
-        merge_method="n/a"
-        merge_detail="HEAD is detached at $branch"
-    else
-        # Method 1: gh-aware
-        if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-            local pr_json
-            pr_json=$(gh pr list --state merged --head "$branch" --limit 1 --json number,mergedAt 2>/dev/null)
-            local pr_num
-            pr_num=$(echo "$pr_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['number']) if d else None" 2>/dev/null)
-            if [ -n "$pr_num" ] && [ "$pr_num" != "None" ]; then
-                local pr_merged_at
-                pr_merged_at=$(echo "$pr_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['mergedAt'][:10]) if d else None" 2>/dev/null)
-                local cherry_count
-                cherry_count=$(git rev-list --cherry-pick --right-only --count "$base_ref...$branch" 2>/dev/null || echo "?")
-                merge_method="gh"
-                if [ "$cherry_count" = "0" ]; then
-                    merge_state="BRANCH_MERGED_CLEAN"
-                    merge_detail="PR #$pr_num merged $pr_merged_at; no drift"
-                elif [ "$cherry_count" = "?" ]; then
-                    merge_state="BRANCH_UNCLEAR"
-                    merge_detail="PR #$pr_num merged $pr_merged_at; cherry-pick count failed"
-                else
-                    merge_state="BRANCH_MERGED_WITH_DRIFT"
-                    merge_detail="PR #$pr_num merged $pr_merged_at; $cherry_count commits since merge (vs $base_ref)"
-                fi
-            fi
-        fi
-
-        # Method 2: git-only fallback
-        if [ -z "$merge_state" ]; then
-            merge_method="git-only"
-            if git merge-base --is-ancestor HEAD "$base_ref" 2>/dev/null; then
-                merge_state="BRANCH_MERGED_CLEAN"
-                merge_detail="HEAD is an ancestor of $base_ref"
-            else
-                local cherry_count
-                cherry_count=$(git rev-list --cherry-pick --right-only --count "$base_ref...$branch" 2>/dev/null)
-                if [ "$cherry_count" = "0" ]; then
-                    merge_state="BRANCH_MERGED_CLEAN"
-                    merge_detail="cherry-pick count vs $base_ref is 0"
-                else
-                    merge_state="BRANCH_UNMERGED"
-                    merge_detail="${cherry_count:-?} unique commits vs $base_ref"
-                fi
-            fi
-        fi
-    fi
+    # Branch / base_ref / merge state — the ONE oracle (_merge_state_probe, Step 1 of
+    # evidence-gated-completion). Called with "$cur_pwd", NEVER the project root: a
+    # `git -C "$root"` conversion would resolve the repo from the wrong directory and
+    # silently break WRONG_DIRECTORY detection, the exact condition preflight exists for.
+    local branch base_ref merge_state merge_method merge_detail head_sha pr_num
+    {
+        IFS= read -r branch
+        IFS= read -r base_ref
+        IFS= read -r merge_state
+        IFS= read -r merge_method
+        IFS= read -r merge_detail
+        IFS= read -r head_sha
+        IFS= read -r pr_num
+    } <<EOF
+$(_merge_state_probe "$cur_pwd")
+EOF
 
     # Determine status_code and human status
     local status_code=""
