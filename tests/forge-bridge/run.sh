@@ -3914,7 +3914,7 @@ sed -n '/^_evidence_mode()/,/^}$/p;/^_evidence_enforcing()/,/^}$/p;/^_ev_timed()
         /^_ev_is_timeout() {.*}$/p;/^_evidence_cfg()/,/^}$/p;
         /^_evidence_probe_timeout()/,/^}$/p;/^_evidence_net_timeout()/,/^}$/p;
         /^_ev_pt() {.*}$/p;/^_ev_nt() {.*}$/p;
-        /^_ev_emit()/,/^}$/p;/^_ev_grade()/,/^}$/p;/^_ev_detail()/,/^}$/p;
+        /^_ev_emit()[[:space:]]*{.*}/p;/^_ev_grade()[[:space:]]*{.*}/p;/^_ev_detail()[[:space:]]*{.*}/p;
         /^_ev_probe_/,/^}$/p;/^_evidence_baseline()/,/^}$/p;
         /^_evidence_stage_record()/,/^}$/p;/^_ev_verdict()/,/^}$/p;
         /^_merge_state_probe()/,/^}$/p;/^_ms_field()/,/^}$/p' "$BRIDGE" > "$EVFNS"
@@ -3987,6 +3987,170 @@ printf '%s' "$pf" | grep -q "^merge_check_detail: *$p_det\$" \
 printf '%s' "$pf" | grep -qE '^merge_check_detail:.*[a-z0-9]_[a-z0-9]+_[a-z0-9]' \
   && bad "T-EV-PREFLIGHT-PARITY detail was whitespace-collapsed (R1 regression)" \
   || ok "T-EV-PREFLIGHT-PARITY detail is not whitespace-collapsed"
+
+# T-EV-GH-TIMEOUT — 2 arms (N4; one per bounded gh call)
+EGH="$(mkG evgh)"
+ev_shim "$WORK/gh-auth" gh 'case "$1" in auth) sleep 30 ;; *) echo "[]" ;; esac'
+ev_shim "$WORK/gh-list" gh 'case "$1" in auth) exit 0 ;; *) sleep 30 ;; esac'
+for arm in gh-auth gh-list; do
+  t0=$(date +%s)
+  line="$(PATH="$WORK/$arm:$PATH" FORGE_EVIDENCE_NET_TIMEOUT_S=1 _merge_state_probe "$EGH")"
+  t1=$(date +%s)
+  st="$(_ms_field "$line" 3)"; meth="$(_ms_field "$line" 4)"
+  { [ "$st" = BRANCH_UNCLEAR ] && [ "$meth" = gh-timeout ] && [ $((t1-t0)) -lt 15 ]; } \
+    && ok "T-EV-GH-TIMEOUT $arm hung gh -> BRANCH_UNCLEAR/gh-timeout in $((t1-t0))s" \
+    || bad "T-EV-GH-TIMEOUT $arm state=$st method=$meth elapsed=$((t1-t0))s"
+done
+g="$(PATH="$WORK/gh-list:$PATH" FORGE_EVIDENCE_NET_TIMEOUT_S=1 _ev_probe_merge_state "$EGH")"
+[ "$(_ev_grade "$g")" = UNKNOWN ] \
+  && ok "T-EV-GH-TIMEOUT merge-state grades UNKNOWN (never a refusal)" || bad "T-EV-GH-TIMEOUT grade $g"
+
+# T-EV-PROBE-TIMEOUT — incl. the config-spawn-count arm (N11)
+ETO="$(mkG evto)"
+ev_shim "$WORK/slowgit" git 'sleep 60'
+t0=$(date +%s)
+tor="$(FORGE_EVIDENCE_PROBE_TIMEOUT_S=1 PATH="$WORK/slowgit:$PATH" _ev_probe_clean_tree "$ETO")"
+t1=$(date +%s)
+{ [ "$(_ev_grade "$tor")" = UNKNOWN ] && [ "$(_ev_detail "$tor")" = timeout ] && [ $((t1-t0)) -lt 10 ]; } \
+  && ok "T-EV-PROBE-TIMEOUT hung git -> UNKNOWN:timeout in $((t1-t0))s (bounded, no stall)" \
+  || bad "T-EV-PROBE-TIMEOUT out=$tor elapsed=$((t1-t0))s"
+# A probe NEVER fails its caller.
+_ev_probe_clean_tree "$ETO" >/dev/null 2>&1
+[ $? = 0 ] && ok "T-EV-PROBE-TIMEOUT probes always return rc 0" || bad "T-EV-PROBE-TIMEOUT probe rc"
+# N11: one config parse per recording pass, not one per child. Count python3 invocations that
+# read forge-project.yml via a counting shim.
+CNT="$WORK/py-count"; : > "$CNT"
+ev_shim "$WORK/pyshim" python3 "echo \$@ >> '$CNT'; exec /opt/homebrew/bin/python3 \"\$@\""
+EPC="$(mkG evpc)"; mkdir -p "$EPC/.claude"
+printf 'evidence:\n  probe_timeout_s: 4\n' > "$EPC/.claude/forge-project.yml"
+_EV_T="$(_evidence_probe_timeout "$EPC")"
+: > "$CNT"
+PATH="$WORK/pyshim:$PATH" _ev_probe_clean_tree "$EPC" >/dev/null 2>&1
+PATH="$WORK/pyshim:$PATH" _ev_probe_git_state  "$EPC" >/dev/null 2>&1
+[ "$(grep -c 'forge-project.yml' "$CNT" 2>/dev/null)" = 0 ] \
+  && ok "T-EV-PROBE-TIMEOUT primed budget: probes re-parse no config (N11)" \
+  || bad "T-EV-PROBE-TIMEOUT config re-parsed per child: $(grep -c 'forge-project.yml' "$CNT")"
+_EV_T=""
+
+# T-EV-COMMITTED / T-EV-NOBASE / T-EV-ANCESTRY-WRONGBRANCH / T-EV-ANCESTRY-RENAME
+EC="$(mkG evc)"; BASE="$(git -C "$EC" rev-parse HEAD)"
+anc="$(_ev_probe_baseline_ancestry "$EC" "$BASE")"
+[ "$(_ev_grade "$anc")" = PASS ] || bad "T-EV-COMMITTED setup ancestry"
+# no commit yet
+[ "$(_ev_grade "$(_ev_probe_committed "$EC" "$BASE" PASS)")" = FAIL ] \
+  && ok "T-EV-COMMITTED no commit -> FAIL" || bad "T-EV-COMMITTED no-commit"
+# real commit
+printf 'x\n' >> "$EC/seed.txt"; git -C "$EC" commit -aqm real
+[ "$(_ev_grade "$(_ev_probe_committed "$EC" "$BASE" PASS)")" = PASS ] \
+  && ok "T-EV-COMMITTED real commit -> PASS" || bad "T-EV-COMMITTED real"
+# empty commit: >=1 commit but ZERO files (R12)
+EE="$(mkG eve)"; EB="$(git -C "$EE" rev-parse HEAD)"
+git -C "$EE" commit -q --allow-empty -m empty
+r="$(_ev_probe_committed "$EE" "$EB" PASS)"
+{ [ "$(_ev_grade "$r")" = FAIL ] && printf '%s' "$r" | grep -q 'files=0'; } \
+  && ok "T-EV-COMMITTED --allow-empty -> FAIL (>=1 file required, R12)" || bad "T-EV-COMMITTED empty: $r"
+# no baseline
+[ "$(_ev_detail "$(_ev_probe_baseline_ancestry "$EC" '')")" = no-baseline ] \
+  && ok "T-EV-NOBASE missing DISPATCH baseline -> UNKNOWN:no-baseline" || bad "T-EV-NOBASE"
+# wrong branch: commit on a DIVERGED branch. `committed` alone would grade PASS (count=3 with
+# a real delta) — ancestry is what catches it, and it POISONS committed to UNKNOWN.
+EW="$(mkG evw)"; WB="$(git -C "$EW" rev-parse HEAD)"
+git -C "$EW" checkout -q -b other "$WB~0"; git -C "$EW" checkout -q --detach "$WB"
+git -C "$EW" checkout -q -B diverged "$WB"; git -C "$EW" commit -q --allow-empty -m d1
+git -C "$EW" checkout -q -B main "$WB"; printf 'a\n' >> "$EW/seed.txt"; git -C "$EW" commit -aqm mainline
+git -C "$EW" checkout -q diverged; printf 'b\n' >> "$EW/seed.txt"; git -C "$EW" commit -aqm div
+WBASE="$(git -C "$EW" rev-parse main)"
+wanc="$(_ev_probe_baseline_ancestry "$EW" "$WBASE")"
+wcom="$(_ev_probe_committed "$EW" "$WBASE" "$(_ev_grade "$wanc")")"
+{ [ "$(_ev_grade "$wanc")" = FAIL ] && [ "$(_ev_grade "$wcom")" = UNKNOWN ]; } \
+  && ok "T-EV-ANCESTRY-WRONGBRANCH ancestry FAIL poisons committed to UNKNOWN (never green)" \
+  || bad "T-EV-ANCESTRY-WRONGBRANCH anc=$wanc com=$wcom"
+# benign RENAME: commits preserved, name changed -> ancestry PASS, committed PASS
+ER="$(mkG evr)"; RB="$(git -C "$ER" rev-parse HEAD)"
+printf 'c\n' >> "$ER/seed.txt"; git -C "$ER" commit -aqm work
+git -C "$ER" branch -m renamed-branch
+ranc="$(_ev_probe_baseline_ancestry "$ER" "$RB")"
+rcom="$(_ev_probe_committed "$ER" "$RB" "$(_ev_grade "$ranc")")"
+{ [ "$(_ev_grade "$ranc")" = PASS ] && [ "$(_ev_grade "$rcom")" = PASS ]; } \
+  && ok "T-EV-ANCESTRY-RENAME rename preserves ancestry (no false positive)" \
+  || bad "T-EV-ANCESTRY-RENAME anc=$ranc com=$rcom"
+
+# T-EV-REPORT / T-EV-STALE-REPORT
+EP="$(mkR evrep)"
+for pair in "COMPLETE PASS" "FAILED FAIL" "PARTIAL FAIL" "VALIDATION_FAILED FAIL"; do
+  set -- $pair
+  ev_report "$EP" rp "$1"
+  [ "$(_ev_grade "$(_ev_probe_report_consistent "$EP" rp '')")" = "$2" ] \
+    && ok "T-EV-REPORT status=$1 -> $2" || bad "T-EV-REPORT $1"
+done
+ev_report "$EP" rp COMPLETE "Group 2: NOT COMMITTED"
+r="$(_ev_probe_report_consistent "$EP" rp '')"
+{ [ "$(_ev_grade "$r")" = FAIL ] && printf '%s' "$r" | grep -q not-committed-marker; } \
+  && ok "T-EV-REPORT 'NOT COMMITTED' marker -> FAIL even with status COMPLETE" || bad "T-EV-REPORT marker: $r"
+rm -f "$EP/.dev/proposals/rp/coder-report.md"
+[ "$(_ev_detail "$(_ev_probe_report_consistent "$EP" rp '')")" = no-report ] \
+  && ok "T-EV-REPORT missing report -> UNKNOWN:no-report" || bad "T-EV-REPORT missing"
+# staleness: mtime strictly older than the stage's dispatch pending ts -> UNKNOWN, NEVER FAIL
+ev_report "$EP" rp FAILED
+touch -t 202001010000 "$EP/.dev/proposals/rp/coder-report.md"
+[ "$(_ev_detail "$(_ev_probe_report_consistent "$EP" rp '2026-07-26T00:00:00Z')")" = stale-report ] \
+  && ok "T-EV-STALE-REPORT report older than dispatch -> UNKNOWN:stale-report, never FAIL" \
+  || bad "T-EV-STALE-REPORT"
+
+# T-EV-CLEAN-TREE-UNTRACKED / T-EV-NONGIT (first assertion only; the observe-grade arm
+# needs _ev_observe_grade, added in Group 5 — see coder-report.md)
+ECT="$(mkG evct)"; printf 'stray\n' > "$ECT/stray.swp"
+[ "$(_ev_probe_clean_tree "$ECT")" != "" ] && \
+[ "$(_ev_detail "$(_ev_probe_clean_tree "$ECT")")" = tracked-clean ] \
+  && ok "T-EV-CLEAN-TREE-UNTRACKED stray untracked file does NOT grade dirty" \
+  || bad "T-EV-CLEAN-TREE-UNTRACKED untracked: $(_ev_probe_clean_tree "$ECT")"
+printf 'edit\n' >> "$ECT/seed.txt"
+[ "$(_ev_grade "$(_ev_probe_clean_tree "$ECT")")" = FAIL ] \
+  && ok "T-EV-CLEAN-TREE-UNTRACKED a TRACKED edit does grade dirty" || bad "T-EV-CLEAN-TREE-UNTRACKED tracked"
+# evidence-gated-completion Group 4 fix: mkR (tests/forge-bridge/run.sh:59) runs
+# `git -C "$d" init -q`, so it is NOT a non-git root — a real non-git-repo probe here
+# needs a directory outside any git work tree, which $WORK already is.
+ENG="$WORK/evng-plain"; mkdir -p "$ENG"
+[ "$(_ev_detail "$(_ev_probe_git_state "$ENG")")" = not-a-git-repo ] \
+  && ok "T-EV-NONGIT non-git root -> UNKNOWN:not-a-git-repo" || bad "T-EV-NONGIT"
+
+# T-EV-DISPATCH-BASELINE
+EDB="$(mkG evdb)"
+ev_dispatch_event "$EDB" db coding deadbeefcafe feat/x '2026-07-26T10:00:00Z'
+b="$(_evidence_baseline "$EDB" db coding '2026-07-26T10:00:00Z')"
+[ "$b" = "deadbeefcafe|feat/x" ] \
+  && ok "T-EV-DISPATCH-BASELINE head/branch/pending_timestamp round-trip" || bad "T-EV-DISPATCH-BASELINE '$b'"
+[ -z "$(_evidence_baseline "$EDB" db coding '2026-07-26T11:11:11Z')" ] \
+  && ok "T-EV-DISPATCH-BASELINE a non-matching pending ts selects nothing (exact match only)" \
+  || bad "T-EV-DISPATCH-BASELINE fuzzy match"
+
+# T-EV-RERUN / T-EV-REDISPATCH-OPEN (+ the shared-fold standing guard)
+ERR="$(mkR evrr)"; mkdir -p "$ERR/.dev/proposals/rr" "$ERR/.dev/forge-tmp"
+cat > "$ERR/.dev/proposals/rr/forge-log.yml" <<'YML'
+entries:
+  - timestamp: "2026-07-26T09:00:00Z"
+    stage: coding
+    response: "FORGE_DONE: coding"
+  - timestamp: "2026-07-26T10:00:00Z"
+    stage: coding
+    response: "FORGE_DONE: coding"
+YML
+printf 'EVIDENCE: pipeline=rr stage=coding pending_timestamp=2026-07-26T09:00:00Z committed=FAIL verdict=contradicted\n' >> "$ERR/.dev/forge-tmp/orchestrator-events.log"
+printf 'EVIDENCE: pipeline=rr stage=coding pending_timestamp=2026-07-26T10:00:00Z committed=PASS verdict=ok\n'          >> "$ERR/.dev/forge-tmp/orchestrator-events.log"
+_evidence_stage_record "$ERR" rr coding | grep -q 'pending_timestamp=2026-07-26T10:00:00Z' \
+  && ok "T-EV-RERUN latest CLOSED entry by dispatch ts wins -> the clean re-run is selected" \
+  || bad "T-EV-RERUN selected the wrong record"
+# latest entry still OPEN -> UNKNOWN:stage-in-flight, no refusal
+awk '/response: "FORGE_DONE: coding"/{n++} n==2{sub(/response: "FORGE_DONE: coding"/,"response: null")} {print}' \
+  "$ERR/.dev/proposals/rr/forge-log.yml" > "$ERR/.dev/proposals/rr/forge-log.yml.new" \
+  && mv "$ERR/.dev/proposals/rr/forge-log.yml.new" "$ERR/.dev/proposals/rr/forge-log.yml"
+[ "$(_evidence_stage_record "$ERR" rr coding)" = "UNKNOWN:stage-in-flight" ] \
+  && ok "T-EV-REDISPATCH-OPEN latest entry open -> UNKNOWN:stage-in-flight (no refusal)" \
+  || bad "T-EV-REDISPATCH-OPEN: $(_evidence_stage_record "$ERR" rr coding)"
+# Standing guard: the watcher-side fold this deliberately DIFFERS from must still exist.
+grep -q 'closed_max_ts' "$ROOT/bin/forge-watch" \
+  && ok "T-EV-RERUN watcher closed_max_ts fold still present (shared-spec obligation, 698eaea)" \
+  || bad "T-EV-RERUN watcher fold refactored away — re-read _evidence_stage_record's contract"
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
