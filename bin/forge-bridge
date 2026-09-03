@@ -717,14 +717,36 @@ _evidence_enforcing() {
 # for the wrong reason. The bound is enforced here, three ways, in preference order, and it
 # NEVER degrades to an unbounded exec:
 #   1. real timeout(1) if one is ever installed (Linux / brew coreutils) — rc 124
-#   2. perl alarm(2), which survives execve, so the exec'd child inherits the pending SIGALRM
-#      and dies with rc 142. This is the in-repo precedent: forge-watch's fw_timed (:80-87)
-#      records exactly this conclusion. /usr/bin/perl is part of the base macOS install.
-#   3. python3 subprocess.run(timeout=) — python3 is ALREADY a hard dependency of this script
-#      (_hygiene_write, _hygiene_decide, _terminal_state, _callback_pending_select_exact and
-#      others shell to it unconditionally), so this arm can never be missing. Degrading to an
-#      unbounded exec here would run `git status --porcelain` unbounded on the CALLBACK
-#      LATENCY PATH with no UNKNOWN and no ceiling — verbatim the stall R7 names.
+#   2. perl, forking into its OWN PROCESS GROUP and killing that whole group on the alarm — rc
+#      142. /usr/bin/perl is part of the base macOS install.
+#   3. python3 subprocess.Popen(start_new_session=True) + os.killpg on timeout — python3 is
+#      ALREADY a hard dependency of this script (_hygiene_write, _hygiene_decide,
+#      _terminal_state, _callback_pending_select_exact and others shell to it unconditionally),
+#      so this arm can never be missing. Degrading to an unbounded exec here would run
+#      `git status --porcelain` unbounded on the CALLBACK LATENCY PATH with no UNKNOWN and no
+#      ceiling — verbatim the stall R7 names.
+#
+# BOTH the perl and python3 arms below put the exec'd command in its OWN process group and kill
+# THE WHOLE GROUP on timeout, not just the immediate process. This corrects a defect in the
+# original (bare `alarm(); exec()` / bare `subprocess.run(timeout=)`) shape, found live on this
+# machine (evidence-gated-completion, corrective commit after 40d8e21):
+#   PERL ARM, bare form: `alarm()` correctly survives `exec()` and kills the exec'd process at
+#   the budget — but if that process is a SCRIPT (as `git`/`gh` can invoke internally for a
+#   credential helper, ssh, or similar) and it has already forked a CHILD of its own (e.g. a
+#   shell script's last command, which is a real fork on this platform — verified with `ps`
+#   showing a distinct child PID, not a tail-call exec), the alarm only kills the exec'd
+#   process, never its child. If the caller captures output via `$(...)` (a pipe), the orphaned
+#   grandchild still holds the pipe's write end open, so the caller's read-to-EOF cannot
+#   complete until the grandchild's OWN natural duration elapses — the bound fires (correct rc)
+#   but the CALLER still blocks for the unbounded duration. Reproduced directly: bare
+#   `_ev_timed 1 <script that forks `sleep 5`>`, captured via `$()`, returned rc=142 but only
+#   after 5s, not 1s.
+#   PYTHON3 ARM, bare form: `subprocess.run(timeout=)` DOES bound the caller's wait correctly
+#   (it does not rely on pipe EOF, so it isn't vulnerable to the same caller-blocking failure) —
+#   but on timeout it kills only the immediate child, not any grandchild, leaving an orphaned
+#   process running in the background indefinitely (verified with `ps`). Hardened for the same
+#   reason even though this arm is unreachable while perl is present, so it does not become the
+#   same latent gap if perl is ever removed.
 # Every arm runs argv DIRECTLY (no shell), so a worker-supplied string can never be re-parsed
 # as shell, and stdout passes through verbatim. NOTE the one non-parity between arms: the
 # python3 arm pipes stdout only and leaves stderr inherited, matching timeout/perl; a future
@@ -735,17 +757,39 @@ _ev_timed() {   # <seconds> <cmd> [args...]
     if command -v timeout >/dev/null 2>&1; then
         timeout "$s" "$@"
     elif command -v perl >/dev/null 2>&1; then
-        perl -e 'alarm(shift @ARGV); exec @ARGV; exit 127;' "$s" "$@"
+        perl -e '
+use POSIX ();
+my $s = shift @ARGV;
+my $pid = fork();
+if (!defined $pid) { exit 125; }
+if ($pid == 0) { POSIX::setpgid(0, 0); exec @ARGV; exit 127; }
+POSIX::setpgid($pid, $pid);
+my $timed_out = 0;
+local $SIG{ALRM} = sub { $timed_out = 1; kill 9, -$pid; };
+alarm($s);
+waitpid($pid, 0);
+alarm(0);
+if ($timed_out) { exit 142; }
+my $rc = $?;
+exit(($rc & 127) ? 128 + ($rc & 127) : ($rc >> 8));
+' "$s" "$@"
     else
         FORGE_EV_TMO="$s" python3 - "$@" <<'PY'
-import os,subprocess,sys
+import os,signal,subprocess,sys
 if len(sys.argv)<2: sys.exit(125)
 try:
-    p=subprocess.run(sys.argv[1:],stdout=subprocess.PIPE,
-                     timeout=float(os.environ.get("FORGE_EV_TMO") or 5))
-except subprocess.TimeoutExpired: sys.exit(124)
+    p=subprocess.Popen(sys.argv[1:],stdout=subprocess.PIPE,start_new_session=True)
 except Exception: sys.exit(125)
-sys.stdout.write(p.stdout.decode("utf-8","replace"))
+try:
+    out,_=p.communicate(timeout=float(os.environ.get("FORGE_EV_TMO") or 5))
+except subprocess.TimeoutExpired:
+    try: os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except Exception: pass
+    try: p.communicate(timeout=2)
+    except Exception: pass
+    sys.exit(124)
+except Exception: sys.exit(125)
+sys.stdout.write(out.decode("utf-8","replace"))
 rc=p.returncode
 # A signal death is negative here and 128+N on the perl arm; both are non-zero and neither
 # is 124/142, so _ev_is_timeout agrees across arms and every probe grades UNKNOWN either way.
