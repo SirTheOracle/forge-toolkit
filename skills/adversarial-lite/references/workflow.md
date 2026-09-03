@@ -109,6 +109,13 @@ Agent({
 
 **Timeout:** If either agent has not completed after 5 minutes, treat as failure and apply error recovery.
 
+**The wait is watchdogged.** A background notification that never arrives is indistinguishable from work in progress, so all four rules apply:
+
+1. **Poll for output.** Verify bytes on disk at `{output_dir}/proposal-A.md` and `{output_dir}/proposal-B.md` — the `.md`, never the `.tmp`. Missing notification is not evidence of a proposer still working.
+2. The 5-minute budget above is measured against an **absent file**, not against silence.
+3. **Ping once** via SendMessage when the budget expires — a ping can wake a wedged proposer. **No reply does not mean dead:** a pinged proposer can surface minutes later and rename its `.tmp` into place, so never conclude a silent one is gone.
+4. **Any replacement writes to a distinct path** (`proposal-A.md` → `proposal-A-r2.md`, via `proposal-A-r2.md.tmp`) so a late-waking original cannot clobber it.
+
 ### Quality Gate
 
 After both proposals arrive, the lead reads each and checks:
@@ -241,6 +248,13 @@ Agent({
 
 **Timeout:** If C has not completed after 8 minutes, treat as failure.
 
+**The wait is watchdogged**, same four rules:
+
+1. **Poll for output.** Verify bytes on disk at `{output_dir}/final-plan.md` — the `.md`, never the `.tmp`.
+2. The 8-minute budget above is measured against that absent file.
+3. **Ping once** via SendMessage when it expires. **No reply does not mean dead:** a wedged synthesizer can wake minutes after the ping, so keep waiting rather than declaring it gone.
+4. **A re-spawned C writes to a distinct path** (`final-plan-r2.md`) so a late-waking original cannot clobber it.
+
 ### Cleanup
 
 After `final-plan.md` is written (or on terminal failure):
@@ -264,24 +278,32 @@ Use this if the `Agent` tool's `model` parameter is not available or if backgrou
 | Parallel execution | `run_in_background: true` | `run_in_background: true` + polling |
 | Atomic writes | Same (.tmp → rename) | Same (.tmp → rename) — critical for polling |
 
-### File-Based Completion Polling
+### File-Based Completion Polling (the output watchdog)
+
+An agent that produces no output while "running" is indistinguishable from one that is working, so the file on disk is the only evidence of progress. The poll loop must be **bounded** — an unbounded `until [ -f ... ]` cannot time out, which is the whole defect.
 
 ```bash
-# Poll for Round 1 completion
+# Poll for Round 1 completion. Deliverables: proposal-A.md, proposal-B.md. Budget: 5 minutes.
 # Only check for .md files (not .tmp) — atomic rename means .md exists only when complete
+deadline=$(( $(date +%s) + 300 ))
 until [ -f "{output_dir}/proposal-A.md" ] && [ -f "{output_dir}/proposal-B.md" ]; do
+  [ "$(date +%s)" -ge "$deadline" ] && { echo "watchdog: 5-minute budget expired, files still absent"; break; }
   sleep 10
 done
 ```
 
 ```bash
-# Poll for Round 2 completion
+# Poll for Round 2 completion. Deliverable: final-plan.md. Budget: 8 minutes.
+deadline=$(( $(date +%s) + 480 ))
 until [ -f "{output_dir}/final-plan.md" ]; do
+  [ "$(date +%s)" -ge "$deadline" ] && { echo "watchdog: 8-minute budget expired, file still absent"; break; }
   sleep 10
 done
 ```
 
 **Important:** Polling checks for the renamed `.md` file, never the `.tmp` file. This is why atomic writes are critical — a `.md` file only exists when the proposal is fully written.
+
+**When a budget expires with the file absent: ping once**, addressing the agent by the name or ID from the spawn result — a ping can wake a wedged agent. **No reply does not mean dead:** a pinged agent can surface minutes later and rename its `.tmp` into place, so never conclude a silent agent is gone. Any replacement must therefore be spawned with a **distinct output path** (`proposal-A-r2.md`, `final-plan-r2.md`), as the recovery table below requires.
 
 ### Fallback Model Warning
 
@@ -298,14 +320,16 @@ The adversarial structure still provides independent-investigation value.
 
 ## Error Recovery
 
+"Fails" means the full watchdog cycle completed: the round's **timeout budget expired**, the **deliverable is still absent from disk**, and **one ping went unanswered**. Because no reply does not mean dead, every retry below writes to a **distinct path**.
+
 | Round | Failure | Recovery |
 |-------|---------|----------|
-| Round 1 | One proposer fails | Retry once. If still fails, proceed to Round 2 — C reviews single proposal with instruction to check for blind spots. Note reduced confidence in final-plan.md. |
+| Round 1 | One proposer fails | Retry once to a **distinct path** (`proposal-A-r2.md`). If still fails, proceed to Round 2 — C reviews single proposal with instruction to check for blind spots. Note reduced confidence in final-plan.md. |
 | Round 1 | Both proposers fail | Abort workflow. Report to user. Preserve problem-statement.md. |
 | Round 1 | One proposal fails quality gate after retry | Proceed to Round 2 with available proposals. Flag quality gap to C in the prompt. |
-| Round 1 | Isolation violation (A references B's work) | Discard contaminated proposal. Re-run that proposer once. If violation repeats, proceed with single-proposal path. |
-| Round 2 | C fails | Re-spawn once with same prompt. If second attempt fails, present raw proposals to user with recommendation to use full adversarial-proposal. |
-| Round 2 | C produces partial file | .tmp file exists but .md does not. Re-spawn C. Remove the .tmp file first. |
+| Round 1 | Isolation violation (A references B's work) | Discard contaminated proposal. Re-run that proposer once to a **distinct path** (`proposal-A-r2.md`). If violation repeats, proceed with single-proposal path. |
+| Round 2 | C fails | Re-spawn once with the same prompt but a **distinct path** (`final-plan-r2.md`). If second attempt fails, present raw proposals to user with recommendation to use full adversarial-proposal. |
+| Round 2 | C produces partial file | .tmp file exists but .md does not. Remove the .tmp file, then re-spawn C to a **distinct path** (`final-plan-r2.md`) — the original may still wake and write. |
 | Round 2 | C concludes both proposals are wrong | C produces final-plan.md with its own approach, flags LOW confidence, recommends full adversarial-proposal. This is valid — present it to user. |
 | Any | Timeout | After max wait (5 min proposers, 8 min synthesizer), treat as failure. Apply recovery for that round. |
 | Any | Output directory collision | Archive existing directory as {slug}-{timestamp}/ before starting. |

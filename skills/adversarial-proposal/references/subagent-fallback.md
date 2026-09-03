@@ -54,8 +54,9 @@ Task({
   run_in_background: true
 })
 
-// Poll for completion
-// Watch for proposal-A.md and proposal-B.md to appear on disk
+// Poll for completion — see "Output Watchdog" below. Deliverables:
+//   {output_dir}/proposal-A.md and {output_dir}/proposal-B.md
+// Timeout: 5 minutes per proposer. Then ping once; no reply does not mean dead.
 ```
 
 **Investigation notes** (`investigation-notes-A.md`, `investigation-notes-B.md`): Since subagent sessions don't persist, each proposer must also write an investigation notes file containing:
@@ -81,7 +82,9 @@ Same as agent-teams-workflow: pause for user review of both proposals.
 ### Round 2: Synthesis
 
 ```
-// Wait until both files exist, then:
+// Wait until both files exist — see "Output Watchdog" below — then:
+// Deliverables of this round: {output_dir}/proposal-C.md, review-for-A.md,
+// review-for-B.md. Timeout: 8 minutes. Then ping once; no reply does not mean dead.
 Task({
   subagent_type: "general-purpose",
   prompt: "
@@ -112,7 +115,9 @@ Same as agent-teams-workflow: pause for user review of proposal-C.md.
 ### Round 3: Feedback
 
 ```
-// Spawn two feedback subagents in parallel
+// Spawn two feedback subagents in parallel — see "Output Watchdog" below.
+// Deliverables: {output_dir}/feedback-A.md and {output_dir}/feedback-B.md
+// Timeout: 5 minutes per critic. Then ping once; no reply does not mean dead.
 Task({
   subagent_type: "general-purpose",
   prompt: "Read {output_dir}/proposal-A.md (this was YOUR original proposal).
@@ -153,7 +158,9 @@ Task({
 ### Round 4: Reconciliation
 
 ```
-// If one feedback file is missing (subagent failed), proceed with available feedback
+// If one feedback file is missing after its full watchdog cycle (budget expired,
+// file absent, one ping unanswered), proceed with available feedback.
+// Deliverable of this round: {output_dir}/final-plan.md. Timeout: 8 minutes.
 Task({
   subagent_type: "general-purpose",
   prompt: "Read {output_dir}/proposal-C.md (this was YOUR proposal).
@@ -163,29 +170,46 @@ Task({
 })
 ```
 
-## Polling for File Completion
+## Output Watchdog (polling for file completion)
 
-Since subagents can't send messages, the lead polls for files:
+A subagent that produces no output while "running" is indistinguishable from one that is working. Since subagents can't send messages, the file on disk is the ONLY evidence of progress. All four rules apply at every round:
+
+**1. Poll for output.** Verify bytes on disk — never an agent status — and name the deliverable being polled:
+
+| Round | Deliverables polled | Timeout budget |
+|-------|--------------------|----------------|
+| Round 1 | `proposal-A.md`, `proposal-B.md` | 5 minutes per proposer |
+| Round 2 | `proposal-C.md`, `review-for-A.md`, `review-for-B.md` | 8 minutes |
+| Round 3 | `feedback-A.md`, `feedback-B.md` | 5 minutes per critic |
+| Round 4 | `final-plan.md` | 8 minutes |
+
+**2. Timeout budget.** The loop must be BOUNDED — an unbounded `while [ ! -f ... ]` cannot time out, which is the whole defect:
 
 ```bash
-# In a loop with sleep:
+# Round 1. deadline = now + 5 minutes (300s); use the round's budget from the table.
+deadline=$(( $(date +%s) + 300 ))
 while [ ! -f "{output_dir}/proposal-A.md" ] || [ ! -f "{output_dir}/proposal-B.md" ]; do
+  [ "$(date +%s)" -ge "$deadline" ] && { echo "watchdog: budget expired, files still absent"; break; }
   sleep 10
 done
 ```
 
+**3. Ping once, then keep waiting.** When the budget expires with the file absent, ping the subagent once (SendMessage, addressing it by the name or ID from the spawn result) — a ping can wake a wedged subagent. **No reply does not mean dead:** a pinged subagent can surface minutes later and write its file, so never conclude a silent subagent is gone.
+
+**4. Distinct output paths for any replacement.** A re-spawned subagent MUST be told to write to a distinct path from the original (`proposal-C.md` → `proposal-C-r2.md`) so a late-waking original cannot clobber it. This is wired into the recovery rows below.
+
 ## Error Handling
 
-Same recovery logic as agent-teams-workflow, adapted for subagents:
+Same recovery logic as agent-teams-workflow, adapted for subagents. "Fails" means the full watchdog cycle above completed: the round's **timeout budget expired**, the **deliverable is still absent from disk**, and **one ping went unanswered**. Because no reply does not mean dead, every re-spawn below writes to a **distinct path**.
 
 | Round | Failure | Recovery |
 |-------|---------|----------|
 | Round 1 | One subagent fails | Wait for the other. Skip adversarial process if only one arrives. |
 | Round 1 | Both fail | Abort workflow. Report to user. |
-| Round 2 | Synthesizer fails | Re-spawn with same prompt. If second attempt fails, present raw proposals. |
+| Round 2 | Synthesizer fails | Re-spawn with the same prompt but **distinct paths** (`proposal-C-r2.md`, `review-for-A-r2.md`, `review-for-B-r2.md`). If second attempt fails, present raw proposals. |
 | Round 3 | One feedback subagent fails | Proceed to Round 4 with available feedback. |
 | Round 3 | Both fail | Proceed to Round 4 with no feedback. |
-| Round 4 | Reconciler fails | Re-spawn. If second attempt fails, present proposal-C.md as output. |
+| Round 4 | Reconciler fails | Re-spawn to a **distinct path** (`final-plan-r2.md`). If second attempt fails, present proposal-C.md as output. |
 
 ## Output Directory
 
