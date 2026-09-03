@@ -1389,7 +1389,7 @@ _ev_verdict() {   # <class>=<grade:detail…> ...
 # whitespace, which is precisely why the two-sink split exists.
 _ev_artifact_write() {   # <root> <slug> <stage> <cb_id> <kind> <class>=<line> ...
     local root="$1" slug="$2" stage="$3" cbid="$4" kind="$5"; shift 5
-    local dir="$root/.dev/qa/$slug" out="$dir/evidence-${stage}-${cbid}.yaml"
+    local dir="$root/.dev/qa/$slug"; local out="$dir/evidence-${stage}-${cbid}.yaml"
     mkdir -p "$dir" 2>/dev/null || { printf ''; return 0; }
     FORGE_EVA_OUT="$out" FORGE_EVA_KIND="$kind" FORGE_EVA_SLUG="$slug" \
     FORGE_EVA_STAGE="$stage" FORGE_EVA_CBID="$cbid" \
@@ -1434,6 +1434,59 @@ except Exception:
     raise SystemExit(1)
 print(out)
 PY
+}
+
+# _ev_record_callback <root> <slug> <stage> <worker> <cb_id> <pending_ts> <session> <inc>
+# Tier 0 + Tier 1 ONLY — no network on the callback path. Always returns 0.
+# Primes the per-pass budgets ONCE (N11): _evidence_cfg spawns python3 + PyYAML (~21ms), and a
+# probe running in command substitution cannot memoize for its caller.
+# NOTE: NO `trap … RETURN` here or in its callers — cmd_callback already installs
+# `trap _hygiene_release_all RETURN` at :3848 and a second would REPLACE it. This function
+# allocates no temp files precisely so it needs none.
+_ev_record_callback() {
+    local root="$1" slug="$2" stage="$3" worker="$4" cbid="$5" pt="$6" sess="$7" inc="$8"
+    _EV_T="$(_evidence_probe_timeout "$root")"
+    local gs base bh anc com clean rep tst art verdict
+    gs="$(_ev_probe_git_state "$root")"
+    base="$(_evidence_baseline "$root" "$slug" "$stage" "$pt")"
+    bh="${base%%|*}"
+    anc="$(_ev_probe_baseline_ancestry "$root" "$bh")"
+    com="$(_ev_probe_committed "$root" "$bh" "$(_ev_grade "$anc")")"
+    clean="$(_ev_probe_clean_tree "$root")"
+    rep="$(_ev_probe_report_consistent "$root" "$slug" "$pt")"
+    tst="$(_ev_probe_tests "$root" "$slug")"
+    verdict="$(_ev_verdict "git-state=$gs" "baseline-ancestry=$anc" "committed=$com" \
+                           "clean-tree=$clean" "report-consistent=$rep" "tests=$tst")"
+    art="$(_ev_artifact_write "$root" "$slug" "$stage" "$cbid" callback \
+               "git-state=$gs" "baseline-ancestry=$anc" "committed=$com" \
+               "clean-tree=$clean" "report-consistent=$rep" "tests=$tst")"
+    _emit_event EVIDENCE "$slug" \
+        "stage=$stage worker=$worker callback_id=$cbid pending_timestamp=$pt session=$sess incarnation=$inc git-state=$(_ev_grade "$gs") baseline-ancestry=$(_ev_grade "$anc") committed=$(_ev_grade "$com") clean-tree=$(_ev_grade "$clean") report-consistent=$(_ev_grade "$rep") tests=claim:$(_ev_grade "$tst") verdict=$verdict artifact=${art##*/}"
+    _EV_T=""
+    return 0
+}
+
+# Tier-0-only delivery grade for the observe-mode COMPLETE line (Step 11 item 5).
+# NO network, no writes, no side effects. Always prints exactly one of
+# unknown|uncommitted|committed-local.
+_ev_observe_grade() {   # <root> <slug> <stage> <pending_ts>
+    local root="$1" base bh anc com clean
+    _EV_T="$(_evidence_probe_timeout "$root")"
+    base="$(_evidence_baseline "$root" "$2" "$3" "$4")"
+    bh="${base%%|*}"
+    anc="$(_ev_probe_baseline_ancestry "$root" "$bh")"
+    com="$(_ev_probe_committed "$root" "$bh" "$(_ev_grade "$anc")")"
+    clean="$(_ev_probe_clean_tree "$root")"
+    _EV_T=""
+    case "$(_ev_grade "$com")" in
+        FAIL) printf 'uncommitted'; return 0 ;;
+        PASS) case "$(_ev_grade "$clean")" in
+                  FAIL) printf 'uncommitted' ;;
+                  PASS) printf 'committed-local' ;;
+                  *)    printf 'unknown' ;;
+              esac; return 0 ;;
+    esac
+    printf 'unknown'
 }
 
 # Per-session/incarnation hygiene journal path. Separate from forge-context/forge-usage.
@@ -5619,6 +5672,31 @@ EOF
         _hygiene_write "$project_root" observe-unknown "$worker_canonical" && _cb_invalidated=1
         [ "$_cb_invalidated" = 1 ] || _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=observation-invalidation-unpersisted (journal unwritable) — prior evidence may be stale"
     fi
+    # evidence-gated-completion Step 6, SECOND placement — deliberately narrow.
+    # update_context runs at :3899-3900, INSIDE the terminal-close block and BEFORE the
+    # evidence tail, so in OBSERVE the COMPLETE: emit at :1442-1454 fires before any
+    # tail-placed evidence exists (F12). Scoping this to the single verify/DONE callback that
+    # can emit COMPLETE in observe bounds the exposure to ONE CALLBACK PER PIPELINE.
+    # Read-only, Tier 0 only (no network), timeout-bounded; _observe_usage already runs
+    # capture-pane under this same worker lock at :3966.
+    #
+    # The grade rides a PLAIN shell variable: update_context runs in a `( cd … && … )`
+    # SUBSHELL, which inherits non-exported variables. It is deliberately NOT exported —
+    # exporting would leak it into every child process for the rest of the callback. The
+    # script-level `_EV_OBSERVE_DELIVERY=""` at :~90 is what keeps a same-named value
+    # inherited from the operator's environment out of update_context's OTHER two callers
+    # (cmd_set_context :2919 and the park-resolve path :2737).
+    #
+    # `unknown` fallback: inside this guard a grade WAS meant to be reported, and
+    # _ev_observe_grade always prints one of unknown|uncommitted|committed-local — so the
+    # fallback fires only if the helper itself failed, where `unknown` is the honest answer
+    # and is exactly what design invariant §2.4 requires. Byte-identity for legacy pipelines
+    # is unaffected: they never enter this block, so the token is never appended.
+    _EV_OBSERVE_DELIVERY=""
+    if [ "$status" = DONE ] && [ "$stage" = verify ] && [ "$FORGE_WORKER_HYGIENE_MODE" != enforce ]; then
+        _EV_OBSERVE_DELIVERY="$(_ev_observe_grade "$project_root" "$slug" "$stage" "$selected_pending_timestamp" 2>/dev/null)"
+        [ -n "$_EV_OBSERVE_DELIVERY" ] || _EV_OBSERVE_DELIVERY=unknown
+    fi
     # §3.3: serialize publication against park/resolve/supersede/consume on the same
     # (slug,stage). Acquire before close-then-publish; release after the mv.
     _callback_prelock_barrier
@@ -5780,6 +5858,17 @@ PY
         fi
         _hygiene_write "$project_root" promote "$worker_canonical" "pending_timestamp=$selected_pending_timestamp" 2>/dev/null || true
         _worker_unlock "$worker_canonical"
+    fi
+
+    # evidence-gated-completion Step 6, FIRST placement (all stages).
+    # DESIGN INVARIANT §2.1: the callback NEVER fails on evidence — rc, stdout, and the
+    # callback file's bytes are unchanged. Placed AFTER _worker_unlock so git subprocesses
+    # never sit inside the held worker lock (R7), and run in a subshell with `|| true` so no
+    # probe, write, or emit can alter rc or stdout. DONE only: BLOCKED keeps its pending open
+    # (it is not a completion claim) and ERROR makes no work claim at all.
+    if [ "$status" = DONE ]; then
+        ( _ev_record_callback "$project_root" "$slug" "$stage" "$worker_canonical" \
+              "$cb_id" "$selected_pending_timestamp" "$cb_session" "$cb_incarnation" ) >/dev/null 2>&1 || true
     fi
 
     _render_status_file
