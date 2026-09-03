@@ -7487,6 +7487,151 @@ PYEOF
     return 0
 }
 
+# ---- Merge-state oracle (evidence-gated-completion Step 1) ----
+# THE one merge-state oracle, lifted VERBATIM out of cmd_preflight so both preflight and the
+# Tier-2 evidence probe run the same code.
+#
+# Prints EXACTLY SEVEN LINES, newline-delimited:
+#   1 branch  2 base_ref  3 merge_state  4 merge_method  5 merge_detail  6 head_sha  7 pr
+# Newline-delimited, NOT the "|"-joined form the plan sketched: merge_detail is free prose
+# ("PR #12 merged 2026-01-01; 3 commits since merge (vs origin/main)") and base_ref comes from
+# an UNVALIDATED forge.base_ref key in .claude/forge-project.yml which is itself interpolated
+# into merge_detail at :5798/:5817 — so one stray "|" would shift head_sha into pr, bind a
+# wrong head_sha into the journal, and strand finalize on a bad ancestry check FOREVER. A git
+# refname cannot contain a newline and detail is single-line by construction.
+#
+# `detail` is emitted RAW. The plan's Step-1 bullet says to sanitize it here; that would
+# rewrite preflight's `merge_check_detail:` line (:5872) AND the BRANCH_MERGED_WITH_DRIFT
+# status string (:5847), breaking R1 and T-EV-PREFLIGHT-PARITY. The two evidence consumers
+# (event line, hygiene journal) sanitize at their own boundary instead, which is where F7/R8
+# actually bite; merge_detail never enters the journal at all — it rides the artifact.
+#
+# <workdir> only, as the plan specifies. The forge-project.yml walk-up is repeated INSIDE
+# because base_ref's override is read from that file and cmd_preflight resolved it at
+# :5702-5710, outside the lifted range; dropping it would change preflight's `base_ref:` line
+# on any project that configures one. cmd_preflight passes "$cur_pwd", NOT the project root —
+# that is what preserves WRONG_DIRECTORY detection, the exact condition preflight exists for,
+# which a naive `git -C "$root"` conversion would break.
+#
+# BOTH gh invocations are bounded (the plan bounds only `gh pr list`, but `gh auth status`
+# validates the token against api.github.com and is a network call too), EACH WITH ITS OWN RC
+# CAPTURE — an inline `if command -v gh && _ev_timed … gh auth status` would treat a TIMEOUT
+# as "not authenticated" and fall silently to the git-only method instead of reporting
+# BRANCH_UNCLEAR/gh-timeout. Both run inside `( cd "$w" … )` so gh resolves the intended
+# repository rather than the bridge's cwd (the evidence path calls this with $project_root
+# from cmd_verify_decision, which never cds).
+_merge_state_probe() {   # <workdir>
+    local w="$1"
+    local branch detached="false" sha base_ref="" project_yml="" _dir
+    local merge_state="" merge_method="" merge_detail="" head_sha="" pr_num=""
+
+    branch=$(git -C "$w" branch --show-current 2>/dev/null)
+    if [ -z "$branch" ]; then
+        sha=$(git -C "$w" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        branch="(detached: $sha)"
+        detached="true"
+    fi
+    head_sha=$(git -C "$w" rev-parse HEAD 2>/dev/null || echo "")
+
+    _dir="$w"
+    while [ "$_dir" != "/" ] && [ -n "$_dir" ]; do
+        if [ -f "$_dir/.claude/forge-project.yml" ]; then project_yml="$_dir/.claude/forge-project.yml"; break; fi
+        _dir=$(dirname "$_dir")
+    done
+    if [ -n "$project_yml" ]; then
+        base_ref=$(python3 -c "
+import yaml
+try:
+    with open('$project_yml') as f:
+        data = yaml.safe_load(f) or {}
+    print(data.get('forge', {}).get('base_ref', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+    fi
+    if [ -z "$base_ref" ]; then
+        base_ref=$(git -C "$w" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/@@')
+    fi
+    if [ -z "$base_ref" ] && git -C "$w" rev-parse --verify origin/main >/dev/null 2>&1; then
+        base_ref="origin/main"
+    fi
+    if [ -z "$base_ref" ]; then
+        base_ref="main"
+    fi
+
+    if [ "$detached" = "true" ]; then
+        merge_state="DETACHED_HEAD"
+        merge_method="n/a"
+        merge_detail="HEAD is detached at $branch"
+    else
+        # Method 1: gh-aware (both calls bounded, each with its own rc).
+        local _nt; _nt="$(_ev_nt "$w")"
+        if command -v gh >/dev/null; then
+            local _auth_rc=0
+            ( cd "$w" 2>/dev/null && _ev_timed "$_nt" gh auth status >/dev/null 2>&1 ) || _auth_rc=$?
+            if _ev_is_timeout "$_auth_rc"; then
+                merge_state="BRANCH_UNCLEAR"; merge_method="gh-timeout"
+                merge_detail="gh auth status exceeded ${_nt}s"
+            elif [ "$_auth_rc" = 0 ]; then
+                local pr_json _pl_rc=0
+                pr_json=$( cd "$w" 2>/dev/null && _ev_timed "$_nt" gh pr list --state merged --head "$branch" --limit 1 --json number,mergedAt 2>/dev/null ) || _pl_rc=$?
+                if _ev_is_timeout "$_pl_rc"; then
+                    merge_state="BRANCH_UNCLEAR"; merge_method="gh-timeout"
+                    merge_detail="gh pr list exceeded ${_nt}s"
+                else
+                    pr_num=$(echo "$pr_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['number']) if d else None" 2>/dev/null)
+                    if [ -n "$pr_num" ] && [ "$pr_num" != "None" ]; then
+                        local pr_merged_at
+                        pr_merged_at=$(echo "$pr_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['mergedAt'][:10]) if d else None" 2>/dev/null)
+                        local cherry_count
+                        cherry_count=$(git -C "$w" rev-list --cherry-pick --right-only --count "$base_ref...$branch" 2>/dev/null || echo "?")
+                        merge_method="gh"
+                        if [ "$cherry_count" = "0" ]; then
+                            merge_state="BRANCH_MERGED_CLEAN"
+                            merge_detail="PR #$pr_num merged $pr_merged_at; no drift"
+                        elif [ "$cherry_count" = "?" ]; then
+                            merge_state="BRANCH_UNCLEAR"
+                            merge_detail="PR #$pr_num merged $pr_merged_at; cherry-pick count failed"
+                        else
+                            merge_state="BRANCH_MERGED_WITH_DRIFT"
+                            merge_detail="PR #$pr_num merged $pr_merged_at; $cherry_count commits since merge (vs $base_ref)"
+                        fi
+                    else
+                        pr_num=""
+                    fi
+                fi
+            fi
+        fi
+
+        # Method 2: git-only fallback
+        if [ -z "$merge_state" ]; then
+            merge_method="git-only"
+            if git -C "$w" merge-base --is-ancestor HEAD "$base_ref" 2>/dev/null; then
+                merge_state="BRANCH_MERGED_CLEAN"
+                merge_detail="HEAD is an ancestor of $base_ref"
+            else
+                local cherry_count
+                cherry_count=$(git -C "$w" rev-list --cherry-pick --right-only --count "$base_ref...$branch" 2>/dev/null)
+                if [ "$cherry_count" = "0" ]; then
+                    merge_state="BRANCH_MERGED_CLEAN"
+                    merge_detail="cherry-pick count vs $base_ref is 0"
+                else
+                    merge_state="BRANCH_UNMERGED"
+                    merge_detail="${cherry_count:-?} unique commits vs $base_ref"
+                fi
+            fi
+        fi
+    fi
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$branch" "$base_ref" "$merge_state" "$merge_method" "$merge_detail" "$head_sha" "$pr_num"
+}
+
+# Field accessor for _merge_state_probe's newline-delimited output.
+#   1 branch  2 base_ref  3 merge_state  4 method  5 detail  6 head_sha  7 pr
+_ms_field() {   # <probe_output> <n>
+    printf '%s\n' "$1" | sed -n "${2}p"
+}
+
 cmd_preflight() {
     # Pre-flight discipline (Phase 1a). Prints a kickoff snapshot and a
     # final status_code line. Does NOT require a tmux session. Always
@@ -7535,91 +7680,22 @@ except Exception:
         directory_state="WRONG_DIRECTORY"
     fi
 
-    # Branch detection
-    local branch
-    branch=$(git branch --show-current 2>/dev/null)
-    local detached="false"
-    if [ -z "$branch" ]; then
-        local sha
-        sha=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-        branch="(detached: $sha)"
-        detached="true"
-    fi
-
-    # Resolve base_ref: forge-project.yml override, else origin/HEAD, else origin/main, else main
-    local base_ref=""
-    if [ -n "$project_yml" ]; then
-        base_ref=$(python3 -c "
-import yaml
-try:
-    with open('$project_yml') as f:
-        data = yaml.safe_load(f) or {}
-    print(data.get('forge', {}).get('base_ref', ''))
-except Exception:
-    pass
-" 2>/dev/null)
-    fi
-    if [ -z "$base_ref" ]; then
-        base_ref=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/@@')
-    fi
-    if [ -z "$base_ref" ] && git rev-parse --verify origin/main >/dev/null 2>&1; then
-        base_ref="origin/main"
-    fi
-    if [ -z "$base_ref" ]; then
-        base_ref="main"
-    fi
-
-    # Merge state detection — see check_merge_state() below
-    local merge_state="" merge_method="" merge_detail=""
-    if [ "$detached" = "true" ]; then
-        merge_state="DETACHED_HEAD"
-        merge_method="n/a"
-        merge_detail="HEAD is detached at $branch"
-    else
-        # Method 1: gh-aware
-        if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-            local pr_json
-            pr_json=$(gh pr list --state merged --head "$branch" --limit 1 --json number,mergedAt 2>/dev/null)
-            local pr_num
-            pr_num=$(echo "$pr_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['number']) if d else None" 2>/dev/null)
-            if [ -n "$pr_num" ] && [ "$pr_num" != "None" ]; then
-                local pr_merged_at
-                pr_merged_at=$(echo "$pr_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['mergedAt'][:10]) if d else None" 2>/dev/null)
-                local cherry_count
-                cherry_count=$(git rev-list --cherry-pick --right-only --count "$base_ref...$branch" 2>/dev/null || echo "?")
-                merge_method="gh"
-                if [ "$cherry_count" = "0" ]; then
-                    merge_state="BRANCH_MERGED_CLEAN"
-                    merge_detail="PR #$pr_num merged $pr_merged_at; no drift"
-                elif [ "$cherry_count" = "?" ]; then
-                    merge_state="BRANCH_UNCLEAR"
-                    merge_detail="PR #$pr_num merged $pr_merged_at; cherry-pick count failed"
-                else
-                    merge_state="BRANCH_MERGED_WITH_DRIFT"
-                    merge_detail="PR #$pr_num merged $pr_merged_at; $cherry_count commits since merge (vs $base_ref)"
-                fi
-            fi
-        fi
-
-        # Method 2: git-only fallback
-        if [ -z "$merge_state" ]; then
-            merge_method="git-only"
-            if git merge-base --is-ancestor HEAD "$base_ref" 2>/dev/null; then
-                merge_state="BRANCH_MERGED_CLEAN"
-                merge_detail="HEAD is an ancestor of $base_ref"
-            else
-                local cherry_count
-                cherry_count=$(git rev-list --cherry-pick --right-only --count "$base_ref...$branch" 2>/dev/null)
-                if [ "$cherry_count" = "0" ]; then
-                    merge_state="BRANCH_MERGED_CLEAN"
-                    merge_detail="cherry-pick count vs $base_ref is 0"
-                else
-                    merge_state="BRANCH_UNMERGED"
-                    merge_detail="${cherry_count:-?} unique commits vs $base_ref"
-                fi
-            fi
-        fi
-    fi
+    # Branch / base_ref / merge state — the ONE oracle (_merge_state_probe, Step 1 of
+    # evidence-gated-completion). Called with "$cur_pwd", NEVER the project root: a
+    # `git -C "$root"` conversion would resolve the repo from the wrong directory and
+    # silently break WRONG_DIRECTORY detection, the exact condition preflight exists for.
+    local branch base_ref merge_state merge_method merge_detail head_sha pr_num
+    {
+        IFS= read -r branch
+        IFS= read -r base_ref
+        IFS= read -r merge_state
+        IFS= read -r merge_method
+        IFS= read -r merge_detail
+        IFS= read -r head_sha
+        IFS= read -r pr_num
+    } <<EOF
+$(_merge_state_probe "$cur_pwd")
+EOF
 
     # Determine status_code and human status
     local status_code=""

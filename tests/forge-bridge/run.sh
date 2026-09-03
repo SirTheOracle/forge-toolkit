@@ -3911,9 +3911,9 @@ echo "── EV: evidence-gated completion ──"
 # a tmux session. Mirrors the suite's existing extraction idiom.
 EVFNS="$WORK/ev-fns.sh"
 sed -n '/^_evidence_mode()/,/^}$/p;/^_evidence_enforcing()/,/^}$/p;/^_ev_timed()/,/^}$/p;
-        /^_ev_is_timeout()/,/^}$/p;/^_evidence_cfg()/,/^}$/p;
+        /^_ev_is_timeout() {.*}$/p;/^_evidence_cfg()/,/^}$/p;
         /^_evidence_probe_timeout()/,/^}$/p;/^_evidence_net_timeout()/,/^}$/p;
-        /^_ev_pt()/,/^}$/p;/^_ev_nt()/,/^}$/p;
+        /^_ev_pt() {.*}$/p;/^_ev_nt() {.*}$/p;
         /^_ev_emit()/,/^}$/p;/^_ev_grade()/,/^}$/p;/^_ev_detail()/,/^}$/p;
         /^_ev_probe_/,/^}$/p;/^_evidence_baseline()/,/^}$/p;
         /^_evidence_stage_record()/,/^}$/p;/^_ev_verdict()/,/^}$/p;
@@ -3968,6 +3968,25 @@ FORGE_EVIDENCE_MODE=bogus bash -c ". '$EVFNS'; _evidence_enforcing" >/dev/null 2
            || bad "T-EV-MODE-BOGUS enforcing rc"
 FORGE_EVIDENCE_MODE=observe bash -c ". '$EVFNS'; _evidence_enforcing" >/dev/null 2>&1
 [ $? = 1 ] && ok "T-EV-MODE-BOGUS observe is not enforcing" || bad "T-EV-MODE-BOGUS observe rc"
+
+# T-EV-PREFLIGHT-PARITY — 4 arms (arms 3 and 4 are what catch a sanitized-detail regression)
+EPF="$(mkG evpf)"
+pf="$( cd "$EPF" && "$BRIDGE" preflight 2>&1 )"
+probe="$(_merge_state_probe "$EPF")"
+p_br="$(_ms_field "$probe" 1)"; p_base="$(_ms_field "$probe" 2)"
+p_st="$(_ms_field "$probe" 3)"; p_det="$(_ms_field "$probe" 5)"
+printf '%s' "$pf" | grep -q "^branch: *$p_br\$"       && ok "T-EV-PREFLIGHT-PARITY branch"      || bad "T-EV-PREFLIGHT-PARITY branch '$p_br'"
+printf '%s' "$pf" | grep -q "^base_ref: *$p_base\$"   && ok "T-EV-PREFLIGHT-PARITY base_ref"    || bad "T-EV-PREFLIGHT-PARITY base_ref '$p_base'"
+printf '%s' "$pf" | grep -q "^merge_state: *$p_st\$"  && ok "T-EV-PREFLIGHT-PARITY merge_state" || bad "T-EV-PREFLIGHT-PARITY merge_state '$p_st'"
+# ARM 3: the oracle's detail must reach preflight VERBATIM. This is the assertion that would
+# have caught sanitizing `detail` inside the helper.
+printf '%s' "$pf" | grep -q "^merge_check_detail: *$p_det\$" \
+  && ok "T-EV-PREFLIGHT-PARITY merge_check_detail renders the oracle's detail VERBATIM" \
+  || bad "T-EV-PREFLIGHT-PARITY detail drift: probe='$p_det'"
+# ARM 4: the sanitizer's own signature must never appear in preflight output.
+printf '%s' "$pf" | grep -qE '^merge_check_detail:.*[a-z0-9]_[a-z0-9]+_[a-z0-9]' \
+  && bad "T-EV-PREFLIGHT-PARITY detail was whitespace-collapsed (R1 regression)" \
+  || ok "T-EV-PREFLIGHT-PARITY detail is not whitespace-collapsed"
 
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
