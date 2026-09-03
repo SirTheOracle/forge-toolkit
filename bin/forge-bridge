@@ -2769,7 +2769,16 @@ EOF
                 *) _cq=" qualifier=incomplete $_cu" ;;
             esac
         fi
-        _emit_event COMPLETE "$slug" "last_stage=$stage worker=$worker$_cq"
+        # evidence-gated-completion Step 11.5: in OBSERVE there is no terminal gate at all
+        # (F12) — this emit IS the completion. It carries the Tier-0 delivery grade the
+        # callback computed before update_context ran (Step 6b). Tier 0 only, NO network:
+        # this is the callback close path.
+        # `_EV_OBSERVE_DELIVERY` is set ONLY by cmd_callback's verify/DONE/observe branch and
+        # is reset to "" at script level, so update_context's other two callers
+        # (cmd_set_context :2919, park-resolve :2737) can never append a stale or inherited
+        # token. Empty => the line is byte-identical to today (W-EV-LEGACY-COMPLETE).
+        local _cd=""; [ -n "${_EV_OBSERVE_DELIVERY:-}" ] && _cd=" delivery=$_EV_OBSERVE_DELIVERY"
+        _emit_event COMPLETE "$slug" "last_stage=$stage worker=$worker$_cq$_cd"
         [ "$FORGE_WORKER_HYGIENE_MODE" != enforce ] && _emit_event HYGIENE_BYPASSED "$slug" "reason=observe-mode last_stage=$stage worker=$worker"
     fi
 }
@@ -4368,9 +4377,23 @@ _render_status_file() {
     # `infra-lock status` does not call _render_status_file, so no recursion.
     local il_line=""
     il_line=$(cmd_infra_lock status 2>/dev/null | sed 's/^INFRA_LOCK: //')
+    # evidence-gated-completion Step 11.1. Space-free tokens only. Empty when the journal
+    # carries no decision, in which case the renderer omits the section ENTIRELY and the
+    # status file is byte-identical to today (T-EV-STATUS-LEGACY).
+    local ev_line=""
+    if [ -n "$(_terminal_field "$project_root" delivery_grade)" ]; then
+        ev_line="$(printf 'delivery=%s merge_state=%s branch=%s head=%s dirty_tracked=%s ack=%s at=%s' \
+            "$(_terminal_field "$project_root" delivery_grade)" \
+            "$(_terminal_field "$project_root" merge_state)" \
+            "$(_terminal_field "$project_root" branch)" \
+            "$(_terminal_field "$project_root" head_sha)" \
+            "$(_terminal_field "$project_root" dirty_tracked)" \
+            "$(_terminal_field "$project_root" evidence_ack)" \
+            "$(_terminal_field "$project_root" evidence_at)")"
+    fi
     python3 - "$project_root/$CONTEXT_FILE" "$project_root/$DEV_DIR" "$out_file" "$il_line" \
               "$project_root/$(_usage_file)" "$project_root/$DEV_DIR/forge-tmp/orchestrator-events.log" \
-              "$(_usage_max_age_s)" <<'PYEOF'
+              "$(_usage_max_age_s)" "$ev_line" <<'PYEOF'
 import sys, os, yaml, datetime
 
 context_file, dev_dir, out_file = sys.argv[1:4]
@@ -4384,6 +4407,15 @@ try:
     usage_max_age = int(sys.argv[7]) if len(sys.argv) > 7 else 900
 except ValueError:
     usage_max_age = 900
+# evidence-gated-completion Step 11.1. Absent => the Delivery section is omitted entirely and
+# the rendered file is byte-identical to a pre-evidence pipeline.
+_ev_raw = sys.argv[8] if len(sys.argv) > 8 else ''
+evidence = {}
+for _t in _ev_raw.split():
+    if '=' in _t:
+        _k, _v = _t.split('=', 1)
+        if _v:
+            evidence[_k] = _v
 
 # Worker callback responses (and notes) arrive as raw markdown source; the
 # status file is a plain-text surface, so `**bold**`/backticks/[x](url) would
@@ -4668,6 +4700,18 @@ if notes:
 else:
     L.append("  (none)")
 L.append("")
+
+# evidence-gated-completion Step 11.1: LAST section, omitted entirely when there is no
+# terminal decision for this pipeline (T-EV-STATUS-LEGACY / T-EV-STATUS-SECTIONS).
+if evidence:
+    L.append("## Delivery")
+    L.append("")
+    L.append('Delivery:  %s  (branch %s, merge_state %s, head %s)' % (
+        evidence.get('delivery', '?'), evidence.get('branch', '?'),
+        evidence.get('merge_state', '?'), (evidence.get('head', '') or '?')[:12]))
+    L.append('Evidence:  dirty_tracked=%s ack=%s at=%s' % (
+        evidence.get('dirty_tracked', '?'), evidence.get('ack', '0'),
+        evidence.get('at', '?')))
 
 with open(out_file, 'w') as f:
     f.write("\n".join(L))

@@ -4157,6 +4157,70 @@ grep -q 'closed_max_ts' "$ROOT/bin/forge-watch" \
   && ok "T-EV-RERUN watcher closed_max_ts fold still present (shared-spec obligation, 698eaea)" \
   || bad "T-EV-RERUN watcher fold refactored away — re-read _evidence_stage_record's contract"
 
+echo "── EV Group 8: status Delivery section (T-EV-STATUS-LEGACY / T-EV-STATUS-SECTIONS) ──"
+# _terminal_field's only dependency is _hygiene_file; _hygiene_write seeds the journal entry
+# the renderer reads. Mirrors the suite's existing extraction idiom ($EVFNS above, $AVFNS at
+# ACM §V) rather than widening either.
+SFFNS="$WORK/sf-fns.sh"
+sed -n '/^_hygiene_file()/,/^}$/p;/^_hygiene_write()/,/^}$/p;/^_terminal_field()/,/^}$/p;
+        /^_context_file()/p;/^_status_file_name()/p;/^_render_status_file()/,/^}$/p' "$BRIDGE" > "$SFFNS"
+# shellcheck disable=SC1090
+. "$SFFNS"
+cmd_infra_lock(){ :; }
+SFR="$(mkR sfstatus)"
+_resolve_project_root(){ printf '%s' "$SFR"; }
+_session_or_sentinel(){ printf 'sfS'; }
+SF="$SFR/.dev/forge-status.sfS.md"
+
+# LEGACY: no terminal decision in the journal -> the Delivery section is entirely absent, and
+# every pre-existing section still renders (nothing else about the legacy path is disturbed).
+# (A literal pre-/post-diff byte comparison would need a frozen copy of the prior renderer
+# embedded in this file to stay reproducible on a future checkout — brittle against any
+# unrelated future edit to the same function — so this proves the same invariant structurally:
+# the ONLY diff a no-evidence render can have from a legacy one is the Delivery section, and
+# that section is verified fully absent below.)
+_render_status_file
+[ -s "$SF" ] || bad "T-EV-STATUS-LEGACY the renderer produced no status file (later assertions would be vacuous)"
+grep -q '^## Delivery' "$SF" \
+  && bad "T-EV-STATUS-LEGACY Delivery section emitted with no evidence" \
+  || ok "T-EV-STATUS-LEGACY Delivery section omitted entirely when absent"
+_sf_missing=""
+for h in '# Forge Pipeline Status' '## Recent activity' '## Pending callbacks' '## Artifacts' '## Notes'; do
+  grep -qF "$h" "$SF" || _sf_missing="$_sf_missing|$h"
+done
+[ -z "$_sf_missing" ] \
+  && ok "T-EV-STATUS-LEGACY all pre-existing sections still render with no evidence present" \
+  || bad "T-EV-STATUS-LEGACY missing sections: $_sf_missing"
+
+# SECTIONS: seed a terminal decision, then confirm the documented headings appear in order as
+# an ORDERED SUBSEQUENCE (not exact-list equality) — active-context-management's S1 inserts
+# sections into this same renderer; an exact pin would go red on a legitimate insertion, and
+# the cheapest fix would be to rewrite the assertion, destroying the property. A subsequence
+# still proves "## Delivery" comes last, which is the invariant that matters.
+export ID_target_session=sfS ID_target_incarnation=1
+_hygiene_write "$SFR" terminal "" \
+  "delivery_grade=committed-local merge_state=BRANCH_UNMERGED branch=feat/x head_sha=abc123def dirty_tracked=0 evidence_ack= evidence_at=2026-09-03T00:00:00Z" \
+  >/dev/null 2>&1
+_render_status_file
+grep -q '^## Delivery' "$SF" && grep -q 'Delivery:  committed-local' "$SF" \
+  && ok "T-EV-STATUS-SECTIONS Delivery section renders once a terminal decision exists" \
+  || bad "T-EV-STATUS-SECTIONS Delivery section missing/wrong: $(grep -A2 '^## Delivery' "$SF")"
+python3 - "$SF" <<'PY' && ok "T-EV-STATUS-SECTIONS documented headings appear in order (insertions allowed)" || bad "T-EV-STATUS-SECTIONS order violated"
+import re,sys
+# want[] reconciled against the renderer's ACTUAL headings (applier note, implementation.md
+# Diff 11a): active-context-management's S4.1 already inserted 'Worker context' and 'Recent
+# hygiene decisions' ahead of this feature; only the trailing 'Delivery' is contributed here.
+want=['# Forge Pipeline Status','## Recent activity','## Pending callbacks',
+      '## Worker context','## Recent hygiene decisions','## Artifacts','## Notes','## Delivery']
+got=[l.rstrip() for l in open(sys.argv[1]) if re.match(r'^(# Forge Pipeline Status|## )',l)]
+i=0
+for h in got:
+    if i < len(want) and h == want[i]: i += 1
+assert i == len(want), "missing/out-of-order: got=%r want=%r stopped at %r" % (got, want, want[i:i+1])
+PY
+unset -f cmd_infra_lock
+unset ID_target_session ID_target_incarnation
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

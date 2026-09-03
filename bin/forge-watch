@@ -1249,6 +1249,18 @@ def _handle_event_line(root, label, line):
         for _k in ('delivery', 'merge_state', 'branch'):
             if fields.get(_k):
                 f[_k] = fields[_k]
+    elif typ == 'EVIDENCE':
+        # evidence-gated-completion Step 11.4. Sourced from the bridge's own EVIDENCE line;
+        # `EVIDENCE` is NOT on cmd_emit's whitelist, so a protocol-following worker cannot
+        # forge one. policy='daily' matches ZOMBIE-ACTIVE's cadence for a standing condition.
+        if fields.get('verdict') == 'contradicted':
+            f = add_finding('EVIDENCE-CONTRADICTED', root, f"{slug}\t{stage}",
+                            f"{label} · {slug} — evidence contradicts the {stage} completion "
+                            f"(delivery {fields.get('delivery', '?')})",
+                            policy='daily', slug=slug, stage=stage)
+            for _k in ('delivery', 'merge_state', 'branch'):
+                if fields.get(_k):
+                    f[_k] = fields[_k]
     elif typ == 'RESET_UNAVAILABLE':
         add_finding('RESET-UNAVAILABLE', root, slug,
                     f"{label} · {slug} — reset unavailable ({fields.get('family', '?')}) — actionable",
@@ -2259,7 +2271,7 @@ NOTIFY = ['SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'DELIVERY-UNVERIFIED',
           'PIPELINE-COMPLETE', 'ZOMBIE-ACTIVE', 'SPAWN-FIRST-LAUNCH', 'WORKTREE-DIRTY-SOURCE', 'STATE-UNPARSEABLE',
           'RECOVER-PENDING',
           'RESET-UNAVAILABLE', 'PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED',
-          'HYGIENE-CLEANUP']
+          'HYGIENE-CLEANUP', 'EVIDENCE-CONTRADICTED']
 order = {c: i for i, c in enumerate(
     # NOTE: NOTIFY is used ONLY to build this sort map. The three active-context-management
     # conditions belong in `order` and in HOT, but NOT in NOTIFY (which would say nothing) and
@@ -2301,8 +2313,14 @@ HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH', 'WOR
        #   2. a session whose ONLY finding is a qualified completion flips from '- idle' to
        #      the hot glyph at :2146 — correct, a shipped-but-unclean run wants a look.
        'PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED'}
+# EVIDENCE-CONTRADICTED is ACTIVE, NOT HOT, for the duration of the observe soak. A red
+# menubar alert from a brand-new, unvalidated grader during exactly the phase designed to
+# MEASURE its false-positive rate would train the operator to ignore the channel. ACTIVE still
+# reaches cc-board/1 and NOTIFY still drives terminal-notifier, so the soak is fully observable
+# without a red count. PROMOTE TO HOT IN THE SAME COMMIT THAT FLIPS
+# FORGE_EVIDENCE_MODE=enforce — not before.
 ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE',
-          'EPISODE-ACTIVE', 'EPISODE-SETTLED'}
+          'EPISODE-ACTIVE', 'EPISODE-SETTLED', 'EVIDENCE-CONTRADICTED'}
 STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
             'SESSION-DONE': 'done', 'EPISODE-ACTIVE': 'working', 'EPISODE-SETTLED': 'done',
             'EPISODE-STUCK': 'needs-input', 'NEEDS-PERMISSION': 'needs-input',
@@ -2453,10 +2471,15 @@ if BOARD:
              'acked': bool(conds.get(f['key'], {}).get('acked'))}
         # Episode metadata must be copied EXPLICITLY (R1c) — _row emits a fixed field set
         # and would otherwise silently drop it from board rows.
+        # R1c: `delivery`, `merge_state`, `branch` are the evidence row fields, attached at
+        # the add_finding sites that know them (the COMPLETE handler and the EVIDENCE
+        # handler); findings without them are byte-identical, because each key is copied
+        # only `if kx in f`.
         for kx in ('pane', 'episode_id', 'first_at', 'last_at', 'turn_count',
                    'mid_turn', 'earlier',
                    'reason', 'parked_at', 'uncommitted', 'worker', 'entry_ts',
-                   'duplicates', 'blocked_at', 'incarnation', 'callback_shape'):
+                   'duplicates', 'blocked_at', 'incarnation', 'callback_shape',
+                   'delivery', 'merge_state', 'branch'):
             if kx in f:
                 v = f[kx]
                 # Board rows are JSON — coerce any datetime (unquoted YAML timestamps,
