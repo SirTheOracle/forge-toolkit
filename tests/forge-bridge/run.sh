@@ -3905,6 +3905,70 @@ for row in rows:
     assert re.fullmatch(r'[0-9a-f]{64}',str(row.get('callback_sha256') or '')), row
 assert not any(row.get('action')=='terminalize-delivery' for row in all_rows), all_rows
 PY
+
+echo "── EV: evidence-gated completion ──"
+# Pure-helper extraction: source only the evidence functions, so probe/shim units run without
+# a tmux session. Mirrors the suite's existing extraction idiom.
+EVFNS="$WORK/ev-fns.sh"
+sed -n '/^_evidence_mode()/,/^}$/p;/^_evidence_enforcing()/,/^}$/p;/^_ev_timed()/,/^}$/p;
+        /^_ev_is_timeout()/,/^}$/p;/^_evidence_cfg()/,/^}$/p;
+        /^_evidence_probe_timeout()/,/^}$/p;/^_evidence_net_timeout()/,/^}$/p;
+        /^_ev_pt()/,/^}$/p;/^_ev_nt()/,/^}$/p;
+        /^_ev_emit()/,/^}$/p;/^_ev_grade()/,/^}$/p;/^_ev_detail()/,/^}$/p;
+        /^_ev_probe_/,/^}$/p;/^_evidence_baseline()/,/^}$/p;
+        /^_evidence_stage_record()/,/^}$/p;/^_ev_verdict()/,/^}$/p;
+        /^_merge_state_probe()/,/^}$/p;/^_ms_field()/,/^}$/p' "$BRIDGE" > "$EVFNS"
+# shellcheck disable=SC1090
+. "$EVFNS"
+
+# mkG <name>  -> a git-backed project root with one seeded commit; echoes the path
+mkG() {
+  local d; d="$(mkR "$1")"
+  git -C "$d" init -q 2>/dev/null
+  git -C "$d" config user.email t@t; git -C "$d" config user.name t
+  printf 'seed\n' > "$d/seed.txt"; git -C "$d" add -A; git -C "$d" commit -qm seed
+  printf '%s' "$d"
+}
+# ev_shim <dir> <binname> <body> -> a PATH shim that shadows the real binary
+ev_shim() { mkdir -p "$1"; printf '#!/bin/sh\n%s\n' "$3" > "$1/$2"; chmod +x "$1/$2"; }
+# ev_report <root> <slug> <status> [extra]
+ev_report() {
+  mkdir -p "$2/.dev/proposals/$3" 2>/dev/null
+  mkdir -p "$1/.dev/proposals/$2" 2>/dev/null
+  printf '# Coder Report\n\n**Status**: %s\n\n%s\n' "$3" "${4:-}" > "$1/.dev/proposals/$2/coder-report.md"
+}
+# ev_dispatch_event <root> <slug> <stage> <head> <branch> <pending_ts>
+ev_dispatch_event() {
+  mkdir -p "$1/.dev/forge-tmp"
+  printf 'DISPATCH: pipeline=%s stage=%s worker=codex-a head=%s branch=%s pending_timestamp=%s\n' \
+    "$2" "$3" "$4" "$5" "$6" >> "$1/.dev/forge-tmp/orchestrator-events.log"
+}
+
+# T-EV-TIMEOUT-SHIM — the highest-value addition: without it, every other probe test passes
+# for the wrong reason if the bounded-exec primitive silently degrades, and the plan mandates
+# a binary (timeout(1)) that does not exist on this machine.
+t0=$(date +%s); _ev_timed 1 sleep 5 >/dev/null 2>&1; trc=$?; t1=$(date +%s)
+{ [ $((t1-t0)) -lt 4 ] && _ev_is_timeout "$trc"; } \
+  && ok "T-EV-TIMEOUT-SHIM bounded exec kills a 5s child under a 1s budget (rc=$trc)" \
+  || bad "T-EV-TIMEOUT-SHIM elapsed=$((t1-t0))s rc=$trc"
+_ev_timed 5 false >/dev/null 2>&1; prc=$?
+[ "$prc" = 1 ] && ok "T-EV-TIMEOUT-SHIM passes the child rc through (false -> 1)" \
+                || bad "T-EV-TIMEOUT-SHIM passthrough rc=$prc"
+_ev_timed 5 /nonexistent-binary-xyz >/dev/null 2>&1; erc=$?
+{ [ "$erc" != 0 ] && ! _ev_is_timeout "$erc"; } \
+  && ok "T-EV-TIMEOUT-SHIM exec failure is non-zero and NOT a timeout (rc=$erc)" \
+  || bad "T-EV-TIMEOUT-SHIM exec-failure rc=$erc misreads as a grade"
+
+# T-EV-MODE-BOGUS
+o=$(FORGE_EVIDENCE_MODE=bogus bash -c ". '$EVFNS'; _evidence_mode" 2>&1); rc=$?
+{ [ "$rc" = 1 ] && printf '%s' "$o" | grep -q CONFIG_ERROR; } \
+  && ok "T-EV-MODE-BOGUS invalid mode is a HARD config error" || bad "T-EV-MODE-BOGUS rc=$rc o=$o"
+FORGE_EVIDENCE_MODE=bogus bash -c ". '$EVFNS'; _evidence_enforcing" >/dev/null 2>&1
+[ $? = 2 ] && ok "T-EV-MODE-BOGUS _evidence_enforcing returns rc2 on an invalid mode" \
+           || bad "T-EV-MODE-BOGUS enforcing rc"
+FORGE_EVIDENCE_MODE=observe bash -c ". '$EVFNS'; _evidence_enforcing" >/dev/null 2>&1
+[ $? = 1 ] && ok "T-EV-MODE-BOGUS observe is not enforcing" || bad "T-EV-MODE-BOGUS observe rc"
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

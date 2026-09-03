@@ -85,6 +85,23 @@ FORGE_HYGIENE_LOCK_WAIT_S="${FORGE_HYGIENE_LOCK_WAIT_S:-5}"
 FORGE_WORKER_MIN_HEADROOM="${FORGE_WORKER_MIN_HEADROOM:-75}"
 # Capability/anchor fixture path (data-driven; never hard-coded).
 FORGE_RESET_CAPABILITY_FILE="${FORGE_RESET_CAPABILITY_FILE:-$HOME/.config/forge/reset-capability.yml}"
+
+# ---- Evidence-gated completion (evidence-gated-completion feature) ----
+# observe = compute + record + render, refuse nothing. This is the SHIPPED default and the
+# runtime kill switch: bin/* is deployed live by symlink, so reverting a binary mid-incident
+# is a poor kill switch. enforce = verify-decision may refuse a contradicted completion.
+FORGE_EVIDENCE_MODE="${FORGE_EVIDENCE_MODE:-observe}"
+# Per-pass scratch. These are ORDINARY shell variables, deliberately NOT exported and
+# deliberately RESET here: update_context is reached from three call sites (cmd_callback
+# :3900, cmd_set_context :2919, and the park-resolve path :2737), and only the first one
+# sets _EV_OBSERVE_DELIVERY. Initialising at script level means a same-named value inherited
+# from the operator's environment can never append a bogus `delivery=` on the other two.
+# _EV_T / _EV_NT memoize the probe budgets for one recording pass (N11): _evidence_cfg
+# spawns python3 + PyYAML (~21ms measured), and a probe cannot memoize for its caller
+# because probes run inside command substitution.
+_EV_OBSERVE_DELIVERY=""
+_EV_T=""
+_EV_NT=""
 FORGE_BROKER_BIN="${FORGE_BROKER_BIN:-forge-broker}"
 
 # ---- Active-context-management controls (S11) ----
@@ -675,6 +692,117 @@ _hygiene_enforcing() {
     local m; m="$(_hygiene_mode)" || return 2
     [ "$m" = enforce ]
 }
+
+# ---- Evidence mode (evidence-gated-completion Step 2) ----
+# Exact structural mirror of _hygiene_mode/_hygiene_enforcing, including the CONFIG_ERROR
+# hard-fail, so a typo (e.g. `enforc`) can NEVER silently fall through to observe in a
+# gating path.
+_evidence_mode() {
+    case "${FORGE_EVIDENCE_MODE:-observe}" in
+        observe|enforce) printf '%s' "${FORGE_EVIDENCE_MODE:-observe}" ;;
+        *) echo "CONFIG_ERROR: FORGE_EVIDENCE_MODE='$FORGE_EVIDENCE_MODE' must be observe|enforce" >&2; return 1 ;;
+    esac
+}
+# rc0 iff the resolved mode is enforce; rc2 on invalid mode (caller aborts).
+_evidence_enforcing() {
+    local m; m="$(_evidence_mode)" || return 2
+    [ "$m" = enforce ]
+}
+
+# ---- Bounded exec (evidence-gated-completion Step 4; plan invariant §2.4) ----
+# The plan says `timeout "${FORGE_EVIDENCE_PROBE_TIMEOUT_S:-5}" …`. THERE IS NO timeout(1) ON
+# THIS PLATFORM — verified: neither `timeout` nor `gtimeout` is on PATH, macOS ships no
+# coreutils, and no existing bin/ code invokes it. A literal `timeout 5 git …` would exit 127
+# for every probe, grading the whole feature UNKNOWN forever AND making every probe test pass
+# for the wrong reason. The bound is enforced here, three ways, in preference order, and it
+# NEVER degrades to an unbounded exec:
+#   1. real timeout(1) if one is ever installed (Linux / brew coreutils) — rc 124
+#   2. perl alarm(2), which survives execve, so the exec'd child inherits the pending SIGALRM
+#      and dies with rc 142. This is the in-repo precedent: forge-watch's fw_timed (:80-87)
+#      records exactly this conclusion. /usr/bin/perl is part of the base macOS install.
+#   3. python3 subprocess.run(timeout=) — python3 is ALREADY a hard dependency of this script
+#      (_hygiene_write, _hygiene_decide, _terminal_state, _callback_pending_select_exact and
+#      others shell to it unconditionally), so this arm can never be missing. Degrading to an
+#      unbounded exec here would run `git status --porcelain` unbounded on the CALLBACK
+#      LATENCY PATH with no UNKNOWN and no ceiling — verbatim the stall R7 names.
+# Every arm runs argv DIRECTLY (no shell), so a worker-supplied string can never be re-parsed
+# as shell, and stdout passes through verbatim. NOTE the one non-parity between arms: the
+# python3 arm pipes stdout only and leaves stderr inherited, matching timeout/perl; a future
+# caller that wants stderr captured must do it itself, on every arm.
+_ev_timed() {   # <seconds> <cmd> [args...]
+    local s="$1"; shift
+    case "$s" in ''|*[!0-9]*) s=5 ;; esac
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$s" "$@"
+    elif command -v perl >/dev/null 2>&1; then
+        perl -e 'alarm(shift @ARGV); exec @ARGV; exit 127;' "$s" "$@"
+    else
+        FORGE_EV_TMO="$s" python3 - "$@" <<'PY'
+import os,subprocess,sys
+if len(sys.argv)<2: sys.exit(125)
+try:
+    p=subprocess.run(sys.argv[1:],stdout=subprocess.PIPE,
+                     timeout=float(os.environ.get("FORGE_EV_TMO") or 5))
+except subprocess.TimeoutExpired: sys.exit(124)
+except Exception: sys.exit(125)
+sys.stdout.write(p.stdout.decode("utf-8","replace"))
+rc=p.returncode
+# A signal death is negative here and 128+N on the perl arm; both are non-zero and neither
+# is 124/142, so _ev_is_timeout agrees across arms and every probe grades UNKNOWN either way.
+sys.exit(rc if isinstance(rc,int) and 0 <= rc < 256 else 125)
+PY
+    fi
+}
+# rc0 iff the rc names a timeout kill: 124 = GNU timeout / python3 arm, 142 = 128+SIGALRM.
+_ev_is_timeout() { [ "$1" = 124 ] || [ "$1" = 142 ]; }
+
+# Optional `evidence:` block in .claude/forge-project.yml (Step 12). Echoes the value or the
+# supplied default; never fails, never blocks. Lists space-join; booleans normalize to
+# true/false. Precedence at every call site: env > this > shipped default. The project root
+# is passed EXPLICITLY — no hidden _resolve_project_root call on the probe path, and the
+# helper is unit-testable against a path.
+_evidence_cfg() {   # <project_root> <key> <default>
+    local yml="$1/.claude/forge-project.yml"
+    [ -f "$yml" ] || { printf '%s' "$3"; return 0; }
+    local out
+    out="$(FORGE_EVC_KEY="$2" FORGE_EVC_DEF="$3" python3 - "$yml" 2>/dev/null <<'PY'
+import os,sys,yaml
+k=os.environ["FORGE_EVC_KEY"]; dflt=os.environ["FORGE_EVC_DEF"]
+try: d=yaml.safe_load(open(sys.argv[1])) or {}
+except Exception: print(dflt); raise SystemExit(0)
+e=(d.get("evidence") or {}) if isinstance(d,dict) else {}
+v=e.get(k)
+if v is None: print(dflt)
+elif isinstance(v,bool): print("true" if v else "false")
+elif isinstance(v,(list,tuple)): print(" ".join(str(x) for x in v))
+else: print(v)
+PY
+)"
+    printf '%s' "${out:-$3}"
+}
+
+# Effective ceilings. env > evidence.<key> > shipped default, clamped the way
+# _reset_proof_timeout clamps. Each call costs a python3 + PyYAML startup (~21ms measured),
+# so a recording pass resolves them ONCE into _EV_T/_EV_NT and the probes read those.
+_evidence_probe_timeout() {   # [project_root]
+    local t="${FORGE_EVIDENCE_PROBE_TIMEOUT_S:-}"
+    [ -n "$t" ] || t="$(_evidence_cfg "${1:-.}" probe_timeout_s 5)"
+    case "$t" in ''|*[!0-9]*) t=5 ;; esac
+    [ "$t" -lt 1 ] && t=1; [ "$t" -gt 60 ] && t=60
+    printf '%s' "$t"
+}
+_evidence_net_timeout() {   # [project_root]
+    local t="${FORGE_EVIDENCE_NET_TIMEOUT_S:-}"
+    [ -n "$t" ] || t="$(_evidence_cfg "${1:-.}" net_timeout_s 8)"
+    case "$t" in ''|*[!0-9]*) t=8 ;; esac
+    [ "$t" -lt 1 ] && t=1; [ "$t" -gt 120 ] && t=120
+    printf '%s' "$t"
+}
+# Per-pass budget accessors. A probe runs inside command substitution, so it CANNOT memoize
+# for its caller — the caller primes _EV_T/_EV_NT once and the probe's subshell inherits them.
+# Unprimed (a direct unit-test call) falls back to a full resolve, so probes stay standalone.
+_ev_pt() { [ -n "${_EV_T:-}" ]  && { printf '%s' "$_EV_T";  return 0; }; _evidence_probe_timeout "${1:-.}"; }
+_ev_nt() { [ -n "${_EV_NT:-}" ] && { printf '%s' "$_EV_NT"; return 0; }; _evidence_net_timeout  "${1:-.}"; }
 # Test-only crash injector (P0-5). NO-OP unless BOTH FORGE_HYGIENE_TEST=1 AND
 # FORGE_HYGIENE_CRASH_AT names <phase>. Neither is ever set in production, so it cannot
 # fire accidentally. On a match it `exit 99`s, simulating a hard crash at that exact point.
