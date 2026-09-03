@@ -312,7 +312,12 @@ Agent({
 
 **CRITICAL -- Both prompts must instruct the teammate to WAIT after completing their report**, not exit. They will be needed again in Round 3.
 
-Monitor inbox for "done" messages from both A and B.
+**Wait for A and B -- with the output watchdog.** Monitoring the inbox is not a wait strategy: a tester that produces no output while "running" is indistinguishable from one that is working, and a silent inbox is not evidence of work. All four rules apply:
+
+1. **Poll for output.** Verify bytes on disk at `{output_dir}/qa-report-A.md` and `{output_dir}/qa-report-B.md`. A tester that has written no file has produced nothing, whatever its status says.
+2. **Timeout:** 5 minutes per tester.
+3. **Ping once** via SendMessage when the budget expires -- a ping can wake a wedged tester. **No reply does not mean dead:** a pinged tester can surface minutes later, so never conclude a silent tester is gone.
+4. **Any replacement writes to a distinct path** (`qa-report-A.md` -> `qa-report-A-r2.md`) so a late-waking original cannot clobber it.
 
 After both arrive: **quality check** (real test evidence, actual pass/fail results, screenshots where applicable).
 
@@ -343,7 +348,12 @@ Agent({
 })
 ```
 
-Monitor inbox for C's "done" message.
+**Wait for C -- with the output watchdog** (same four rules):
+
+1. **Poll for output.** Verify bytes on disk at `{output_dir}/qa-synthesis.md`, `{output_dir}/review-for-A.md` and `{output_dir}/review-for-B.md` -- all three, not just the first. A partial artifact set is a failed round, not a completed one.
+2. **Timeout:** 8 minutes for the synthesizer.
+3. **Ping once** via SendMessage when the budget expires. **No reply does not mean dead:** a wedged synthesizer can wake minutes after the ping, so keep waiting rather than declaring it gone.
+4. **A re-spawned C writes to distinct paths** (`qa-synthesis-r2.md`, `review-for-A-r2.md`, `review-for-B-r2.md`) so a late-waking original cannot clobber them.
 
 ### Step 4: Round 3 -- Message A and B with Their Review Files
 
@@ -356,7 +366,8 @@ SendMessage({
   content: "Read review-for-A.md -- a QA reviewer's assessment of your findings.
             ISOLATION RULE: Read ONLY review-for-A.md. Do NOT read qa-synthesis.md,
             review-for-B.md, qa-report-B.md, or any other files in the output
-            directory. You may re-run tests to defend your findings. Give detailed feedback.",
+            directory. You may re-run tests to defend your findings. Give detailed feedback.
+            Save your feedback as {output_dir}/feedback-A.md as well as replying.",
   summary: "Review feedback for QA Tester A"
 })
 
@@ -366,12 +377,18 @@ SendMessage({
   content: "Read review-for-B.md -- a QA reviewer's assessment of your findings.
             ISOLATION RULE: Read ONLY review-for-B.md. Do NOT read qa-synthesis.md,
             review-for-A.md, qa-report-A.md, or any other files in the output
-            directory. You may re-run tests to defend your findings. Give detailed feedback.",
+            directory. You may re-run tests to defend your findings. Give detailed feedback.
+            Save your feedback as {output_dir}/feedback-B.md as well as replying.",
   summary: "Review feedback for QA Tester B"
 })
 ```
 
-Monitor inbox for feedback from both A and B.
+**Wait for both -- with the output watchdog** (same four rules):
+
+1. **Poll for output.** Verify bytes on disk at `{output_dir}/feedback-A.md` and `{output_dir}/feedback-B.md`. This is why the messages above require the feedback on disk: a reply alone leaves nothing to verify.
+2. **Timeout:** 5 minutes per tester.
+3. **Ping once** via SendMessage when the budget expires. **No reply does not mean dead:** the tester may be mid-rerun and surface minutes later.
+4. **Any replacement writes to a distinct path** (`feedback-A.md` -> `feedback-A-r2.md`).
 
 ### Step 5: Round 4 -- Forward Feedback to C
 
@@ -399,7 +416,12 @@ SendMessage({
 })
 ```
 
-Monitor inbox for C's "done" message.
+**Wait for C -- with the output watchdog** (same four rules):
+
+1. **Poll for output.** Verify bytes on disk at `{output_dir}/issues.md` and `{output_dir}/test-plan.md` -- both, since both are deliverables.
+2. **Timeout:** 8 minutes for the reconciler.
+3. **Ping once** via SendMessage when the budget expires. **No reply does not mean dead** -- keep waiting after the ping rather than assuming the reconciler is gone.
+4. **A re-spawned reconciler writes to distinct paths** (`issues-r2.md`, `test-plan-r2.md`) so a late-waking original cannot clobber them.
 
 ### Step 6: Cleanup and Present
 
@@ -553,14 +575,22 @@ The **test-plan.md** output explicitly recommends which approach for each area, 
 
 ### Teammate Timeout / Exit Recovery
 
+**How a failure is DETECTED.** "Fails" in the table below is not a guess. A teammate has failed only when all three of these hold, in this order:
+
+1. Its **timeout budget** has expired -- 5 minutes for a tester (Rounds 1 and 3), 8 minutes for the synthesizer or reconciler (Rounds 2 and 4).
+2. Its **deliverable is still absent from disk** -- the paths named in the output watchdog at each wait site, not an inbox status.
+3. **One ping** via SendMessage has gone unanswered for a further budget.
+
+**No reply does not mean dead.** A ping can wake a wedged teammate minutes later, so a silent teammate must never be assumed gone; that is precisely why every replacement below writes to a **distinct path**.
+
 | Round | Failure | Recovery |
 |-------|---------|----------|
 | Round 1 | One tester fails | Wait for the other. C reviews single report for gaps. |
 | Round 1 | Both fail | Abort workflow. Report to user. |
-| Round 2 | Synthesizer fails | Re-spawn C. If second attempt fails, present raw reports. |
+| Round 2 | Synthesizer fails | Re-spawn C **writing to distinct paths** (`qa-synthesis-r2.md`, `review-for-A-r2.md`, `review-for-B-r2.md`). If second attempt fails, present raw reports. |
 | Round 3 | One tester fails | Proceed to Round 4 with available feedback. |
 | Round 3 | Both fail | C produces final report from synthesis alone. |
-| Round 4 | Synthesizer fails | Re-spawn reconciler. If fails again, present qa-synthesis.md. |
+| Round 4 | Synthesizer fails | Re-spawn reconciler **writing to distinct paths** (`issues-r2.md`, `test-plan-r2.md`). If fails again, present qa-synthesis.md. |
 
 ### Test Infrastructure Failures
 

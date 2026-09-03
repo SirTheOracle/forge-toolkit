@@ -169,7 +169,12 @@ Spawn both agents **in the same turn** for parallel execution.
 
 **Both prompts must instruct the agent to WAIT after completing**, not exit.
 
-Monitor inbox for "done" messages from both.
+**Wait for both — with the output watchdog.** An agent that produces no output while "running" is indistinguishable from one that is working, and a silent inbox is not evidence of work. All four rules apply here and at every later wait in this workflow:
+
+1. **Poll for output.** Verify bytes on disk before assuming progress. Round 1 polls `{output_dir}/impl-A.md` and `{output_dir}/impl-B.md`; Round 2 polls `{output_dir}/impl-C.md` + `review-for-A.md` + `review-for-B.md`; Round 3 polls `{output_dir}/impl-feedback-A.md` and `impl-feedback-B.md`; Round 4 polls `{output_dir}/implementation.md`.
+2. **Timeout budget.** **5 minutes** per implementer or critic (Rounds 1 and 3); **8 minutes** for the synthesizer and the reconciler (Rounds 2 and 4). The budget expires only against an absent file, never against an inbox status.
+3. **Ping once, then keep waiting.** Ping once via SendMessage — a ping can wake a wedged agent. **No reply does not mean dead:** a pinged agent can surface minutes later, so never conclude a silent agent is gone.
+4. **Distinct output paths for any replacement.** A re-spawned agent MUST write to a distinct path from the original (`impl-A.md` → `impl-A-r2.md`) so a late-waking original cannot clobber it.
 
 After both arrive: **quality check** (coverage matrix present, diffs included, tests specified) then **convergence check**.
 
@@ -201,13 +206,15 @@ Spawn synthesizer with:
 - Wait for instructions
 ```
 
+C's round is complete only when all three files exist on disk. Apply the output watchdog above (8-minute budget, ping once, `-r2` paths for a replacement).
+
 ### Step 3: Round 3 — Message A and B
 
-When C completes, message both agents with their review files. Same isolation rules as the proposal skill.
+When C completes, message both agents with their review files. Same isolation rules as the proposal skill. Each message must also require the critic to **save its feedback to `{output_dir}/impl-feedback-A.md` (resp. `impl-feedback-B.md`)** — the file is what the output watchdog polls (5-minute budget, ping once, `-r2` paths for a replacement); a reply alone leaves nothing on disk to verify.
 
 ### Step 4: Round 4 — Forward Feedback to C
 
-When both feedback messages arrive, forward to C with the reconciler role. C produces `implementation.md`.
+When both feedback messages arrive, forward to C with the reconciler role. C produces `implementation.md`. Apply the output watchdog to this wait too (8-minute budget, ping once, `implementation-r2.md` for a replacement).
 
 ### Step 5: Cleanup and Present
 
@@ -245,14 +252,22 @@ Each prompt must be **self-contained** — embed everything inline.
 
 ### Agent Timeout / Exit Recovery
 
+**How a failure is DETECTED.** "Fails" below is not a guess. An agent has failed only when all three hold, in order:
+
+1. Its **timeout budget** has expired — 5 minutes for an implementer or critic (Rounds 1 and 3), 8 minutes for the synthesizer or reconciler (Rounds 2 and 4).
+2. Its **deliverable is still absent from disk** — the paths named in the output watchdog (Step 1), not an inbox status.
+3. **One ping** via SendMessage has gone unanswered for a further budget.
+
+**No reply does not mean dead.** A ping can wake a wedged agent minutes later, so a silent agent must never be assumed gone — which is exactly why every replacement below writes to a **distinct path**.
+
 | Round | Failure | Recovery |
 |-------|---------|----------|
 | Round 1 | One agent fails | Wait for the other. C reviews single doc for gaps. |
 | Round 1 | Both fail | Abort workflow. Report to user. |
-| Round 2 | Synthesizer fails | Re-spawn C. If second attempt fails, present both raw docs. |
+| Round 2 | Synthesizer fails | Re-spawn C **writing to distinct paths** (`impl-C-r2.md`, `review-for-A-r2.md`, `review-for-B-r2.md`). If second attempt fails, present both raw docs. |
 | Round 3 | One agent fails | Proceed to Round 4 with available feedback. |
 | Round 3 | Both fail | Proceed to Round 4 with no feedback. C reconciles from synthesis alone. |
-| Round 4 | Synthesizer fails | Re-spawn reconciler. If second attempt fails, present impl-C.md. |
+| Round 4 | Synthesizer fails | Re-spawn reconciler **writing to a distinct path** (`implementation-r2.md`). If second attempt fails, present impl-C.md. |
 
 ### Quality Gate Failures
 

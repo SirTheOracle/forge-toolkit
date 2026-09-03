@@ -178,6 +178,13 @@ Agent({
 
 **Wait** for both agents to complete (background notification). **Timeout:** 5 minutes per proposer.
 
+**The wait is watchdogged.** A background notification that never arrives is indistinguishable from work in progress, so:
+
+1. **Poll for output.** Verify bytes on disk at `{output_dir}/proposal-A.md` and `{output_dir}/proposal-B.md` — the `.md`, never the `.tmp`. A notification you did not receive is not evidence of a proposer still working.
+2. The 5-minute budget above is measured against an **absent file**, not against silence.
+3. **Ping once** via SendMessage when the budget expires — a ping can wake a wedged proposer. **No reply does not mean dead:** a pinged proposer can surface minutes later, so never conclude a silent one is gone.
+4. **Any replacement writes to a distinct path** (`proposal-A.md` → `proposal-A-r2.md`) so a late-waking original cannot clobber it.
+
 ### Quality Gate
 
 After both proposals arrive, read each and run checks.
@@ -243,6 +250,13 @@ Agent({
 
 **Timeout:** 8 minutes.
 
+**The wait is watchdogged**, same four rules:
+
+1. **Poll for output.** Verify bytes on disk at `{output_dir}/final-plan.md` — the `.md`, never the `.tmp`.
+2. The 8-minute budget above is measured against that absent file.
+3. **Ping once** via SendMessage when it expires. **No reply does not mean dead:** a wedged synthesizer can wake minutes after the ping, so keep waiting rather than declaring it gone.
+4. **A re-spawned C writes to a distinct path** (`final-plan-r2.md`) so a late-waking original cannot clobber it.
+
 ---
 
 ## Completion
@@ -262,12 +276,12 @@ After `final-plan.md` is written:
 
 | Failure | Recovery |
 |---------|----------|
-| One proposer fails | Retry once. If still fails, C reviews single proposal with blind-spot check. Note reduced confidence. |
+| One proposer fails | Retry once, the retry writing to a **distinct path** (`proposal-A-r2.md`). If still fails, C reviews single proposal with blind-spot check. Note reduced confidence. |
 | Both proposers fail | Abort. Report to user. Preserve problem-statement.md. |
 | Proposal fails quality gate after retry | Proceed to Round 2 with available proposals. Flag gap to C. |
-| Isolation violation (A references B) | Discard contaminated proposal. Re-run once. If repeats, single-proposal path. |
-| C fails | Re-spawn once. If second failure, present raw proposals. Recommend full version. |
-| C produces partial file | .tmp exists but .md does not. Remove .tmp, re-spawn C. |
+| Isolation violation (A references B) | Discard contaminated proposal. Re-run once to a **distinct path** (`proposal-A-r2.md`). If repeats, single-proposal path. |
+| C fails | Re-spawn once to a **distinct path** (`final-plan-r2.md`). If second failure, present raw proposals. Recommend full version. |
+| C produces partial file | .tmp exists but .md does not. Remove .tmp, re-spawn C to a **distinct path** (`final-plan-r2.md`) — the original may still wake and write. |
 | C concludes both proposals wrong | Valid outcome. C writes final-plan.md with own approach, LOW confidence, recommends full version. |
 | Complexity gate escalates | Stop lite. Preserve problem-statement.md. Print escalation reason. |
 | Output directory collision | Archive existing as {slug}-{timestamp}/ before starting. |
