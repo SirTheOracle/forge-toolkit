@@ -1409,6 +1409,13 @@ if [ -s "$WORK/usage-skill.txt" ] && diff -q "$WORK/usage-skill.txt" "$WORK/usag
 else
   bad "T-USAGE-DOC-LOCKSTEP skill and agent Usage Awareness drifted"
 fi
+sed -n '/^24\. \*\*Evidence is bridge-owned/,/^---$/p' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/ev-skill.txt"
+sed -n '/^24\. \*\*Evidence is bridge-owned/,/^---$/p' "$ROOT/agents/forge-orchestrator.md"        > "$WORK/ev-agent.txt"
+if [ -s "$WORK/ev-skill.txt" ] && diff -q "$WORK/ev-skill.txt" "$WORK/ev-agent.txt" >/dev/null; then
+  ok "T-EV-DOC-LOCKSTEP Hard Rule 24 agrees across the skill and agent copies"
+else
+  bad "T-EV-DOC-LOCKSTEP Hard Rule 24 drifted"
+fi
 grep -F 'Fallback to the other HIGH pane is an availability decision (Hard Rule 9), not a usage-threshold decision; the bridge owns context hygiene' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/usage-route-skill.txt"
 grep -F 'Fallback to the other HIGH pane is an availability decision (Hard Rule 9), not a usage-threshold decision; the bridge owns context hygiene' "$ROOT/agents/forge-orchestrator.md" > "$WORK/usage-route-agent.txt"
 if [ -s "$WORK/usage-route-skill.txt" ] && diff -q "$WORK/usage-route-skill.txt" "$WORK/usage-route-agent.txt" >/dev/null; then

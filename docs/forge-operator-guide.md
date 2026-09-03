@@ -957,3 +957,84 @@ indices and are not migrated; transient old labels on day-one board rows are exp
 repo-local git `user.name` values to the new worker indices, or accept one stale-ident cycle.
 The worker grid occupies the lower 60% of the window, so short terminals may leave each worker
 with only three or four visible rows; enlarge the terminal rather than changing the layout.
+
+## What COMPLETE now tells you
+
+Every `COMPLETE` line and `forge-bridge status` render now carry a `Delivery:` line —
+`merged`, `committed-local`, `uncommitted`, or `unknown`. Read it before treating a
+completion as shipped:
+
+- **`merged`** — the branch is an ancestor of (or was clean-merged into) its base ref.
+- **`committed-local`** — everything is committed and the tree is clean, but nothing is
+  known to be merged. This is **green**, not a warning: the orchestrator is forbidden
+  to push, so `committed-local` is the highest state most pipelines can machine-reach.
+  There is deliberately no `pushed-unmerged` tier — a possibly-stale local
+  `refs/remotes/origin/<branch>` ref is not something to grade a delivery on.
+- **`uncommitted`** — the tracked tree is dirty, or the coding stage's own commit check
+  failed. Do not treat this completion as delivered.
+- **`unknown`** — nothing could be probed (non-git root, stale/missing report, a
+  re-dispatched stage still in flight). Not a failure — just unproven. Never treated as
+  either a blocker or a green light.
+
+### When a verify-decision refusal is legitimate
+
+Under `FORGE_EVIDENCE_MODE=enforce`, `verify-decision` refuses a completion whose
+evidence contradicts the worker's DONE claim. The contradiction set is closed at three
+cases:
+
+1. a coding-class stage's coder-report says `FAILED` / `PARTIAL`, carries a
+   `NOT COMMITTED` marker, or (only if you opt in via
+   `evidence.validation_failed_blocks`) says `VALIDATION_FAILED`, while its callback
+   claimed `DONE`;
+2. a coding-class stage has zero commits (or zero changed files) since its dispatch
+   baseline, even though the baseline is an ancestor of `HEAD`;
+3. at `finalize`, the decision basis was destroyed — the bound `head_sha` is no longer
+   an ancestor of `HEAD` (history was rewritten), or the decision artifact's digest no
+   longer matches.
+
+The refusal names the class, the exact command you can re-run to see the same thing,
+and the remedy. The terminal state is left untouched — this is not an error to route
+around. Fix the stage and re-dispatch it; a clean re-run allows.
+
+`UNKNOWN` never refuses and never contradicts. An unprobeable repo, a stale report, or
+a re-dispatched stage still in flight all grade `UNKNOWN` — do not treat it as a
+blocker.
+
+### The `--acknowledge-evidence` escape
+
+```
+forge-bridge verify-decision --slug <s> --callback-id <id> --pending-timestamp <ts> \
+    --acknowledge-evidence "<why this is acceptable>"
+```
+
+This is the **one audited escape**, and it is **operator-only** (Hard Rule 24 — workers
+never pass it). It publishes `complete-qualified`, **never green**, and it records your
+reason in the hygiene journal and on an `EVIDENCE_ACK` event. It is honoured only when
+a contradiction is actually present under enforce — passing it against a clean run is a
+no-op (it cannot downgrade a green completion), and an empty reason is refused outright.
+
+### The kill switch
+
+`FORGE_EVIDENCE_MODE=observe` (the shipped default) restores pre-evidence behavior
+exactly: evidence is still computed and recorded — the `Delivery:` line, the
+`EVIDENCE-CONTRADICTED` board row, and the artifacts under `.dev/qa/<slug>/` all still
+appear — but nothing is ever refused. `bin/*` is deployed live by symlink, so this
+environment variable, not a binary revert, is the real kill switch mid-incident.
+
+### What evidence gating does not prove
+
+Read this before treating a `committed-local` or `merged` completion as a correctness
+guarantee — it is not one:
+
+- **A commit touching one file satisfies `committed`.** The probe checks for at least
+  one commit and at least one changed file since the dispatch baseline; it says nothing
+  about whether the change is correct or complete.
+- **Test results carry `provenance=claim`.** The bridge parses the worker's own
+  coder-report; it does not re-run your test suite. A worker that reports `PASS`
+  dishonestly is not caught by this feature.
+- **`pushed` is read from a possibly-stale local ref**, and is never itself a delivery
+  grade — see `committed-local` above.
+- **A worker with shell access can write to either evidence sink.** The property this
+  feature provides is "a protocol-following worker cannot forge this" — not
+  "unforgeable". `evidence_sha256` in the terminal journal makes a post-decision
+  mutation of the decision artifact detectable, which is the boundary this rests on.

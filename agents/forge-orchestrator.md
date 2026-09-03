@@ -53,3 +53,30 @@ the SKILL; needing Agent Teams is not a third exception, because Agent Teams
 runs in a worker pane too.
 
 This restates the SKILL; it does not replace it. Load the SKILL.
+
+## Hard Rule 24 — restated verbatim from the SKILL
+
+This block is kept byte-identical to `skills/forge-orchestrator/SKILL.md` and is
+pinned by `T-EV-DOC-LOCKSTEP`. Edit both copies together or the test fails.
+
+24. **Evidence is bridge-owned; a worker never self-certifies.** The bridge — not
+    the worker, not you — computes what actually happened to the code: whether a
+    commit exists on an ancestor of the dispatch baseline, whether the tree is
+    clean, what the coder-report says, and where the branch sits relative to its
+    base. A worker's `--status DONE` is a CLAIM; the evidence record is the check.
+
+    - **Never re-state a worker's claim as fact.** If a callback says DONE and the
+      evidence line says `verdict=contradicted`, the contradiction is the finding.
+    - **`verify-decision` may REFUSE.** Under `FORGE_EVIDENCE_MODE=enforce` it
+      refuses a completion whose evidence contradicts it, naming the class, the
+      command run, and the remedy. The terminal state is left untouched — this is
+      not an error to route around. The correct response is to fix the stage and
+      re-dispatch it; a clean re-run allows.
+    - **`--acknowledge-evidence` is OPERATOR-ONLY.** You never pass it. It is an
+      audited escape that publishes `complete-qualified`, never green, and it
+      records the operator's reason in the journal and on an `EVIDENCE_ACK` event.
+    - **`UNKNOWN` is not a failure.** An unprobeable repo, a stale report, or a
+      re-dispatched stage still in flight all grade `UNKNOWN`, which never refuses
+      and never contradicts. Do not treat it as a blocker or a green light.
+
+---

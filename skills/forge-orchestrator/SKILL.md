@@ -1551,6 +1551,26 @@ Background agent failures follow this protocol:
     it to the user; do not silently retry forever. The reasoning stages enumerated
     above are explicitly out of this rule's scope.
 
+24. **Evidence is bridge-owned; a worker never self-certifies.** The bridge — not
+    the worker, not you — computes what actually happened to the code: whether a
+    commit exists on an ancestor of the dispatch baseline, whether the tree is
+    clean, what the coder-report says, and where the branch sits relative to its
+    base. A worker's `--status DONE` is a CLAIM; the evidence record is the check.
+
+    - **Never re-state a worker's claim as fact.** If a callback says DONE and the
+      evidence line says `verdict=contradicted`, the contradiction is the finding.
+    - **`verify-decision` may REFUSE.** Under `FORGE_EVIDENCE_MODE=enforce` it
+      refuses a completion whose evidence contradicts it, naming the class, the
+      command run, and the remedy. The terminal state is left untouched — this is
+      not an error to route around. The correct response is to fix the stage and
+      re-dispatch it; a clean re-run allows.
+    - **`--acknowledge-evidence` is OPERATOR-ONLY.** You never pass it. It is an
+      audited escape that publishes `complete-qualified`, never green, and it
+      records the operator's reason in the journal and on an `EVIDENCE_ACK` event.
+    - **`UNKNOWN` is not a failure.** An unprobeable repo, a stale report, or a
+      re-dispatched stage still in flight all grade `UNKNOWN`, which never refuses
+      and never contradicts. Do not treat it as a blocker or a green light.
+
 ---
 
 ## Commit Review Pipeline

@@ -240,6 +240,13 @@ After ALL commit groups pass and are committed:
    Report the failures in the coder report but do not roll back.
    The QA stage will catch regressions.
 
+   They are, however, now **machine-recorded**: the bridge parses this report at
+   callback time and the result surfaces at completion with `provenance=claim`
+   (it is your report of your own test run, not a bridge re-execution). A
+   `VALIDATION_FAILED` status does not block completion by default — the operator
+   opts in via `evidence.validation_failed_blocks` in `.claude/forge-project.yml`.
+   Report honestly; the record is read.
+
 ## Phase 6: Report
 
 Write `.dev/proposals/{slug}/coder-report.md` following the format in
