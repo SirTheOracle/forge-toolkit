@@ -2219,7 +2219,19 @@ HOT = {'SPAWN-POPULATE-FAILED', 'SPAWN-NEEDS-REPAIR', 'SPAWN-FIRST-LAUNCH', 'WOR
        'PARK-INCONSISTENT', 'ITEM-BLOCKED-ABANDONED', 'TASK-STUCK', 'EPISODE-STUCK', 'DELIVERY-UNVERIFIED',
        'STAGE-ERROR', 'PIPELINE-ERROR', 'WORKER-STALLED', 'WORKER-STALL-EVENT',
        'ZOMBIE-ACTIVE', 'STATE-UNPARSEABLE', 'RECOVER-PENDING', 'RESET-UNAVAILABLE',
-       'WORKER-LOW-CONTEXT', 'ORCHESTRATOR-LOW-CONTEXT', 'RESET-PROOF-DIVERGENT'}
+       'WORKER-LOW-CONTEXT', 'ORCHESTRATOR-LOW-CONTEXT', 'RESET-PROOF-DIVERGENT',
+       # PRE-EXISTING DEFECT (F15), fixed here independently of evidence-gated completion:
+       # both were in NOTIFY but in NEITHER HOT nor ACTIVE, so _cls returned 'maintenance',
+       # maintenance rows collapse in cc-board/1 (:2053), and SwiftBar reads only
+       # hot|tasks|parked|episodes — a shipped-but-unclean or abandoned run reached NEITHER
+       # surface. They survived only because the PRETTY renderer special-cases them outside
+       # _cls (:2219-2229). Ships as its own revertible commit; this feature depends on it but
+       # did not cause it.
+       # Two intended downstream effects beyond board/SwiftBar visibility:
+       #   1. they leave maintenance.rows;
+       #   2. a session whose ONLY finding is a qualified completion flips from '- idle' to
+       #      the hot glyph at :2146 — correct, a shipped-but-unclean run wants a look.
+       'PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED'}
 ACTIVE = {'SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'PIPELINE-COMPLETE',
           'EPISODE-ACTIVE', 'EPISODE-SETTLED'}
 STATE_OF = {'SESSION-QUEUED': 'queued-input', 'SESSION-WORKING': 'working',
@@ -2578,8 +2590,15 @@ if PRETTY:
             print(paint('2', f"  … {older} older task(s) in maintenance"))
 
     pipes = [f for f in active if f['condition'] == 'PIPELINE-COMPLETE']
+    # Now that both are HOT they already render in NEEDS YOU (:2065 + :2090-2096); re-listing
+    # them here would print the same completion twice. The non-hot filter also keeps this
+    # section correct if the HOT promotion is reverted — it ships as its own commit,
+    # deliberately revertible, and this line must survive that revert unchanged.
+    # Visual consequence (say so in the promotion commit message): a qualified completion now
+    # renders once in NEEDS YOU with the red '!' instead of in PIPELINES with the yellow '!'.
     qpipes = [f for f in findings
-              if f['condition'] in ('PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED')]
+              if f['condition'] in ('PIPELINE-COMPLETE-QUALIFIED', 'CLEANUP-ABANDONED')
+              and _cls(f['condition']) != 'hot']
     if pipes or qpipes:
         print()
         print(sect('PIPELINES'))
