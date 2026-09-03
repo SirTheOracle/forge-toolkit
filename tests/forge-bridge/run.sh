@@ -2814,6 +2814,11 @@ PY
   else
     bad "T-HYG-F degraded: rc=$(rc_of hff13) $(out_of hff13 | tail -1)"
   fi
+  # T-EV-QUAL-PERSIST: a hygiene-disabled finalize must persist the token set into the context
+  # file. Runs with FORGE_EVIDENCE_MODE unset, so it proves P25 independently of Steps 1-6/8-10.
+  grep -q '^qualifier: hygiene-disabled$' "$FCTX" \
+    && ok "T-EV-QUAL-PERSIST qualifier token set persisted in the final context write (F5)" \
+    || bad "T-EV-QUAL-PERSIST qualifier not persisted"
   # D. hygiene-abandon lifecycle.
   fclean
   fsetup f8 || bad "T-HYG-F f8 setup failed"

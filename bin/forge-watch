@@ -1221,19 +1221,34 @@ def _handle_event_line(root, label, line):
         add_finding('WORKER-STALL-EVENT', root, f"{slug}\t{stage}\t{st}", msg,
                     slug=slug, stage=stage)
     elif typ == 'COMPLETE' and NOTIFY_COMPLETE:
-        q = fields.get('qualifier')
-        if q == 'incomplete':
+        # evidence-gated-completion Step 7.3: `qualifier` is a COMMA-JOINED TOKEN SET, so
+        # these are MEMBERSHIP tests, not equality compares. The old `q == '...'` form was the
+        # F10 defect: any multi-token value fell through the green `else`, and because
+        # add_finding keys on (root, condition, key) that green PIPELINE-COMPLETE could NOT
+        # dedup against the context path's PIPELINE-COMPLETE-QUALIFIED (F16) — the board would
+        # carry a green completion AND a qualified one for the same slug at once.
+        qset = {t for t in (fields.get('qualifier') or '').split(',') if t}
+        dtail = _delivery_suffix(fields.get('delivery'), fields.get('branch'))
+        if 'incomplete' in qset:
             pk = fields.get('parked', '0'); bl = fields.get('blocked', '0')
-            msg = f"{label} · {slug} — complete — {pk} parked, {bl} blocked (incomplete)"
-        elif q == 'hygiene-disabled':
-            wd = fields.get('workers_dirty', '?')
-            add_finding('PIPELINE-COMPLETE-QUALIFIED', root, slug,
-                        f"{label} · {slug} — shipped, workers left dirty ({wd}) — hygiene-disabled",
-                        policy='once', slug=slug)
+            msg = f"{label} · {slug} — complete — {pk} parked, {bl} blocked (incomplete){dtail}"
+        elif qset:
+            # EVENT path: workers_dirty exists here, so keep today's '?' fallback and today's
+            # parenthetical. (The context path has no such field — see the contract
+            # in _qualifier_reason.)
+            f = add_finding('PIPELINE-COMPLETE-QUALIFIED', root, slug,
+                            f"{label} · {slug} — {_qualifier_reason(qset, fields.get('workers_dirty', '?'))}{dtail}",
+                            policy='once', slug=slug)
+            for _k in ('delivery', 'merge_state', 'branch'):
+                if fields.get(_k):
+                    f[_k] = fields[_k]
             return
         else:
-            msg = f"{label} · {slug} — pipeline COMPLETE"
-        add_finding('PIPELINE-COMPLETE', root, slug, msg, policy='once', slug=slug)
+            msg = f"{label} · {slug} — pipeline COMPLETE{dtail}"
+        f = add_finding('PIPELINE-COMPLETE', root, slug, msg, policy='once', slug=slug)
+        for _k in ('delivery', 'merge_state', 'branch'):
+            if fields.get(_k):
+                f[_k] = fields[_k]
     elif typ == 'RESET_UNAVAILABLE':
         add_finding('RESET-UNAVAILABLE', root, slug,
                     f"{label} · {slug} — reset unavailable ({fields.get('family', '?')}) — actionable",
@@ -1242,6 +1257,52 @@ def _handle_event_line(root, label, line):
         add_finding('CLEANUP-ABANDONED', root, slug,
                     f"{label} · {slug} — cleanup abandoned ({fields.get('reason', '?')}) — workers unproven, NOT complete",
                     policy='once', slug=slug)
+
+def _qualifier_reason(qset, workers_dirty=None):
+    """evidence-gated-completion Step 7.4. Render a qualifier TOKEN SET as prose.
+
+    The context path used to hardcode "shipped, workers left dirty — hygiene-disabled" off
+    `next_stage == 'complete-qualified'`, so an evidence-acknowledged completion rendered a
+    factually FALSE reason. Order is stable so the message is deterministic.
+
+    BYTE-COMPATIBILITY CONTRACT — do not reword without updating BOTH:
+        tests/forge-watch/run.sh  needs "<slug> — shipped, workers left dirty"  (event path)
+        tests/forge-watch/run.sh  needs "<slug> — shipped, workers left dirty"  (context path)
+
+    THE TWO SHIPPED STRINGS DIFFER AND BOTH MUST BE REPRODUCED EXACTLY:
+        EVENT path   has workers_dirty and renders it in parentheses
+        CONTEXT path does NOT — forge-context.*.yml carries no such field — and
+                                 renders NO parenthetical at all.
+    Passing workers_dirty=None reproduces the context string verbatim. DO NOT give this
+    parameter a '?' default: a substring-match grep would still pass, while the operator's
+    board silently grows a bare "(?)" it never had.
+    """
+    wd = f" ({workers_dirty})" if workers_dirty else ""
+    parts = []
+    if 'hygiene-disabled' in qset:
+        parts.append(f"workers left dirty{wd} — hygiene-disabled")
+    if 'evidence-acknowledged' in qset:
+        parts.append("evidence contradiction acknowledged by the operator")
+    parts += sorted(qset - {'hygiene-disabled', 'evidence-acknowledged', 'incomplete'})
+    if not parts:                       # pre-token-set context: today's wording, verbatim
+        parts.append(f"workers left dirty{wd} — hygiene-disabled")
+    return "shipped, " + "; ".join(parts)
+
+
+def _delivery_suffix(delivery, branch=None):
+    """evidence-gated-completion Step 11.2. Append WHERE THE CODE LIVES to a completion
+    message. Absent delivery => empty string, so a legacy COMPLETE line renders
+    byte-identically to today."""
+    if not delivery:
+        return ''
+    if delivery == 'merged':
+        return ' — merged'
+    if delivery == 'committed-local':
+        return f" — committed on `{branch or '?'}`, unmerged"
+    if delivery == 'uncommitted':
+        return ' — UNCOMMITTED WORK'
+    return ' — delivery unknown'
+
 
 def _has_hygiene_terminal_vocab(root, slug):
     """Worker-context-hygiene: has this slug ever produced enforce-mode hygiene
@@ -1288,9 +1349,17 @@ def _eval_context(root, label, cp, embedded, is_live,
             return  # surfaced via HYGIENE_ABANDON; not a zombie, not complete
         cid = ctx.get('completion_id')
         if nxt == 'complete-qualified':
-            # P0-5: qualified (hygiene-disabled) completion is shipped-but-unclean, NEVER green.
+            # P0-5: a qualified completion is shipped-but-unclean, NEVER green.
+            # evidence-gated-completion Step 7.4: the reason comes from the qualifier TOKEN
+            # SET cmd_finalize persisted into the context file (written in the same atomic
+            # write as next_stage/completion_id, because update_context would otherwise
+            # destroy it, F5). An absent qualifier — every pre-token-set context — yields
+            # today's exact wording.
+            # workers_dirty is NOT passed: forge-context.*.yml carries no such field, and the
+            # shipped context-path string has no parenthetical. See _qualifier_reason.
+            _qset = {t for t in str(ctx.get('qualifier') or '').split(',') if t}
             add_finding('PIPELINE-COMPLETE-QUALIFIED', root, slug,
-                        f"{label} · {slug} — shipped, workers left dirty — hygiene-disabled",
+                        f"{label} · {slug} — {_qualifier_reason(_qset)}",
                         policy='once', slug=slug)
             return
         # P0-5: an enforce completion is green ONLY with a published completion_id in context.

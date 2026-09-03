@@ -47,6 +47,10 @@ new_env() {
     # quiet-unchanged OFF here; the dedicated hardening tests opt in inline.
     export FORGE_WATCH_QUIET_UNCHANGED=0
     unset FORGE_WATCH_CHECK_TIMEOUT_S FORGE_WATCH_NOTIFY_TIMEOUT_S 2>/dev/null || true
+    # The lifecycle-terminalization fixture `export`s these two for its own stub broker; since
+    # export persists for the rest of this process, any LATER env that never sets its own copy
+    # would otherwise inherit that env's now-stale $TDIR/broker-paths and protected dir.
+    unset FORGE_BROKER_BIN FORGE_WATCH_TEST_PROTECTED 2>/dev/null || true
 }
 
 mk_root() {  # mk_root <name>  -> echoes path; registers in watch-roots
@@ -149,6 +153,9 @@ message: |
 EOF
 }
 board_parked() { run_status --board | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin).get("parked") or []))'; }
+# board_json -> path to a file holding the current cc-board/1 JSON (for `python3 - "$(board_json)"`)
+board_json() { local f="$TDIR/board.json"; run_status --board > "$f"; printf '%s' "$f"; }
+run_pretty() { run_status --pretty; }
 
 evlog() { echo "$1/.dev/forge-tmp/orchestrator-events.log"; }
 evlog_touch() { : > "$(evlog "$1")"; }        # empty file to baseline against
@@ -2885,6 +2892,80 @@ assert_status_has "TERMINALIZE-REFUSED" "deleting the response cannot suppress a
 printf '{"status":"ok","intent_id":"lci-forged","delivery_id":"delivery-11111111111111111111111111111111"}\n' > "$R/.dev/forge-broker/lifecycle/responses/lci-forged.json"
 run_check >/dev/null
 assert_status_has "TERMINALIZE-REFUSED" "rewriting the response to ok cannot suppress it either"
+
+echo "── EV: evidence-gated completion (qualifier token set + honest watcher reasons) ──"
+
+# ── W-EV-QUALIFIED-HOT + W-EV-NO-DOUBLE-COMPLETE (F16) + W-EV-NO-DOUBLE-RENDER (N7) ──
+# A real cmd_finalize writes BOTH the event line (immediate notification, this process only —
+# see the twelfth plan-authoring defect note in coder-report.md: the event log's read offset
+# is consumed by the FIRST `check` that sees it, so a LATER separate process, exactly what
+# `board_json`/`run_pretty` are, can never observe the event path's own rendering) AND the
+# context file (`next_stage: complete-qualified` + `qualifier:`, durable across processes
+# because contexts are re-scanned from current content every invocation, not offset-consumed).
+# Mirror both so this fixture matches what a real finalize produces and what a later, separate
+# `forge board`/SwiftBar query actually reads.
+new_env wev2
+R=$(mk_root proj); live_session forge-1 "$R"; evlog_touch "$R"; run_check >/dev/null
+ctx "$R" forge-1 <<EOF
+active_pipeline: e2
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete-qualified
+qualifier: hygiene-disabled,evidence-acknowledged
+completion_id: beef
+updated_at: "$(iso_ago 5)"
+EOF
+evlog_append "$R" "COMPLETE: pipeline=e2 completion_id=beef qualifier=hygiene-disabled,evidence-acknowledged workers_dirty=codex-a"
+run_check >/dev/null
+# The workers_dirty detail is event-path-only (forge-context.*.yml carries no such field, by
+# design — see _qualifier_reason's docstring), so it is observable ONLY via the notification
+# this same `check` call captured, not via a later separate board/pretty query.
+assert_notified "workers left dirty (codex-a)" "W-EV-QUALIFIED-HOT event-path message carries the dirty worker list"
+python3 - "$(board_json)" <<'PY' && ok "W-EV-QUALIFIED-HOT qualified completion is class=='hot'" || bad "W-EV-QUALIFIED-HOT"
+import json,sys
+b=json.load(open(sys.argv[1]))
+q=[r for r in b['hot'] if r['condition']=='PIPELINE-COMPLETE-QUALIFIED' and r['slug']=='e2']
+assert q, "not hot: %r" % [(r['condition'],r['class']) for r in b['hot']+b['active']+b['maintenance']['rows']]
+assert 'evidence contradiction acknowledged' in q[0]['msg'], q[0]['msg']
+PY
+assert_not_notified "e2 — pipeline COMPLETE" "W-EV-NO-DOUBLE-COMPLETE no green PIPELINE-COMPLETE for the same slug (F16)"
+# N7 count-not-presence check: neither add_finding call for this condition passes session=/
+# stage=, so the pretty renderer's header falls back to the root label (never the bare slug)
+# and its detail line strips the "label · slug —" prefix entirely (see detail_of()) — 'e2'
+# itself never appears in pretty output for ANY finding of this shape, condition name included
+# or not. Counting the CONDITION NAME instead still proves the real invariant Diff 7h protects:
+# this finding renders in NEEDS YOU once and is not ALSO re-listed in PIPELINES.
+n="$(run_pretty | grep -c 'PIPELINE-COMPLETE-QUALIFIED')"
+[ "$n" = 1 ] && ok "W-EV-NO-DOUBLE-RENDER qualified completion renders exactly once on the pretty board" \
+             || bad "W-EV-NO-DOUBLE-RENDER condition rendered $n times (NEEDS YOU + PIPELINES)"
+
+# ── W-EV-CONTEXT-REASON: the reason is derived, and the legacy string is preserved ──
+new_env wev3
+R=$(mk_root proj); live_session forge-1 "$R"
+ctx "$R" forge-1 <<EOF
+active_pipeline: e3
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete-qualified
+qualifier: evidence-acknowledged
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_notified "e3 — shipped, evidence contradiction acknowledged" "W-EV-CONTEXT-REASON names the CORRECT reason"
+assert_not_notified "e3 — shipped, workers left dirty" "W-EV-CONTEXT-REASON does not claim workers were dirty"
+# ...and a context with NO qualifier keeps today's exact wording, WITHOUT a bare "(?)".
+new_env wev3b
+R=$(mk_root proj); live_session forge-1 "$R"
+ctx "$R" forge-1 <<EOF
+active_pipeline: e3b
+last_stage_completed: verify
+last_stage_status: done
+next_stage: complete-qualified
+updated_at: "$(iso_ago 600)"
+EOF
+run_check >/dev/null
+assert_notified "e3b — shipped, workers left dirty — hygiene-disabled" "W-EV-CONTEXT-REASON legacy context wording preserved"
+assert_not_notified "e3b — shipped, workers left dirty (?)" "W-EV-CONTEXT-REASON context path grows NO bare '(?)'"
 
 echo "═══════════════════════════════════════"
 green "PASS: $PASS"

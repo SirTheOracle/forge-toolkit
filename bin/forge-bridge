@@ -6851,6 +6851,15 @@ PY
             to_clear="$to_clear $w"; echo "  $w: needs reset (decision=$_dec)"
         fi
     done
+    # evidence-gated-completion Step 7.1: `qualifier` becomes a COMMA-JOINED TOKEN SET, so a
+    # completion can be qualified for more than one reason at once. Order is FIXED so the
+    # string is deterministic. Computed HERE — after the preflight loop that populates `dirty`
+    # and `qualified` and BEFORE the context write below that persists it.
+    # (Computing it at the `_extra` line would be too late: the context write runs first and
+    # would persist an empty qualifier, silently not delivering P25.)
+    # Step 9d extends this block with the evidence-acknowledged token.
+    local _qtok=""
+    [ -n "${dirty%,}" ] && _qtok="hygiene-disabled"
     if [ "$any_bad" = 1 ]; then
         for w in $order; do _worker_unlock "$w"; done
         echo "FINALIZE_UNCONFIRMED — a pane is not idle / config error; left terminal-cleanup, no COMPLETE." >&2; return 1; fi
@@ -6886,9 +6895,10 @@ PY
     # conflicting pre-existing completion_id, and fsyncs a temp-rename.
     local _final_state; _final_state=$([ "$qualified" = 1 ] && echo complete-qualified || echo complete)
     local ctx; ctx="$pr/$(_context_file)"
-    if ! FORGE_FC_NEXT="$_final_state" FORGE_FC_CID="$_cid" python3 - "$ctx" <<'PY'
+    if ! FORGE_FC_NEXT="$_final_state" FORGE_FC_CID="$_cid" FORGE_FC_QUAL="${_qtok:-}" python3 - "$ctx" <<'PY'
 import os,sys,re
 ctx=sys.argv[1]; nxt=os.environ["FORGE_FC_NEXT"]; cid=os.environ["FORGE_FC_CID"]
+qual=os.environ.get("FORGE_FC_QUAL") or ""
 try: txt=open(ctx).read()
 except Exception: sys.exit(1)
 m=re.search(r'(?m)^completion_id:\s*(\S+)\s*$', txt)
@@ -6896,13 +6906,21 @@ if m and m.group(1)!=cid: sys.stderr.write("CONTEXT_CID_CONFLICT\n"); sys.exit(2
 if re.search(r'(?m)^next_stage:', txt): txt=re.sub(r'(?m)^next_stage:.*$','next_stage: '+nxt,txt)
 else: txt=txt.rstrip('\n')+'\nnext_stage: '+nxt+'\n'
 if not m: txt=txt.rstrip('\n')+'\ncompletion_id: '+cid+'\n'
+# Persisted qualifier token set (plan Step 7 item 2). Written HERE and nowhere earlier:
+# update_context rewrites the context file wholesale (F5), destroying any earlier write.
+# Absent when nothing qualified => legacy contexts stay byte-identical.
+if qual:
+    if re.search(r'(?m)^qualifier:', txt): txt=re.sub(r'(?m)^qualifier:.*$','qualifier: '+qual,txt)
+    else: txt=txt.rstrip('\n')+'\nqualifier: '+qual+'\n'
 tmp=ctx+'.tmp.%d'%os.getpid()
 try:
     with open(tmp,'w') as f: f.write(txt); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,ctx)
 except Exception: sys.exit(1)
 v=open(ctx).read()
-sys.exit(0 if (('next_stage: '+nxt) in v and ('completion_id: '+cid) in v) else 3)
+ok=('next_stage: '+nxt) in v and ('completion_id: '+cid) in v
+if qual: ok = ok and ('qualifier: '+qual) in v
+sys.exit(0 if ok else 3)
 PY
     then echo "FINALIZE_CONTEXT_WRITE_FAILED — outbox stays resets-confirmed, no COMPLETE." >&2; return 1; fi
     _hygiene_crash_at fin-context
@@ -6915,7 +6933,10 @@ PY
     # (idempotent by exact match), so it publishes exactly once and is never spoofable by an
     # unrelated event carrying the id.
     local evlog="$pr/.dev/forge-tmp/orchestrator-events.log"
-    local _extra=""; [ "$qualified" = 1 ] && _extra=" qualifier=hygiene-disabled workers_dirty=${dirty%,}"
+    # With only hygiene qualifying, `_qtok` is exactly `hygiene-disabled` and this line is
+    # byte-identical to the previous single-literal form — tests/forge-bridge/run.sh pins that
+    # exact string and must stay green UNEDITED.
+    local _extra=""; [ -n "$_qtok" ] && _extra=" qualifier=$_qtok workers_dirty=${dirty%,}"
     _append_complete_event "$pr" "$slug" "$_cid" "$_extra" || {
         echo "FINALIZE_EVENT_UNCONFIRMED — COMPLETE not durably appended; outbox stays event-pending, retry finalize." >&2; return 1; }
     _hygiene_crash_at fin-event
