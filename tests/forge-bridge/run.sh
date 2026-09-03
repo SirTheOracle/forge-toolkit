@@ -4221,6 +4221,137 @@ PY
 unset -f cmd_infra_lock
 unset ID_target_session ID_target_incarnation
 
+echo "── EV Group 9: EVIDENCE_ACK emit whitelist (T-EV-EMIT-BLOCKED) ──"
+EVMR="$(mkR ev9emit)"
+o=$( cd "$EVMR" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" emit EVIDENCE --slug x 2>&1 ); rc=$?
+{ [ "$rc" != 0 ] && printf '%s' "$o" | grep -q 'emit TYPE must be one of'; } \
+  && ok "T-EV-EMIT-BLOCKED 'emit EVIDENCE' is refused (bridge-authored only, not on the whitelist)" \
+  || bad "T-EV-EMIT-BLOCKED EVIDENCE rc=$rc o=$o"
+( cd "$EVMR" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" emit EVIDENCE_ACK --slug m1 reason=ok ) >/dev/null 2>&1 \
+  && grep -q '^EVIDENCE_ACK: pipeline=m1 ' "$EVMR/.dev/forge-tmp/orchestrator-events.log" \
+  && ok "T-EV-EMIT-BLOCKED EVIDENCE_ACK round-trips cmd_emit" || bad "T-EV-EMIT-BLOCKED ack"
+# Standing guard: EVIDENCE_ACK must still be membership-testable in the whitelist source, and
+# the BOGUS-rejection message must still name it.
+grep -qE "(\||^| )EVIDENCE_ACK(\||\)| )" "$BRIDGE" \
+  && ok "T-EV-EMIT-BLOCKED EVIDENCE_ACK present in the whitelist source" \
+  || bad "T-EV-EMIT-BLOCKED EVIDENCE_ACK missing from whitelist source"
+o=$( cd "$EVMR" && FORGE_WATCH_TRIGGER=0 "$BRIDGE" emit BOGUS --slug m1 2>&1 ); rc=$?
+{ [ "$rc" != 0 ] && printf '%s' "$o" | grep -q 'EVIDENCE_ACK' && printf '%s' "$o" | grep -q "; got 'BOGUS'"; } \
+  && ok "T-EV-EMIT-BLOCKED BOGUS rejection message names EVIDENCE_ACK" \
+  || bad "T-EV-EMIT-BLOCKED bogus message: $o"
+
+echo "── EV Group 9: gate + acknowledge (real tmux) ──"
+# implementation.md §6.1's T-EV-ENFORCE-REFUSE/-OBSERVE-INERT/-ACK* read fixtures
+# ($EOB/$EEN/$EACK/$EAS/$ENOOP/$ENS/$EBEV) that are never assigned anywhere in the document —
+# the same "fixtures never defined" plan-authoring defect already recorded for
+# T-EV-CB-NEUTRAL/T-EV-ARTIFACT (coder-report.md, Group 5/7). Rather than guess the intended
+# shape, this reuses two ALREADY-ESTABLISHED, in-file idioms instead: the manual
+# forge-log.yml + EVIDENCE-line construction T-EV-RERUN already uses to drive
+# _evidence_stage_record without a real coding dispatch+callback cycle, and the real-tmux
+# verify/DONE + verify-decision flow HYG §V already uses (vclean/hygv1-log/hygv1-cb). Each
+# slug below is independent and journal-isolated by a full `.dev` wipe between them, mirroring
+# HYG §V's `vclean`, because the hygiene journal is one file PER SESSION+INCARNATION, shared
+# across every slug run in it.
+if command -v tmux >/dev/null 2>&1; then
+  GV9S="fbev9-$$"
+  GV9C="$(mkR ev9)"
+  git -C "$GV9C" config user.email t@t; git -C "$GV9C" config user.name t
+  git -C "$GV9C" branch -M main 2>/dev/null
+  printf 'seed\n' > "$GV9C/seed.txt"; git -C "$GV9C" add -A; git -C "$GV9C" commit -qm seed
+mk_session "$GV9S" 220 50 "$GV9C"
+  GV9INC="$(tmux display-message -p -t "$GV9S:0.0" '#{session_created}')"
+  sleep 1
+  GV9EV="$GV9C/.dev/forge-tmp/orchestrator-events.log"
+  GV9ENF="FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=enforce"
+  gv9clean(){ rm -rf "$GV9C/.dev"; mkdir -p "$GV9C/.dev/proposals" "$GV9C/.dev/forge-tmp/callbacks"; GV9EV="$GV9C/.dev/forge-tmp/orchestrator-events.log"; }
+  gv9term(){ ID_target_session="$GV9S" ID_target_incarnation="$GV9INC" _terminal_state "$GV9C"; }
+  gv9field(){ ID_target_session="$GV9S" ID_target_incarnation="$GV9INC" _terminal_field "$GV9C" "$1"; }
+  # Seed a coding-stage EVIDENCE record with committed=FAIL/verdict=contradicted, then a real
+  # verify/DONE callback + CLEAR report for <slug>, and print "<callback_id> <pending_ts>".
+  gv9_seed_contradiction() {   # <slug>
+    local slug="$1"
+    mkdir -p "$GV9C/.dev/proposals/$slug"
+    printf 'entries:\n  - timestamp: "2026-09-03T00:00:00Z"\n    stage: coding\n    response: "FORGE_DONE: coding"\n' \
+      > "$GV9C/.dev/proposals/$slug/forge-log.yml"
+    printf 'EVIDENCE: pipeline=%s stage=coding worker=codex-a callback_id=cb-seed pending_timestamp=2026-09-03T00:00:00Z session=%s incarnation=%s git-state=PASS baseline-ancestry=PASS committed=FAIL clean-tree=PASS report-consistent=UNKNOWN tests=claim:UNKNOWN verdict=contradicted artifact=seed.yaml\n' \
+      "$slug" "$GV9S" "$GV9INC" >> "$GV9EV"
+  }
+  gv9_verify_callback() {   # <slug> -> sets gv9_cbid / gv9_pt
+    local slug="$1"
+    run_in_pane "$GV9S:0.1" "gv9-$slug-log" "( cd $GV9C && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug $slug --stage verify --from claude --to codex-a --prompt p )"
+    tmux send-keys -t "$GV9S:0.2" C-c 2>/dev/null; sleep 0.3
+    run_in_pane "$GV9S:0.3" "gv9-$slug-cb" "( cd $GV9C && $GV9ENF $BRIDGE callback --slug $slug --stage verify --status DONE --worker codex-a --message ok --quiet )"
+    local cb="$GV9C/.dev/forge-tmp/callbacks/$slug-verify.$GV9S.$GV9INC.callback"
+    gv9_cbid="$(grep '^callback_id:' "$cb" 2>/dev/null | awk '{print $2}')"
+    gv9_pt="$(grep '^selected_pending_timestamp:' "$cb" 2>/dev/null | sed 's/^selected_pending_timestamp:[[:space:]]*//; s/^\"//; s/\"$//')"
+    [ -n "$gv9_cbid" ] && [ -n "$gv9_pt" ] || bad "EV Group 9 setup: callback id/ts extraction failed for $slug"
+    mkdir -p "$GV9C/.dev/qa/$slug"
+    printf 'verdict: CLEAR\nsummary: ok\n' > "$GV9C/.dev/qa/$slug/verification-report.yaml"
+  }
+
+  # ── T-EV-OBSERVE-INERT: FORGE_EVIDENCE_MODE unset (default observe) — records +
+  # renders, refuses NOTHING, even with a real committed=FAIL contradiction present. ──
+  gv9clean; gv9_seed_contradiction ev9o; gv9_verify_callback ev9o
+  run_in_pane "$GV9S:0.1" gv9-obs "( cd $GV9C && $GV9ENF $BRIDGE verify-decision --slug ev9o --callback-id $gv9_cbid --pending-timestamp \"$gv9_pt\" )"
+  { [ "$(rc_of gv9-obs)" = 0 ] && out_of gv9-obs | grep -q '^EVIDENCE_OBSERVED slug=ev9o' \
+      && out_of gv9-obs | grep -q 'verdict=contradicted' \
+      && grep -q '^EVIDENCE: .*pipeline=ev9o stage=verify.*verdict=contradicted' "$GV9EV"; } \
+    && ok "T-EV-OBSERVE-INERT observe records verdict=contradicted and refuses NOTHING" \
+    || bad "T-EV-OBSERVE-INERT rc=$(rc_of gv9-obs) $(out_of gv9-obs | tail -3)"
+
+  # ── T-EV-ENFORCE-REFUSE + T-EV-ACK-EMPTY + T-EV-ACK + T-EV-JOURNAL-WS: same shape,
+  # FORGE_EVIDENCE_MODE=enforce this time, on a fresh slug. ──
+  gv9clean; gv9_seed_contradiction ev9r; gv9_verify_callback ev9r
+  GV9TERM_BEFORE="$(gv9term)"
+  GV9J="$GV9C/.dev/forge-hygiene.$GV9S.$GV9INC.yml"
+  GV9J_BEFORE="$(shasum -a 256 "$GV9J" 2>/dev/null | awk '{print $1}')"
+  run_in_pane "$GV9S:0.1" gv9-enf "( cd $GV9C && $GV9ENF FORGE_EVIDENCE_MODE=enforce $BRIDGE verify-decision --slug ev9r --callback-id $gv9_cbid --pending-timestamp \"$gv9_pt\" )"
+  { [ "$(rc_of gv9-enf)" = 1 ] && out_of gv9-enf | grep -q 'REFUSED: evidence contradicts' \
+      && [ "$(gv9term)" = "$GV9TERM_BEFORE" ] \
+      && [ "$(shasum -a 256 "$GV9J" 2>/dev/null | awk '{print $1}')" = "$GV9J_BEFORE" ]; } \
+    && ok "T-EV-ENFORCE-REFUSE enforce refuses; terminal state AND journal unchanged" \
+    || bad "T-EV-ENFORCE-REFUSE rc=$(rc_of gv9-enf) $(out_of gv9-enf | tail -3)"
+  o="$(out_of gv9-enf)"
+  { printf '%s' "$o" | grep -q 'contradiction:' && printf '%s' "$o" | grep -q 'command run:' \
+      && printf '%s' "$o" | grep -q 'remedy:'; } \
+    && ok "T-EV-ENFORCE-REFUSE names the class, the command run, and the remedy" \
+    || bad "T-EV-ENFORCE-REFUSE message incomplete: $o"
+  run_in_pane "$GV9S:0.1" gv9-ackempty "( cd $GV9C && $GV9ENF FORGE_EVIDENCE_MODE=enforce $BRIDGE verify-decision --slug ev9r --callback-id $gv9_cbid --pending-timestamp \"$gv9_pt\" --acknowledge-evidence '' )"
+  [ "$(rc_of gv9-ackempty)" = 1 ] \
+    && ok "T-EV-ACK-EMPTY empty reason is rc 1" || bad "T-EV-ACK-EMPTY rc=$(rc_of gv9-ackempty)"
+  run_in_pane "$GV9S:0.1" gv9-ack "( cd $GV9C && $GV9ENF FORGE_EVIDENCE_MODE=enforce $BRIDGE verify-decision --slug ev9r --callback-id $gv9_cbid --pending-timestamp \"$gv9_pt\" --acknowledge-evidence 'operator accepts this run' )"
+  { [ "$(rc_of gv9-ack)" = 0 ] && out_of gv9-ack | grep -q '^EVIDENCE_ACKNOWLEDGED slug=ev9r' \
+      && [ "$(gv9field evidence_ack)" = 1 ] \
+      && grep -q '^EVIDENCE_ACK: pipeline=ev9r ' "$GV9EV" \
+      && [ "$(gv9term)" = terminal-cleanup ]; } \
+    && ok "T-EV-ACK acknowledged contradiction proceeds; evidence_ack=1 + EVIDENCE_ACK recorded" \
+    || bad "T-EV-ACK rc=$(rc_of gv9-ack) term=$(gv9term) ack=$(gv9field evidence_ack) $(out_of gv9-ack | tail -3)"
+  { [ -n "$(gv9field evidence_ack_reason)" ] && printf '%s' "$(gv9field evidence_ack_reason)" | grep -q '_' \
+      && [ -n "$(gv9field delivery_grade)" ] && [ -n "$(gv9field evidence_at)" ]; } \
+    && ok "T-EV-JOURNAL-WS spaced ack reason is sanitized; delivery_grade/evidence_at round-trip" \
+    || bad "T-EV-JOURNAL-WS reason=$(gv9field evidence_ack_reason)"
+
+  # ── T-EV-ACK-NOOP: a CLEAN slug (no seeded contradiction) — the escape is inert and
+  # cannot downgrade a clean run. ──
+  gv9clean
+  run_in_pane "$GV9S:0.1" gv9c-log "( cd $GV9C && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug ev9c --stage verify --from claude --to codex-a --prompt p )"
+  tmux send-keys -t "$GV9S:0.2" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$GV9S:0.3" gv9c-cb "( cd $GV9C && $GV9ENF $BRIDGE callback --slug ev9c --stage verify --status DONE --worker codex-a --message ok --quiet )"
+  GV9CCB="$GV9C/.dev/forge-tmp/callbacks/ev9c-verify.$GV9S.$GV9INC.callback"
+  gv9c_cbid="$(grep '^callback_id:' "$GV9CCB" | awk '{print $2}')"
+  gv9c_pt="$(grep '^selected_pending_timestamp:' "$GV9CCB" | sed 's/^selected_pending_timestamp:[[:space:]]*//; s/^\"//; s/\"$//')"
+  mkdir -p "$GV9C/.dev/qa/ev9c"; printf 'verdict: CLEAR\nsummary: ok\n' > "$GV9C/.dev/qa/ev9c/verification-report.yaml"
+  run_in_pane "$GV9S:0.1" gv9c-noop "( cd $GV9C && $GV9ENF FORGE_EVIDENCE_MODE=enforce $BRIDGE verify-decision --slug ev9c --callback-id $gv9c_cbid --pending-timestamp \"$gv9c_pt\" --acknowledge-evidence 'nothing to see' )"
+  { [ "$(rc_of gv9c-noop)" = 0 ] && out_of gv9c-noop | grep -q 'NOTE: --acknowledge-evidence ignored' \
+      && [ -z "$(gv9field evidence_ack)" ] && [ "$(gv9term)" = terminal-cleanup ]; } \
+    && ok "T-EV-ACK-NOOP no contradiction -> ack is inert, no evidence_ack recorded" \
+    || bad "T-EV-ACK-NOOP rc=$(rc_of gv9c-noop) $(out_of gv9c-noop | tail -3)"
+
+  tmux kill-session -t "$GV9S" 2>/dev/null
+else
+  echo "  (skip EV Group 9: tmux unavailable)"
+fi
+
 echo
 printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

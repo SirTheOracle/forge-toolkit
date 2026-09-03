@@ -6734,13 +6734,21 @@ cmd_verify_decision() {
     # P0-9: enforce-only terminal command. In observe it must NOT persist the new terminal
     # vocabulary; an invalid mode is a hard error, never a silent observe fall-through.
     _hygiene_enforcing || { echo "ERROR: verify-decision is an enforce-mode command (mode=$FORGE_WORKER_HYGIENE_MODE); in observe, verify/DONE closes via legacy completion." >&2; return 1; }
-    local slug="" callback_id="" pending_ts=""
+    # --acknowledge-evidence: the ONE audited escape, modelled on hygiene-abandon's --reason
+    # (:4861-4862). Operator-only by convention and by documentation (Hard Rule 24); an empty
+    # reason is rc 1. It is honoured ONLY when a contradiction is actually present under
+    # enforce — it is an escape FROM A REFUSAL, never a way to downgrade a clean completion.
+    local slug="" callback_id="" pending_ts="" ack_seen=0 ack_reason=""
     while [ $# -gt 0 ]; do case "$1" in
         --slug) slug="$2"; shift 2 ;;
         --callback-id) callback_id="$2"; shift 2 ;;
         --pending-timestamp) pending_ts="$2"; shift 2 ;;
+        --acknowledge-evidence) ack_seen=1; ack_reason="$2"; shift 2 ;;
         *) shift ;;
     esac; done
+    if [ "$ack_seen" = 1 ] && [ -z "$(printf '%s' "$ack_reason" | tr -d '[:space:]')" ]; then
+        echo "ERROR: --acknowledge-evidence requires a non-empty reason" >&2; return 1
+    fi
     [ -n "$slug" ] && [ -n "$callback_id" ] && [ -n "$pending_ts" ] || {
         echo "Usage: forge-bridge verify-decision --slug <s> --callback-id <id> --pending-timestamp <ts>" >&2; return 1; }
     local pr; pr="$(_resolve_project_root "")"; [ -n "$pr" ] || { echo "ERROR: no project root" >&2; return 1; }
@@ -6787,8 +6795,6 @@ PY
     # NO `trap … RETURN` in this block: cmd_verify_decision already installs
     # `trap _hygiene_release_all RETURN` at :4581 and a second would REPLACE it, silently
     # disabling every lock release. Nothing here allocates a temp file.
-    local _ev_ack_kv=""   # set by Step 9b (not yet applied); empty here
-    #
     # Per-pass budgets, resolved ONCE (N11).
     _EV_T="$(_evidence_probe_timeout "$pr")"; _EV_NT="$(_evidence_net_timeout "$pr")"
 
@@ -6885,6 +6891,51 @@ PY
     _emit_event EVIDENCE "$slug" \
         "stage=verify worker=$_cbwk callback_id=$callback_id pending_timestamp=$pending_ts session=${ID_target_session:-} incarnation=${ID_target_incarnation:-} delivery=$_ev_delivery merge_state=${_ev_ms_state:-unknown} branch=${_ev_branch:-unknown} head=${_ev_head:-unknown} dirty_tracked=$_ev_dirty clean-tree=$(_ev_grade "$_ev_tree") merge-state=$(_ev_grade "$_ev_merge") pushed=local-ref:$(_ev_grade "$_ev_push") evidence_sha256=${_ev_sha:-none} verdict=$_ev_verd"
     _EV_T=""; _EV_NT=""
+
+    # ═══ evidence-gated-completion Step 9: THE GATE ═══════════════════════════════
+    # The contradiction set was computed UNCONDITIONALLY in Step 8, in BOTH modes. That is a
+    # re-read of records the probes already produced, not new work, and computing it in
+    # observe too is what lets the acknowledge path verify there is SOMETHING to acknowledge.
+    #
+    # The set is CLOSED and EXHAUSTIVE — three cases:
+    #   1. a coding-class stage whose FRESH report-consistent read said FAILED / PARTIAL, or
+    #      carried a NOT COMMITTED marker, while its callback said DONE;
+    #   2. a coding-class stage with committed=FAIL (baseline present AND an ancestor, zero
+    #      commits or no file delta);
+    #   3. evidence_sha256 mismatch / destroyed basis at finalize (Step 10).
+    # UNKNOWN NEVER REFUSES and never contradicts. VALIDATION_FAILED never refuses in v1 (the
+    # config gate lives in Step 8). A refusal returns BEFORE the _hygiene_write below, so the
+    # terminal state is UNTOUCHED.
+    local _ev_ack_kv=""
+    if [ -n "$(printf '%s' "$_ev_block" | tr -d '[:space:]')" ] && _evidence_enforcing; then
+        if [ "$ack_seen" = 1 ]; then
+            _ev_ack_kv=" evidence_ack=1 evidence_ack_reason=$(_sanitize_event_value "$ack_reason") evidence_ack_at=$(timestamp)"
+            _emit_event EVIDENCE_ACK "$slug" "stage=verify worker=$_cbwk callback_id=$callback_id classes=$(_sanitize_event_value "$_ev_block") delivery=$_ev_delivery reason=$(_sanitize_event_value "$ack_reason")"
+            echo "EVIDENCE_ACKNOWLEDGED slug=$slug classes=$_ev_block — completion will publish as complete-qualified."
+        else
+            _lifecycle_unlock
+            {
+              echo "REFUSED: evidence contradicts the DONE claim for '$slug' (delivery=$_ev_delivery). Terminal state UNCHANGED."
+              echo "  contradiction:$_ev_block"
+              echo "  command run:  ${_ev_cmd:-see $_ev_art}"
+              echo "  evidence:     $_ev_art"
+              echo "  remedy:       fix the work and re-dispatch the stage (a clean re-run allows), OR"
+              echo "                forge-bridge verify-decision --slug $slug --callback-id $callback_id \\"
+              echo "                    --pending-timestamp \"$pending_ts\" --acknowledge-evidence \"<why this is acceptable>\""
+              echo "  kill switch:  FORGE_EVIDENCE_MODE=observe restores pre-evidence behavior exactly."
+            } >&2
+            return 1
+        fi
+    elif [ -n "$(printf '%s' "$_ev_block" | tr -d '[:space:]')" ]; then
+        # OBSERVE: record and render, refuse nothing (R9). The EVIDENCE line above already
+        # carries verdict=contradicted, which the watcher surfaces as EVIDENCE-CONTRADICTED.
+        echo "EVIDENCE_OBSERVED slug=$slug verdict=$_ev_verd contradicted=$_ev_block (mode=observe — NOT gated)"
+    elif [ "$ack_seen" = 1 ]; then
+        # The flag is an escape FROM a refusal. With nothing to escape, honouring it would
+        # downgrade a clean run to complete-qualified (Step 9d ORs evidence_ack into
+        # `qualified`, and :4808 turns that into complete-qualified).
+        echo "NOTE: --acknowledge-evidence ignored — no contradiction to acknowledge (evidence mode=$(_evidence_mode)). Publishing an unqualified completion." >&2
+    fi
 
     # P0-3/P1-7: the decision + terminal transition are HARD — a silent journal failure must
     # not leave the caller believing the decision was recorded. Written under the verify
@@ -7061,6 +7112,16 @@ PY
     # Step 9d extends this block with the evidence-acknowledged token.
     local _qtok=""
     [ -n "${dirty%,}" ] && _qtok="hygiene-disabled"
+    # evidence-gated-completion Step 9: an acknowledged evidence contradiction is OR-ed into
+    # the EXISTING `qualified` flag, so _final_state becomes complete-qualified through the
+    # ALREADY-TESTED path. cmd_verify_decision cannot publish a terminal state of any kind
+    # (F11 discipline); it only records the acknowledgement in the journal, and this is where
+    # that record is consumed.
+    local _ev_ack; _ev_ack="$(_terminal_field "$pr" evidence_ack)"
+    if [ "$_ev_ack" = 1 ]; then
+        qualified=1
+        _qtok="${_qtok:+$_qtok,}evidence-acknowledged"
+    fi
     if [ "$any_bad" = 1 ]; then
         for w in $order; do _worker_unlock "$w"; done
         echo "FINALIZE_UNCONFIRMED — a pane is not idle / config error; left terminal-cleanup, no COMPLETE." >&2; return 1; fi
@@ -7933,12 +7994,17 @@ cmd_emit() {
         return 1
     fi
     local type="$1"; shift
+    # EVIDENCE is deliberately ABSENT: evidence lines are bridge-authored only, so a
+    # protocol-following worker cannot forge one via the CLI. EVIDENCE_ACK is present so the
+    # orchestrator can surface an operator acknowledgement. Placed on the first
+    # case-alternative line (unpinned by any literal-substring test) and, in the message,
+    # immediately after USAGE.
     case "$type" in
-        DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE) ;;
+        DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|EVIDENCE_ACK) ;;
         RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY) ;;
         WORKER_LOW_CONTEXT|ORCHESTRATOR_LOW_CONTEXT) ;;
         *)
-            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY|WORKER_LOW_CONTEXT|ORCHESTRATOR_LOW_CONTEXT; got '$type'" >&2
+            echo "ERROR: emit TYPE must be one of DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|EVIDENCE_ACK|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY|WORKER_LOW_CONTEXT|ORCHESTRATOR_LOW_CONTEXT; got '$type'" >&2
             return 1
             ;;
     esac
