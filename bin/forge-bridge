@@ -1489,6 +1489,35 @@ _ev_observe_grade() {   # <root> <slug> <stage> <pending_ts>
     printf 'unknown'
 }
 
+# _ev_finalize_basis <root> <slug> -> "ok" | "REFUSE:<reason>" | "drift:<new_head>"
+# Called at BOTH of cmd_finalize's revalidation points. REFUSE only when the decision BASIS IS
+# DESTROYED: the bound head_sha is no longer an ancestor of HEAD (history was rewritten under
+# the decision) or the artifact digest no longer matches.
+# Benign FORWARD drift — HEAD merely advanced, or merge_state changed — is RECORDED, never
+# refused: under enforce, terminal-cleanup blocks worker sends but NOT the operator committing
+# in another pane, so forward drift is routine. Stranding a completed pipeline over it is
+# worse than a stale grade. A TIMEOUT grades ok — UNKNOWN never refuses.
+# No `trap … RETURN`: cmd_finalize already installs one at :4707.
+_ev_finalize_basis() {
+    local pr="$1" slug="$2" bound_head bound_sha art rc=0 t
+    bound_head="$(_terminal_field "$pr" head_sha)"
+    bound_sha="$(_terminal_field "$pr" evidence_sha256)"
+    [ -n "$bound_head" ] || { printf 'ok'; return 0; }          # legacy / no decision bound
+    [ "$bound_head" = unknown ] && { printf 'ok'; return 0; }
+    t="$(_evidence_probe_timeout "$pr")"
+    _ev_timed "$t" git -C "$pr" merge-base --is-ancestor "$bound_head" HEAD >/dev/null 2>&1; rc=$?
+    _ev_is_timeout "$rc" && { printf 'ok'; return 0; }
+    [ "$rc" = 1 ] && { printf 'REFUSE:head-rewritten (bound head_sha %s is no longer an ancestor of HEAD)' "$bound_head"; return 0; }
+    if [ -n "$bound_sha" ] && [ "$bound_sha" != none ]; then
+        art="$pr/.dev/qa/$slug/evidence-verify-$(_terminal_field "$pr" verify_callback_id).yaml"
+        local now; now="$(shasum -a 256 "$art" 2>/dev/null | awk '{print $1}')"
+        [ "$now" = "$bound_sha" ] || { printf 'REFUSE:evidence-digest-mismatch (artifact %s)' "$art"; return 0; }
+    fi
+    local cur; cur="$(_ev_timed "$t" git -C "$pr" rev-parse HEAD 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$cur" ] && [ "$cur" != "$bound_head" ]; then printf 'drift:%s' "$cur"; return 0; fi
+    printf 'ok'
+}
+
 # Per-session/incarnation hygiene journal path. Separate from forge-context/forge-usage.
 _hygiene_file() {
     local s="${ID_target_session:-__nosession__}" i="${ID_target_incarnation:-0}"
@@ -1856,6 +1885,21 @@ ng=d.get("next_generation",1)
 if not (isinstance(ng,int) and not isinstance(ng,bool) and ng>=1):
     sys.stderr.write("JOURNAL_NEXTGEN_INVALID\n"); sys.exit(1)
 sys.exit(0)
+PY
+}
+
+# Read a `terminal.<field>` value from the hygiene journal. Empty if absent.
+# Exact structural mirror of _hygiene_finalization_field below, one level shallower. A NEW
+# helper rather than an extension of the existing one, so no current caller's semantic moves.
+# Consumers: cmd_finalize's evidence re-check (Step 10), _render_status_file (Step 11), and
+# cmd_finalize's evidence_ack read (Step 9d).
+_terminal_field() {   # <project_root> <field>
+    python3 - "$1/$(_hygiene_file)" "$2" <<'PY'
+import sys,yaml,os
+jf=sys.argv[1]
+try: d=(yaml.safe_load(open(jf)) or {}) if os.path.exists(jf) else {}
+except Exception: d={}
+print((d.get("terminal") or {}).get(sys.argv[2]) or "")
 PY
 }
 
@@ -6694,10 +6738,114 @@ PY
     case "$_verdict" in CLEAR) ;; *) _lifecycle_unlock; echo "REFUSED: verdict='$_verdict' (not CLEAR) — no cleanup." >&2; return 1 ;; esac
     local _rhash2; _rhash2="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
     [ "$_rhash" = "$_rhash2" ] || { _lifecycle_unlock; echo "REFUSED: report changed during decision" >&2; return 1; }
+
+    # ═══ evidence-gated-completion Step 8: decide and bind (NO GATE YET) ══════════
+    # NO `trap … RETURN` in this block: cmd_verify_decision already installs
+    # `trap _hygiene_release_all RETURN` at :4581 and a second would REPLACE it, silently
+    # disabling every lock release. Nothing here allocates a temp file.
+    local _ev_ack_kv=""   # set by Step 9b (not yet applied); empty here
+    #
+    # Per-pass budgets, resolved ONCE (N11).
+    _EV_T="$(_evidence_probe_timeout "$pr")"; _EV_NT="$(_evidence_net_timeout "$pr")"
+
+    # Tier 0 re-run against CURRENT HEAD plus Tier 2 (network). The bridge RE-CHECKS STATE;
+    # it never re-runs work. The oracle is invoked EXACTLY ONCE and its output is threaded
+    # through, so there is one network round-trip and the caller holds the RAW merge_detail
+    # (plan Step 8.4) — which a module-level variable could not carry out of a probe running
+    # in command substitution.
+    local _ev_gs _ev_tree _ev_merge _ev_push _ev_head _ev_branch
+    local _ev_ms_line _ev_ms_state _ev_ms_base _ev_ms_detail
+    _ev_gs="$(_ev_probe_git_state "$pr")"
+    _ev_head="$(_ev_detail "$_ev_gs")"; _ev_branch="${_ev_head#*,}"; _ev_head="${_ev_head%%,*}"
+    case "$(_ev_grade "$_ev_gs")" in PASS) ;; *) _ev_head=unknown; _ev_branch=unknown ;; esac
+    _ev_tree="$(_ev_probe_clean_tree "$pr")"
+    _ev_ms_line="$(_merge_state_probe "$pr" 2>/dev/null)"
+    _ev_merge="$(_ev_probe_merge_state "$pr" "$_ev_ms_line")"
+    _ev_ms_base="$(_ms_field "$_ev_ms_line" 2)"
+    _ev_ms_state="$(_ms_field "$_ev_ms_line" 3)"
+    _ev_ms_detail="$(_ms_field "$_ev_ms_line" 5)"
+    _ev_push="$(_ev_probe_pushed "$pr" "$_ev_branch")"
+
+    # Decision set: one _evidence_stage_record per coding-class stage of this slug.
+    # `coding_stages` is config-driven (Step 12) and defaults to the shipped single stage.
+    # UNKNOWN records are SKIPPED — UNKNOWN never contradicts (design invariant §2.4).
+    local _ev_stages; _ev_stages="$(_evidence_cfg "$pr" coding_stages coding)"
+    local _ev_vfb; _ev_vfb="$(_evidence_cfg "$pr" validation_failed_blocks false)"
+    local _ev_block="" _ev_cmd="" _ev_st _ev_rec _ev_fresh
+    local _ev_committed_seen=0 _ev_committed_bad=0
+    for _ev_st in $_ev_stages; do
+        _ev_rec="$(_evidence_stage_record "$pr" "$slug" "$_ev_st")"
+        case "$_ev_rec" in UNKNOWN:*) continue ;; esac
+        # Case 1 — report-consistent. The record's grade is advisory; the CONTRADICTION is
+        # decided on a FRESH read (plan: "whose FRESH report-consistent read"), so a stage
+        # fixed and re-run since the callback is not held against it.
+        case "$_ev_rec" in *" report-consistent=FAIL"*)
+            _ev_fresh="$(_ev_probe_report_consistent "$pr" "$slug" "")"
+            case "$_ev_fresh" in
+                FAIL:status=VALIDATION_FAILED*)
+                    # skills/forge-coder/SKILL.md:241-244 declares full-validation failures
+                    # NON-BLOCKING BY DESIGN. Reversing a documented policy must be a
+                    # deliberate operator decision, so it is config-gated, default false.
+                    if [ "$_ev_vfb" = true ]; then
+                        _ev_block="$_ev_block report-consistent($_ev_st)=$(_ev_detail "$_ev_fresh")"
+                        _ev_cmd="grep '^\\*\\*Status\\*\\*:' .dev/proposals/$slug/coder-report.md"
+                    fi ;;
+                FAIL*)
+                    _ev_block="$_ev_block report-consistent($_ev_st)=$(_ev_detail "$_ev_fresh")"
+                    _ev_cmd="grep '^\\*\\*Status\\*\\*:' .dev/proposals/$slug/coder-report.md" ;;
+            esac ;;
+        esac
+        # Case 2 — committed=FAIL. Ancestry failure POISONS committed to UNKNOWN upstream, so
+        # this can never fire on a diverged history or a mid-stage operator rebase (R6).
+        case "$_ev_rec" in
+            *" committed=FAIL"*)
+                _ev_block="$_ev_block committed($_ev_st)=FAIL"
+                _ev_cmd="git rev-list --count <baseline>..HEAD && git diff --shortstat <baseline>..HEAD"
+                _ev_committed_bad=1 ;;
+            *" committed=PASS"*) _ev_committed_seen=1 ;;
+            *)                   _ev_committed_bad=1 ;;   # UNKNOWN committed: not green
+        esac
+    done
+
+    # Delivery grade. `committed-local` is GREEN: the orchestrator is FORBIDDEN to push, so it
+    # is the highest machine-reachable state for most pipelines. There is deliberately NO
+    # `pushed-unmerged` tier — refs/remotes/origin/<branch> is a possibly-stale local ref and
+    # `git ls-remote` is a network call under the terminal mutex, so a `pushed` GRADE would
+    # rest on an unverified assertion, the exact thing this feature eliminates.
+    local _ev_dirty=false _ev_delivery=unknown
+    case "$(_ev_grade "$_ev_tree")" in FAIL) _ev_dirty=true ;; esac
+    case "$_ev_ms_state" in
+        BRANCH_MERGED_CLEAN|BRANCH_MERGED_WITH_DRIFT) _ev_delivery=merged ;;
+        *)
+            if [ "$_ev_dirty" = true ] || [ "$_ev_committed_bad" = 1 ]; then
+                [ "$_ev_dirty" = true ] && _ev_delivery=uncommitted
+                [ "$_ev_committed_bad" = 1 ] && [ "$_ev_dirty" != true ] && _ev_delivery=unknown
+                [ "$_ev_committed_bad" = 1 ] && case "$_ev_rec" in *" committed=FAIL"*) _ev_delivery=uncommitted ;; esac
+            elif [ "$_ev_committed_seen" = 1 ]; then
+                _ev_delivery=committed-local
+            fi ;;
+    esac
+
+    # Decision artifact + digest. Same shasum idiom as report_sha256 (:4614). The RAW
+    # merge_detail rides the artifact as an INFO-only `merge-detail` class: it cannot go on
+    # the EVIDENCE: event line (_sanitize_event_value collapses whitespace, truncates at 200
+    # bytes) and it cannot go in the hygiene journal (values split on whitespace, F7) — which
+    # is exactly the two-sink split's reason for existing (plan Step 8.4).
+    local _ev_art _ev_sha _ev_verd
+    _ev_art="$(_ev_artifact_write "$pr" "$slug" verify "$callback_id" decision \
+                   "git-state=$_ev_gs" "clean-tree=$_ev_tree" "merge-state=$_ev_merge" \
+                   "pushed=$_ev_push" "merge-detail=INFO:${_ev_ms_detail}	_merge_state_probe $pr	0")"
+    _ev_sha="$(shasum -a 256 "$_ev_art" 2>/dev/null | awk '{print $1}')"
+    _ev_verd="$(_ev_verdict "git-state=$_ev_gs" "clean-tree=$_ev_tree" "merge-state=$_ev_merge")"
+    [ -n "$(printf '%s' "$_ev_block" | tr -d '[:space:]')" ] && _ev_verd=contradicted
+    _emit_event EVIDENCE "$slug" \
+        "stage=verify worker=$_cbwk callback_id=$callback_id pending_timestamp=$pending_ts session=${ID_target_session:-} incarnation=${ID_target_incarnation:-} delivery=$_ev_delivery merge_state=${_ev_ms_state:-unknown} branch=${_ev_branch:-unknown} head=${_ev_head:-unknown} dirty_tracked=$_ev_dirty clean-tree=$(_ev_grade "$_ev_tree") merge-state=$(_ev_grade "$_ev_merge") pushed=local-ref:$(_ev_grade "$_ev_push") evidence_sha256=${_ev_sha:-none} verdict=$_ev_verd"
+    _EV_T=""; _EV_NT=""
+
     # P0-3/P1-7: the decision + terminal transition are HARD — a silent journal failure must
     # not leave the caller believing the decision was recorded. Written under the verify
     # lifecycle lock (serializes against callback publication / park-resolve on this stage).
-    _hygiene_write "$pr" terminal "" "slug=$slug verify_callback_id=$callback_id verify_pending_ts=$pending_ts report_sha256=$_rhash verdict=CLEAR worker=$_cbwk decided_at=$(timestamp)" \
+    _hygiene_write "$pr" terminal "" "slug=$slug verify_callback_id=$callback_id verify_pending_ts=$pending_ts report_sha256=$_rhash verdict=CLEAR worker=$_cbwk decided_at=$(timestamp) delivery_grade=$_ev_delivery evidence_sha256=${_ev_sha:-none} merge_state=${_ev_ms_state:-unknown} branch=${_ev_branch:-unknown} head_sha=${_ev_head:-unknown} base_ref=${_ev_ms_base:-unknown} dirty_tracked=$_ev_dirty evidence_at=$(timestamp)${_ev_ack_kv:-}" \
         || { _lifecycle_unlock; echo "ERROR: verify-decision: could not persist the CLEAR decision (journal write failed) — no transition." >&2; return 1; }
     local _cu; _cu="$(_completion_unresolved "$pr")"
     case "$_cu" in
@@ -6826,6 +6974,15 @@ PY
     local report="$pr/.dev/qa/$slug/verification-report.yaml" _rh2
     _rh2="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
     [ "$_rh2" = "$_trh" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: report hash changed since decision" >&2; return 1; }
+    # evidence-gated-completion Step 10: refuse ONLY on a destroyed decision basis.
+    local _ev_basis; _ev_basis="$(_ev_finalize_basis "$pr" "$slug")"
+    case "$_ev_basis" in
+        REFUSE:*) for w in $order; do _worker_unlock "$w"; done
+                  echo "REFUSED: evidence basis destroyed since verify-decision — ${_ev_basis#REFUSE:}" >&2
+                  echo "         Re-run verify-decision to re-bind, or FORGE_EVIDENCE_MODE=observe." >&2
+                  return 1 ;;
+        drift:*)  _hygiene_write "$pr" terminal "" "head_moved=true head_sha_at_finalize=${_ev_basis#drift:}" 2>/dev/null || true ;;
+    esac
     local _cu; _cu="$(_completion_unresolved "$pr")"
     [ "$_cu" = "parked=0 blocked=0" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: unresolved residue $_cu" >&2; return 1; }
     local _cid; _cid="$(_completion_id "${ID_target_session}" "${ID_target_incarnation}" "$slug" "$_tcb" "$_tpt" "$_trh")"
@@ -6883,6 +7040,15 @@ PY
         *) for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: terminal state changed to '$_rev' during finalize — no COMPLETE." >&2; return 1 ;; esac
     _rh2="$(shasum -a 256 "$report" 2>/dev/null | awk '{print $1}')"
     [ "$_rh2" = "$_trh" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: report hash changed during finalize — no COMPLETE." >&2; return 1; }
+    # evidence-gated-completion Step 10, second revalidation point — immediately before the
+    # irreversible publication, under the held worker locks.
+    _ev_basis="$(_ev_finalize_basis "$pr" "$slug")"
+    case "$_ev_basis" in
+        REFUSE:*) for w in $order; do _worker_unlock "$w"; done
+                  echo "REFUSED: evidence basis destroyed during finalize — ${_ev_basis#REFUSE:} — no COMPLETE." >&2
+                  return 1 ;;
+        drift:*)  _hygiene_write "$pr" terminal "" "head_moved=true head_sha_at_finalize=${_ev_basis#drift:}" 2>/dev/null || true ;;
+    esac
     _cu="$(_completion_unresolved "$pr")"
     [ "$_cu" = "parked=0 blocked=0" ] || { for w in $order; do _worker_unlock "$w"; done; echo "REFUSED: residue appeared during finalize ($_cu) — no COMPLETE." >&2; return 1; }
     # ---- Durable outbox publication (plan Step 9). Pre-COMPLETE writes are HARD. P0-8:
