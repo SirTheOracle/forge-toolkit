@@ -12,6 +12,7 @@ for suite in \
   tests/forge-cc/spawn.sh \
   tests/forge-watch/run.sh \
   tests/forge-infra-lock/run.sh \
-  tests/forge-recover/run.sh; do
+  tests/forge-recover/run.sh \
+  tests/adversarial-skills/run.sh; do
   echo "== $suite =="; bash "$ROOT/$suite"
 done

@@ -138,7 +138,7 @@ Details in `references/agent-teams-workflow.md` §"Round 0".
 
 Two `Agent(team_name=..., name="proposer-a", ...)` calls in a single message. Each prompt embeds the **proposer role** (`agents/proposer.md`), the **proposal format** (`references/proposal-format.md`), the assigned strategy, the **isolation rule** (see below), and explicit **"wait, don't exit"** instructions.
 
-Then the lead idles — teammate "done" messages arrive as new conversation turns. No polling.
+Then the lead waits — teammate "done" messages arrive as new conversation turns. **Waiting is not idling.** Apply the **output watchdog** (§"Error Handling") at this and every later wait: poll for bytes on disk at `{output_dir}/proposal-A.md` and `{output_dir}/proposal-B.md`, **timeout 5 minutes per proposer**, then ping once. A silent inbox is not evidence of work.
 
 ### Step 3 — Gates after Round 1
 
@@ -171,7 +171,7 @@ Two `SendMessage` calls in one turn, using these exact `description` values for 
 
 (Consistent naming makes transcripts scriptable and breach detection straightforward.)
 
-Each message embeds `agents/critic.md` and the per-proposer isolation rule (read ONLY own review file + own proposal). Teammates resume with full Round 1 context.
+Each message embeds `agents/critic.md` and the per-proposer isolation rule (read ONLY own review file + own proposal). Teammates resume with full Round 1 context. Each message must also instruct the critic to **save its feedback to `{output_dir}/feedback-A.md` (resp. `feedback-B.md`)** as well as replying — the file is what the output watchdog polls, and a reply alone leaves nothing on disk to verify.
 
 ### Step 7 — Round 4: Reconciliation
 
@@ -257,12 +257,19 @@ Tailor the investigation emphasis in the proposer prompts:
 |-------|---------|----------|
 | Round 1 | One proposer fails | Wait for the other. Skip adversarial process — C reviews the single proposal for blind spots. |
 | Round 1 | Both fail | Abort workflow. Report to user. |
-| Round 2 | Synthesizer fails | Re-spawn C. If second attempt fails, present raw proposals. |
+| Round 2 | Synthesizer fails | Re-spawn C **writing to distinct paths** (`proposal-C-r2.md`, `review-for-A-r2.md`, `review-for-B-r2.md`) so a late-waking original cannot clobber them. If second attempt fails, present raw proposals. |
 | Round 3 | One proposer fails | Proceed to Round 4 with available feedback. Note which is missing. |
 | Round 3 | Both fail | Proceed to Round 4 with no feedback. C produces final-plan.md from synthesis alone. |
-| Round 4 | Synthesizer fails | Re-spawn reconciler. If second attempt fails, present proposal-C.md. |
+| Round 4 | Synthesizer fails | Re-spawn reconciler **writing to distinct paths** (`final-plan-r2.md`, `reconciliation-notes-r2.md`). If second attempt fails, present proposal-C.md. |
 
-A teammate that produces no output while "running" is indistinguishable from one that is working — verify bytes on disk before assuming progress, ping once via SendMessage (a ping can wake a wedged teammate), and if respawning a replacement, give it different output paths so a late-waking original cannot clobber them.
+### Output watchdog (applies to every wait in this workflow)
+
+A teammate that produces no output while "running" is indistinguishable from one that is working. All four of these apply at every wait site — none is optional.
+
+1. **Poll for output.** Verify bytes on disk before assuming progress; a silent inbox is not evidence of work. Round 1 polls `proposal-A.md` + `proposal-B.md`; Round 2 polls `proposal-C.md` + `review-for-A.md` + `review-for-B.md`; Round 3 polls `feedback-A.md` + `feedback-B.md`; Round 4 polls `final-plan.md` + `reconciliation-notes.md`.
+2. **Timeout budget.** **5 minutes** per proposer or critic (Rounds 1 and 3); **8 minutes** for the synthesizer and the reconciler (Rounds 2 and 4). When the budget expires with the deliverable still absent from disk, apply the recovery row above.
+3. **Ping once, then keep waiting.** Ping once via SendMessage — a ping can wake a wedged teammate. **No reply does not mean dead:** a pinged teammate can surface minutes later, so never conclude a silent teammate is gone, and never give a replacement the original's output paths.
+4. **Distinct output paths for any replacement.** A re-spawned teammate MUST write to a distinct path from the original (`proposal-C.md` → `proposal-C-r2.md`) so a late-waking original cannot clobber it. This is wired into the recovery rows above.
 
 ### Quality Gate Failures
 

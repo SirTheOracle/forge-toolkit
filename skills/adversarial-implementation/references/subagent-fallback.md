@@ -48,7 +48,9 @@ Task({
   run_in_background: true
 })
 
-// Poll for completion — watch for impl-A.md and impl-B.md on disk
+// Poll for completion — see "Output Watchdog" below. Deliverables:
+//   {output_dir}/impl-A.md and {output_dir}/impl-B.md
+// Timeout: 5 minutes per subagent. Then ping once; no reply does not mean dead.
 ```
 
 **Investigation notes** (`impl-notes-A.md`, `impl-notes-B.md`): Since subagent sessions don't persist, each agent must also write investigation notes containing:
@@ -76,6 +78,9 @@ If both implementations produce essentially the same diffs and tests, skip Round
 ### Round 2: Synthesis
 
 ```
+// See "Output Watchdog" below. Deliverables of this round:
+//   {output_dir}/impl-C.md, review-for-A.md, review-for-B.md — all three.
+// Timeout: 8 minutes. Then ping once; no reply does not mean dead.
 Task({
   subagent_type: "general-purpose",
   prompt: "
@@ -100,7 +105,9 @@ Task({
 ### Round 3: Feedback
 
 ```
-// Spawn two feedback subagents in parallel
+// Spawn two feedback subagents in parallel — see "Output Watchdog" below.
+// Deliverables: {output_dir}/impl-feedback-A.md and {output_dir}/impl-feedback-B.md
+// Timeout: 5 minutes per critic. Then ping once; no reply does not mean dead.
 Task({
   subagent_type: "general-purpose",
   prompt: "Read {output_dir}/impl-A.md (this was YOUR implementation doc).
@@ -133,6 +140,9 @@ Task({
 ### Round 4: Reconciliation
 
 ```
+// See "Output Watchdog" below. Deliverable of this round:
+//   {output_dir}/implementation.md
+// Timeout: 8 minutes. Then ping once; no reply does not mean dead.
 Task({
   subagent_type: "general-purpose",
   prompt: "Read {output_dir}/impl-C.md (this was YOUR synthesis).
@@ -148,25 +158,46 @@ Task({
 })
 ```
 
-## Polling for File Completion
+## Output Watchdog (polling for file completion)
+
+A subagent that produces no output while "running" is indistinguishable from one that is working. Since subagents can't send messages, the file on disk is the ONLY evidence of progress. All four rules apply at every round:
+
+**1. Poll for output.** Verify bytes on disk — never a subagent status — and name the deliverable being polled:
+
+| Round | Deliverables polled | Timeout budget |
+|-------|--------------------|----------------|
+| Round 1 | `impl-A.md`, `impl-B.md` | 5 minutes per subagent |
+| Round 2 | `impl-C.md`, `review-for-A.md`, `review-for-B.md` | 8 minutes |
+| Round 3 | `impl-feedback-A.md`, `impl-feedback-B.md` | 5 minutes per critic |
+| Round 4 | `implementation.md` | 8 minutes |
+
+**2. Timeout budget.** The loop must be BOUNDED — an unbounded `while [ ! -f ... ]` cannot time out, which is the whole defect:
 
 ```bash
-# In a loop with sleep:
+# Round 1. deadline = now + 5 minutes (300s); use the round's budget from the table.
+deadline=$(( $(date +%s) + 300 ))
 while [ ! -f "{output_dir}/impl-A.md" ] || [ ! -f "{output_dir}/impl-B.md" ]; do
+  [ "$(date +%s)" -ge "$deadline" ] && { echo "watchdog: budget expired, files still absent"; break; }
   sleep 10
 done
 ```
 
+**3. Ping once, then keep waiting.** When the budget expires with the file absent, ping the subagent once (SendMessage, addressing it by the name or ID from the spawn result) — a ping can wake a wedged subagent. **No reply does not mean dead:** a pinged subagent can surface minutes later and write its file, so never conclude a silent subagent is gone.
+
+**4. Distinct output paths for any replacement.** A re-spawned subagent MUST be told to write to a distinct path from the original (`impl-A.md` → `impl-A-r2.md`) so a late-waking original cannot clobber it. This is wired into the recovery rows below.
+
 ## Error Handling
+
+"Fails" means the full watchdog cycle above completed: the round's **timeout budget expired**, the **deliverable is still absent from disk**, and **one ping went unanswered**. Because no reply does not mean dead, every re-spawn below writes to a **distinct path**.
 
 | Round | Failure | Recovery |
 |-------|---------|----------|
 | Round 1 | One subagent fails | Wait for the other. Skip adversarial — C reviews single doc for gaps. |
 | Round 1 | Both fail | Abort workflow. Report to user. |
-| Round 2 | Synthesizer fails | Re-spawn with same prompt. If second attempt fails, present both raw docs. |
+| Round 2 | Synthesizer fails | Re-spawn with the same prompt but **distinct paths** (`impl-C-r2.md`, `review-for-A-r2.md`, `review-for-B-r2.md`). If second attempt fails, present both raw docs. |
 | Round 3 | One feedback subagent fails | Proceed to Round 4 with available feedback. |
 | Round 3 | Both fail | Proceed to Round 4 with no feedback. |
-| Round 4 | Reconciler fails | Re-spawn. If second attempt fails, present impl-C.md as output. |
+| Round 4 | Reconciler fails | Re-spawn to a **distinct path** (`implementation-r2.md`). If second attempt fails, present impl-C.md as output. |
 
 ## Output Directory
 

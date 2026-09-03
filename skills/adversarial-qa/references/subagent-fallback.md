@@ -47,7 +47,9 @@ Agent({
   run_in_background: true
 })
 
-// Poll for completion: watch for qa-report-A.md and qa-report-B.md
+// Poll for completion -- see "Output Watchdog" below. Deliverables:
+//   {output_dir}/qa-report-A.md and {output_dir}/qa-report-B.md
+// Timeout: 5 minutes per tester. Then ping once; no reply does not mean dead.
 ```
 
 **Testing notes** (`testing-notes-A.md`, `testing-notes-B.md`): Since subagent sessions don't persist, each tester must also write a testing notes file containing:
@@ -70,6 +72,9 @@ Same: if both find zero issues, skip to lightweight review.
 ### Round 2: Synthesis
 
 ```
+// See "Output Watchdog" below. Deliverables of this round:
+//   {output_dir}/qa-synthesis.md, review-for-A.md, review-for-B.md -- all three.
+// Timeout: 8 minutes. Then ping once; no reply does not mean dead.
 Agent({
   subagent_type: "general-purpose",
   prompt: "
@@ -98,7 +103,9 @@ Agent({
 ### Round 3: Feedback
 
 ```
-// Spawn two feedback agents in parallel
+// Spawn two feedback agents in parallel -- see "Output Watchdog" below.
+// Deliverables: {output_dir}/feedback-A.md and {output_dir}/feedback-B.md
+// Timeout: 5 minutes per tester. Then ping once; no reply does not mean dead.
 Agent({
   subagent_type: "general-purpose",
   prompt: "Read {output_dir}/qa-report-A.md (this was YOUR QA report).
@@ -146,6 +153,9 @@ Agent({
 ### Round 4: Reconciliation
 
 ```
+// See "Output Watchdog" below. Deliverables of this round:
+//   {output_dir}/issues.md and {output_dir}/test-plan.md -- both.
+// Timeout: 8 minutes. Then ping once; no reply does not mean dead.
 Agent({
   subagent_type: "general-purpose",
   prompt: "Read {output_dir}/qa-synthesis.md (this was YOUR synthesis).
@@ -159,29 +169,46 @@ Agent({
 })
 ```
 
-## Polling for File Completion
+## Output Watchdog (polling for file completion)
 
-Since subagents can't send messages, the lead polls for files:
+An agent that produces no output while "running" is indistinguishable from one that is working. Since subagents can't send messages, the file on disk is the ONLY evidence of progress. All four rules apply at every round:
+
+**1. Poll for output.** Verify bytes on disk -- never an agent status -- and name the deliverable being polled:
+
+| Round | Deliverables polled | Timeout budget |
+|-------|--------------------|----------------|
+| Round 1 | `qa-report-A.md`, `qa-report-B.md` | 5 minutes per tester |
+| Round 2 | `qa-synthesis.md`, `review-for-A.md`, `review-for-B.md` | 8 minutes |
+| Round 3 | `feedback-A.md`, `feedback-B.md` | 5 minutes per tester |
+| Round 4 | `issues.md`, `test-plan.md` | 8 minutes |
+
+**2. Timeout budget.** The loop must be BOUNDED -- an unbounded `while [ ! -f ... ]` cannot time out, which is the whole defect:
 
 ```bash
-# In a loop with sleep:
+# Round 1. deadline = now + 5 minutes (300s); use the round's budget from the table.
+deadline=$(( $(date +%s) + 300 ))
 while [ ! -f "{output_dir}/qa-report-A.md" ] || [ ! -f "{output_dir}/qa-report-B.md" ]; do
+  [ "$(date +%s)" -ge "$deadline" ] && { echo "watchdog: budget expired, files still absent"; break; }
   sleep 10
 done
 ```
 
+**3. Ping once, then keep waiting.** When the budget expires with the file absent, ping the agent once (SendMessage, addressing it by the name or ID from the spawn result) -- a ping can wake a wedged agent. **No reply does not mean dead:** a pinged agent can surface minutes later and write its file, so never conclude a silent agent is gone.
+
+**4. Distinct output paths for any replacement.** A re-spawned agent MUST be told to write to a distinct path from the original (`qa-report-A.md` -> `qa-report-A-r2.md`) so a late-waking original cannot clobber it. This is wired into the recovery rows below.
+
 ## Error Handling
 
-Same recovery logic as agent-teams-workflow, adapted for subagents:
+Same recovery logic as agent-teams-workflow, adapted for subagents. "Fails" means the full watchdog cycle above completed: the round's **timeout budget expired**, the **deliverable is still absent from disk**, and **one ping went unanswered**. Because no reply does not mean dead, every re-spawn below writes to a **distinct path**.
 
 | Round | Failure | Recovery |
 |-------|---------|----------|
 | Round 1 | One agent fails | Wait for the other. C reviews single report. |
 | Round 1 | Both fail | Abort. Report to user. |
-| Round 2 | Synthesizer fails | Re-spawn. If fails again, present raw reports. |
+| Round 2 | Synthesizer fails | Re-spawn to **distinct paths** (`qa-synthesis-r2.md`, `review-for-A-r2.md`, `review-for-B-r2.md`). If fails again, present raw reports. |
 | Round 3 | One feedback agent fails | Proceed to Round 4 with available feedback. |
 | Round 3 | Both fail | Proceed to Round 4 with no feedback. |
-| Round 4 | Reconciler fails | Re-spawn. If fails again, present qa-synthesis.md. |
+| Round 4 | Reconciler fails | Re-spawn to **distinct paths** (`issues-r2.md`, `test-plan-r2.md`). If fails again, present qa-synthesis.md. |
 
 ## Output Directory
 
