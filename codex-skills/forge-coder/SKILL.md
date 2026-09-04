@@ -26,6 +26,38 @@ a natural boundary; it is best-effort, never required.
 8. Never infer missing structure from prose — reject malformed implementation steps instead of guessing
 9. Never accept standalone `# new_file` blocks, partial-file placeholders, or commit-group tests that depend on later groups
 
+## When to Stop: turn ceiling and declared-file scope
+
+These are additional entry conditions into the stop-and-report path Phase 4 already
+defines for failing tests: **files stay modified but are NOT committed**, the coder
+report records what is done and what remains, and you stop. They never override Hard
+Constraint 7 (one git commit per commit group) or Hard Constraint 4 (never continue to
+the next commit group if tests fail). If you hit one of them mid-group you STOP and
+escalate — you do NOT commit a partial group to satisfy them, and you do NOT start a
+second commit for the same group.
+
+**Turn-duration ceiling — 30 minutes.** If a single uninterrupted turn reaches **30
+minutes** without producing a commit, stop. Never continue silently. Escalate with
+`forge ask` — or send a `BLOCKED` callback if you cannot proceed at all — describing
+what is done and what remains. The 30-minute number is a first calibration, reasoned
+from observed runaways rather than measured across runs; it is tunable, and changing it
+should be a deliberate edit.
+
+**Declared-file scope guard.** Never edit a file outside the declared file list of the
+commit group you are executing. Reading other files for context is allowed and is often
+necessary. Editing outside that list — or concluding that work outside that list is
+required before the group can finish — is an escalation trigger, not something to
+resolve and note: stop and escalate.
+
+**Prefer recorded partial progress over open-ended diagnosis.** When a group is not
+complete, **record** what is done and what remains as known-incomplete in
+`coder-report.md` and stop. Record, do not commit: Hard Constraint 5 already requires
+the report even on failure, and this states the preference for reaching it early rather
+than continuing an unbounded investigation. A completed group whose tests pass still
+commits normally. Concretely: diagnosing test assertions that belong to a *different*
+commit group is out-of-scope work — stop and report the observation instead of pursuing
+it.
+
 ## Required Reads
 
 Before any coding action, read these files in order:
@@ -302,6 +334,16 @@ Do NOT ask for things you can resolve and note: a reasonable default, a naming
 choice, a locally-decidable assumption. Log those in `coder-report.md` under an
 "Assumptions" note and proceed. Ask-worthy = a human must decide before it is
 safe to continue; proceed-and-note = you can continue and the report records it.
+
+**Exceptions to the do-not-ask line.** The two stop conditions in "When to Stop: turn
+ceiling and declared-file scope" — the 30-minute turn-duration ceiling and the
+declared-file scope guard — are explicit exceptions to the paragraph above. They are
+ask-worthy even though they look locally resolvable: a worker that is not making
+progress, or that has concluded it must edit outside its declared file list, escalates
+rather than proceed-and-note. Precedence: both are entry conditions into the
+stop-and-report path and never override Hard Constraint 7 (one git commit per commit
+group) or Hard Constraint 4 (never continue past a failing group); a worker that hits
+the ceiling mid-group stops and escalates, it does not commit to satisfy the ceiling.
 
 ## Error Recovery
 
