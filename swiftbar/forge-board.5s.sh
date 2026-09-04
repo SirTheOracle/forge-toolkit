@@ -14,7 +14,12 @@ FORGE_BIN="${FORGE_BIN:-forge}"
 # (see the SVG header comment). Replaces the word "forge" in the title; the
 # status text (N!, ⚙N, ✓, ⚠) stays beside it.
 ICON="iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAYAAADhAJiYAAAAAXNSR0IArs4c6QAAAGxlWElmTU0AKgAAAAgABAEaAAUAAAABAAAAPgEbAAUAAAABAAAARgEoAAMAAAABAAIAAIdpAAQAAAABAAAATgAAAAAAAACQAAAAAQAAAJAAAAABAAKgAgAEAAAAAQAAACSgAwAEAAAAAQAAACQAAAAAQCQK+gAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAAaxJREFUWAntV7tKBEEQPEVN1MzYw8gPUExUMPBXBCMjYwNjA0ND8RsMTU38AxMFY8MDwXcVO3s0vbc9zzsX2YJmHl1d09PXO3CDQQ+7AnO2O8i7BNaOYz5gfA+KmhJpC7ovsB9nnHPvT8DKyGRkUvTNHPs4sU5Cj3up2cynBrpkMsLLh3buJ+MVt2Gyj7KbunOfvZXQKW6/wjJMASNoXsTqXiNAfz2l1tSOxgEiSiWgdagdDf6cTzAtlrumZmurWO8QD76BlQY1qZ2EDUR9w3KrUsdTi5qtWGj1VI5nDCewNcc7xLjr5hzuYXdizanFeYWfmsVwCaX6thy51gjh6Jjx2uqhMWmWkz4hX7V9Ta3jdUVXQVhXJO5JtL45khQ7HyLgFvYFk00dMmcMY6lRBMtQ4esacrjFoQa1snEEBeugGB+1TOiemETenLSZuOfVCmlqzblCMuewRU9SH/CfwY4FT2sJVzX1EhoR1cYbBlpxhCT0qU7ljeWtldtcaq0GOaSHHhtR6RtFtDr32bMeQxgfN5Y85jMnlzHBD2Pss86ei/0nMnJJYejxDyvwC5DK7O/F7D/AAAAAAElFTkSuQmCC"
+# rc is captured, not discarded: `forge board --json` now exits 75 with a NON-EMPTY busy
+# payload when the watcher's state.lock is held by another run. EMPTY stdout remains the only
+# "watcher absent" signal. (This file deliberately sets no shell options, so the assignment
+# cannot abort on its own — the rc simply has to be taken on the very next line.)
 json="$("$FORGE_BIN" board --json 2>/dev/null)"
+rc=$?
 if [ -z "$json" ]; then
     echo "⚠ | templateImage=$ICON"; echo "---"; echo "board unavailable — is forge-watch installed? | color=red"; exit 0
 fi
@@ -32,6 +37,16 @@ def esc(s):
     # SwiftBar uses '|' to separate text from line metadata — a content pipe corrupts the
     # line. Collapse whitespace too (snippets arrive multi-line).
     return " ".join((s or "").split()).replace("|", "¦")
+
+if b.get("unavailable_reason") == "state_lock_busy":
+    # Transient and HEALTHY: an hourglass, never the red install warning. The old empty-stdout
+    # path rendered "board unavailable — is forge-watch installed?" while the watcher was fine,
+    # which is the false-alarm half of this defect. No `stale` read here: the busy payload
+    # deliberately omits it (heartbeat age is unknowable behind the lock).
+    print(f"⌛ | templateImage={ICON}")
+    print("---")
+    print(f"watcher busy — {esc(b.get('message') or 'state.lock held by another run')} | color=orange")
+    raise SystemExit(0)
 
 def h_age(s):
     # Clamp: clock skew can make quiet_s negative (the watcher computes NOW - last_at and
@@ -65,6 +80,12 @@ tasks = b.get("tasks") or []
 parked = b.get("parked") or []             # additive cc-board/1 key (.get or [])
 ctx   = b.get("context") or []             # additive cc-board/1 key; ALERTING ROWS ONLY
 eps   = b.get("episodes") or []            # absent on an older forge-watch → today's render
+# Orchestrator/seat work (pane 0) reaches the board as an ACTIVE `SESSION-WORKING` row, never
+# as a worker episode — so it was invisible in the title while the seat was plainly working.
+# It gets its OWN segment (▶N). The gear keeps meaning worker episode progress ONLY
+# (final-plan D5, deliberately preserved): SESSION-WORKING never joins `inprog`.
+active = b.get("active") or []
+orch = [r for r in active if r.get("condition") == "SESSION-WORKING" and r.get("state") == "working"]
 # In-progress = worker-pane episodes only, by decision (final-plan D5): SESSION-WORKING
 # (orchestrator pane / operator seat) is deliberately NOT counted — the gear means worker progress.
 inprog = sorted((e for e in eps if e.get("current") and e.get("state") == "in_progress"),
@@ -76,13 +97,15 @@ if unseen:
     parts.append(f"{unseen}!")
 if inprog:
     parts.append(f"⚙{len(inprog)}")
+if orch:
+    parts.append(f"▶{len(orch)}")          # orchestrator/seat work — NOT worker gear
 if parked:
     parts.append(f"⏸{len(parked)}")        # between ⚙N and ✓; never part of `unseen`
 if ctx:
     parts.append(f"◐{len(ctx)}")           # after ⏸N, before ✓; low-context panes
-# ✓ only when unseen, in-progress, parked, AND context are all empty — a context-only board
-# must never render "◐1 ✓".
-if not unseen and not inprog and not parked and not ctx:
+# ✓ only when unseen, in-progress, orchestrator, parked, AND context are all empty — a
+# context-only board must never render "◐1 ✓", and neither must a ▶1 one.
+if not unseen and not inprog and not orch and not parked and not ctx:
     parts.append("✓")
 print(" ".join(parts) + (" ⚠" if stale else "") + f" | templateImage={ICON}")
 print("---")
@@ -106,6 +129,12 @@ for r in hot:
 acked = len(hot) - unseen
 if acked:
     print(f"{acked} seen item(s) hidden — details: forge board | color=gray")
+for r in orch[:3]:
+    who = esc(r.get("session") or r.get("label") or "")
+    msg = esc(r.get("msg") or "working")
+    print(f"▶ {who} · {msg} | color=blue")
+if len(orch) > 3:
+    print(f"+{len(orch)-3} more orchestrator session(s) working | color=gray")
 for r in parked[:3]:
     slug = esc(r.get("slug") or "")
     stage = esc(r.get("stage") or "")
