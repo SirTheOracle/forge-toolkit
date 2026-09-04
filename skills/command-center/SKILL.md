@@ -19,6 +19,10 @@ memory: every fact comes from a fresh `forge board`.
 
 ```
 forge board --json   # machine-readable cc-board/1 JSON: hot / active / maintenance
+                     # exit 75 + {"busy":true,"unavailable_reason":"state_lock_busy"}
+                     #   = the watcher is momentarily locked by another run. Healthy and
+                     #   transient: retry shortly, never report it as a dead watcher.
+                     # EMPTY stdout is the only "watcher absent" signal.
 forge board          # human board (NEEDS YOU / SESSIONS / hidden maintenance)
 forge board --all    # human board with maintenance residue expanded
 forge tasks          # read-only per-TASK view — every pane's tasks (dispatched or typed)

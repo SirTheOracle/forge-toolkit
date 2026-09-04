@@ -22,7 +22,10 @@
 #                 repo's common-dir info/exclude. Fail-closed: no --force here;
 #                 --force remains a register/spawn-only override.
 #   forge board [--all]             human board (--all lists maintenance residue)
-#   forge board --json              machine cc-board/1 JSON
+#   forge board --json              machine cc-board/1 JSON. Exit 75 + a NON-EMPTY payload
+#                                   carrying busy/unavailable_reason=state_lock_busy means the
+#                                   watcher is momentarily locked by another run (healthy,
+#                                   retry). Empty stdout = watcher absent.
 #   forge status [--board]          alias for board (--board = the JSON)
 #   forge gc [--root PATH] [--days N]
 #   forge gc --install | --uninstall    daily launchd backstop (com.forge.gc)
@@ -2937,9 +2940,17 @@ cmd_parked() {
 
     # Board JSON rides in an env var — a heredoc owns python's stdin (see
     # swiftbar/forge-board.5s.sh:21), so a `… | python3 - <<PY` pipe is discarded.
-    local _board; _board="$("$FORGE_WATCH_BIN" status --board 2>/dev/null)"
+    # rc-preserving capture: `status --board` now exits 75 with a NON-EMPTY busy payload when
+    # state.lock is held (cc-board/1 `unavailable_reason: state_lock_busy`). `local x="$(...)"`
+    # would mask that rc from `set -e`; a bare assignment would abort the function outright.
+    # Split the declaration from the assignment and take the rc explicitly.
+    local _board _board_rc
+    set +e
+    _board="$("$FORGE_WATCH_BIN" status --board 2>/dev/null)"
+    _board_rc=$?
+    set -e
     FORGE_PK_ROOT="$root_filter" FORGE_PK_SESSION="$session_filter" FORGE_PK_JSON="$jsonout" \
-    FORGE_PK_BOARD="$_board" python3 - <<'PY'
+    FORGE_PK_BOARD="$_board" FORGE_PK_BOARD_RC="$_board_rc" python3 - <<'PY'
 import os, json, sys
 try:
     b = json.loads(os.environ.get("FORGE_PK_BOARD") or "")
@@ -2948,6 +2959,16 @@ except Exception:
 root = os.environ.get("FORGE_PK_ROOT") or ""
 sess = os.environ.get("FORGE_PK_SESSION") or ""
 jsonout = os.environ.get("FORGE_PK_JSON") == "1"
+board_rc = os.environ.get("FORGE_PK_BOARD_RC") or "0"
+# Watcher BUSY is not watcher ABSENT. Empty or unparsable stdout keeps the existing
+# "board unavailable" path above; transient state.lock contention gets its own exit code and a
+# diagnostic. Reporting "no parked items in scope" here would be a false negative from a
+# perfectly healthy system — exactly the defect class this contract exists to close.
+if b.get("unavailable_reason") == "state_lock_busy":
+    if jsonout:
+        print("[]")
+    print(f"forge parked: watcher busy; retry shortly (board rc={board_rc})", file=sys.stderr)
+    sys.exit(75)
 rows = b.get("parked") or []
 def keep(r):
     if root and os.path.realpath(r.get("root") or "") != os.path.realpath(root):

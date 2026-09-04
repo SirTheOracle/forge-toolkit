@@ -31,6 +31,8 @@
 #   FORGE_WATCH_NOTIFY_COMPLETE       default 1  (notify on pipeline completion)
 #   FORGE_WATCH_NOTIFY_STALE_ZOMBIE   default 0  (notify on old zombie contexts)
 #   FORGE_WATCH_EPISODE_SETTLE_S      default 600 (pane quiet this long → episode settles)
+#   FORGE_WATCH_PANE_CAPTURE_BUDGET_S default 3   (aggregate wall-clock budget for the pane
+#                                                  output-liveness snapshot pass; 0 disables)
 #   FORGE_WATCH_NOTIFY_EPISODE_DONE   default 0  (ring once per episode, at settle)
 #   FORGE_WATCH_ROOTS_FILE            path to a roots list (default ~/.config/forge/watch-roots)
 #   FORGE_WATCH_CHECK_TIMEOUT_S       default 90 (check-mode engine watchdog, seconds; 0 disables)
@@ -121,7 +123,7 @@ fw_notify() {
 run_engine() {
     FORGE_BROKER_BIN="${FORGE_BROKER_BIN:-$(dirname "$SELF")/forge-broker}" \
     python3 - "$1" "$2" "${3:-}" <<'PYEOF'
-import sys, os, re, glob, json, time, fcntl, datetime, subprocess
+import sys, os, re, glob, hashlib, json, time, fcntl, datetime, subprocess
 
 MODE       = sys.argv[1]
 NOTIFY_OUT = sys.argv[2]
@@ -155,6 +157,7 @@ ALLOWED_KEYS = {
     'FORGE_WATCH_NOTIFY_STALE_ZOMBIE', 'FORGE_WATCH_ROOTS_FILE',
     'FORGE_WATCH_NOTIFY_REPLY', 'FORGE_WATCH_NOTIFY_DONE',
     'FORGE_WATCH_EPISODE_SETTLE_S', 'FORGE_WATCH_NOTIFY_EPISODE_DONE',
+    'FORGE_WATCH_PANE_CAPTURE_BUDGET_S',
     'FORGE_WATCH_TASK_WINDOW_S',
     'FORGE_WATCH_TASK_STUCK_S', 'FORGE_WATCH_CHECK_TIMEOUT_S',
     'FORGE_WATCH_QUIET_UNCHANGED', 'FORGE_TERMINALIZE_PENDING_S',
@@ -252,6 +255,11 @@ STALE_TICK_S     = 3 * 30    # board/ambient freshness: ~3x the 30s launchd inte
 # quiet time is inside this band; longer-settled history renders rows but never rings. Do not
 # over-widen — the band IS the cold-start blast-radius bound.
 EPISODE_RING_FRESH_S = EPISODE_SETTLE_S + max(270, 3 * STALE_TICK_S)
+# Pane-output liveness (D6). The snapshot pass runs while holding state.lock in board mode,
+# so it is bounded TWICE: a short per-pane timeout and this aggregate wall-clock budget.
+# Unbounded, ~15 stalled panes x one timeout each would MANUFACTURE the lock contention that
+# cause 1 exists to make legible — on the 5s SwiftBar poll path. 0 disables capture entirely.
+PANE_CAPTURE_BUDGET_S = cfg_int('FORGE_WATCH_PANE_CAPTURE_BUDGET_S', 3)
 
 # ── check-mode watchdog ──────────────────────────────────────────────────
 # A hung check holds state.lock while every 30s tick skips silently; one ~110s
@@ -323,6 +331,26 @@ except OSError:
     except OSError:
         pass
     sys.stderr.write(f"forge-watch: {MODE} skipped — state.lock held by another run{held}\n")
+    if BOARD:
+        # cc-board/1 machine consumers must be able to tell "watcher BUSY" from "watcher
+        # ABSENT". Empty stdout + rc 0 rendered as a red "board unavailable — is forge-watch
+        # installed?" on the menubar while the watcher was perfectly healthy (#51 cause 1).
+        # `stale` is deliberately ABSENT, not False: it means "the HEARTBEAT is old" and drives
+        # an install warning, and it lives in state.json behind the lock we just failed to take
+        # — asserting either value would be a guess dressed as a contract field. Consumers read
+        # it with .get() and degrade. Contention is transient and healthy: no operator action.
+        json.dump({
+            "schema": "cc-board/1",
+            "generated_at": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "busy": True,
+            "unavailable_reason": "state_lock_busy",
+            "message": f"state.lock held by another run{held}",
+            "hot": [], "active": [], "parked": [],
+            "maintenance": {"collapsed": True, "count": 0, "rows": []},
+            "tasks": [], "episodes": [], "context": [],
+        }, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        sys.exit(75)
     sys.exit(0)
 # We hold the lock: stamp our start time so a skipped run can report how long.
 _lock_fh.seek(0)
@@ -331,8 +359,11 @@ _lock_fh.write(NOW.isoformat())
 _lock_fh.flush()
 
 def load_state():
+    # pane_snapshots / pane_output_activity are CACHE keys (D2): a missing or corrupt state
+    # simply loses one scan of output-churn evidence and degrades to hook-derived behavior.
+    _EMPTY = {'event_offsets': {}, 'conditions': {}, 'pane_snapshots': {}, 'pane_output_activity': {}}
     if not os.path.exists(STATE_FILE):
-        return {'event_offsets': {}, 'conditions': {}}
+        return dict(_EMPTY)
     try:
         with open(STATE_FILE) as f:
             data = json.load(f)
@@ -340,6 +371,8 @@ def load_state():
             raise ValueError('state root not an object')
         data.setdefault('event_offsets', {})
         data.setdefault('conditions', {})
+        data.setdefault('pane_snapshots', {})
+        data.setdefault('pane_output_activity', {})
         return data
     except (ValueError, OSError):
         # Preserve the bad file; continue with empty advisory state.
@@ -349,7 +382,7 @@ def load_state():
             config_warnings.append(f"corrupt state preserved as {os.path.basename(bad)}")
         except OSError:
             pass
-        return {'event_offsets': {}, 'conditions': {}}
+        return dict(_EMPTY)
 
 def save_state(state):
     tmp = STATE_FILE + '.tmp.' + str(os.getpid())
@@ -394,6 +427,63 @@ def tmux_sessions():
     return m
 
 SESSIONS = tmux_sessions()
+
+def tmux_pane_snapshots():
+    """Map (session_name, pane_index) -> sha256 of the pane's recent output.
+
+    CHURN between two scans is the only non-hook liveness evidence available here; a pane that
+    merely EXISTS proves nothing (D3). Bounded by a per-pane timeout AND the aggregate
+    PANE_CAPTURE_BUDGET_S (D6) — over budget returns PARTIAL evidence, never a blocked board.
+    Read-only, like the rest of this watcher: no input is sent to any pane and nothing is
+    written under a project .dev/.
+
+    Test seam: FORGE_WATCH_TMUX_PANES names a file of 'session<TAB>pane<TAB>snapshot' lines
+    used instead of shelling out to tmux."""
+    inject = os.environ.get('FORGE_WATCH_TMUX_PANES')
+    if inject is not None:
+        m = {}
+        try:
+            with open(inject) as f:
+                for line in f:
+                    parts = line.rstrip('\n').split('\t')
+                    if len(parts) < 3:
+                        continue                  # malformed row: ignored, never fatal
+                    m[(parts[0], parts[1])] = hashlib.sha256(
+                        '\t'.join(parts[2:]).encode('utf-8', 'replace')).hexdigest()
+        except OSError:
+            pass
+        return m
+    if PANE_CAPTURE_BUDGET_S <= 0:
+        return {}
+    deadline = time.monotonic() + PANE_CAPTURE_BUDGET_S
+    try:
+        out = subprocess.run(
+            ['tmux', 'list-panes', '-a', '-F', '#{session_name}\t#{pane_index}'],
+            capture_output=True, text=True, timeout=min(2, PANE_CAPTURE_BUDGET_S))
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if out.returncode != 0:
+        return {}
+    m = {}
+    for line in out.stdout.splitlines():
+        if '\t' not in line:
+            continue
+        sess, pane = line.split('\t', 1)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break                                 # over budget → partial evidence, by design
+        try:
+            cap = subprocess.run(
+                ['tmux', 'capture-pane', '-pt', f'{sess}:0.{pane}', '-S', '-200'],
+                capture_output=True, text=True, timeout=max(0.2, min(2.0, left)))
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if cap.returncode != 0:
+            continue
+        m[(sess, pane)] = hashlib.sha256(cap.stdout.encode('utf-8', 'replace')).hexdigest()
+    return m
+
+PANE_SNAPSHOTS = tmux_pane_snapshots()
 
 def discover_roots():
     roots = set(SESSIONS.values())
@@ -1531,6 +1621,29 @@ def perm_detail(pr):
     cmd = (pr.get('command') or '').strip()
     return f"permission needed: {tool}" + (f" ({cmd[:60]})" if cmd else "")
 
+# Pane-output liveness keys (D2/D3). realpath() on the root so a roots-file entry and a tmux
+# session_path for the same project agree; str() on pane so the worker's string pane_index and
+# a dispatched row's int agree, exactly as current_episodes() already normalizes them.
+def pane_snapshot_key(root, sess, pane):
+    return "\t".join([os.path.realpath(root or ""), str(sess or ""), str(pane or "")])
+
+def episode_activity_key(root, sess, pane, episode_id):
+    return pane_snapshot_key(root, sess, pane) + "\t" + str(episode_id or "")
+
+def pane_output_digest(sess, pane):
+    return PANE_SNAPSHOTS.get((str(sess or ""), str(pane or "")))
+
+# Read the persisted halves through module-level accessors: scan_attention() binds a LOCAL
+# `state` further down (the per-task queued/accepted/answered state), so a bare `state.get(...)`
+# inside that function is an UnboundLocalError, not a read of the watcher's cache.
+def pane_snapshot_baseline(root, sess, pane):
+    return (state.get('pane_snapshots') or {}).get(pane_snapshot_key(root, sess, pane))
+
+def pane_activity_record(root, sess, pane, episode_id):
+    return (state.get('pane_output_activity') or {}).get(
+        episode_activity_key(root, sess, pane, episode_id)) or {}
+
+
 def scan_attention(root, label):
     """Read <root>/.dev/attention/*.json (written by bin/forge + forge-cc-hook)
     and add findings. READ-ONLY — never writes or deletes. The live queued/
@@ -1802,8 +1915,23 @@ def scan_attention(root, label):
             # transition (settle) there is always >=1 wstop, so the id is stable through
             # settle. Do NOT "fix" this by adding persistence.
             quiet = (NOW - last).total_seconds()
-            ep_state = 'in_progress' if (cur and (mid or quiet < EPISODE_SETTLE_S)) else 'settled'
             ep_id = f"{sess}|p{pane}|{ep_start.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+            # Output-churn liveness (D2/D3). Hook silence alone must not settle a pane that is
+            # still producing output. Two independent witnesses, both scoped to the CURRENT
+            # episode: a digest that differs from the previous scan's baseline, and a
+            # same-episode churn observation persisted by an earlier `check` — SwiftBar polls
+            # `status --board` in a SEPARATE process, and without the persisted half the check
+            # that saw the churn would have already consumed it. Pane EXISTENCE proves nothing:
+            # `output_changed` needs a prior digest, so an unchanged pane still settles.
+            cur_digest  = pane_output_digest(sess, pane)
+            prev_digest = pane_snapshot_baseline(root, sess, pane)
+            output_changed = bool(cur and cur_digest and prev_digest and cur_digest != prev_digest)
+            activity = pane_activity_record(root, sess, pane, ep_id)
+            activity_age = age_s(activity.get('last_output_at'))
+            activity_recent = bool(cur and activity_age is not None and activity_age < EPISODE_SETTLE_S)
+            output_active = bool(output_changed or activity_recent)
+            ep_state = ('in_progress' if (cur and (mid or output_active or quiet < EPISODE_SETTLE_S))
+                        else 'settled')
             # swiftbar-stage-visibility: tag the CURRENT episode with its pipeline stage.
             # Settled runs are history — their stage may well be a different one, and a
             # confident wrong tag on old work is the failure mode to avoid. Candidates are
@@ -1830,6 +1958,10 @@ def scan_attention(root, label):
                 'first_at': ep_start.strftime('%Y-%m-%dT%H:%M:%SZ'),
                 'last_at': last.strftime('%Y-%m-%dT%H:%M:%SZ'),
                 'quiet_s': int(quiet), 'earlier': cur and len(runs) > 1,  # stateless reopen hint
+                # ADDITIVE cc-board/1 episode keys — older consumers degrade via .get().
+                'output_changed': bool(output_changed),
+                'output_active': bool(output_active),
+                'output_activity_at': activity.get('last_output_at') if activity_recent else None,
                 'last_snippet': snip})
             for _, w in run:
                 ws_ep[id(w)] = ep_id
@@ -2261,6 +2393,35 @@ if MODE == 'check':
     # module-level NOW: a slow run must not stamp a heartbeat that is already
     # stale at birth (the 115s-stale incident double-counted its own hang).
     state['last_tick'] = datetime.datetime.now(UTC).isoformat()
+    # D2 — durable output-churn liveness. `check` (launchd, 30s) and SwiftBar's
+    # `status --board` (5s) are SEPARATE processes. If check observed the churn and simply
+    # advanced the baseline, the next status would compare current-against-current and settle a
+    # still-working episode from hook silence alone — the exact false-idle this closes. So:
+    # record the observation against the CURRENT episode id FIRST, advance the baseline LAST.
+    act = state.setdefault('pane_output_activity', {})
+    for ep in EPISODES:
+        if not (ep.get('current') and ep.get('output_changed')):
+            continue
+        act[episode_activity_key(ep.get('root'), ep.get('session'), ep.get('pane'),
+                                 ep.get('episode_id'))] = {
+            'episode_id': ep.get('episode_id'),
+            'digest': pane_output_digest(ep.get('session'), ep.get('pane')),
+            'last_output_at': NOW.strftime('%Y-%m-%dT%H:%M:%SZ')}
+    # Prune to CURRENT episodes younger than SETTLE. An unpruned key would hold a finished
+    # episode "active" forever — the false-POSITIVE half of the same defect.
+    live_ids = {e.get('episode_id') for e in EPISODES if e.get('current')}
+    for _k in list(act.keys()):
+        _e = act.get(_k) or {}
+        _age = age_s(_e.get('last_output_at'))
+        if _e.get('episode_id') not in live_ids or _age is None or _age >= EPISODE_SETTLE_S:
+            del act[_k]
+    _snap = {}
+    for (_sess, _pane), _dg in PANE_SNAPSHOTS.items():
+        _r = SESSIONS.get(_sess)
+        if _r is None:
+            continue                    # a pane whose session is not a discovered root
+        _snap[pane_snapshot_key(_r, _sess, _pane)] = _dg
+    state['pane_snapshots'] = _snap
     save_state(state)
 
 # ── output ───────────────────────────────────────────────────────────────
@@ -2907,7 +3068,8 @@ Usage:
   forge-watch check       one scan; print findings and deliver notifications
   forge-watch status      one scan; print raw findings only (no notifications)
   forge-watch status --pretty [--all]   human board (--all lists maintenance)
-  forge-watch status --board            machine JSON (cc-board/1)
+  forge-watch status --board            machine JSON (cc-board/1); exit 75 + a busy payload
+                                        when state.lock is held by another run
   forge-watch ack <t>     silence current conditions for <t> (session|slug|dir)
   forge-watch install     write+load the launchd agent (30s interval)
   forge-watch uninstall   unload+remove the launchd agent

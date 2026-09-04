@@ -1035,6 +1035,35 @@ FORGE_BRIDGE_BIN="$D/forge-bridge" "$ROOT/bin/forge" parked --resolve p coding -
 grep -q 'park --resolve --slug p --stage coding --note a b c' "$D/called" && ok "P-1 --resolve proxies bridge (note one argv)" || bad "P-1 resolve proxy wrong: $(cat "$D/called")"
 rm -rf "$D"
 
+# ── P-BUSY: the board contract's BUSY response (D5 / shared-consumer migration) ──
+# `status --board` now answers state.lock contention with NON-EMPTY cc-board/1 JSON and exit 75.
+# `forge parked` is a production consumer of that same interface: before this it would have
+# parsed the busy payload, found no `parked` rows, and printed "no parked items in scope" — a
+# false negative from a perfectly healthy system, which is the defect class #51 is about.
+watch_stub_busy() {
+  local d; d="$(mktemp -d)"
+  cat > "$d/forge-watch" <<'SHBUSY'
+#!/bin/sh
+[ "$1" = status ] && cat <<'JSONBUSY'
+{"schema":"cc-board/1","generated_at":"2026-01-01T00:00:00Z","busy":true,"unavailable_reason":"state_lock_busy","message":"state.lock held by another run for ~2s","hot":[],"active":[],"parked":[],"maintenance":{"collapsed":true,"count":0,"rows":[]},"tasks":[],"episodes":[],"context":[]}
+JSONBUSY
+exit 75
+SHBUSY
+  chmod +x "$d/forge-watch"; echo "$d"
+}
+D=$(watch_stub_busy)
+out=$( FORGE_WATCH_BIN="$D/forge-watch" TMUX_SESSION=forge-1 "$ROOT/bin/forge" parked --root "$PWD" --session forge-1 2>&1 ); rc=$?
+{ [ "$rc" -eq 75 ] && echo "$out" | grep -q 'watcher busy' \
+  && ! echo "$out" | grep -q 'board unavailable' && ! echo "$out" | grep -q 'no parked items'; } \
+  && ok "P-BUSY human parked exits 75 with 'watcher busy', never a false 'no parked items'" \
+  || bad "P-BUSY human wrong: rc=$rc $out"
+jout=$( FORGE_WATCH_BIN="$D/forge-watch" TMUX_SESSION=forge-1 "$ROOT/bin/forge" parked --root "$PWD" --session forge-1 --json 2>/dev/null ); rc=$?
+jerr=$( FORGE_WATCH_BIN="$D/forge-watch" TMUX_SESSION=forge-1 "$ROOT/bin/forge" parked --root "$PWD" --session forge-1 --json 2>&1 >/dev/null )
+{ [ "$rc" -eq 75 ] && [ "$jout" = "[]" ] && echo "$jerr" | grep -q 'watcher busy'; } \
+  && ok "P-BUSY --json parked exits 75 with stdout '[]' and 'watcher busy' on stderr" \
+  || bad "P-BUSY json wrong: rc=$rc out=[$jout] err=[$jerr]"
+rm -rf "$D"
+
 echo "── T-HYG-LOCKSTEP: bridge-owned hygiene prose in lockstep + emit whitelist ──"
 BRIDGE_BIN="$ROOT/bin/forge-bridge"
 # The original loop grepped ONE literal for every $et, so it passed six times for one match.

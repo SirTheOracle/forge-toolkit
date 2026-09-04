@@ -37,8 +37,14 @@ new_env() {
     mkdir -p "$FORGE_WATCH_CACHE_DIR" "$FORGE_WATCH_CONFIG_DIR"
     ROOTS_DIR="$TDIR/projects"; mkdir -p "$ROOTS_DIR"
     : > "$TDIR/tmux.tsv"
+    : > "$TDIR/panes.tsv"
     : > "$FORGE_WATCH_CONFIG_DIR/watch-roots"
     export FORGE_WATCH_TMUX_LIST="$TDIR/tmux.tsv"
+    # Pane-output snapshots ride the same injection discipline as the session list: an EMPTY
+    # per-env file, never unset. Unset would send every assertion in this suite down the real
+    # `tmux capture-pane` path and read the developer's live panes.
+    export FORGE_WATCH_TMUX_PANES="$TDIR/panes.tsv"
+    unset FORGE_WATCH_PANE_CAPTURE_BUDGET_S 2>/dev/null || true
     CAP="$TDIR/notify.cap"; : > "$CAP"
     export FORGE_WATCH_SINK_CAPTURE="$CAP"
     # Deterministic thresholds: stall 600 (stale=1200s=20m), dwell 300, zombie 7d.
@@ -61,6 +67,15 @@ mk_root() {  # mk_root <name>  -> echoes path; registers in watch-roots
 }
 
 live_session() { printf '%s\t%s\n' "$1" "$2" >> "$FORGE_WATCH_TMUX_LIST"; }
+
+# panes <session> <pane> <text> [<session> <pane> <text> ...] — REPLACES the injected pane
+# snapshot set. The watcher digests <text>; churn between two scans is the liveness evidence.
+panes() {
+    : > "$FORGE_WATCH_TMUX_PANES"
+    while [ "$#" -ge 3 ]; do
+        printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$FORGE_WATCH_TMUX_PANES"; shift 3
+    done
+}
 
 ctx() {  # ctx <root> <session> <<yaml
     local f="$1/.dev/forge-context.$2.yml"; cat > "$f"
@@ -823,7 +838,7 @@ python3 - "$FORGE_WATCH_CACHE_DIR/state.lock" <<'PYLOCK' &
 import sys, fcntl, time
 fh = open(sys.argv[1], 'w')
 fcntl.flock(fh, fcntl.LOCK_EX)
-time.sleep(2.5)
+time.sleep(5)
 PYLOCK
 LOCKPID=$!
 sleep 0.4
@@ -833,6 +848,32 @@ if "$WATCH" check >/dev/null 2>&1 && [ "$(wc -l < "$CAP")" -eq 0 ]; then
 else
     bad "lock contention not handled cleanly"
 fi
+# BOARD mode under the SAME held lock. Empty stdout + rc 0 is what made the menubar say
+# "board unavailable - is forge-watch installed?" about a perfectly healthy watcher (#51
+# cause 1): machine consumers could not tell BUSY from ABSENT. Now: non-empty cc-board/1
+# with busy/state_lock_busy, and a nonzero rc so the distinction survives to the renderer.
+"$WATCH" status --board > "$TDIR/lock-board.json" 2>"$TDIR/lock-board.err"; lkrc=$?
+{ [ "$lkrc" -ne 0 ] && [ -s "$TDIR/lock-board.json" ]; } \
+  && ok "board mode under a held lock exits nonzero with NON-EMPTY stdout" \
+  || bad "board lock contention: rc=$lkrc bytes=$(wc -c < "$TDIR/lock-board.json")"
+python3 - "$TDIR/lock-board.json" <<'PYBUSY' && ok "busy payload is valid cc-board/1 (busy/state_lock_busy, standard arrays, no stale conflation)" || bad "busy payload wrong"
+import json, sys
+b = json.load(open(sys.argv[1]))
+assert b["schema"] == "cc-board/1", b
+assert b["busy"] is True and b["unavailable_reason"] == "state_lock_busy", b
+assert b.get("message"), b
+for k in ("hot", "active", "parked", "tasks", "episodes", "context"):
+    assert b[k] == [], (k, b[k])
+assert b["maintenance"] == {"collapsed": True, "count": 0, "rows": []}, b
+# `stale` means the watcher HEARTBEAT is old and drives an install warning. Lock contention is
+# transient and healthy. Asserting stale here would reintroduce the false alarm one layer down,
+# for every consumer of the shared contract - not just the plugin that short-circuits on
+# unavailable_reason. Pin it so a later edit cannot quietly restore the conflation.
+assert b.get("stale") is not True, b
+PYBUSY
+grep -q "state.lock held by another run" "$TDIR/lock-board.err" \
+  && ok "board contention keeps the stderr trace (silent skips hid a real stall once)" \
+  || bad "board contention lost its stderr trace"
 wait "$LOCKPID" 2>/dev/null || true
 # lock released -> now it fires
 : > "$CAP"; run_check >/dev/null
@@ -1510,6 +1551,89 @@ assert_status_has "p1 — done · 1 turn(s)" "quiet ≥ settle → done"
 assert_status_missing "in progress" "no active row after settle"
 run_status --board | python3 -c 'import json,sys;e=json.load(sys.stdin)["episodes"];assert e[0]["state"]=="settled", e' && ok "episode settled in episodes[]" || bad "state not settled"
 
+echo "── episodes 4b: check-observed pane output survives into a LATER status --board ──"     # +1
+# The load-bearing ordering. `check` (launchd, 30s) and SwiftBar's `status --board` (5s) are
+# SEPARATE processes. If check saw the pane churn and only advanced the digest baseline, the
+# next status would compare current-against-current and settle a still-working episode from
+# hook silence alone - the false idle #51 is about.
+new_env tep4b
+R=$(mk_root proj); live_session forge-1 "$R"
+panes forge-1 1 "screen v1"
+wstopf "$R" forge-1 1 150 tD            # quiet 150 >= SETTLE 120: hooks alone say "settled"
+run_check >/dev/null                    # baseline digest recorded
+panes forge-1 1 "screen v2"             # the pane produced output
+run_check >/dev/null                    # check CONSUMES the churn and advances the baseline
+run_status --board > "$TDIR/d2.json"    # ...and the renderer polls in a separate later process
+python3 - "$TDIR/d2.json" <<'PYD2' && ok "check-observed churn keeps a hook-silent episode in progress for a later status" || bad "durable output activity lost between check and status"
+import json, sys
+e = [x for x in json.load(open(sys.argv[1]))["episodes"] if x["current"]][0]
+assert e["quiet_s"] >= 120, e                 # hooks alone would settle it
+assert e["output_changed"] is False, e        # the baseline was already advanced by `check`
+assert e["output_active"] is True, e          # ...the persisted same-episode record stands
+assert e["output_activity_at"], e
+assert e["state"] == "in_progress", e
+PYD2
+
+echo "── episodes 4c: output activity older than SETTLE stops holding the episode open ──"   # +1
+# Same env, same episode: re-age the persisted observation past SETTLE without waiting for
+# wall-clock. `status` is a pure read and never prunes, so this exercises the AGE gate alone.
+python3 - "$FORGE_WATCH_CACHE_DIR/state.json" "$(iso_ago 5000)" <<'PYAGE'
+import json, sys
+p = sys.argv[1]; st = json.load(open(p))
+for v in (st.get("pane_output_activity") or {}).values():
+    v["last_output_at"] = sys.argv[2]
+json.dump(st, open(p, "w"))
+PYAGE
+run_status --board > "$TDIR/d2b.json"
+python3 - "$TDIR/d2b.json" <<'PYD2B' && ok "expired output activity no longer keeps the episode active" || bad "stale output activity held the episode open"
+import json, sys
+e = [x for x in json.load(open(sys.argv[1]))["episodes"] if x["current"]][0]
+assert e["output_active"] is False and e["output_activity_at"] is None, e
+assert e["state"] == "settled", e
+PYD2B
+
+echo "── episodes 4d: an UNCHANGED pane still settles (existence is not liveness) ──"        # +1
+new_env tep4d
+R=$(mk_root proj); live_session forge-1 "$R"
+panes forge-1 1 "screen v1"
+wstopf "$R" forge-1 1 150 tE
+run_check >/dev/null; run_check >/dev/null    # baseline recorded; nothing changed since
+run_status --board > "$TDIR/d3.json"
+python3 - "$TDIR/d3.json" <<'PYD3' && ok "a live-but-quiet pane with no output churn still settles" || bad "pane existence alone kept the episode active"
+import json, sys
+e = [x for x in json.load(open(sys.argv[1]))["episodes"] if x["current"]][0]
+assert e["output_changed"] is False and e["output_active"] is False, e
+assert e["output_activity_at"] is None, e
+assert e["state"] == "settled", e
+PYD3
+
+echo "── episodes 4e: the pane-capture pass is bounded by an aggregate budget ──"            # +2
+# The snapshot pass runs while HOLDING state.lock in board mode. Unbounded, one timeout per
+# stalled pane would manufacture the very lock contention cause 1 exists to make legible - on
+# the 5s poll path. Real tmux path here (seam unset), against a stub whose captures never return.
+new_env tep4e
+R=$(mk_root proj); live_session forge-1 "$R"
+wstopf "$R" forge-1 1 30 tB
+STUBD="$TDIR/stub-tmux"; mkdir -p "$STUBD"
+cat > "$STUBD/tmux" <<'SHTMUX'
+#!/bin/bash
+case "$1" in
+  list-panes)   for i in 0 1 2 3 4 5 6 7 8 9; do printf 'forge-1\t%s\n' "$i"; done ;;
+  capture-pane) sleep 5; printf 'never\n' ;;
+  *)            exit 1 ;;
+esac
+SHTMUX
+chmod +x "$STUBD/tmux"
+t0=$(python3 -c 'import time; print(time.time())')
+bout=$(env -u FORGE_WATCH_TMUX_PANES FORGE_WATCH_PANE_CAPTURE_BUDGET_S=1 PATH="$STUBD:$PATH" \
+       "$WATCH" status --board 2>/dev/null)
+bel=$(python3 -c 'import sys, time; print(round(time.time() - float(sys.argv[1]), 1))' "$t0")
+python3 -c 'import json,sys; b=json.load(sys.stdin); assert b["schema"]=="cc-board/1" and len(b["episodes"])==1, b' <<<"$bout" \
+  && ok "4e stalled pane captures still produce a valid board (degrade, never block)" || bad "4e board invalid under stalled captures"
+python3 -c 'import sys; assert float(sys.argv[1]) < 6, sys.argv[1]' "$bel" \
+  && ok "4e aggregate budget bounds the board poll (${bel}s for 10 stalled panes, unbounded would be ~20s)" \
+  || bad "4e capture pass blew the aggregate budget: ${bel}s"
+
 echo "── episodes 5: reopen → two episodes, historical tagging, one condition ──"       # +2
 new_env tep5
 R=$(mk_root proj); live_session forge-1 "$R"
@@ -2002,13 +2126,19 @@ echo "$since" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}
   && ok "T-FW-STAGE-8 unquoted YAML timestamp coerced to canonical ...Z" \
   || bad "T-FW-STAGE-8 stage_since not canonical: $since"
 
-echo "── SwiftBar plugin: in-progress episodes SB1-SB16 (hermetic) ──"                     # +21
+echo "── SwiftBar plugin: in-progress episodes SB1-SB19 (hermetic) ──"                     # +25
 new_env tsb2
 PLUGIN="$(cd "$(dirname "$WATCH")/.." && pwd)/swiftbar/forge-board.5s.sh"
 if [ -f "$PLUGIN" ]; then
   sbrun() {  # sbrun <json> — run the plugin against a stub forge emitting <json>
     local f="$WORK/sbstub"
     printf '#!/bin/bash\ncat "$0.json"\n' > "$f"; chmod +x "$f"
+    printf '%s' "$1" > "$f.json"
+    FORGE_BIN="$f" bash "$PLUGIN"
+  }
+  sbrun_rc() {  # sbrun_rc <json> <rc> — stub forge emitting <json> and exiting <rc>
+    local f="$WORK/sbstubrc"
+    printf '#!/bin/bash\ncat "$0.json"\nexit %s\n' "$2" > "$f"; chmod +x "$f"
     printf '%s' "$1" > "$f.json"
     FORGE_BIN="$f" bash "$PLUGIN"
   }
@@ -2088,10 +2218,31 @@ print(json.dumps(eps))')
   line=$(echo "$out" | grep "color=red")
   { echo "$line" | grep -q "forge¦1" && [ "$(printf '%s' "$line" | tr -cd '|' | wc -c | tr -d ' ')" -eq 1 ]; } && ok "SB11: hot row pipe → ¦, one separator" || bad "SB11 row: $line"
 
-  # SB12 — SESSION-WORKING alone does NOT light the gear (final-plan D5, deliberate)
-  out=$(sbrun "{\"schema\":\"cc-board/1\",\"hot\":[],\"active\":[{\"condition\":\"SESSION-WORKING\",\"state\":\"working\",\"session\":\"forge-1\"}],\"maintenance\":{\"collapsed\":true,\"count\":0,\"rows\":[]},\"tasks\":[],\"stale\":false,\"episodes\":[]}")
+  # SB12 — orchestrator/seat work is VISIBLE as ▶N, and still does NOT light the worker gear.
+  # Both halves matter: pane-0 work used to render as an idle ✓ (#51 cause 3), but ⚙ must keep
+  # meaning worker episode progress only (final-plan D5).
+  out=$(sbrun "{\"schema\":\"cc-board/1\",\"hot\":[],\"active\":[{\"condition\":\"SESSION-WORKING\",\"state\":\"working\",\"session\":\"forge-1\",\"msg\":\"demo · forge-1 — working\"}],\"maintenance\":{\"collapsed\":true,\"count\":0,\"rows\":[]},\"tasks\":[],\"stale\":false,\"episodes\":[]}")
   t12=$(echo "$out" | head -1)
-  { [ "${t12%% |*}" = "✓" ] && ! echo "$out" | grep -q "⚙"; } && ok "SB12: SESSION-WORKING-only → no gear (pinned exclusion)" || bad "SB12 title: $t12"
+  { [ "${t12%% |*}" = "▶1" ] && ! echo "$out" | grep -q "⚙"; } && ok "SB12: SESSION-WORKING → exact '▶1', never the worker gear, never ✓" || bad "SB12 title: $t12"
+  echo "$out" | grep -q "^▶ forge-1 · " && ok "SB12: orchestrator dropdown row renders" || bad "SB12 dropdown: $out"
+
+  # SB17 — the two segments coexist and stay distinct
+  out=$(sbrun "{\"schema\":\"cc-board/1\",\"hot\":[],\"active\":[{\"condition\":\"SESSION-WORKING\",\"state\":\"working\",\"session\":\"forge-0\"}],\"maintenance\":{\"collapsed\":true,\"count\":0,\"rows\":[]},\"tasks\":[],\"stale\":false,\"episodes\":[$EP1]}")
+  t17=$(echo "$out" | head -1)
+  [ "${t17%% |*}" = "⚙1 ▶1" ] && ok "SB17: '⚙1 ▶1' — one worker episode, one orchestrator session" || bad "SB17 title: $t17"
+
+  # SB18 — the rc-75 busy payload renders as transient, never as an install alarm
+  BUSY='{"schema":"cc-board/1","generated_at":"2026-01-01T00:00:00Z","busy":true,"unavailable_reason":"state_lock_busy","message":"state.lock held by another run for ~2s","hot":[],"active":[],"parked":[],"maintenance":{"collapsed":true,"count":0,"rows":[]},"tasks":[],"episodes":[],"context":[]}'
+  out=$(sbrun_rc "$BUSY" 75)
+  t18=$(echo "$out" | head -1)
+  { [ "${t18%% |*}" = "⌛" ] && echo "$out" | grep -q "watcher busy" \
+    && ! echo "$out" | grep -q "board unavailable" && ! echo "$out" | grep -q "watcher stale"; } \
+    && ok "SB18: rc-75 busy payload → ⌛ + 'watcher busy', no install/stale alarm" || bad "SB18: $out"
+
+  # SB19 — EMPTY stdout is still the ONLY watcher-absent signal; the red branch is preserved
+  out=$(sbrun_rc "" 75)
+  { echo "$out" | head -1 | grep -q "^⚠ " && echo "$out" | grep -q "board unavailable"; } \
+    && ok "SB19: empty stdout still renders the red 'board unavailable' branch" || bad "SB19: $out"
 
   # ── swiftbar-stage-visibility: stage tag + submenu (SB13-SB16) ──
   EPT=$(printf '%s' "$EP1" | sed 's/"last_snippet":"building the parser"/"last_snippet":"building the parser","slug":"my-slug","stage":"coding","skill":"forge-coder","stage_worker":"claude-sonnet","stage_since":"2026-01-01T00:00:00Z","stage_source":"brief"/')
@@ -2131,7 +2282,7 @@ print(json.dumps(eps))')
     && ok "SB16: slug pipe → ¦, one separator on the pipeline row" || bad "SB16 row: $line"
 else
   echo "  (skip: plugin not found)"
-  for i in $(seq 1 21); do ok "swiftbar in-progress (skipped)"; done
+  for i in $(seq 1 25); do ok "swiftbar in-progress (skipped)"; done
 fi
 
 echo "── CODEX-EMISSION-OFF: marker + no codex signal → maintenance; codex fire clears ──"  # +2
