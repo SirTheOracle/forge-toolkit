@@ -2928,6 +2928,53 @@ cmd_send() {
     shift
     local MSG="$*"
 
+    # ---- #54: payload ceiling on the send path (C1/C2/C3/C4) ----
+    # There is no chunking here. `tmux send-keys -l` returns rc 0 whether or not the
+    # receiving TUI accepted the whole payload into its input buffer, so an over-length
+    # message is delivered TRUNCATED — front dropped, tail kept — while the sender is told
+    # SEND_CONTINUATION. That is Cause 1 (no ceiling anywhere on the send path) compounded
+    # by Cause 2 (success is reported BEFORE delivery is attempted). Refuse loudly instead.
+    #
+    # The ORDERING is the fix, so this guard sits ahead of EVERYTHING that follows: the
+    # log-before-send hook, the all-boundary block guard, the P1-4 fail-closed bookkeeping
+    # (next-gen + the `attempting` delivery record), the HYGIENE_DECISION event and the
+    # operator-visible SEND_CONTINUATION line. A refusal therefore issues NO keystroke and
+    # leaves NO state: no generation advance, no delivery record, no success event — and no
+    # worker lock has been taken yet, so there is nothing to release.
+    #
+    # `--force` does NOT bypass this. --force is the path in the incident report; it
+    # bypasses the log-before-send hook only. Hard Rule 20's /clear is short and unaffected.
+    #
+    # FORGE_SEND_MAX_BYTES, default 2048. Invalid values normalize UP to the default, never
+    # to "disabled" — the OPPOSITE direction from the FORGE_SEND_MIN_HEADROOM normalization
+    # below (`''|*[!0-9]*) _sfloor=0`), deliberately: normalizing to 0 disables a floor,
+    # which is safe, but disabling a CEILING silently restores this bug. There is no value
+    # of FORGE_SEND_MAX_BYTES that turns this guard off; raising it is supported.
+    local _maxb="${FORGE_SEND_MAX_BYTES:-2048}"
+    case "$_maxb" in ''|*[!0-9]*) _maxb=2048 ;; esac
+    [ "$_maxb" -gt 0 ] || _maxb=2048
+    # BYTES, not characters: the constraint is a receiving input buffer and the reported
+    # payload was prose that may contain multi-byte characters.
+    local _msgb; _msgb="$(printf '%s' "$MSG" | LC_ALL=C wc -c | tr -d '[:space:]')"
+    case "$_msgb" in ''|*[!0-9]*) _msgb=0 ;; esac
+    if [ "$_msgb" -gt "$_maxb" ]; then
+        # Actionable: the measured length, the ceiling, and the write-to-file-and-reference
+        # pattern cmd_dispatch already uses. A bare "too long" would be only half the
+        # correction for Cause 2.
+        local _fhint=""; [ "$FORCE" = true ] && _fhint=" --force"
+        echo "SEND REFUSED: message is $_msgb bytes; the ceiling is $_maxb bytes (FORGE_SEND_MAX_BYTES)." >&2
+        echo "  NOTHING was sent: no keystroke, no delivery record, no success line." >&2
+        echo "  tmux send-keys reports success even when the receiving TUI drops the FRONT of an" >&2
+        echo "  over-length payload, so sending this would have truncated SILENTLY (issue #54)." >&2
+        echo "  Use the write-to-file-and-reference pattern that 'dispatch' already uses:" >&2
+        echo "    1. write the full text to .dev/forge-tmp/<name>.md" >&2
+        echo "    2. send a one-line pointer instead:" >&2
+        echo "       ~/bin/forge-bridge send$_fhint $TARGET Read and follow instructions in .dev/forge-tmp/<name>.md" >&2
+        echo "  To raise the ceiling: FORGE_SEND_MAX_BYTES=<bytes>. Empty, non-numeric and 0 fall" >&2
+        echo "  back to 2048 — there is NO value that disables this guard." >&2
+        return 1
+    fi
+
     # Per-target log-before-send hook. Worker panes only.
     # Hard Rule 20's /clear is the only worker-pane --force exemption.
     if [ "$FORCE" = false ]; then

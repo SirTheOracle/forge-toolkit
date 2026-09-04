@@ -60,7 +60,7 @@ chmod +x "$BROKER_STUB"
 export FORGE_BROKER_BIN="$BROKER_STUB"
 export FORGE_BROKER_CAPTURE="$WORK/broker-actions.jsonl"; : > "$FORGE_BROKER_CAPTURE"
 S1="fbid1-$$"; S2="fbid2-$$"; S3="fbid3-$$"; S4="fbid4-$$"; GS="fbguard-$$"
-trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; tmux kill-session -t "${HS:-none}" 2>/dev/null; tmux kill-session -t "${DS:-none}" 2>/dev/null; tmux kill-session -t "${VS:-none}" 2>/dev/null; tmux kill-session -t "${FS:-none}" 2>/dev/null; tmux kill-session -t "${US:-none}" 2>/dev/null; tmux kill-session -t "${SW:-none}" 2>/dev/null; tmux kill-session -t "${RS:-none}" 2>/dev/null; tmux kill-session -t "${HH:-none}" 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; tmux kill-session -t "${HS:-none}" 2>/dev/null; tmux kill-session -t "${DS:-none}" 2>/dev/null; tmux kill-session -t "${VS:-none}" 2>/dev/null; tmux kill-session -t "${FS:-none}" 2>/dev/null; tmux kill-session -t "${US:-none}" 2>/dev/null; tmux kill-session -t "${SW:-none}" 2>/dev/null; tmux kill-session -t "${RS:-none}" 2>/dev/null; tmux kill-session -t "${HH:-none}" 2>/dev/null; tmux kill-session -t "${SMS:-none}" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # ---- Pure-helper extraction (no main dispatch) ----
 FNS="$WORK/fns.sh"
@@ -4494,6 +4494,175 @@ mk_session "$GV9S" 220 50 "$GV9C"
   tmux kill-session -t "$GV9S" 2>/dev/null
 else
   echo "  (skip EV Group 9: tmux unavailable)"
+fi
+
+echo "── SEND-MAX §54: cmd_send payload ceiling (real tmux + tmux invocation spy) ──"
+# Issue #54: a ~3-4KB `send --force` was delivered TRUNCATED (front dropped, tail kept) while
+# the sender saw a normal HYGIENE ... SEND_CONTINUATION success line. `tmux send-keys -l`
+# returns rc 0 whether or not the receiving TUI accepted the whole payload, and cmd_send
+# printed its success line BEFORE attempting delivery. The fix refuses over-length payloads
+# ahead of the hook, the bookkeeping, the success line and any keystroke.
+#
+# These cases assert against CAPTURED TMUX INVOCATIONS, not just exit codes: a `tmux` shim on
+# the pane's PATH appends every invocation to a log and then execs the real binary. "No
+# keystroke" is therefore a positive observation, not an inference from rc.
+if command -v tmux >/dev/null 2>&1; then
+  SMS="fbsendmax-$$"
+  export DEV_DIR=".dev"
+  SMC="$(mkR sendmax)"
+mk_session "$SMS" 220 50 "$SMC"
+  SMINC="$(tmux display-message -p -t "$SMS:0.0" '#{session_created}')"
+  sleep 1
+  SMJ="$SMC/.dev/forge-hygiene.$SMS.$SMINC.yml"
+  SMEV="$SMC/.dev/forge-tmp/orchestrator-events.log"
+  SMSPYDIR="$WORK/sendmax-bin"; mkdir -p "$SMSPYDIR"
+  SMSPY="$WORK/sendmax-tmux.log"; : > "$SMSPY"
+  SMREALTMUX="$(command -v tmux)"
+  {
+    echo '#!/bin/bash'
+    echo "printf '%s\\n' \"\$*\" >> '$SMSPY'"
+    echo "exec '$SMREALTMUX' \"\$@\""
+  } > "$SMSPYDIR/tmux"
+  chmod +x "$SMSPYDIR/tmux"
+
+  # Fixtures. SMBIG is the reported repro size (3400 bytes) and carries a marker so the
+  # worker pane can be checked for the payload directly. SMMB is UNDER the 2048 ceiling in
+  # CHARACTERS (1117) but OVER it in BYTES (2217) — the byte-vs-character case.
+  SMBIG="$WORK/sm-big.txt";   python3 -c "import sys; sys.stdout.write('SENDMAX_BIG_MARKER'+'A'*3382)" > "$SMBIG"
+  SMMB="$WORK/sm-mb.txt";     python3 -c "import sys; sys.stdout.write('SENDMAX_MB_MARKER'+'é'*1100)" > "$SMMB"
+  SMSHORT="$WORK/sm-short.txt"; printf '%s' 'SENDMAX_SHORT_MARKER' > "$SMSHORT"
+  SM100="$WORK/sm-100.txt";   python3 -c "import sys; sys.stdout.write('B'*100)" > "$SM100"
+  [ "$(wc -c < "$SMBIG" | tr -d ' ')" = 3400 ] && [ "$(wc -c < "$SMMB" | tr -d ' ')" = 2217 ] \
+    && ok "T-SENDMAX-FIXTURES repro payload is 3400 bytes; multibyte payload is 2217 bytes / 1117 chars" \
+    || bad "T-SENDMAX-FIXTURES big=$(wc -c < "$SMBIG") mb=$(wc -c < "$SMMB")"
+
+  # sm_script <name> <payload-file> <env-assignments|""> <send-arg...> — emits a runnable
+  # script and echoes its path. A script file (rather than an inline run_in_pane string) is
+  # required because run_in_pane's command may not contain unescaped double quotes and these
+  # payloads are long quoted strings.
+  sm_script(){
+    local name="$1" pf="$2" envline="$3"; shift 3
+    local sh="$WORK/sm-$name.sh" a
+    {
+      echo '#!/bin/bash'
+      echo "cd '$SMC' || exit 90"
+      echo "export PATH='$SMSPYDIR':\$PATH"
+      echo 'export FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe'
+      [ -n "$envline" ] && echo "export $envline"
+      echo "PAYLOAD=\"\$(cat '$pf')\""
+      printf 'exec %s send' "$BRIDGE"
+      for a in "$@"; do printf ' %s' "$a"; done
+      printf ' "$PAYLOAD"\n'
+    } > "$sh"
+    printf '%s' "$sh"
+  }
+  sm_run(){   # sm_run <name> <script-path> — truncates the spy log, then runs in pane 0
+    : > "$SMSPY"
+    run_in_pane "$SMS:0.0" "$1" "bash $2"
+  }
+  sm_sk(){      grep -c 'send-keys' "$SMSPY" 2>/dev/null | tr -d ' \n'; }
+  sm_sk_text(){ grep -n 'send-keys .* -l ' "$SMSPY" 2>/dev/null | head -1 | cut -d: -f1; }
+  sm_sk_enter(){ grep -n 'send-keys .*[[:space:]]Enter$' "$SMSPY" 2>/dev/null | head -1 | cut -d: -f1; }
+  sm_ev_cont(){ grep -c 'SEND_CONTINUATION' "$SMEV" 2>/dev/null | tr -d ' \n'; }
+  sm_gen(){     ID_target_session="$SMS" ID_target_incarnation="$SMINC" _hygiene_current_gen "$SMC" "$1"; }
+  smdel(){   # smdel <worker> <field>
+    python3 - "$SMJ" "$1" "$2" <<'PY'
+import sys,yaml,os
+try: d=(yaml.safe_load(open(sys.argv[1])) or {}) if os.path.exists(sys.argv[1]) else {}
+except Exception: d={}
+w=(d.get("workers") or {}).get(sys.argv[2]) or {}
+print((w.get("delivery") or {}).get(sys.argv[3]) or "")
+PY
+  }
+  sm_pane_has(){   # sm_pane_has <pane> <needle>
+    local captured; captured="$(tmux capture-pane -p -S - -t "$SMS:0.$1" 2>/dev/null | tr -d '\n')" || return 1
+    case "$captured" in *"$2"*) return 0 ;; *) return 1 ;; esac
+  }
+
+  # ── T5/T6 (D2/D1 must-not-break): a normal short send is completely unaffected. ──
+  run_in_pane "$SMS:0.0" sm-log1 "( cd $SMC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug sm1 --stage adhoc --from claude --to codex-a --prompt p )"
+  sm_run sm-short "$(sm_script short "$SMSHORT" '' codex-a)"
+  if [ "$(rc_of sm-short)" = 0 ] && out_of sm-short | grep -q 'SEND_CONTINUATION' \
+     && [ "$(smdel codex-a state)" = delivered ] && [ "$(smdel codex-a kind)" = send ]; then
+    ok "T-SENDMAX-SHORT-OK short send still succeeds, still emits SEND_CONTINUATION, still marks delivered"
+  else
+    bad "T-SENDMAX-SHORT-OK rc=$(rc_of sm-short) state='$(smdel codex-a state)' kind='$(smdel codex-a kind)'"
+  fi
+  smt="$(sm_sk_text)"; sme="$(sm_sk_enter)"
+  if [ "$(sm_sk)" = 2 ] && [ -n "$smt" ] && [ -n "$sme" ] && [ "$smt" -lt "$sme" ]; then
+    ok "T-SENDMAX-TWO-EVENT success path still issues two distinct send-keys: literal text, then a standalone Enter"
+  else
+    bad "T-SENDMAX-TWO-EVENT send-keys=$(sm_sk) text_line='$smt' enter_line='$sme'"
+  fi
+  tmux send-keys -t "$SMS:0.3" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$SMS:0.3" sm1-close "( cd $SMC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug sm1 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
+
+  # ── T1/T2/T3/T8/T9: the reported repro size on the DEFAULT path, no env var set. ──
+  sm_gen_before="$(sm_gen codex-a)"; sm_ev_before="$(sm_ev_cont)"
+  sm_state_before="$(smdel codex-a state)"
+  run_in_pane "$SMS:0.0" sm-log2 "( cd $SMC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug sm2 --stage adhoc --from claude --to codex-a --prompt p )"
+  sm_run sm-big "$(sm_script big "$SMBIG" '' codex-a)"
+  [ "$(rc_of sm-big)" = 1 ] && [ "$(sm_sk)" = 0 ] && ! sm_pane_has 3 SENDMAX_BIG_MARKER \
+    && ok "T-SENDMAX-REFUSE 3400-byte payload exits non-zero and issues ZERO send-keys (T1)" \
+    || bad "T-SENDMAX-REFUSE rc=$(rc_of sm-big) send-keys=$(sm_sk)"
+  out_of sm-big | grep -q '3400 bytes' && out_of sm-big | grep -q '2048 bytes' \
+    && ok "T-SENDMAX-DEFAULT-REPRO the DEFAULT path (no FORGE_SEND_MAX_BYTES set) refuses the reported repro size at 2048 (T8)" \
+    || bad "T-SENDMAX-DEFAULT-REPRO $(out_of sm-big | head -2 | tr '\n' ' ')"
+  { ! out_of sm-big | grep -q 'SEND_CONTINUATION'; } && [ "$(sm_ev_cont)" = "$sm_ev_before" ] \
+    && ok "T-SENDMAX-NO-FALSE-SUCCESS refusal prints no SEND_CONTINUATION and records no HYGIENE_DECISION SEND_CONTINUATION event (T2)" \
+    || bad "T-SENDMAX-NO-FALSE-SUCCESS stderr/event leak: events ${sm_ev_before} -> $(sm_ev_cont)"
+  out_of sm-big | grep -q 'SEND REFUSED' && out_of sm-big | grep -q '.dev/forge-tmp' \
+    && out_of sm-big | grep -q 'FORGE_SEND_MAX_BYTES' \
+    && ok "T-SENDMAX-ACTIONABLE refusal names the measured length, the ceiling, the knob and the write-to-file workaround (T3)" \
+    || bad "T-SENDMAX-ACTIONABLE $(out_of sm-big | head -3 | tr '\n' ' ')"
+  [ "$(sm_gen codex-a)" = "$sm_gen_before" ] && [ "$(smdel codex-a state)" = "$sm_state_before" ] \
+    && [ "$(smdel codex-a state)" != attempting ] \
+    && ok "T-SENDMAX-NO-STATE refusal advances no generation and writes no attempting delivery record (T9)" \
+    || bad "T-SENDMAX-NO-STATE gen ${sm_gen_before} -> $(sm_gen codex-a) state ${sm_state_before} -> $(smdel codex-a state)"
+
+  # ── T4: --force is the path in the incident report and does NOT bypass the ceiling. ──
+  sm_run sm-force "$(sm_script force "$SMBIG" '' --force codex-a)"
+  [ "$(rc_of sm-force)" = 1 ] && [ "$(sm_sk)" = 0 ] && out_of sm-force | grep -q 'SEND REFUSED' \
+    && { ! out_of sm-force | grep -q 'SEND_CONTINUATION'; } \
+    && ok "T-SENDMAX-FORCE --force does not bypass the ceiling: refused, zero send-keys (T4)" \
+    || bad "T-SENDMAX-FORCE rc=$(rc_of sm-force) send-keys=$(sm_sk)"
+
+  # ── T7: the ceiling is configurable under the named contract, both directions. ──
+  run_in_pane "$SMS:0.0" sm-log3 "( cd $SMC && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug sm3 --stage adhoc --from claude --to codex-a --prompt p )"
+  sm_run sm-raise "$(sm_script raise "$SMBIG" 'FORGE_SEND_MAX_BYTES=8192' codex-a)"
+  sm_raise_sk="$(sm_sk)"
+  tmux send-keys -t "$SMS:0.3" C-c 2>/dev/null; sleep 0.3
+  sm_run sm-lower "$(sm_script lower "$SM100" 'FORGE_SEND_MAX_BYTES=64' --force codex-a)"
+  if [ "$(rc_of sm-raise)" = 0 ] && [ "$sm_raise_sk" -ge 2 ] \
+     && [ "$(rc_of sm-lower)" = 1 ] && out_of sm-lower | grep -q 'ceiling is 64 bytes'; then
+    ok "T-SENDMAX-CONFIGURABLE FORGE_SEND_MAX_BYTES=8192 admits 3400 bytes; =64 refuses 100 bytes (T7)"
+  else
+    bad "T-SENDMAX-CONFIGURABLE raise rc=$(rc_of sm-raise) sk=$sm_raise_sk / lower rc=$(rc_of sm-lower)"
+  fi
+  run_in_pane "$SMS:0.3" sm3-close "( cd $SMC && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug sm3 --stage adhoc --status DONE --worker codex-a --message d --quiet )"
+
+  # ── T7b: invalid values normalize UP to the default, never to "disabled". A typo must not
+  # silently restore the silent-truncation bug. ──
+  sm_bad_ok=1
+  for sm_bad in EMPTY abc 0; do
+    case "$sm_bad" in EMPTY) sm_env='FORGE_SEND_MAX_BYTES=' ;; *) sm_env="FORGE_SEND_MAX_BYTES=$sm_bad" ;; esac
+    sm_run "sm-bad-$sm_bad" "$(sm_script "bad-$sm_bad" "$SMBIG" "$sm_env" --force codex-a)"
+    { [ "$(rc_of "sm-bad-$sm_bad")" = 1 ] && [ "$(sm_sk)" = 0 ] \
+        && out_of "sm-bad-$sm_bad" | grep -q 'ceiling is 2048 bytes'; } \
+      || { sm_bad_ok=0; bad "T-SENDMAX-INVALID-FALLBACK '$sm_bad' rc=$(rc_of "sm-bad-$sm_bad") sk=$(sm_sk)"; }
+  done
+  [ "$sm_bad_ok" = 1 ] && ok "T-SENDMAX-INVALID-FALLBACK empty/abc/0 each fall back to 2048 and still refuse; no value disables the guard (T7b)"
+
+  # ── T10: BYTES, not characters. 1117 characters, 2217 bytes. ──
+  sm_run sm-mb "$(sm_script mb "$SMMB" '' --force codex-a)"
+  [ "$(rc_of sm-mb)" = 1 ] && [ "$(sm_sk)" = 0 ] && out_of sm-mb | grep -q '2217 bytes' \
+    && ok "T-SENDMAX-BYTES a 1117-character / 2217-byte payload is refused — the ceiling counts bytes (T10)" \
+    || bad "T-SENDMAX-BYTES rc=$(rc_of sm-mb) sk=$(sm_sk) $(out_of sm-mb | head -1)"
+
+  tmux send-keys -t "$SMS:0.3" C-c 2>/dev/null; sleep 0.3
+  tmux kill-session -t "$SMS" 2>/dev/null
+else
+  echo "  (skip SEND-MAX §54: tmux unavailable)"
 fi
 
 echo
