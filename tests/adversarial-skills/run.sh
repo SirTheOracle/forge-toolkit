@@ -191,4 +191,211 @@ PY
 )
 EOF
 
+echo "== 2. forge-coder coding-stage runaway guards (issue #52), on both copies =="
+# WHY: a dispatched coding worker burned 1h25m on one turn — no commit, no callback,
+# reading a file unrelated to its group — while remaining fully contract-compliant,
+# because forge-coder's SKILL.md says how to proceed and never when to stop. The guards
+# added for #52 are prose, and prose in this repo rots unless a test pins it: before
+# this section NO suite referenced forge-coder at all, in either copy.
+#
+# Both copies are asserted INDEPENDENTLY (plan D2): under rollout=contain, commit-class
+# stages route to the reviewed Claude lane, so a guard present only in the Codex mirror
+# would be absent from the lane that actually commits.
+#
+# T7 is the load-bearing one. An earlier draft of the fix told the worker to "commit
+# what is complete and continue" — mechanically impossible, because the broker binds one
+# commit per delivery and a second attempt fails HEAD_MOVED, leaving the delivery open
+# and blocking every later dispatch to that pane. T7 fails against that wording.
+while IFS= read -r line; do
+  case "$line" in
+    OK\|*)  ok  "${line#OK|}"  ;;
+    BAD\|*) bad "${line#BAD|}" ;;
+    *)      [ -n "$line" ] && printf '%s\n' "$line" ;;
+  esac
+done <<EOF
+$(python3 - "$ROOT" <<'PY'
+import pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+
+COPIES = [
+    "skills/forge-coder/SKILL.md",
+    "codex-skills/forge-coder/SKILL.md",
+]
+
+def norm(t):
+    """Whitespace-normalised, emphasis-stripped, lowercased. Same reason as section 1:
+    these are soft-wrapped markdown paragraphs, so a per-line grep would assert where
+    the line break fell. Markdown emphasis is stripped too, so **30 minutes** and
+    30 minutes are the same claim."""
+    return re.sub(r"\s+", " ", t.replace("*", "").replace("`", "")).lower()
+
+def section(text, heading_re):
+    """A '## ' section: its heading through the next top-level heading (or EOF).
+    Returns '' when absent — itself a failure, since there is then nowhere to wire
+    the guard in."""
+    m = re.search(heading_re, text, re.M)
+    if not m:
+        return ""
+    rest = text[m.end():]
+    nxt = re.search(r"^## ", rest, re.M)
+    return rest[: nxt.start()] if nxt else rest
+
+STOP_HEADING = r"^## When to Stop\b.*$"
+ESC_HEADING = r"^## Escalation: forge ask\b.*$"
+
+# Wording that routes a worker into the broker wedge (see header note). Checked over
+# the WHOLE file, not just the stop section: it is equally wrong anywhere.
+MIDGROUP_COMMIT = [
+    r"commit what is complete",
+    r"commit what is done",
+    r"commit what you have (?:complete|done)",
+    r"continue with a fresh turn",
+]
+
+failures = 0
+sections = {}
+
+for rel in COPIES:
+    p = root / rel
+    if not p.exists():
+        print("BAD|%s: file does not exist" % rel)
+        failures += 1
+        continue
+    raw = p.read_text()
+    whole = norm(raw)
+    stop = norm(section(raw, STOP_HEADING))
+    esc = norm(section(raw, ESC_HEADING))
+    sections[rel] = (section(raw, STOP_HEADING), section(raw, ESC_HEADING))
+
+    if not stop:
+        print("BAD|T1-CEILING %s: no 'When to Stop' section at all — every guard below "
+              "has nowhere to live" % rel)
+        failures += 6
+        continue
+
+    # --- T1: a turn-duration ceiling, stated with a NUMBER. "keep an eye on how long
+    # you have been running" is not a ceiling; the number is the property under test.
+    if "turn-duration ceiling" in stop and re.search(r"\b30[- ]minutes?\b", stop):
+        print("OK|T1-CEILING %s states a turn-duration ceiling of 30 minutes" % rel)
+    else:
+        missing = []
+        if "turn-duration ceiling" not in stop: missing.append("the ceiling itself")
+        if not re.search(r"\b30[- ]minutes?\b", stop): missing.append("its numeric value")
+        print("BAD|T1-CEILING %s: missing %s" % (rel, " and ".join(missing)))
+        failures += 1
+
+    # --- T2: hitting the ceiling must ESCALATE, and silent continuation must be named
+    # and forbidden. Both halves: the runaway was silent, not merely slow.
+    escalates = "forge ask" in stop and "blocked" in stop
+    no_silence = re.search(r"(never|do not|don't) continue silently", stop) is not None
+    if escalates and no_silence:
+        print("OK|T2-ESCALATE %s requires forge ask/BLOCKED on the ceiling and forbids "
+              "silent continuation" % rel)
+    else:
+        missing = []
+        if not escalates: missing.append("the forge ask / BLOCKED escalation")
+        if not no_silence: missing.append("the no-silent-continuation rule")
+        print("BAD|T2-ESCALATE %s: missing %s" % (rel, " and ".join(missing)))
+        failures += 1
+
+    # --- T3: the scope guard binds EDITS, and reading is explicitly still allowed.
+    # The permission half matters: the incident's tell was a legitimate read, and a
+    # guard that forbade reading would fire on normal context-gathering (plan R3).
+    names_list = "declared file list" in stop
+    forbids_edit = re.search(r"(never|do not|don't) edit a file outside", stop) is not None
+    allows_read = re.search(r"reading [^.]{0,80}allowed", stop) is not None
+    if names_list and forbids_edit and allows_read:
+        print("OK|T3-SCOPE %s guards edits outside the declared file list while still "
+              "permitting reads" % rel)
+    else:
+        missing = []
+        if not names_list: missing.append("the declared file list")
+        if not forbids_edit: missing.append("the no-edit-outside rule")
+        if not allows_read: missing.append("the reading-is-allowed carve-out")
+        print("BAD|T3-SCOPE %s: missing %s" % (rel, " and ".join(missing)))
+        failures += 1
+
+    # --- T4: prefer recording partial progress over open-ended diagnosis — RECORD,
+    # not commit — and name the concrete failure mode from the incident.
+    records = re.search(r"record[^.]{0,80}known-incomplete", stop) is not None
+    names_report = "coder-report.md" in stop
+    not_commit = re.search(r"record, (do not|don't) commit", stop) is not None
+    names_mode = "different commit group" in stop
+    if records and names_report and not_commit and names_mode:
+        print("OK|T4-PARTIAL %s prefers recorded (not committed) partial progress and "
+              "names the out-of-scope diagnosis mode" % rel)
+    else:
+        missing = []
+        if not records: missing.append("the record-and-stop instruction")
+        if not names_report: missing.append("the coder-report.md destination")
+        if not not_commit: missing.append("the record-do-not-commit distinction")
+        if not names_mode: missing.append("the other-commit-group diagnosis example")
+        print("BAD|T4-PARTIAL %s: missing %s" % (rel, " and ".join(missing)))
+        failures += 1
+
+    # --- T5: region-scoped on purpose. "Do NOT ask for things you can resolve and
+    # note" is what made the runaway contract-compliant — a worker that is merely slow
+    # or off-scope reads as resolve-and-note. The exception must be stated where that
+    # line is, or the surrounding text keeps steering the wrong way.
+    if not esc:
+        print("BAD|T5-EXCEPTION %s: no 'Escalation: forge ask' section to carve the "
+              "exception out of" % rel)
+        failures += 1
+    else:
+        carve = re.search(r"exceptions? to the do-not-ask", esc) is not None
+        cites_line = "resolve and note" in esc
+        names_both = "turn-duration ceiling" in esc and "declared-file scope guard" in esc
+        if carve and cites_line and names_both:
+            print("OK|T5-EXCEPTION %s states both new triggers as explicit exceptions to "
+                  "the resolve-and-note line" % rel)
+        else:
+            missing = []
+            if not carve: missing.append("the stated exception")
+            if not cites_line: missing.append("the resolve-and-note line it excepts")
+            if not names_both: missing.append("one or both trigger names")
+            print("BAD|T5-EXCEPTION %s: missing %s" % (rel, " and ".join(missing)))
+            failures += 1
+
+    # --- T7: the resulting contract must be NON-CONTRADICTORY. Two halves: no
+    # mid-group-commit wording anywhere in the file, and explicit deference to the
+    # rules the new text sits next to.
+    offenders = [pat for pat in MIDGROUP_COMMIT if re.search(pat, whole)]
+    defers = ("hard constraint 7" in stop and "hard constraint 4" in stop
+              and "not committed" in stop)
+    if not offenders and defers:
+        print("OK|T7-NONCONTRA %s never instructs a mid-group commit and defers to Hard "
+              "Constraints 7 and 4" % rel)
+    else:
+        why = []
+        if offenders:
+            why.append("instructs a mid-group commit (%s)" % ", ".join(offenders))
+        if not defers:
+            why.append("does not defer to Hard Constraint 7 / Hard Constraint 4 / the "
+                       "files-modified-but-NOT-committed rule")
+        print("BAD|T7-NONCONTRA %s: %s" % (rel, "; ".join(why)))
+        failures += 1
+
+# --- Lockstep, in the R2-LOCKSTEP idiom: the two copies must carry the SAME guard
+# text. This is scoped to the NEW sections only — the copies' pre-existing 72-line
+# drift is issue #65 and is deliberately not asserted here.
+if len(sections) == len(COPIES):
+    stops = set(norm(s) for s, _ in sections.values())
+    escs = set(norm(e) for _, e in sections.values())
+    if len(stops) == 1 and len(escs) == 1:
+        print("OK|T-LOCKSTEP both forge-coder copies carry identical stop-condition and "
+              "escalation-exception text")
+    else:
+        drifted = []
+        if len(stops) != 1: drifted.append("the stop-condition section")
+        if len(escs) != 1: drifted.append("the escalation exception")
+        print("BAD|T-LOCKSTEP the two forge-coder copies have drifted in %s"
+              % " and ".join(drifted))
+        failures += 1
+
+sys.exit(1 if failures else 0)
+PY
+)
+EOF
+
 printf '\nPASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"; [ "$FAIL" = 0 ]
