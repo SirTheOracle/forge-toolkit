@@ -3875,6 +3875,82 @@ print('|'.join(fields))
 PY
 }
 
+# Issue #56 freshness predicate, shared by the wait validator (D1) and the terminal consume
+# cleanup (D2) so the two halves of the fix can never disagree about what "stale" means.
+# A delivery-bound callback is FRESH only when the NEWEST delivery-bound log entry for the
+# same (stage, canonical worker, session, incarnation) is the very pending the callback bound
+# to. A repeated dispatch of the same stage appends a LATER delivery-bound pending, which is
+# exactly what turns the prior terminal callback into replayable residue.
+#   rc 0 = fresh · rc 6 = superseded · rc 4 = legacy (no delivery binding to judge)
+#   rc 3 = unparseable or indeterminate (fail closed; callers refuse)
+_callback_selected_pending_superseded() {   # <callback> <log> <stage> <worker> <session> <incarnation>
+    python3 - "$@" <<'PY'
+import datetime, sys, yaml
+cb_path, log_path, stage, worker, session, incarnation = sys.argv[1:7]
+aliases={'inline':'claude-opus','general':'claude-opus','claude-general':'claude-opus','opus':'claude-opus','codex':'codex-a','orchestrator':'claude','claude-orchestrator':'claude','sonnet':'claude-sonnet'}
+canonical=lambda value: aliases.get(value,value)
+try:
+    cb = yaml.load(open(cb_path), Loader=yaml.BaseLoader) or {}
+    entries = (yaml.load(open(log_path), Loader=yaml.BaseLoader) or {}).get('entries') or []
+except Exception as exc:
+    print('CALLBACK_ARTIFACT_INVALID:'+str(exc), file=sys.stderr); sys.exit(3)
+if not isinstance(cb, dict) or not isinstance(entries, list):
+    print('CALLBACK_ARTIFACT_INVALID: expected maps', file=sys.stderr); sys.exit(3)
+selected = str(cb.get('selected_pending_timestamp') or '')
+if not selected or not str(cb.get('delivery_id') or ''):
+    # Pre-broker callbacks carry no generation to compare against; the caller keeps its
+    # historical legacy contract.
+    print('CALLBACK_ARTIFACT_LEGACY', file=sys.stderr); sys.exit(4)
+def parse(value):
+    return datetime.datetime.strptime(str(value), '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+newest = None; newest_raw = ''
+for e in entries:
+    if not isinstance(e, dict): continue
+    if str(e.get('stage') or '') != stage: continue
+    if canonical(str(e.get('to') or '')) != canonical(worker): continue
+    if str(e.get('session') or '') != session: continue
+    if str(e.get('incarnation') or '') != incarnation: continue
+    if not str(e.get('delivery_id') or ''): continue
+    try: ts = parse(e.get('timestamp'))
+    except Exception:
+        print('CALLBACK_ARTIFACT_INVALID: pending timestamp', file=sys.stderr); sys.exit(3)
+    if newest is None or ts > newest:
+        newest = ts; newest_raw = str(e.get('timestamp') or '')
+if newest is None:
+    # The callback claims a delivery-bound generation this identity has no log entry for.
+    # Freshness is indeterminate, so fail closed rather than guess.
+    print('CALLBACK_SUPERSESSION_INDETERMINATE: no delivery-bound pending for identity', file=sys.stderr); sys.exit(3)
+if newest_raw != selected:
+    print('CALLBACK_SUPERSEDED: newest='+newest_raw+' selected='+selected, file=sys.stderr); sys.exit(6)
+print('FRESH')
+PY
+}
+
+# Issue #56 (D2/D3) cleanup selector: the normal terminal tuple, but ONLY for residue a LATER
+# delivery-bound dispatch has already superseded. A terminal callback closes its pending
+# BEFORE publication, so "no open pending" cannot separate stale residue from a fresh result
+# no `wait` has read yet -- the newest-relevant delivery-bound entry can. Consume-only by
+# construction: _callback_terminal_select keeps its unchanged default so verify-decision
+# continues to select FRESH terminal callbacks.
+#   rc 6 = fresh terminal callback: refuse cleanup, archive nothing.
+_callback_terminal_superseded_select() {   # <cb_dir> <slug> <stage> <session> <incarnation> <statuses> <log>
+    local cb_dir="$1" slug="$2" stage="$3" session="$4" incarnation="$5" statuses="$6" plog="$7"
+    local selection rc=0
+    selection="$(_callback_terminal_select "$cb_dir" "$slug" "$stage" "$session" "$incarnation" "$statuses" "$plog")" || rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    local cb_file cb_status cb_id selected_ts cb_session cb_incarnation cb_origin cb_hash
+    IFS='|' read -r cb_file cb_status cb_id selected_ts cb_session cb_incarnation cb_origin cb_hash <<< "$selection"
+    local cb_worker sup_rc=0
+    cb_worker="$(sed -n 's/^worker:[[:space:]]*//p' "$cb_file" | head -1)"
+    _callback_selected_pending_superseded "$cb_file" "$plog" "$stage" "$cb_worker" \
+        "$cb_session" "$cb_incarnation" >/dev/null 2>&1 || sup_rc=$?
+    case "$sup_rc" in
+        6) printf '%s\n' "$selection" ;;
+        0) echo "CALLBACK_TERMINAL_NOT_SUPERSEDED" >&2; return 6 ;;
+        *) echo "CALLBACK_TERMINAL_SUPERSESSION_UNKNOWN:$sup_rc" >&2; return 3 ;;
+    esac
+}
+
 _parked_pending_select() { # <log> <stage> <session> <incarnation>
     python3 - "$@" <<'PY'
 import sys,yaml
@@ -3896,7 +3972,11 @@ print('%s\t%s' % (str(rows[0].get('timestamp') or ''),str(rows[0].get('to') or '
 PY
 }
 
-_callback_selection_unchanged() {   # <before tuple> plus selector args
+_callback_selection_unchanged() {   # [--selector <fn>] <before tuple> plus selector args
+    # #56: terminal consume must revalidate under the lifecycle lock with the SAME selector
+    # it selected with. The default stays _callback_mutation_select for every other caller.
+    local selector=_callback_mutation_select
+    if [ "$1" = "--selector" ]; then selector="$2"; shift 2; fi
     local before="$1"; shift
     local cb_dir="$1" slug="$2" stage="$3" actor_s="$4" actor_i="$5"
     local live_i
@@ -3906,7 +3986,7 @@ _callback_selection_unchanged() {   # <before tuple> plus selector args
         echo "CALLBACK_IDENTITY_CHANGED" >&2
         return 1
     fi
-    local after rc=0; after="$(_callback_mutation_select "$@")" || rc=$?
+    local after rc=0; after="$("$selector" "$@")" || rc=$?
     [ "$rc" -eq 0 ] && [ "$after" = "$before" ] || {
         echo "CALLBACK_IDENTITY_CHANGED" >&2
         return 1
@@ -6118,13 +6198,21 @@ PY
 
 # Validate the selected callback against the pipeline artifact before wait emits
 # it. A callback header is not authority: delivery-bound callbacks must carry
-# the same delivery_id recorded on the selected pending entry, and every
-# callback must be emitted no earlier than that entry. This keeps replayed
-# callback files from being accepted on their status line alone.
-_callback_artifact_matches_pending() {   # <callback> <pipeline-log> <stage>
-    python3 - "$@" <<'PY'
+# the same delivery_id recorded on the selected pending entry, must belong to the
+# actor this `wait` is waiting for, and must still be the NEWEST delivery-bound
+# generation for that identity -- a repeated dispatch of the same slug/stage turns
+# the previous terminal callback into replayable residue (issue #56). This keeps
+# replayed callback files from being accepted on their status line alone.
+#   rc 2 = identity changed  rc 3 = invalid  rc 4 = legacy (still accepted by wait)
+#   rc 6 = superseded by a newer delivery-bound pending (a poll miss, not an error)
+_callback_artifact_matches_pending() {   # <callback> <pipeline-log> <stage> <worker> <session> <incarnation>
+    local cb_path="$1" log_path="$2" stage="$3" worker="${4:-}" session="${5:-}" incarnation="${6:-}"
+    local rc=0
+    python3 - "$cb_path" "$log_path" "$stage" "$worker" "$session" "$incarnation" <<'PY'
 import datetime, sys, yaml
-cb_path, log_path, stage = sys.argv[1:4]
+cb_path, log_path, stage, worker, session, incarnation = sys.argv[1:7]
+aliases={'inline':'claude-opus','general':'claude-opus','claude-general':'claude-opus','opus':'claude-opus','codex':'codex-a','orchestrator':'claude','claude-orchestrator':'claude','sonnet':'claude-sonnet'}
+canonical=lambda value: aliases.get(value,value)
 try:
     cb = yaml.load(open(cb_path), Loader=yaml.BaseLoader) or {}
     data = yaml.load(open(log_path), Loader=yaml.BaseLoader) or {}
@@ -6147,6 +6235,12 @@ if not entries:
     # to bind. Preserve their historical scanner contract; real dispatches
     # always write a non-empty pipeline log before publication.
     print('CALLBACK_ARTIFACT_NO_LOG', file=sys.stderr); sys.exit(4)
+# #56: a delivery-bound callback is authority ONLY for the actor this wait is waiting
+# for. Anything else is identity drift, which is fail-closed rather than a poll miss.
+if canonical(str(cb.get('worker') or '')) != canonical(worker):
+    print('CALLBACK_IDENTITY_CHANGED: worker mismatch', file=sys.stderr); sys.exit(2)
+if str(cb.get('session') or '') != session or str(cb.get('incarnation') or '') != incarnation:
+    print('CALLBACK_IDENTITY_CHANGED: actor mismatch', file=sys.stderr); sys.exit(2)
 matches = [e for e in entries if isinstance(e, dict)
            and str(e.get('timestamp') or '') == selected
            and str(e.get('stage') or '') == stage]
@@ -6164,6 +6258,12 @@ if str(entry.get('delivery_id') or '') != callback_delivery:
     print('CALLBACK_IDENTITY_CHANGED: delivery_id mismatch', file=sys.stderr); sys.exit(2)
 print('OK')
 PY
+    rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    # The artifact matches the generation it claims. It stays eligible only while no NEWER
+    # delivery-bound generation exists for the same identity (#56).
+    _callback_selected_pending_superseded "$cb_path" "$log_path" "$stage" \
+        "$worker" "$session" "$incarnation"
 }
 
 # Resolve the callback file for (slug,stage) for the ACTING session. Prefers the
@@ -6377,12 +6477,20 @@ cmd_wait() {
         if [ "$cb_resolve_rc" -eq 0 ] && [ -n "$cb_file" ] && [ -f "$cb_file" ]; then
             local artifact_rc=0
             if grep -Eq '^delivery_id: [^[:space:]]' "$cb_file"; then
-                _callback_artifact_matches_pending "$cb_file" "$project_root/.dev/proposals/$slug/forge-log.yml" "$stage" >/dev/null 2>&1 || artifact_rc=$?
+                _callback_artifact_matches_pending "$cb_file" "$project_root/.dev/proposals/$slug/forge-log.yml" "$stage" \
+                    "$worker_canonical" "$wait_session" "${ID_host_incarnation:-}" >/dev/null 2>&1 || artifact_rc=$?
             else
                 artifact_rc=4
             fi
+            local cb_superseded=0
             case "$artifact_rc" in
                 0|4) ;; # 4 is an explicitly tolerated pre-delivery legacy callback.
+                # #56: rc 6 is residue from an EARLIER dispatch generation for this same
+                # identity. This poll found nothing eligible, so fall through to the live
+                # permission/stall/timeout checks and keep polling for THIS generation's
+                # callback. Emitting here would terminalize the delivery, release the infra
+                # lock, render a digest, and advance orchestration on a stale result.
+                6) cb_superseded=1 ;;
                 2|3)
                     _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=CALLBACK_IDENTITY_CHANGED"
                     printf 'STATUS: ERROR\nSTAGE: %s\nSLUG: %s\nWORKER: %s\nDETAIL: CALLBACK_IDENTITY_CHANGED\n' \
@@ -6396,32 +6504,36 @@ cmd_wait() {
                     return 1
                     ;;
             esac
-            if grep -Eq '^delivery_id: [^[:space:]]' "$cb_file"; then
-                local wait_delivery wait_status wait_terminal wait_sha wait_intent wait_reply wait_code wait_rc=0
-                wait_delivery="$(sed -n 's/^delivery_id:[[:space:]]*//p' "$cb_file" | head -1)"
-                wait_status="$(sed -n 's/^status:[[:space:]]*//p' "$cb_file" | head -1)"
-                case "$wait_status" in DONE) wait_terminal=completed ;; ERROR) wait_terminal=failed ;; *) wait_terminal="" ;; esac
-                if [ -n "$wait_terminal" ]; then
-                    wait_sha="$(shasum -a 256 "$cb_file" | awk '{print $1}')"
-                    wait_intent="$(python3 - "$wait_delivery" "$wait_terminal" "$cb_file" "$wait_sha" <<'PY'
+            # #56: emit ONLY for a fresh callback. Superseded residue must not terminalize
+            # the delivery, render a digest, write the status file, or end this wait.
+            if [ "$cb_superseded" -eq 0 ]; then
+                if grep -Eq '^delivery_id: [^[:space:]]' "$cb_file"; then
+                    local wait_delivery wait_status wait_terminal wait_sha wait_intent wait_reply wait_code wait_rc=0
+                    wait_delivery="$(sed -n 's/^delivery_id:[[:space:]]*//p' "$cb_file" | head -1)"
+                    wait_status="$(sed -n 's/^status:[[:space:]]*//p' "$cb_file" | head -1)"
+                    case "$wait_status" in DONE) wait_terminal=completed ;; ERROR) wait_terminal=failed ;; *) wait_terminal="" ;; esac
+                    if [ -n "$wait_terminal" ]; then
+                        wait_sha="$(shasum -a 256 "$cb_file" | awk '{print $1}')"
+                        wait_intent="$(python3 - "$wait_delivery" "$wait_terminal" "$cb_file" "$wait_sha" <<'PY'
 import json,sys
 print(json.dumps({'action':'reconcile-delivery','delivery_id':sys.argv[1],
                   'terminal':sys.argv[2],'callback_path':sys.argv[3],
                   'callback_sha256':sys.argv[4],'allow_expired':True},separators=(',',':')))
 PY
 )"
-                    wait_reply="$(printf '%s\n' "$wait_intent" | "$FORGE_BROKER_BIN" control --root "$project_root" --json)" || wait_rc=$?
-                    wait_code="$(printf '%s' "$wait_reply" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("code", ""))' 2>/dev/null)"
-                    if [ "$wait_rc" -ne 0 ] && [ "$wait_code" != DELIVERY_CLOSED ]; then
-                        _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=terminalize-pending delivery_id=$wait_delivery"
-                        printf 'TERMINALIZE: PENDING\n'
+                        wait_reply="$(printf '%s\n' "$wait_intent" | "$FORGE_BROKER_BIN" control --root "$project_root" --json)" || wait_rc=$?
+                        wait_code="$(printf '%s' "$wait_reply" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("code", ""))' 2>/dev/null)"
+                        if [ "$wait_rc" -ne 0 ] && [ "$wait_code" != DELIVERY_CLOSED ]; then
+                            _emit_event ERROR "$slug" "stage=$stage worker=$worker_canonical reason=terminalize-pending delivery_id=$wait_delivery"
+                            printf 'TERMINALIZE: PENDING\n'
+                        fi
                     fi
                 fi
+                _wait_emit_callback "$cb_file" "$slug" "$stage" "$worker_canonical" \
+                    "$digest_template" "$project_root"
+                _render_status_file
+                return 0
             fi
-            _wait_emit_callback "$cb_file" "$slug" "$stage" "$worker_canonical" \
-                "$digest_template" "$project_root"
-            _render_status_file
-            return 0
         fi
 
         local permission_json="" worker_idx protected_delivery=""
@@ -6540,8 +6652,9 @@ print(d.get('message', '') or '')
     fi
 }
 
-# callback-consume — archive a CONSUMED non-terminal (BLOCKED) callback (R4-1).
-#   forge-bridge callback-consume --slug <s> --stage <s> --status BLOCKED
+# callback-consume — archive a CONSUMED non-terminal (BLOCKED) callback (R4-1), or clean up
+# STALE TERMINAL residue left by a repeated dispatch of the same stage (#56).
+#   forge-bridge callback-consume --slug <s> --stage <s> --status BLOCKED|PARKED|DONE|ERROR
 # Read and consume are deliberately SPLIT: `wait` reads the canonical BLOCKED
 # callback and LEAVES it in place (so a resume before the continuation re-surfaces
 # the same blocked state — no deadlock). The orchestrator calls THIS only AFTER a
@@ -6554,6 +6667,11 @@ print(d.get('message', '') or '')
 #   - Nothing to consume (no canonical file, or its status != the requested
 #     non-terminal status) -> STRUCTURED NO-OP (exit 0) so the orchestrator does
 #     not re-wait blindly.
+#   - DONE|ERROR is STALE-RESIDUE CLEANUP ONLY (#56). A terminal callback closes its pending
+#     BEFORE publication, so open-pending presence cannot tell residue from a fresh result;
+#     eligibility is instead "a NEWER delivery-bound dispatch for the same
+#     (stage, worker, session, incarnation) already superseded this callback". A fresh
+#     terminal callback is REFUSED with CALLBACK_TERMINAL_NOT_SUPERSEDED and no bytes change.
 cmd_callback_consume() {
     local slug="" stage="" status="BLOCKED" _no_lock=0 _closed_selection=""
     while [ $# -gt 0 ]; do
@@ -6567,12 +6685,14 @@ cmd_callback_consume() {
         esac
     done
     if [ -z "$slug" ] || [ -z "$stage" ]; then
-        echo "Usage: forge-bridge callback-consume --slug <s> --stage <s> [--status BLOCKED]" >&2
+        echo "Usage: forge-bridge callback-consume --slug <s> --stage <s> [--status BLOCKED|PARKED|DONE|ERROR]" >&2
         return 1
     fi
+    local consume_selector=_callback_mutation_select
     case "$status" in
         BLOCKED|PARKED) ;;
-        *) echo "ERROR: callback-consume only consumes BLOCKED|PARKED; got '$status'" >&2; return 1 ;;
+        DONE|ERROR) consume_selector=_callback_terminal_superseded_select ;;
+        *) echo "ERROR: callback-consume only consumes BLOCKED|PARKED (open) or DONE|ERROR (superseded stale residue); got '$status'" >&2; return 1 ;;
     esac
     require_identity "callback-consume" host-degrade || return 1
     local project_root; project_root=$(_resolve_project_root "")
@@ -6584,7 +6704,7 @@ cmd_callback_consume() {
         [ "$_no_lock" = 1 ] || { echo "ERROR: delegated closed selection requires --_no_lock" >&2; return 1; }
         selection="$_closed_selection"
     else
-        selection="$(_callback_mutation_select "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" "$status" "$pipeline_log")" || select_rc=$?
+        selection="$("$consume_selector" "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" "$status" "$pipeline_log")" || select_rc=$?
         if [ "$select_rc" -eq 1 ]; then
             _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=noop reason=no-canonical-callback status=$status"
             echo "CALLBACK_CONSUME NOOP stage=$stage slug=$slug reason=no-canonical-callback (nothing to archive)"
@@ -6594,6 +6714,11 @@ cmd_callback_consume() {
             _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=noop reason=status-mismatch status=$status"
             echo "CALLBACK_CONSUME NOOP stage=$stage slug=$slug reason=status-mismatch (nothing to archive)"
             return 0
+        fi
+        if [ "$select_rc" -eq 6 ]; then
+            _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=refused reason=CALLBACK_TERMINAL_NOT_SUPERSEDED status=$status"
+            echo "REFUSED: CALLBACK_TERMINAL_NOT_SUPERSEDED stage=$stage slug=$slug status=$status — this terminal callback is the NEWEST delivery-bound result for its worker/session/incarnation, so it is a FRESH result, not stale residue. Read it with 'forge-bridge wait' (or supersede it with a newer dispatch) before cleaning up; no bytes were changed." >&2
+            return 1
         fi
         [ "$select_rc" -eq 0 ] || return 1
     fi
@@ -6605,7 +6730,7 @@ cmd_callback_consume() {
         _callback_prelock_barrier
         _lifecycle_lock "$slug" "$stage" || return 1
         _held=1
-        if ! _callback_selection_unchanged "$selection" "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" "$status" "$pipeline_log"; then
+        if ! _callback_selection_unchanged --selector "$consume_selector" "$selection" "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" "$status" "$pipeline_log"; then
             _lifecycle_unlock
             echo "REFUSED: callback-consume revalidation failed; no bytes changed." >&2
             return 1
@@ -9792,8 +9917,9 @@ case "${1:-help}" in
         echo "  callback --slug <s> --stage <s> --status <DONE|BLOCKED|ERROR> [--message <m>] [--worker <w>] [--quiet]"
         echo "                                Worker-side declarative completion: writes callback file, auto-logs, notifies orchestrator (--quiet suppresses notification)"
         echo "                                Terminal DONE/ERROR closes the pending FIRST then publishes atomically; non-terminal BLOCKED keeps the pending open"
-        echo "  callback-consume --slug <s> --stage <s> [--status BLOCKED]"
-        echo "                                Archive a consumed non-terminal (BLOCKED) callback AFTER a send --force continuation; structured no-op if none. See infra-lock Shape A."
+        echo "  callback-consume --slug <s> --stage <s> [--status BLOCKED|PARKED|DONE|ERROR]"
+        echo "                                Archive a consumed non-terminal (BLOCKED|PARKED) callback AFTER a send --force continuation; structured no-op if none. See infra-lock Shape A."
+        echo "                                DONE|ERROR is stale-residue cleanup ONLY: it archives a terminal callback only when a NEWER delivery-bound dispatch superseded it, and refuses a fresh one (CALLBACK_TERMINAL_NOT_SUPERSEDED)."
         echo "  park --slug <s> --stage <s> --reason <text> [--worker <w>] [--uncommitted]"
         echo "                                Park an open BLOCKED item: keeps the pending open, writes a durable parked record, flips the callback to PARKED. Use 'park --resolve --slug <s> --stage <s> [--note <text>]' to close a parked item."
         echo "  blocked-audit [--root <path>] [--json]"

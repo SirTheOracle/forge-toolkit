@@ -1296,6 +1296,41 @@ run_in_pane "$S2:0.0" e-scan-exact "FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $E
 [ "$(rc_of e-scan-exact)" = 0 ] && out_of e-scan-exact | grep -q 'STATUS: BLOCKED' \
   && ok "T-P1E-WAIT-EXACT" || bad "T-P1E-WAIT-EXACT"
 
+# #56 D4: a callback carrying no delivery metadata cannot be proven stale, so a NEWER
+# delivery-bound pending for the same identity must not stop it from emitting. Uses its own
+# slug and fixtures so the $ES-$EST exact callback the contention cases below reuse is untouched.
+B56L=b56legacy
+mkdir -p "$rootA/.dev/proposals/$B56L"
+cat > "$rootA/.dev/proposals/$B56L/forge-log.yml" <<EOF2
+pipeline: $B56L
+entries:
+  - timestamp: "2026-07-16T01:00:00Z"
+    stage: $EST
+    to: codex-a
+    session: $S2
+    incarnation: $S2INC
+    delivery_id: delivery-test
+    response: null
+EOF2
+cat > "$ED/$B56L-$EST.$S2.$S2INC.callback" <<EOF2
+slug: $B56L
+stage: $EST
+status: BLOCKED
+worker: codex-a
+session: $S2
+incarnation: $S2INC
+origin:
+callback_id: b56-legacy-id
+timestamp: 2026-07-14T00:00:00Z
+message: legacy
+EOF2
+run_in_pane "$S2:0.0" b56-legacy "FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $B56L --stage $EST --worker codex-a --timeout 3 --interval 0.1"
+if [ "$(rc_of b56-legacy)" = 0 ] && out_of b56-legacy | grep -q 'STATUS: BLOCKED' \
+   && out_of b56-legacy | grep -q 'CALLBACK_ID: b56-legacy-id'; then
+    ok "T-B56-WAIT-LEGACY-CALLBACK-STILL-EMITS"
+else bad "T-B56-WAIT-LEGACY-CALLBACK-STILL-EMITS (rc=$(rc_of b56-legacy) out=$(out_of b56-legacy | tr '\n' ' '))"; fi
+rm -f "$ED/$B56L-$EST.$S2.$S2INC.callback"; rm -rf "$rootA/.dev/proposals/$B56L"
+
 # A lock miss is a poll miss: release after one short acquisition ceiling and
 # the same wait proceeds to select the exact callback.
 LOCK="$rootA/.dev/forge-tmp/locks/lifecycle-${ES}--${EST}.lock"; mkdir -p "$(dirname "$LOCK")"
@@ -1388,6 +1423,94 @@ run_in_pane "$S2:0.0" p1wc-consume "FORGE_WATCH_TRIGGER=0 $BRIDGE callback-consu
 WC_ARCH="$rootA/.dev/forge-tmp/callbacks/archive/$WC_SLUG-$WC_STAGE.$wc_id.callback"
 [ "$(rc_of p1wc-consume)" = 0 ] && [ "$wc_hash" = "$(shasum -a 256 "$WC_ARCH" | awk '{print $1}')" ] \
   && grep -q "^incarnation: $S2INC$" "$WC_ARCH" && ok "T-P1WC-CONSUME-BYTE-PRESERVE" || bad "T-P1WC-CONSUME-BYTE-PRESERVE"
+
+# ---- #56 repeated-stage callback replay ----
+# A repeated dispatch of the same slug/stage appends a NEWER delivery-bound pending while the
+# previous terminal callback still sits in the canonical path. `wait` must treat that file as
+# residue (a poll miss, not a result), terminal `callback-consume` must be able to archive it,
+# and a FRESH terminal callback must still emit and still refuse cleanup.
+echo "== #56 repeated-stage callback replay =="
+B56_STAGE=adhoc
+b56_round1(){  # b56_round1 <slug> <ts> — one OPEN delivery-bound pending for the live S2 identity
+    local d="$rootA/.dev/proposals/$1"; mkdir -p "$d"
+    { echo "pipeline: $1"; echo "entries:"; b56_entry "$2"; } > "$d/forge-log.yml"
+}
+b56_append(){  # b56_append <slug> <ts> — a LATER delivery-bound generation, same identity
+    b56_entry "$2" >> "$rootA/.dev/proposals/$1/forge-log.yml"
+}
+b56_entry(){
+    echo "  - timestamp: \"$1\""
+    echo "    stage: $B56_STAGE"
+    echo "    to: codex-a"
+    echo "    session: $S2"
+    echo "    incarnation: $S2INC"
+    echo "    delivery_id: delivery-test"
+    echo "    response: null"
+}
+b56_cb(){ echo "$rootA/.dev/forge-tmp/callbacks/$1-$B56_STAGE.$S2.$S2INC.callback"; }
+b56_arch(){ echo "$rootA/.dev/forge-tmp/callbacks/archive/$1-$B56_STAGE.$2.callback"; }
+b56_id(){ sed -n 's/^callback_id:[[:space:]]*//p' "$1" | head -1; }
+b56_sha(){ shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
+
+# T-B56-WAIT-IGNORES-STALE-TERMINAL-REPLAY: round 1's terminal callback must NOT be replayed
+# to the wait that is waiting on round 2 (the diagnosed cause).
+B56R=b56replay
+b56_round1 "$B56R" "2026-07-16T00:00:00Z"
+run_in_pane "$S2:0.0" b56r-cb1 "FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug $B56R --stage $B56_STAGE --status DONE --worker codex-a --message b56-round-1 --quiet"
+B56R_CB="$(b56_cb "$B56R")"; b56r_id1="$(b56_id "$B56R_CB")"
+b56_append "$B56R" "2026-07-16T00:01:00Z"
+run_in_pane "$S2:0.0" b56r-wait1 "FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $B56R --stage $B56_STAGE --worker codex-a --timeout 1 --interval 0.1"
+if [ "$(rc_of b56r-cb1)" = 0 ] && [ -n "$b56r_id1" ] && [ "$(rc_of b56r-wait1)" = 0 ] \
+   && out_of b56r-wait1 | grep -q 'STATUS: TIMEOUT' \
+   && ! out_of b56r-wait1 | grep -q "CALLBACK_ID: $b56r_id1" \
+   && ! out_of b56r-wait1 | grep -q 'PENDING_TIMESTAMP: 2026-07-16T00:00:00Z'; then
+    ok "T-B56-WAIT-IGNORES-STALE-TERMINAL-REPLAY"
+else bad "T-B56-WAIT-IGNORES-STALE-TERMINAL-REPLAY (cb1=$(rc_of b56r-cb1) id1=$b56r_id1 wait=$(rc_of b56r-wait1) out=$(out_of b56r-wait1 | tr '\n' ' '))"; fi
+
+# Round 2 half of the same case: the fresh terminal callback still emits, with the NEW callback
+# id and the NEW pending timestamp.
+run_in_pane "$S2:0.0" b56r-cb2 "FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug $B56R --stage $B56_STAGE --status DONE --worker codex-a --message b56-round-2 --quiet"
+b56r_id2="$(b56_id "$B56R_CB")"
+run_in_pane "$S2:0.0" b56r-wait2 "FORGE_WATCH_TRIGGER=0 $BRIDGE wait --slug $B56R --stage $B56_STAGE --worker codex-a --timeout 3 --interval 0.1"
+if [ "$(rc_of b56r-cb2)" = 0 ] && [ -n "$b56r_id2" ] && [ "$b56r_id2" != "$b56r_id1" ] \
+   && [ "$(rc_of b56r-wait2)" = 0 ] \
+   && out_of b56r-wait2 | grep -q 'STATUS: DONE' \
+   && out_of b56r-wait2 | grep -q "CALLBACK_ID: $b56r_id2" \
+   && out_of b56r-wait2 | grep -q 'PENDING_TIMESTAMP: 2026-07-16T00:01:00Z'; then
+    ok "T-B56-WAIT-IGNORES-STALE-TERMINAL-REPLAY round 2 emits the fresh terminal callback"
+else bad "T-B56-WAIT-IGNORES-STALE-TERMINAL-REPLAY round 2 (cb2=$(rc_of b56r-cb2) id2=$b56r_id2 wait=$(rc_of b56r-wait2) out=$(out_of b56r-wait2 | tr '\n' ' '))"; fi
+
+# T-B56-CONSUME-DONE-ARCHIVES-SUPERSEDED-TERMINAL (D2): the supported cleanup route for
+# already-existing stale terminal residue, byte-preserving.
+B56C=b56consume
+b56_round1 "$B56C" "2026-07-16T00:00:00Z"
+run_in_pane "$S2:0.0" b56c-cb "FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug $B56C --stage $B56_STAGE --status DONE --worker codex-a --message b56-stale --quiet"
+B56C_CB="$(b56_cb "$B56C")"; b56c_id="$(b56_id "$B56C_CB")"; b56c_sha="$(b56_sha "$B56C_CB")"
+b56_append "$B56C" "2026-07-16T00:01:00Z"
+run_in_pane "$S2:0.0" b56c-consume "FORGE_WATCH_TRIGGER=0 $BRIDGE callback-consume --slug $B56C --stage $B56_STAGE --status DONE"
+B56C_ARCH="$(b56_arch "$B56C" "$b56c_id")"
+if [ "$(rc_of b56c-cb)" = 0 ] && [ -n "$b56c_id" ] && [ "$(rc_of b56c-consume)" = 0 ] \
+   && out_of b56c-consume | grep -q "CALLBACK_CONSUME ARCHIVED stage=$B56_STAGE slug=$B56C status=DONE" \
+   && [ -f "$B56C_ARCH" ] && [ "$b56c_sha" = "$(b56_sha "$B56C_ARCH")" ] && [ ! -e "$B56C_CB" ]; then
+    ok "T-B56-CONSUME-DONE-ARCHIVES-SUPERSEDED-TERMINAL"
+else bad "T-B56-CONSUME-DONE-ARCHIVES-SUPERSEDED-TERMINAL (cb=$(rc_of b56c-cb) consume=$(rc_of b56c-consume) out=$(out_of b56c-consume | tr '\n' ' '))"; fi
+
+# T-B56-CONSUME-DONE-REFUSES-FRESH-TERMINAL (D2): cleanup must never eat a result no wait has
+# read yet. Nothing supersedes this callback, so it is refused with actionable guidance.
+B56F=b56fresh
+b56_round1 "$B56F" "2026-07-16T00:00:00Z"
+run_in_pane "$S2:0.0" b56f-cb "FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug $B56F --stage $B56_STAGE --status DONE --worker codex-a --message b56-fresh --quiet"
+B56F_CB="$(b56_cb "$B56F")"; b56f_id="$(b56_id "$B56F_CB")"; b56f_sha="$(b56_sha "$B56F_CB")"
+run_in_pane "$S2:0.0" b56f-consume "FORGE_WATCH_TRIGGER=0 $BRIDGE callback-consume --slug $B56F --stage $B56_STAGE --status DONE"
+B56F_ARCH="$(b56_arch "$B56F" "$b56f_id")"
+if [ "$(rc_of b56f-cb)" = 0 ] && [ -n "$b56f_id" ] && [ "$(rc_of b56f-consume)" != 0 ] \
+   && out_of b56f-consume | grep -q 'CALLBACK_TERMINAL_NOT_SUPERSEDED' \
+   && out_of b56f-consume | grep -Eq "forge-bridge wait|supersede" \
+   && [ -f "$B56F_CB" ] && [ "$b56f_sha" = "$(b56_sha "$B56F_CB")" ] && [ ! -e "$B56F_ARCH" ]; then
+    ok "T-B56-CONSUME-DONE-REFUSES-FRESH-TERMINAL"
+else bad "T-B56-CONSUME-DONE-REFUSES-FRESH-TERMINAL (cb=$(rc_of b56f-cb) consume=$(rc_of b56f-consume) out=$(out_of b56f-consume | tr '\n' ' '))"; fi
+rm -f "$rootA/.dev/forge-tmp/callbacks/b56"*.callback
+rm -rf "$rootA/.dev/proposals/$B56R" "$rootA/.dev/proposals/$B56C" "$rootA/.dev/proposals/$B56F"
 
 # ---- Per-callback usage observation (Codex parity V2) ----
 echo "== per-callback usage observation (Codex parity V2) =="
