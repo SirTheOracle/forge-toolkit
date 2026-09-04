@@ -5420,7 +5420,7 @@ PY
     local registration_rc=0
     DELIVERY_JSON="$(printf '%s\n' "$DELIVERY_INTENT" | "$FORGE_BROKER_BIN" control --root "$physical_code_root" --json)" || registration_rc=$?
     if [ "$registration_rc" -eq 6 ]; then
-        local blocking_cb blocking_delivery blocking_status blocking_terminal blocking_sha blocking_intent reconcile_rc=0
+        local blocking_cb blocking_delivery blocking_status blocking_terminal blocking_sha blocking_intent reconcile_rc=0 reap_intent reap_rc=0
         blocking_delivery="$(printf '%s' "$DELIVERY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("detail", ""))' 2>/dev/null)"
         blocking_cb="$(python3 - "$project_root/.dev/forge-tmp/callbacks" "$blocking_delivery" <<'PY'
 import pathlib,re,sys
@@ -5453,13 +5453,48 @@ PY
                     DELIVERY_JSON="$(printf '%s\n' "$DELIVERY_INTENT" | "$FORGE_BROKER_BIN" control --root "$physical_code_root")" || registration_rc=$?
                 fi
             fi
+        else
+            # C3: an empty $blocking_cb covers BOTH cases -- no callback file at all, and
+            # the ambiguous len(matches) != 1 case in the matcher above. Neither is
+            # evidence of a terminal state, so neither may be used to synthesise a
+            # reconcile-delivery intent. Decided deliberately: ask the broker to reap on
+            # ITS OWN state instead, which is the one recovery route the lost callback
+            # cannot gate.
+            # C1/D1: `force` is OMITTED here, never set false. reap-delivery reads
+            # `request.get("force") is True` (bin/forge-broker:920), so omitting the key
+            # keeps the expired-only precondition intact. That is the load-bearing safety
+            # property of this whole change: adding `force` would re-open regression N-7
+            # (a mistyped pane cancelling a healthy running stage). Never add it to make
+            # a test pass -- T3 exists to fail if you do.
+            reap_intent="$(python3 - "$ID_target_session" "$worker_pane" <<'PYRE'
+import json,sys
+print(json.dumps({'action':'reap-delivery','session':sys.argv[1],'pane':sys.argv[2],
+                  'operator_command':'forge-bridge dispatch auto-reap'},separators=(',',':')))
+PYRE
+)"
+            printf '%s\n' "$reap_intent" | "$FORGE_BROKER_BIN" control --root "$physical_code_root" >/dev/null 2>&1 || reap_rc=$?
+            if [ "$reap_rc" -eq 0 ]; then
+                _emit_event LIFECYCLE_AUTO_REAPED "$slug" "stage=$stage worker=$worker_canonical delivery_id=${blocking_delivery:-unknown}"
+                echo "LIFECYCLE_AUTO_REAPED delivery_id=${blocking_delivery:-unknown}" >&2
+                # C2/D3: exactly ONE re-registration attempt. No loop, no backoff, no
+                # second reap.
+                registration_rc=0
+                DELIVERY_JSON="$(printf '%s\n' "$DELIVERY_INTENT" | "$FORGE_BROKER_BIN" control --root "$physical_code_root" --json)" || registration_rc=$?
+            fi
         fi
-        if [ "$reconcile_rc" -ne 0 ] || [ -z "$blocking_cb" ]; then
+        if [ "$registration_rc" -ne 0 ] && { [ "$reconcile_rc" -ne 0 ] || [ -z "$blocking_cb" ]; }; then
             _emit_event LIFECYCLE_RECONCILE_REFUSED "$slug" "stage=$stage worker=$worker_canonical delivery_id=${blocking_delivery:-unknown}"
+            # C4: the recovery can still legitimately refuse -- most importantly
+            # DELIVERY_NOT_EXPIRED (Risk R2, out of scope by decision). Cause 3 of the
+            # diagnosis is that _emit_event never writes stderr, so the operator saw
+            # exit 1 and nothing else for nine hours. Name the delivery and the remedy.
+            echo "LIFECYCLE_RECONCILE_REFUSED delivery_id=${blocking_delivery:-unknown}" >&2
+            echo "  remedy: forge codex-broker reap --root $physical_code_root --pane $worker_pane" >&2
+            echo "  add --force ONLY if that delivery has not expired yet: --force cancels a live stage and is recorded as forced in the protected audit." >&2
         fi
     fi
     if [ "$registration_rc" -ne 0 ] || [ -z "$DELIVERY_JSON" ]; then
-        _emit_event BROKER_REGISTRATION_FAILED "$slug" "stage=$stage worker=$worker_canonical"
+        _emit_event BROKER_REGISTRATION_FAILED "$slug" "stage=$stage worker=$worker_canonical delivery_id=${blocking_delivery:-unknown}"
         _worker_unlock "$worker_canonical"; return 1
     fi
     delivery_id="$(printf '%s' "$DELIVERY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["delivery_id"])')"

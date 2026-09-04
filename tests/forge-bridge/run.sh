@@ -27,7 +27,12 @@ payload="$(cat)"
 action="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("action",""))' "$payload")"
 case "$action" in
   register-delivery)
-    if [ "${FORGE_BROKER_REGISTER_ACTIVE:-0}" = 1 ]; then
+    # FORGE_BROKER_CLOSED_MARKER (optional) models the real broker's post-close state:
+    # once the blocking delivery has been closed -- by reap-delivery OR by
+    # reconcile-delivery -- registration is no longer refused. Absent the marker this
+    # branch behaves exactly as before, so every pre-existing test is unaffected.
+    if [ "${FORGE_BROKER_REGISTER_ACTIVE:-0}" = 1 ] \
+       && { [ -z "${FORGE_BROKER_CLOSED_MARKER:-}" ] || [ ! -f "${FORGE_BROKER_CLOSED_MARKER}" ]; }; then
       printf '{"schema":"forge-broker-result/1","status":"error","code":"DELIVERY_ALREADY_ACTIVE","detail":"delivery-test"}\n'
       exit 6
     fi
@@ -36,7 +41,18 @@ case "$action" in
   delivery-result) printf '{"delivery_id":"delivery-test","status":"ok"}\n' ;;
   reconcile-delivery)
     [ "${FORGE_BROKER_RECONCILE_RC:-0}" -eq 0 ] || exit "$FORGE_BROKER_RECONCILE_RC"
+    [ -n "${FORGE_BROKER_CLOSED_MARKER:-}" ] && : > "$FORGE_BROKER_CLOSED_MARKER"
     printf '{"delivery_id":"delivery-test","state":"completed"}\n' ;;
+  reap-delivery)
+    # FORGE_BROKER_REAP_REFUSE names a refusal code (e.g. DELIVERY_NOT_EXPIRED). The real
+    # broker prints the refusal to stderr and exits 3 for anything outside its explicit
+    # exit map (bin/forge-broker:1612-1615); mirror both.
+    if [ -n "${FORGE_BROKER_REAP_REFUSE:-}" ]; then
+      printf '{"schema":"forge-broker-result/1","status":"error","code":"%s","detail":"delivery-test"}\n' "$FORGE_BROKER_REAP_REFUSE" >&2
+      exit 3
+    fi
+    [ -n "${FORGE_BROKER_CLOSED_MARKER:-}" ] && : > "$FORGE_BROKER_CLOSED_MARKER"
+    printf '{"delivery_id":"delivery-test","state":"cancelled"}\n' ;;
   *) printf '{"status":"ok"}\n' ;;
 esac
 SH
@@ -1034,6 +1050,127 @@ run_in_pane "$S2:0.0" reusestatus "FORGE_WATCH_TRIGGER=0 $BRIDGE status"
 [ "$(rc_of reusestatus)" = "0" ] \
     && ok "T-REUSE-ROUNDTRIP status renderer tolerates the incarnation field" \
     || bad "T-REUSE-ROUNDTRIP status renderer (rc=$(rc_of reusestatus))"
+
+# ---- #41 broker lost-callback deadlock: callback-free reap fallback (C1-C4, D1-D3) ----
+# The wedge: a worker's callback file never lands, the broker delivery stays open, and
+# every later dispatch dies at DELIVERY_ALREADY_ACTIVE because the ONLY recovery path was
+# gated on the very artifact whose loss caused the wedge. These cases drive cmd_dispatch's
+# registration_rc==6 block through the stub's FORGE_BROKER_REGISTER_ACTIVE seam.
+# They need a REAL pane: cmd_dispatch's first act is `require_identity dispatch host-pane`.
+echo "== broker lost-callback deadlock (#41) =="
+RPROOT="$(mkR rpreap)"; RPS="fbreap-$$"
+mk_session "$RPS" 200 50 "$RPROOT"
+sleep 1
+RPCB="$RPROOT/.dev/forge-tmp/callbacks"; mkdir -p "$RPCB"
+RPEV="$RPROOT/.dev/forge-tmp/orchestrator-events.log"
+RPCAP="$WORK/reap-capture.jsonl"
+RPMARK="$WORK/reap-closed-marker"
+RPENV="FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$PDIR FORGE_WORKER_HYGIENE_MODE=observe FORGE_BROKER_REGISTER_ACTIVE=1 FORGE_BROKER_CAPTURE=$RPCAP FORGE_BROKER_CLOSED_MARKER=$RPMARK"
+
+reap_reset(){ rm -f "$RPCB"/*.callback "$RPMARK" 2>/dev/null; : > "$RPCAP"; : > "$RPEV"; }
+reap_cb(){ printf 'slug: %s\nstage: adhoc\nstatus: DONE\nworker: codex-a\ndelivery_id: delivery-test\ncallback_id: %s\ntimestamp: 2026-09-03T00:00:00Z\nmessage: fixture\n' "$1" "$2" > "$RPCB/$2.callback"; }
+reap_actions(){ python3 - "$RPCAP" <<'PY'
+import json,sys
+for line in open(sys.argv[1]):
+    line=line.strip()
+    if not line: continue
+    try: print(json.loads(line).get('action',''))
+    except ValueError: pass
+PY
+}
+# A successful dispatch leaves an open pending; the worker-lock guard refuses the next
+# dispatch until it is closed. Mirrors guard_done.
+reap_close(){ tmux send-keys -t "$RPS:0.3" C-c 2>/dev/null; sleep 0.3
+    run_in_pane "$RPS:0.3" "$1-close" "( cd $RPROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug $1 --stage adhoc --status DONE --worker codex-a --message reap-fixture-done --quiet )"; }
+
+# T1 (C1/C2): no callback carries the blocking delivery id -> auto reap + ONE retry -> DISPATCHED.
+reap_reset
+run_in_pane "$RPS:0.0" reap-t1 "( cd $RPROOT && $RPENV $BRIDGE dispatch --slug reapt1 --stage adhoc --worker codex-a )"
+if [ "$(rc_of reap-t1)" = 0 ] && out_of reap-t1 | grep -q 'DISPATCHED' \
+   && reap_actions | grep -qx 'reap-delivery' \
+   && grep -q 'LIFECYCLE_AUTO_REAPED' "$RPEV" \
+   && ! grep -q 'BROKER_REGISTRATION_FAILED' "$RPEV"; then
+    ok "T-REAP-1 missing callback recovers via broker-side reap + one retry (C1,C2)"
+else bad "T-REAP-1 (rc=$(rc_of reap-t1) actions=$(reap_actions | tr '\n' ' ') out=$(out_of reap-t1 | tail -6 | tr '\n' ' '))"; fi
+
+# T3 (D1): the emitted reap intent must NOT carry `force`. reap-delivery reads
+# `request.get("force") is True`; adding the key would reap a LIVE delivery and re-open
+# regression N-7. This assertion exists to fail if anyone adds it to make a test pass.
+t3="$(python3 - "$RPCAP" <<'PY'
+import json,sys
+found=[]
+for line in open(sys.argv[1]):
+    line=line.strip()
+    if not line: continue
+    try: d=json.loads(line)
+    except ValueError: continue
+    if d.get('action')=='reap-delivery': found.append(d)
+if len(found)!=1: print('BAD n=%d'%len(found)); raise SystemExit
+d=found[0]
+if 'force' in d: print('BAD force-key-present'); raise SystemExit
+if set(d)!={'action','session','pane','operator_command'}: print('BAD keys=%s'%sorted(d)); raise SystemExit
+if d['pane']!='3': print('BAD pane=%s'%d['pane']); raise SystemExit
+if not d['session']: print('BAD empty-session'); raise SystemExit
+print('OK')
+PY
+)"
+[ "$t3" = OK ] \
+    && ok "T-REAP-3 reap intent omits 'force' entirely; expired-only precondition intact (D1)" \
+    || bad "T-REAP-3 ($t3)"
+reap_close reapt1
+
+# T2 (C3): an AMBIGUOUS callback set (two files, same delivery_id) is not evidence of a
+# terminal state -> it takes the same reap path, not the old silent dead end.
+reap_reset
+reap_cb reapt2 reapt2-a
+reap_cb reapt2 reapt2-b
+run_in_pane "$RPS:0.0" reap-t2 "( cd $RPROOT && $RPENV $BRIDGE dispatch --slug reapt2 --stage adhoc --worker codex-a )"
+if [ "$(rc_of reap-t2)" = 0 ] && out_of reap-t2 | grep -q 'DISPATCHED' \
+   && reap_actions | grep -qx 'reap-delivery' \
+   && ! reap_actions | grep -qx 'reconcile-delivery' \
+   && grep -q 'LIFECYCLE_AUTO_REAPED' "$RPEV" \
+   && ! grep -q 'BROKER_REGISTRATION_FAILED' "$RPEV"; then
+    ok "T-REAP-2 ambiguous callback match takes the reap path, never reconcile (C3)"
+else bad "T-REAP-2 (rc=$(rc_of reap-t2) actions=$(reap_actions | tr '\n' ' ') out=$(out_of reap-t2 | tail -6 | tr '\n' ' '))"; fi
+reap_close reapt2
+
+# T6 (must-not-break): exactly ONE matching callback with status DONE still takes the
+# pre-existing reconcile-delivery path and still emits LIFECYCLE_RECONCILED. No reap.
+reap_reset
+reap_cb reapt6 reapt6-only
+run_in_pane "$RPS:0.0" reap-t6 "( cd $RPROOT && $RPENV $BRIDGE dispatch --slug reapt6 --stage adhoc --worker codex-a )"
+if [ "$(rc_of reap-t6)" = 0 ] && out_of reap-t6 | grep -q 'DISPATCHED' \
+   && reap_actions | grep -qx 'reconcile-delivery' \
+   && ! reap_actions | grep -qx 'reap-delivery' \
+   && grep -q 'LIFECYCLE_RECONCILED' "$RPEV" \
+   && ! grep -q 'LIFECYCLE_RECONCILE_REFUSED' "$RPEV"; then
+    ok "T-REAP-6 single-match reconcile path unchanged (must-not-break)"
+else bad "T-REAP-6 (rc=$(rc_of reap-t6) actions=$(reap_actions | tr '\n' ' ') out=$(out_of reap-t6 | tail -6 | tr '\n' ' '))"; fi
+reap_close reapt6
+
+# T4 (D2): the broker refuses DELIVERY_NOT_EXPIRED -> dispatch still FAILS. The fix must
+# never convert a refusal into a success by any other route.
+# T5 (C4): that refusal names the blocking delivery and the literal remedy on stderr.
+# T7 (C4/MINOR-1): and the BROKER_REGISTRATION_FAILED event record names it too.
+reap_reset
+run_in_pane "$RPS:0.0" reap-t4 "( cd $RPROOT && $RPENV FORGE_BROKER_REAP_REFUSE=DELIVERY_NOT_EXPIRED $BRIDGE dispatch --slug reapt4 --stage adhoc --worker codex-a )"
+if [ "$(rc_of reap-t4)" != 0 ] && ! out_of reap-t4 | grep -q 'DISPATCHED' \
+   && reap_actions | grep -qx 'reap-delivery' \
+   && [ ! -e "$RPROOT/.dev/proposals/reapt4/forge-log.yml" ]; then
+    ok "T-REAP-4 an unexpired delivery still refuses; no dispatch, no pending (D2)"
+else bad "T-REAP-4 (rc=$(rc_of reap-t4) actions=$(reap_actions | tr '\n' ' ') out=$(out_of reap-t4 | tail -6 | tr '\n' ' '))"; fi
+
+if out_of reap-t4 | grep -q 'delivery-test' \
+   && out_of reap-t4 | grep -q 'forge codex-broker reap' \
+   && out_of reap-t4 | grep -q -- '--force'; then
+    ok "T-REAP-5 the surviving refusal is actionable on stderr: delivery id + remedy (C4)"
+else bad "T-REAP-5 ($(out_of reap-t4 | tail -8 | tr '\n' ' '))"; fi
+
+if grep 'BROKER_REGISTRATION_FAILED' "$RPEV" | grep -q 'delivery_id=delivery-test'; then
+    ok "T-REAP-7 BROKER_REGISTRATION_FAILED names the blocking delivery id (C4, MINOR-1)"
+else bad "T-REAP-7 ($(grep 'BROKER_REGISTRATION_FAILED' "$RPEV" | tr '\n' ' '))"; fi
+
+tmux kill-session -t "$RPS" 2>/dev/null
 
 # P1-E read-only audit matrix (fixture bytes must not change).
 ED="$rootA/.dev/forge-tmp/callbacks"; mkdir -p "$ED"; ES="p1e-audit"; EST="coding"
