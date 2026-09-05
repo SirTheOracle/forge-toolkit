@@ -40,7 +40,7 @@ OPERATOR_FILES=(
 # Single bin manifest (was duplicated across install/uninstall/drift).
 BIN_SCRIPTS=(forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review
              forge-stall-install-regex forge-watch forge forge-cc-hook forge-broker
-             forge-git-request)
+             forge-git-request forge-sync-main)
 MANAGED_POLICY_FILES=(codex-forge.config.toml codex-forge-runtime.json idle-prompts.yml)
 
 RED='\033[0;31m'

@@ -566,6 +566,56 @@ notification permission to Script Editor in **System Settings ▸ Notifications*
 then re-run `forge-watch check`. `install` fires one test notification so you
 can catch this immediately.
 
+## Keeping the Local Trunk in Sync (`forge-sync-main`)
+
+Every commit on `main` arrives through a merged pull request. A commit made
+straight onto the local `main` therefore has nothing upstream to come back
+from: the checkout goes ahead-and-behind at once, `git pull` stops being a
+fast-forward, and the drift compounds until someone reconciles it by hand.
+
+`forge-sync-main` is the supported way to keep the local trunk identical to the
+remote one:
+
+```bash
+forge-sync-main            # fetch, fast-forward main, print the drift table
+forge-sync-main --check    # report drift and exit 3; move no branch
+forge-sync-main -C <repo>  # operate on another repository
+```
+
+It does exactly three things, and refuses rather than improvise:
+
+| Local `main` is… | What happens |
+|---|---|
+| identical to `origin/main` | reports in sync, prints the worktree table |
+| strictly behind | fast-forwards — in the worktree that has `main` checked out, so index and files move together |
+| ahead (or diverged) | **refuses**, lists the commits that never went through a PR, prints the branch/push/`gh pr create` steps, changes nothing |
+| behind, but its worktree is dirty | **refuses**, shows the uncommitted paths, changes nothing |
+
+It never merges, rebases, or resets. Each of those would hide a direct commit
+instead of routing it, which is the failure the command exists to prevent.
+Untracked files never block a sync — every forge root carries some.
+
+The closing table positions **every** worktree against `origin/main`, so drift
+is visible before it accumulates:
+
+```
+BRANCH                  AHEAD  BEHIND  STATE  PATH
+main                    0      0       clean  /…/forge-toolkit
+feat/forge-layout-…     0      75      clean  /…/.claude/worktrees/layout-renumber
+```
+
+`AHEAD` on a feature branch is ordinary unmerged work. `AHEAD` on the trunk row
+is the thing to fix, and is flagged `UNPUSHED-TRUNK`.
+
+Exit codes: `0` in sync (or fast-forwarded), `3` drift (refused, or `--check`
+found something), `1` a usage or environment error. `--check` fetches — it
+promises not to move a *branch*, and a fetch only advances remote-tracking
+refs — so it is safe to run on a schedule. Use `--no-fetch` when offline.
+
+The trunk name is read from the remote's own `HEAD`, so a repository on
+`master` works unconfigured; `FORGE_SYNC_TRUNK` and `FORGE_SYNC_REMOTE`
+override it.
+
 ## Recovery
 
 <!-- docs-refresh:start section=recovery -->
