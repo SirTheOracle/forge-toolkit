@@ -1,0 +1,155 @@
+#!/bin/bash
+# forge-sync-main — keep the local trunk identical to the remote trunk.
+#
+# Usage:
+#   forge-sync-main [--check] [--quiet] [-C <repo>]
+#
+#   --check     Report drift and exit non-zero; never move a branch or a worktree.
+#   --no-fetch  Compare against the remote-tracking refs already on disk.
+#   --quiet     Print only refusals and the drift table (for cron/loops).
+#   -C <repo>   Operate on that repository instead of the current directory.
+#
+# Every commit on this repository's trunk arrives through a merged pull request.
+# A commit made straight onto the local trunk therefore has no upstream to come
+# back from, and the checkout silently drifts ahead-and-behind until a pull is
+# no longer a fast-forward. This command is the one supported way to reconcile:
+#
+#   * refuses — loudly, without changing anything — when the local trunk holds
+#     commits the remote does not, and prints how to route them through a PR;
+#   * fast-forwards the local trunk when it is strictly behind;
+#   * reports every worktree's position against the remote trunk, so drift is
+#     visible before it accumulates.
+#
+# It never merges, never rebases, and never resets: those hide the direct commit
+# instead of routing it. Exit 0 = in sync, 3 = drift (refused or --check), 1 = error.
+set -uo pipefail
+
+QUIET=0; CHECK=0; REPO=""; FETCH="${FORGE_SYNC_FETCH:-1}"
+while [ $# -gt 0 ]; do case "$1" in
+    --check) CHECK=1; shift ;;
+    --no-fetch) FETCH=0; shift ;;
+    --quiet) QUIET=1; shift ;;
+    -C) REPO="${2:-}"; [ -n "$REPO" ] || { echo "forge-sync-main: -C needs a path" >&2; exit 1; }; shift 2 ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "forge-sync-main: unknown argument '$1' (try --help)" >&2; exit 1 ;;
+esac; done
+
+say(){ [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+die(){ printf 'forge-sync-main: %s\n' "$*" >&2; exit 1; }
+
+cd "${REPO:-.}" 2>/dev/null || die "no such directory: $REPO"
+git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $(pwd)"
+
+REMOTE="${FORGE_SYNC_REMOTE:-origin}"
+git remote get-url "$REMOTE" >/dev/null 2>&1 || die "no remote named '$REMOTE'"
+
+# Trunk name comes from the remote's own HEAD, so a repo on master or trunk works
+# without configuration. FORGE_SYNC_TRUNK overrides; `main` is the last resort.
+TRUNK="${FORGE_SYNC_TRUNK:-}"
+if [ -z "$TRUNK" ]; then
+    TRUNK="$(git symbolic-ref -q --short "refs/remotes/$REMOTE/HEAD" 2>/dev/null | sed "s|^$REMOTE/||")"
+    [ -n "$TRUNK" ] || TRUNK=main
+fi
+UPSTREAM="$REMOTE/$TRUNK"
+
+# --check fetches too. It promises to move no local branch and touch no worktree,
+# and a fetch does neither — it only advances remote-tracking refs. Skipping it
+# would make --check compare against whatever the last fetch happened to leave
+# behind and cheerfully report "in sync" while the remote had moved on, which is
+# precisely the drift it exists to catch.
+if [ "$FETCH" = 1 ]; then
+    say "Fetching ${REMOTE}..."
+    git fetch -q "$REMOTE" --prune || die "fetch from '$REMOTE' failed"
+else
+    say "Using the remote-tracking refs on disk (--no-fetch)"
+fi
+
+git rev-parse --verify -q "$UPSTREAM" >/dev/null || die "'$UPSTREAM' does not exist — is the remote trunk named something else? (FORGE_SYNC_TRUNK=<name>)"
+git rev-parse --verify -q "refs/heads/$TRUNK" >/dev/null || die "no local branch '$TRUNK' to sync"
+
+# Which worktree, if any, has the trunk checked out. `git worktree list --porcelain`
+# is the only listing that covers the primary worktree and linked ones alike.
+TRUNK_WT=""
+while IFS= read -r line; do
+    case "$line" in
+        worktree\ *) wt="${line#worktree }" ;;
+        branch\ refs/heads/*) [ "${line#branch refs/heads/}" = "$TRUNK" ] && TRUNK_WT="$wt" ;;
+    esac
+done < <(git worktree list --porcelain)
+
+read -r BEHIND AHEAD <<<"$(git rev-list --left-right --count "$UPSTREAM...refs/heads/$TRUNK")"
+
+# ── Refusal: the local trunk carries commits the remote has never seen ────────
+# Fast-forwarding is impossible and every alternative (merge, rebase, reset)
+# either fabricates history or throws the commits away, so stop and hand the
+# operator the routing steps instead of guessing which they wanted.
+if [ "$AHEAD" -gt 0 ]; then
+    printf '\nREFUSED: local %s is %s commit(s) ahead of %s.\n\n' "$TRUNK" "$AHEAD" "$UPSTREAM" >&2
+    printf 'These commits never went through a pull request:\n\n' >&2
+    git log --format='  %h  %s' "$UPSTREAM..refs/heads/$TRUNK" >&2
+    printf '\nRoute them through a PR, then sync:\n\n' >&2
+    printf '  git branch <descriptive-branch> %s\n' "$TRUNK" >&2
+    printf '  git push -u %s <descriptive-branch>\n' "$REMOTE" >&2
+    printf '  gh pr create --base %s --head <descriptive-branch>\n' "$TRUNK" >&2
+    printf '  # after the PR merges:\n' >&2
+    printf '  git branch -f %s %s   # only once <descriptive-branch> is on %s\n' "$TRUNK" "$UPSTREAM" "$UPSTREAM" >&2
+    printf '  forge-sync-main\n\n' >&2
+    printf 'Nothing was changed.\n' >&2
+    exit 3
+fi
+
+# ── Fast-forward ─────────────────────────────────────────────────────────────
+if [ "$BEHIND" = 0 ]; then
+    say "In sync: $TRUNK == $UPSTREAM ($(git rev-parse --short "$UPSTREAM"))"
+elif [ "$CHECK" = 1 ]; then
+    printf 'DRIFT: local %s is %s commit(s) behind %s. Run forge-sync-main to fast-forward.\n' "$TRUNK" "$BEHIND" "$UPSTREAM" >&2
+    exit 3
+elif [ -n "$TRUNK_WT" ]; then
+    # The trunk is checked out: only a real fast-forward merge in that worktree
+    # updates the index and the files together. A bare ref move would leave the
+    # worktree reporting every incoming change as a local deletion.
+    DIRTY="$(git -C "$TRUNK_WT" status --porcelain=v1 --untracked-files=no)"
+    if [ -n "$DIRTY" ]; then
+        printf '\nREFUSED: %s is checked out at %s with uncommitted changes:\n\n' "$TRUNK" "$TRUNK_WT" >&2
+        printf '%s\n' "$DIRTY" | sed 's/^/  /' >&2
+        printf '\nCommit them onto a branch (they do not belong on %s) or stash them, then re-run.\n' "$TRUNK" >&2
+        exit 3
+    fi
+    git -C "$TRUNK_WT" merge --ff-only -q "$UPSTREAM" || die "fast-forward of $TRUNK in $TRUNK_WT failed"
+    say "Fast-forwarded $TRUNK to $(git rev-parse --short "$UPSTREAM") (+$BEHIND) in $TRUNK_WT"
+else
+    git update-ref "refs/heads/$TRUNK" "$UPSTREAM" || die "could not move $TRUNK to $UPSTREAM"
+    say "Fast-forwarded $TRUNK to $(git rev-parse --short "$UPSTREAM") (+$BEHIND)"
+fi
+
+# ── Drift table ──────────────────────────────────────────────────────────────
+# Every worktree, positioned against the remote trunk. `behind` is how much of
+# the trunk a branch is missing; `ahead` is unmerged work, which is normal on a
+# feature branch and is exactly what must not appear on the trunk row.
+say ""
+say "Worktrees vs $UPSTREAM:"
+{
+    printf 'BRANCH\tAHEAD\tBEHIND\tSTATE\tPATH\n'
+    wt=""; br=""
+    emit(){
+        [ -n "$wt" ] || return 0
+        local a b state dirty
+        if [ -z "$br" ]; then
+            printf '(detached)\t-\t-\t-\t%s\n' "$wt"; return 0
+        fi
+        read -r b a <<<"$(git rev-list --left-right --count "$UPSTREAM...refs/heads/$br" 2>/dev/null || echo '? ?')"
+        dirty="$(git -C "$wt" status --porcelain=v1 --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')"
+        state=clean; [ "$dirty" = 0 ] || state="dirty($dirty)"
+        [ "$br" != "$TRUNK" ] || [ "$a" = 0 ] || state="$state UNPUSHED-TRUNK"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$br" "$a" "$b" "$state" "$wt"
+    }
+    while IFS= read -r line; do
+        case "$line" in
+            worktree\ *) emit; wt="${line#worktree }"; br="" ;;
+            branch\ refs/heads/*) br="${line#branch refs/heads/}" ;;
+        esac
+    done < <(git worktree list --porcelain)
+    emit
+} | { [ "$QUIET" = 1 ] && cat || column -t -s"$(printf '\t')"; }
+
+exit 0
