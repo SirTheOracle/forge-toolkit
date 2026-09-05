@@ -10,17 +10,53 @@ prose outside the markers is preserved.
 <!-- docs-refresh:start section=getting-started -->
 ### One-time setup per project
 
-A forge project needs:
+Three steps, in order. Nothing creates step 1 for you.
 
-1. **A `.claude/forge-project.yml`** at the project root declaring
-   `project.name`, `forge.expected_root`, `forge.base_ref`, and the
-   service/test/qa sections that workers read for their environment
-   preamble. (See the project-config section of `technical-reference.md`
-   for the schema.)
-2. **`forge-start`** to provision a session-named Git worktree, seed its
-   root-local Forge assets, create the 5-pane tmux session there, and write
-   `.dev/.forge-session` with the session name. Worktrees are deliberately
-   never auto-removed.
+1. **Create `.claude/forge-project.yml`** at the project root. A minimal file
+   is enough when the worktree defaults already fit the project — the parent
+   defaults to the directory containing the repository, the leaf prefix to the
+   repository directory name, and the branch to `forge/<session>`:
+
+   ```bash
+   mkdir -p .claude
+   printf 'project:\n  name: "MyProject"\n' > .claude/forge-project.yml
+   ```
+
+   For the full set of options — services, ports, test commands, worktree seed
+   paths — copy the commented example instead:
+
+   ```bash
+   cp <forge-toolkit>/config/forge-project.example.yml .claude/forge-project.yml
+   ```
+
+   Do **not** set `forge.expected_root` to an absolute path in a file the
+   repository tracks: a worktree cannot satisfy it, and provisioning refuses
+   rather than rewrite a tracked file. Delete the key or set it to `.`.
+
+2. **`forge register <root>`** — the verb takes a path argument, always. From
+   inside the project that is `forge register .`; a bare `forge register`
+   exits with `register requires <root>`.
+
+   Register installs the toolkit-owned `/.dev/` exclusion, merges the Claude
+   Code hook block into `.claude/settings.json` and the codex hooks into
+   `.codex/hooks.json`, appends the root to `~/.config/forge/watch-roots` so
+   `forge-watch` monitors it, and writes the repo identity → alias → path entry
+   in `~/.config/forge/registry.yml`.
+
+   It does **not** create `.claude/forge-project.yml`. Step 1 is yours.
+
+   Register once per repository, not per worktree: registry identity is keyed
+   on the Git *common directory*, which every worktree of a repository shares.
+   That is why worktree provisioning bootstraps root assets but deliberately
+   leaves registry and watch-root writes to `register`.
+
+   `forge-start` never consults the registry, so a session will launch without
+   this step — but the root is then invisible to `forge-watch`, the board, and
+   the alias that `forge dispatch @session`, `gc`, and `recover` resolve.
+
+3. **`forge-start [name]`** provisions a session-named Git worktree, seeds its
+   root-local Forge assets, creates the 5-pane tmux session there, and writes
+   `.dev/.forge-session`. Worktrees are deliberately never auto-removed.
 
    Worktrees land in `.forge-worktrees/` **inside the project the session
    works on** — `<project>/.forge-worktrees/<project>-<session>` — so each
@@ -46,7 +82,12 @@ A forge project needs:
    refusal is fail-closed: `--force` exists on `forge register` and
    `forge spawn`, not on `forge-start` or `forge worktree ensure`.
 
-   Override per project with `forge.worktree.parent` in
+   `forge root-assets ensure-dev-exclusion --root <path>` installs and verifies
+   that exclusion on its own. Session start calls it for the paths that never
+   run `worktree ensure`, and it is the supported way to migrate a root that
+   predates the mechanism.
+
+   Override the container per project with `forge.worktree.parent` in
    `.claude/forge-project.yml`, or per invocation with `FORGE_WORKTREE_PARENT`;
    both still accept a path anywhere on disk. `forge.worktree.prefix` names the
    leaf (default: the repository directory name).
@@ -56,14 +97,41 @@ A forge project needs:
    of ripgrep and pytest collection by default, but it is not a `git clean`
    guard.
 
-`forge-start --here [name]` is the escape hatch: it starts in the current
-physical Git root and does not provision. Use `forge-start --here` when working
-on `forge-toolkit` itself because the installed `~/bin/forge*` launchers point
-at the primary toolkit checkout. Under `--here`, a subdirectory invocation is
-collapsed to the Git toplevel, so `.dev/.forge-session` is no longer written in
-the subdirectory. Re-run `forge register` at a primary root after the canonical
-hook block changes; provisioning refreshes the worktree copy but intentionally
-does not mutate the primary as a side effect.
+### Restarting a session under the same name
+
+Re-running `forge-start <name>` reattaches that session's existing worktree
+rather than cutting a new one, **including when its branch has moved**. A
+session's branch legitimately changes as its pipeline works — workers cut and
+check out feature branches — so provisioning reports the branch actually held
+and reuses the container:
+
+```
+forge worktree: NOTICE: reusing this session's worktree on 'fix/some-work'
+rather than 'forge/<session>' — a session's branch moves as its pipeline works
+```
+
+Reattach never touches the working tree, so uncommitted and unpushed work in
+that worktree survives. A path that exists but is **not** a registered worktree
+of the repository is still refused — that guard is about foreign directories,
+not branch drift.
+
+### `--here`
+
+`forge-start --here [name]` starts in the current physical Git root and does not
+provision a worktree. Under `--here`, a subdirectory invocation is collapsed to
+the Git toplevel, so `.dev/.forge-session` is not written in the subdirectory.
+
+Prefer the default worktree mode when working on **forge-toolkit itself**. The
+installed `~/bin/forge*` launchers are symlinks into the primary toolkit
+checkout, so under `--here` a worker editing `bin/forge` rewrites the binary its
+own session — and the 30-second `com.forge.watch` timer — is executing. In a
+worktree the panes keep invoking the installed binaries while workers edit the
+worktree copy; changes go live on merge. To exercise a change in-session, invoke
+`./bin/forge` explicitly, which is how the test suites already resolve it.
+
+Re-run `forge register` at a primary root after the canonical hook block
+changes; provisioning refreshes the worktree copy but intentionally does not
+mutate the primary as a side effect.
 
 ### Starting a pipeline
 
