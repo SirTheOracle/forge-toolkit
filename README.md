@@ -113,9 +113,14 @@ echo '.dev/' >> .gitignore
 ```bash
 forge-start           # Auto-names: forge-1, forge-2, etc.
 forge-start myproject  # Custom session name
+forge-start --no-attach  # Build the session but stay detached
 ```
 
-This creates a tmux session with 5 panes. Codex panes are launched through the
+This creates a tmux session with 5 panes and attaches you to it. Run from
+inside tmux, it switches the current client to the new session instead of
+nesting an attach. A non-interactive run (output piped or redirected) stays
+detached and just prints the attach command, as does `--no-attach` /
+`FORGE_START_ATTACH=0`; `FORGE_START_ATTACH=1` forces the attach without a tty. Codex panes are launched through the
 explicit contain policy; direct Git/network authority is not part of the worker
 contract. Commit and PR publication use the delivery-bound host broker only
 after their rollout gates pass, and unsupported stages use the reviewed lane.
