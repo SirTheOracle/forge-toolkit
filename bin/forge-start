@@ -15,7 +15,7 @@
 #   └──────────────────┴──────────────────┘
 #
 # Usage:
-#   forge-start [--here] [--allow-dirty-base] [name]
+#   forge-start [--here] [--allow-dirty-base] [--no-attach] [name]
 #   forge-start --populate-existing <name>
 #
 # Plain starts provision a Git worktree by default, under .forge-worktrees/
@@ -23,6 +23,13 @@
 # starting from a worktree does not nest). --here (or FORGE_START_WORKTREE=0)
 # keeps the current physical root; use it while working on forge-toolkit itself
 # because the installed launchers point at this checkout.
+#
+# A plain start attaches to the session it just built when stdin is a terminal;
+# from inside tmux it switches the current client instead of nesting. Pass
+# --no-attach (or FORGE_START_ATTACH=0) to keep the session detached and only
+# print the attach command; FORGE_START_ATTACH=1 forces the attach without a
+# tty. --populate-existing NEVER attaches: `forge spawn` drives it headlessly
+# and an attach there would block the caller forever.
 # ============================================================
 
 set -e
@@ -32,6 +39,7 @@ FORGE_BIN="${FORGE_BIN:-$HOME/bin/forge}"
 FORGE_CODEX_DOCTOR_BIN="${FORGE_CODEX_DOCTOR_BIN:-$HOME/bin/forge}"
 FORGE_START_WORKTREE="${FORGE_START_WORKTREE:-1}"
 FORGE_START_CODEX_PREFLIGHT="${FORGE_START_CODEX_PREFLIGHT:-1}"
+FORGE_START_ATTACH="${FORGE_START_ATTACH:-auto}"
 
 DIR="$(pwd)"
 POPULATE=0
@@ -42,6 +50,7 @@ FORGE_LAYOUT_VERSION="${FORGE_LAYOUT_VERSION:-2}"
 while [ $# -gt 0 ]; do case "$1" in
     --here) FORGE_START_WORKTREE=0; shift ;;
     --allow-dirty-base) ALLOW_DIRTY=1; shift ;;
+    --no-attach) FORGE_START_ATTACH=0; shift ;;
     *) break ;;
 esac; done
 
@@ -291,5 +300,30 @@ echo "  Pane 2 (bottom-left):     Claude Sonnet worker"
 echo "  Pane 3 (middle-right):    Codex A"
 echo "  Pane 4 (bottom-right):    Codex B"
 echo ""
+# Auto-attach. Plain mode only: --populate-existing is driven headlessly by
+# `forge spawn` (bin/forge cmd_spawn step 8), which would hang forever on an
+# attach. Both stdin AND stdout must be a terminal: that is what keeps every
+# scripted/CI caller — and every test that pipes this output — detached.
+# FORGE_START_ATTACH=1 overrides the tty test for callers that know better.
+_forge_should_attach() {
+    [ "$POPULATE" = 0 ] || return 1
+    case "$FORGE_START_ATTACH" in
+        0|no|false)     return 1 ;;
+        1|yes|true|force) return 0 ;;
+        *)              { [ -t 0 ] && [ -t 1 ]; } || return 1 ;;
+    esac
+    return 0
+}
+
+if _forge_should_attach; then
+    if [ -n "${TMUX:-}" ]; then
+        # tmux refuses to nest an attach; move this client to the new session.
+        echo "Switching this tmux client to '$SESSION'."
+        exec tmux switch-client -t "$SESSION"
+    fi
+    echo "Attaching to '$SESSION'  (detach with: <prefix> d)"
+    exec tmux attach-session -t "$SESSION"
+fi
+
 echo "Attach with:  tmux attach -t $SESSION"
 echo ""

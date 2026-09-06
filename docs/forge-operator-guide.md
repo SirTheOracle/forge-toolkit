@@ -55,8 +55,16 @@ Three steps, in order. Nothing creates step 1 for you.
    the alias that `forge dispatch @session`, `gc`, and `recover` resolve.
 
 3. **`forge-start [name]`** provisions a session-named Git worktree, seeds its
-   root-local Forge assets, creates the 5-pane tmux session there, and writes
-   `.dev/.forge-session`. Worktrees are deliberately never auto-removed.
+   root-local Forge assets, creates the 5-pane tmux session there, writes
+   `.dev/.forge-session`, and attaches you to the session (from inside tmux it
+   switches the current client rather than nesting an attach). Worktrees are
+   deliberately never auto-removed.
+
+   The attach is skipped whenever it would block or surprise a caller: in
+   `--populate-existing` mode, which `forge spawn` drives headlessly, and in any
+   run whose stdin or stdout is not a terminal. `--no-attach` (or
+   `FORGE_START_ATTACH=0`) keeps a terminal run detached and prints the attach
+   command as before; `FORGE_START_ATTACH=1` forces it without a tty.
 
    Worktrees land in `.forge-worktrees/` **inside the project the session
    works on** — `<project>/.forge-worktrees/<project>-<session>` — so each

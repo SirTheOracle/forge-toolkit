@@ -353,6 +353,53 @@ out=$( TMLOG="$TMLOG" PATH="$SHIM:$PATH" FAKE_HAS_RC=0 FAKE_PANES=1 FAKE_DISP="$
 ! grep -q '^kill-session ' "$TMLOG" && ok 'T-DEV-V17 populate refusal never kills the session' || bad 'T-DEV-V17 killed the session'
 ! grep -qE '^(split-window|send-keys) ' "$TMLOG" && ok 'T-DEV-V17 no panes added before the refusal' || bad "T-DEV-V17 split before refusal: $(cat "$TMLOG")"
 
+echo "── T-START-ATTACH: auto-attach decision matrix ──"
+# The end-of-run attach must be invisible to every non-interactive caller (the
+# HC4 golden above already pins that: no attach line survives a piped run) and
+# must never fire in populate mode, which `forge spawn` drives headlessly.
+_attach_run() {   # _attach_run <logname> <env-assignments...> -- <start-args...>
+  local _log="$WORK/$1.log"; shift
+  : > "$_log"
+  local -a _env=()
+  while [ "$1" != "--" ]; do _env+=("$1"); shift; done
+  shift
+  ( cd "$ATT" && env TMLOG="$_log" PATH="$SHIM:$PATH" FORGE_BRIDGE_BIN="$FB" \
+      FORGE_BIN="$RA" HOME="$WORK/h" "${_env[@]}" bash "$START" "$@" >/dev/null 2>&1 )
+  printf '%s' "$_log"
+}
+ATT="$(mktemp -d "${TMPDIR:-/tmp}/fsatt.XXXXXX")"; ATT="$(cd "$ATT" && pwd -P)"
+git -C "$ATT" init -q
+
+L="$(_attach_run att-pipe TMUX= -- --here)"
+! grep -qE '^(attach-session|switch-client) ' "$L" \
+  && ok 'T-START-ATTACH-NOTTY: a piped run stays detached' \
+  || bad "T-START-ATTACH-NOTTY: attached without a tty: $(grep -E '^(attach-session|switch-client) ' "$L")"
+
+L="$(_attach_run att-force FORGE_START_ATTACH=1 TMUX= -- --here)"
+grep -qx "attach-session -t forge-1" "$L" \
+  && ok 'T-START-ATTACH-FORCE: FORGE_START_ATTACH=1 attaches the new session' \
+  || bad "T-START-ATTACH-FORCE: no attach-session in log: $(tail -3 "$L")"
+[ "$(tail -1 "$L")" = "attach-session -t forge-1" ] \
+  && ok 'T-START-ATTACH-LAST: attach is the final tmux call (layout already proven)' \
+  || bad "T-START-ATTACH-LAST: last call was $(tail -1 "$L")"
+
+L="$(_attach_run att-nested FORGE_START_ATTACH=1 TMUX=/tmp/fake-tmux,1,0 -- --here)"
+grep -qx "switch-client -t forge-1" "$L" && ! grep -q '^attach-session ' "$L" \
+  && ok 'T-START-ATTACH-NESTED: inside tmux it switches the client, never nests an attach' \
+  || bad "T-START-ATTACH-NESTED: wrong call: $(tail -1 "$L")"
+
+L="$(_attach_run att-flag FORGE_START_ATTACH=1 TMUX= -- --here --no-attach)"
+! grep -qE '^(attach-session|switch-client) ' "$L" \
+  && ok 'T-START-ATTACH-FLAG: --no-attach beats FORGE_START_ATTACH=1' \
+  || bad "T-START-ATTACH-FLAG: attached anyway: $(tail -1 "$L")"
+
+L="$(_attach_run att-populate FORGE_START_ATTACH=1 TMUX= FAKE_HAS_RC=0 FAKE_PANES=1 \
+       FAKE_DISP="$ATT" -- --populate-existing attpop)"
+! grep -qE '^(attach-session|switch-client) ' "$L" \
+  && ok 'T-START-ATTACH-POPULATE: populate never attaches (forge spawn would hang)' \
+  || bad "T-START-ATTACH-POPULATE: attached in populate mode: $(tail -1 "$L")"
+rm -rf "$ATT"
+
 echo
 echo "═══════════════════════════════════════"
 printf 'PASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"
