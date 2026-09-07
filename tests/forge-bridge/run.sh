@@ -510,7 +510,11 @@ cmp -s "$_dp_before" "$_dp_after" || _dp_err="$_dp_err check-drift-mutated-HOME"
 # FNS extraction idiom, so they cannot drift from the shipped code. dispatch --dry-run is
 # not usable here: it refuses on session identity outside a forge pane.
 PFNS="$WORK/prompt-fns.sh"
-sed -n '/^_render_preamble()/,/^}$/p; /^_render_template()/,/^}$/p' "$BRIDGE" > "$PFNS"
+# _render_operator_constraints is extracted TOO: _render_template calls it, and an
+# extraction that omits it yields rc 127 and a `render-failed:` for every carrier prompt
+# with a diagnostic that points nowhere near the cause. That function deliberately uses a
+# literal '.dev' rather than $DEV_DIR precisely so it survives this isolation.
+sed -n '/^_render_preamble()/,/^}$/p; /^_render_operator_constraints()/,/^}$/p; /^_render_template()/,/^}$/p' "$BRIDGE" > "$PFNS"
 bash -n "$PFNS" && ok "T-PROMPT-EXTRACT renderer extraction parses" || bad "T-PROMPT-EXTRACT renderer extraction does not parse"
 # shellcheck disable=SC1090
 . "$PFNS"

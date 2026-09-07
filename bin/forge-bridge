@@ -5107,6 +5107,165 @@ print("\n".join(lines))
 PYEOF
 }
 
+# ---- Operator constraint ledger (forge-constraints/1), #77b Step 1/2a ----
+#
+# Renders <project_root>/.dev/proposals/<slug>/constraints.yml as flat text for the
+# synthetic <<<INCLUDE _operator_constraints>>>. Echoes the block on stdout and returns
+# 0; on any failure echoes the DIAGNOSTIC on stdout and returns 2.
+#
+# THIS IS DELIBERATELY NOT _preamble's CONTRACT. _render_preamble returns 0 with empty
+# output when forge-project.yml is absent (:5075-5077) because a project without one is a
+# legitimate state. An ABSENT ledger is not: it means a stage is about to run without the
+# operator's words, which is #77's failure verbatim. So missing / unparseable /
+# schema-invalid / oversized all return 2, and resolve_include turns that into the same
+# sys.exit(2) an ordinary missing include already produces (:5136-5137).
+#
+# SINGLE SOURCE OF THE SCHEMA. cmd_constraint_check calls THIS function rather than
+# restating the field rules. Two copies of a schema is the drift class this whole change
+# exists to stop; a lockstep test over two copies is a worse answer than one copy.
+#
+# LITERAL '.dev', NEVER $DEV_DIR: tests/forge-bridge/run.sh extracts this function and
+# _render_template out of the file with sed and sources them in isolation, where no
+# module-level variable exists.
+#
+# ROLLBACK LEVER, honoured HERE as well as at the dispatch guard. Rendering happens
+# BEFORE cmd_dispatch's --dry-run early return and therefore before the guard, so a lever
+# that only existed at the guard could not actually downgrade a carrier-stage refusal.
+# observe emits a loud placeholder and returns 0; enforce (the default) returns 2.
+_render_operator_constraints() {   # <project_root> <slug>
+    local _oc_mode="${FORGE_CONSTRAINTS_MODE:-enforce}"
+    case "$_oc_mode" in
+        enforce|observe) ;;
+        *) echo "ERROR: FORGE_CONSTRAINTS_MODE must be enforce|observe (got '$_oc_mode')."
+           return 2 ;;
+    esac
+    FORGE_OC_MODE="$_oc_mode" python3 - "$1" "$2" <<'PYEOF'
+import sys, os, json, hashlib, yaml
+
+project_root, slug = sys.argv[1], sys.argv[2]
+mode = os.environ.get("FORGE_OC_MODE", "enforce")
+path = os.path.join(project_root, ".dev", "proposals", slug, "constraints.yml")
+
+REQUIRED = ("id", "principle", "source", "scope", "check")
+SOURCES  = ("operator", "derived", "inferred")
+SCOPES   = ("user-visible", "internal")
+MAX_BYTES = 6000
+HASH_KEYS = ("id", "source", "verbatim", "source_ref", "rederive", "asked_about",
+             "principle", "binds", "scope", "check", "status")
+
+
+def canonical(rows):
+    """Hash input: the canonicalised ROWS, never the file. A comment, a re-indent or a
+    key reorder must NOT move the anchor; a changed field value must."""
+    norm = [{k: ("" if r.get(k) is None else str(r.get(k))) for k in HASH_KEYS}
+            for r in rows if isinstance(r, dict)]
+    return json.dumps(norm, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def validate(doc):
+    """Structure, not semantics — the check_packets ambition level. Returns errors."""
+    if not isinstance(doc, dict):
+        return ["ledger is not a YAML mapping"]
+    errs = []
+    if doc.get("schema") != "forge-constraints/1":
+        errs.append("schema must be 'forge-constraints/1' (got %r)" % (doc.get("schema"),))
+    rows = doc.get("constraints")
+    if not isinstance(rows, list):
+        errs.append("'constraints:' must be a list (use [] for an empty ledger)")
+        return errs
+    if not rows and not str(doc.get("none_recorded_reason") or "").strip():
+        errs.append("an empty ledger requires a non-empty 'none_recorded_reason:' — "
+                    "silence is not a pass; an empty ledger with a stated reason is one "
+                    "a reviewer can attack")
+    seen = set()
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            errs.append("row %d is not a mapping" % i)
+            continue
+        rid = str(r.get("id") or "").strip() or ("#%d" % i)
+        for k in REQUIRED:
+            if not str(r.get(k) or "").strip():
+                errs.append("row %s: '%s' is required and must be non-empty" % (rid, k))
+        if rid in seen:
+            errs.append("row %s: duplicate id" % rid)
+        seen.add(rid)
+        src = str(r.get("source") or "").strip()
+        if src and src not in SOURCES:
+            errs.append("row %s: source must be one of %s" % (rid, "|".join(SOURCES)))
+        if src == "operator" and not str(r.get("verbatim") or "").strip():
+            errs.append("row %s: source 'operator' requires a non-empty 'verbatim'" % rid)
+        if src == "derived" and not str(r.get("rederive") or "").strip():
+            errs.append("row %s: source 'derived' requires a non-empty 'rederive' — a "
+                        "derived row is the orchestrator's READING of a measurement and "
+                        "must carry the command that regenerates it" % rid)
+        sc = str(r.get("scope") or "").strip()
+        if sc and sc not in SCOPES:
+            errs.append("row %s: scope must be one of %s" % (rid, "|".join(SCOPES)))
+    return errs
+
+
+def fail(lines):
+    if mode == "observe":
+        sys.stdout.write(
+            "OPERATOR CONSTRAINTS — UNAVAILABLE (FORGE_CONSTRAINTS_MODE=observe).\n"
+            "This stage is running WITHOUT the operator's constraint ledger. Treat every\n"
+            "statement of what the operator asked for as UNVERIFIED, and say so in your\n"
+            "report. Reason:\n  " + "\n  ".join(lines) + "\n")
+        raise SystemExit(0)
+    sys.stdout.write("\n".join(lines) + "\n")
+    raise SystemExit(2)
+
+
+if not os.path.exists(path):
+    fail(["ERROR: constraint ledger not found: %s" % path,
+          "  Every build- and fix-pipeline stage carries the operator's constraints.",
+          "  Scaffold one:  ~/bin/forge-bridge constraints init --slug %s" % slug])
+try:
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+except Exception as ex:
+    fail(["ERROR: constraint ledger is unparseable: %s: %s" % (path, ex)])
+
+errs = validate(doc)
+if errs:
+    fail(["ERROR: constraint ledger is schema-invalid: %s" % path]
+         + ["  - " + e for e in errs])
+
+rows = doc.get("constraints") or []
+digest = hashlib.sha256(canonical(rows).encode("utf-8")).hexdigest()[:16]
+# `ledger_hash:` is a NAMED, GREPPABLE token, not decoration. It is the ONLY place the
+# P6 version anchor is computed: cmd_dispatch reads it back out of this very block to put
+# `constraints_sha256:` on the log entry, so the digest a stage is shown and the digest the
+# log records are THE SAME NUMBER BY CONSTRUCTION. A second canonicalisation elsewhere
+# would let them diverge with no oracle, which is the drift this change exists to stop —
+# the same argument that keeps the schema in one place.
+out = ["OPERATOR CONSTRAINTS — the operator's own words, carried verbatim.",
+       "Ledger: .dev/proposals/%s/constraints.yml  ledger_hash: %s  rows: %d"
+       % (slug, digest, len(rows))]
+if not rows:
+    out.append("  (empty ledger) none_recorded_reason: %s"
+               % str(doc.get("none_recorded_reason") or "").strip())
+for r in rows:
+    out.append("")
+    out.append("[%s] source=%s scope=%s status=%s"
+               % (r.get("id"), r.get("source"), r.get("scope"), r.get("status") or "OPEN"))
+    for label, key in (("Verbatim", "verbatim"), ("Source ref", "source_ref"),
+                       ("Rederive", "rederive"), ("Asked about", "asked_about"),
+                       ("Principle", "principle"), ("Binds", "binds"),
+                       ("Check", "check")):
+        v = str(r.get(key) or "").strip()
+        if v:
+            out.append("  %-12s %s" % (label + ":", v))
+block = "\n".join(out)
+if len(block.encode("utf-8")) > MAX_BYTES:
+    fail(["ERROR: the rendered constraint ledger is %d bytes, over the %d-byte cap: %s"
+          % (len(block.encode("utf-8")), MAX_BYTES, path),
+          "  A constraint list this long is a spec, and the stage should be told so.",
+          "  Move detail into problem-statement.md and leave the principle here."])
+sys.stdout.write(block)
+PYEOF
+}
+
 # Render a template file with includes + variable substitution.
 # Args: template_path slug stage worker worker_pane project_root
 # Echoes rendered text on stdout. Returns 1 if template missing.
@@ -5118,10 +5277,15 @@ _render_template() {
     fi
     local preamble
     preamble=$(_render_preamble "$project_root")
+    # 2>&1 is load-bearing: on the failure path the captured text IS the diagnostic, and
+    # it is surfaced only if a template actually asks for the include.
+    local oc_text oc_rc
+    oc_text=$(_render_operator_constraints "$project_root" "$slug" 2>&1); oc_rc=$?
     python3 - "$tmpl_path" "$FORGE_PROMPTS_DIR" "$slug" "$stage" "$worker" \
-        "$worker_pane" "$project_root" "$preamble" <<'PYEOF'
+        "$worker_pane" "$project_root" "$preamble" "$oc_rc" "$oc_text" <<'PYEOF'
 import sys, os, re
-(tmpl_path, prompts_dir, slug, stage, worker, worker_pane, project_root, preamble) = sys.argv[1:9]
+(tmpl_path, prompts_dir, slug, stage, worker, worker_pane, project_root, preamble,
+ oc_rc, oc_text) = sys.argv[1:11]
 
 with open(tmpl_path) as f:
     text = f.read()
@@ -5131,6 +5295,17 @@ INCLUDE_RE = re.compile(r'<<<INCLUDE\s+(\S+)\s*>>>')
 def resolve_include(name):
     if name == '_preamble':
         return preamble
+    # Second synthetic (#77b). NOT _preamble's empty-on-miss contract: an absent,
+    # unparseable, schema-invalid or oversized ledger EXITS 2, the same way an ordinary
+    # missing include does below. A stage that runs without the operator's words is the
+    # failure this change exists to stop, so it must stop a dispatch rather than quietly
+    # render a constraint-free prompt. FORGE_CONSTRAINTS_MODE=observe is handled INSIDE
+    # _render_operator_constraints, which returns 0 with a loud placeholder.
+    if name == '_operator_constraints':
+        if oc_rc != '0':
+            sys.stderr.write(oc_text.rstrip('\n') + '\n')
+            sys.exit(2)
+        return oc_text
     path = os.path.join(prompts_dir, f"{name}.txt")
     if not os.path.exists(path):
         sys.stderr.write(f"ERROR: include not found: {name}\n")

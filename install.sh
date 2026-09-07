@@ -55,7 +55,7 @@ FORGE_PROMPTS_DIR="$FORGE_CONFIG_DIR/prompts"
 # CONSTRUCTION, which is how 29 stage prompts stayed untracked while --check-drift
 # reported green.
 PROMPT_NAMES=(
-    _ask_escalation _git_ident _scope_diff_check _unchanged_flow_sweep
+    _ask_escalation _constraint_check _git_ident _scope_diff_check _unchanged_flow_sweep
     coding coding-fix fix-code fix-investigate fix-investigate-solo
     fix-plan fix-plan-review fix-plan-revise fix-plan-solo fix-qa fix-qa-retry
     fix-reproduce fix-scout impl-review implementation incorporate
@@ -65,7 +65,14 @@ PROMPT_NAMES=(
 # bin/forge-bridge's resolve_include special-cases the name and returns text rendered by
 # _render_preamble from .claude/forge-project.yml, never touching disk. A real
 # _preamble.txt would shadow it and silently change all 25 prompts that include it.
-SYNTHETIC_PROMPTS=(_preamble)
+# `_operator_constraints` joins it for the SAME reason and one more: it is rendered PER
+# SLUG from .dev/proposals/<slug>/constraints.yml, so a real _operator_constraints.txt
+# would not merely shadow a synthetic — it would substitute STALE, SLUG-BLIND text for
+# live operator constraints in every carrier prompt. It must never appear in
+# PROMPT_NAMES and must never exist on disk. T-CC6 is the trap.
+# Keep this array on ONE line and paren-free: T-PROMPT-INVENTORY parses it with
+# `^NAME=\(([^)]*)\)`, and a paren in the body degrades three checks to a vacuous pass.
+SYNTHETIC_PROMPTS=(_preamble _operator_constraints)
 # EXCLUSION 2 — quarantined, and for an unrelated reason; do not conflate it with the
 # line above. env-fix and qa-live-retry are not project-agnostic templates: they bake one
 # private project's plaintext login, database UUIDs, schema, API routes, migration
