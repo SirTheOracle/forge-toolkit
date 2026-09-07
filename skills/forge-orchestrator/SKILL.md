@@ -597,7 +597,8 @@ returned digest.
 ```
 
 The bridge renders the stage prompt from `~/.config/forge/prompts/{stage}.txt`
-(see `references/stage-templates.md`), writes it to
+(tracked in the toolkit repo at `prompts/{stage}.txt` and installed from there by
+`install.sh`; there is no `references/stage-templates.md`), writes it to
 `.dev/forge-tmp/{worker}-{stage}-{slug}.txt`, calls `log`, and `send`s the
 short reference message to the worker. One-line stdout:
 `DISPATCHED stage=X worker=Y slug=Z`.
@@ -768,10 +769,15 @@ proposal → review → incorporate → implementation → impl-review → codin
 
 **proposal** — Foreground (needs Agent Teams) + digest
 - Run adversarial-proposal inline — it spawns teammates A, B, C in your context.
-- NOT dispatched via the bridge (no template). This is a `proposal`-specific
-  carve-out, not a general property of Agent Teams: Agent Teams runs fine in a
-  worker pane, and every Agent-Teams **fix** stage is dispatched there (see
-  Fix Pipeline Mode).
+- NOT dispatched via the bridge. This is a `proposal`-specific carve-out, not a
+  general property of Agent Teams: Agent Teams runs fine in a worker pane, and
+  every Agent-Teams **fix** stage is dispatched there (see Fix Pipeline Mode).
+- `prompts/proposal.txt` **exists but is unreachable.** `cmd_dispatch` refuses
+  `--stage proposal` outright (`bin/forge-bridge`, the `proposal)` arm of the
+  tier-routing case), so that template renders no includes and delivers nothing.
+  Anything the proposal stage must be told has to reach it through this skill,
+  through `skills/adversarial-proposal/SKILL.md`, or through the spawn messages
+  you compose — see **The Spec Boundary**.
 - Output: `.dev/proposals/{slug}/final-plan.md`
 - Log as `--from claude --to claude` so the pipeline log records the stage.
 - **Close that entry before advancing.** `proposal` is a local stage with no
