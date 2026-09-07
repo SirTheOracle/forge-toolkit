@@ -167,26 +167,52 @@ rm -f "$rootD/.dev/.forge-session"
 # ---- D1 · T-SESSION-LOCKSTEP: reader/binder lockstep (source scan, no tmux) ----
 # TWO CLASSES, ONE FIELD, OPPOSITE RULES. That is the whole point of this assertion.
 #
-#   LEGACY-PERMISSIVE READERS (7).  cmd_log stamps the literal string `unknown` into a
-#   pending row's `session:` when no session resolves (:3173). Every reader that means
+#   LEGACY-PERMISSIVE READERS (11).  cmd_log stamps the literal string `unknown` into a
+#   pending row's `session:` when no session resolves. Every reader that means
 #   "skip a CONFIRMED different session, never skip a legacy/unscoped row" must
-#   therefore treat `unknown` exactly as it treats empty. Each of the seven carries the
+#   therefore treat `unknown` exactly as it treats empty. Each of the eleven carries the
 #   marker `# LEGACY-SENTINEL` on its normalisation line. #27 residual A WAS this
-#   predicate being written seven times and normalised zero times — and :4104 and :5197
-#   were both added AFTER a review of the identical predicate, which is the recurrence
-#   mechanism this count exists to stop.
+#   predicate being written many times and normalised zero times — and two of them were
+#   added AFTER a review of the identical predicate, which is the recurrence mechanism
+#   this assertion exists to stop. R2 added four more (QA finding A-2): the activation
+#   preflight, `_worker_open_pending_ts` (which feeds the FAIL-CLOSED reset scan AND the
+#   worker-scoped dispatch guard), `_parked_pending_select`, and `_sup_pendings`.
 #
-#   CALLBACK BINDERS (5) — :3733, :3805, :3866, :3911, :6242.  Strict equality with NO
-#   truthiness short-circuit. They tie ONE callback to ONE specific pending. They are
-#   NOT legacy filters and MUST NOT be normalised: doing so alters callback-admission
-#   semantics. A change that greps for `session` and "fixes them all" breaks the
-#   binders, and this half of the count is what catches it.
+#   CALLBACK BINDERS (5).  Strict equality with NO truthiness short-circuit. They tie
+#   ONE callback to ONE specific pending. They are NOT legacy filters and MUST NOT be
+#   normalised: doing so alters callback-admission semantics. A change that greps for
+#   `session` and "fixes them all" breaks the binders, and this half of the count is
+#   what catches it.
+#
+#   R2 (fix-plan §R2-3): COUNTING ALONE COULD NOT DELIVER GUARANTEE 1. An EIGHTH reader
+#   added with no marker changed NEITHER count, so the copy-forward mechanism the
+#   diagnosis names as the actual recurrence path went undetected — four such readers
+#   shipped while this test stayed green. D1 now ENUMERATES: every line that reads a log
+#   ROW's `session` field must be one of
+#     (a) NORMALISED — `# LEGACY-SENTINEL` on the read line or within the two lines below
+#         it (the normalisation always sits directly under the read);
+#     (b) a strict callback BINDER — the `str(...) ==` / `!=` form above; or
+#     (c) the ONE deliberate truthiness exclusion, in
+#         `_callback_selected_pending_superseded`: `str(e.get('session') or '') and …`,
+#         which carries no equality operator and is neither reader nor binder.
+#   Anything else FAILS, naming the bin/forge-bridge line. A row is bound to `e` or
+#   `entry` at every site; `hdr.get` / `cb.get` / `doc.get` / `d.get` / `h.get` / `r.get`
+#   read callback headers, journal docs and lock holders — not rows — and are out of
+#   scope by construction. `\b` is deliberately avoided (BSD grep).
 _sl_norm=$(grep -c '# LEGACY-SENTINEL' "$BRIDGE")
 _sl_bind=$(grep -cE "str\((e|cb)\.get\('session'\) or ''\) *[!=]=" "$BRIDGE")
-if [ "$_sl_norm" = 7 ] && [ "$_sl_bind" = 5 ]; then
-    ok "T-SESSION-LOCKSTEP 7 legacy-sentinel normalisers / 5 strict callback binders stay in lockstep"
+_sl_unclassified=""
+for _sl_n in $(grep -nE "(^|[^A-Za-z0-9_])(e|entry)\.get\([\"']session[\"']" "$BRIDGE" | cut -d: -f1); do
+    _sl_src="$(sed -n "${_sl_n}p" "$BRIDGE")"
+    printf '%s\n' "$_sl_src" | grep -qE "str\((e|cb)\.get\('session'\) or ''\) *[!=]=" && continue   # (b) binder
+    printf '%s\n' "$_sl_src" | grep -qF "str(e.get('session') or '') and " && continue               # (c) listed exclusion
+    sed -n "${_sl_n},$((_sl_n+2))p" "$BRIDGE" | grep -q '# LEGACY-SENTINEL' && continue              # (a) normalised
+    _sl_unclassified="$_sl_unclassified $_sl_n"
+done
+if [ "$_sl_norm" = 11 ] && [ "$_sl_bind" = 5 ] && [ -z "$_sl_unclassified" ]; then
+    ok "T-SESSION-LOCKSTEP every row-session reader is normalised, a binder, or the one listed exclusion (11 markers / 5 binders)"
 else
-    bad "T-SESSION-LOCKSTEP normalisers=$_sl_norm (want 7) binders=$_sl_bind (want 5). The two classes are NOT interchangeable: the 7 legacy-permissive READERS must treat 'unknown' as empty (cmd_log stamps it); the 5 callback BINDERS bind one callback to one pending by strict equality and must NEVER be normalised. Added a reader? Mark its normalisation '# LEGACY-SENTINEL' and bump 7. Added a binder? Bump 5. Do not 'fix them all'."
+    bad "T-SESSION-LOCKSTEP normalisers=$_sl_norm (want 11) binders=$_sl_bind (want 5) UNCLASSIFIED readers at bin/forge-bridge lines:${_sl_unclassified:- none}. The classes are NOT interchangeable: legacy-permissive READERS must treat 'unknown' as empty (cmd_log stamps it); the 5 callback BINDERS bind one callback to one pending by strict equality and must NEVER be normalised. Added a reader? Mark its normalisation '# LEGACY-SENTINEL' and bump 11. Added a binder? Bump 5. Deliberately excluding a site? Add it to class (c) above WITH a comment saying why. Do not 'fix them all'."
 fi
 
 # ---- C2 · T-CWD-DOC: the withdrawn cwd-independence promise (source + help scan) ----
@@ -5065,12 +5091,32 @@ if command -v tmux >/dev/null 2>&1; then
     && out_of unkorph | grep -q "slug 'unkorph' has 1 open pending"; } \
     && ok "T-UNK-ORPHAN the orphan guard now SEES an unknown-session pending and refuses" \
     || bad "T-UNK-ORPHAN rc=$(rc_of unkorph) $(out_of unkorph | tr '\n' ' ')"
+  # ── T-UNK-SUPERSEDE-REFUSES (R2-1) ─────────────────────────────────────────────
+  # RENAMED from "T-UNK-ORPHAN --supersede closes the unknown-session pending", which
+  # asserted rc=0 and NOTHING ELSE while its label claimed a close: it measured PROCEEDS
+  # and reported CLOSES. Pre-R2 the run returned rc 0, printed DISPATCHED, closed nothing
+  # and left TWO open pendings — a green test certifying a fiction.
+  #
+  # Post-R2 contract (fix-plan §R2-1, DECIDED BY THE RUNNER — do not re-litigate):
+  # `--supersede` selects only pendings the acting session+incarnation OWNS. A normalised
+  # `unknown` row is legacy, therefore UNOWNED, so the attempt must FAIL CLOSED and
+  # LOUDLY — it must neither close the row nor dispatch over it. `log-response` is the
+  # recovery (already named at the guard's own :5470), and it works. Both halves are
+  # asserted, and both re-read forge-log.yml and assert on `response:` — never on rc alone.
+  UNKORPHLOG="$UNKR/.dev/proposals/unkorph/forge-log.yml"
   run_in_pane "$DS:0.0" unkorph2 "( cd $UNKR && $UNKENV FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug unkorph --stage adhoc --worker codex-b --supersede )"
-  [ "$(rc_of unkorph2)" = 0 ] \
-    && ok "T-UNK-ORPHAN --supersede closes the unknown-session pending and proceeds" \
-    || bad "T-UNK-ORPHAN supersede rc=$(rc_of unkorph2) $(out_of unkorph2 | tr '\n' ' ')"
-  tmux send-keys -t "$DS:0.4" C-c 2>/dev/null; sleep 0.3
-  run_in_pane "$DS:0.4" unkorph-close "( cd $UNKR && $UNKENV $BRIDGE callback --slug unkorph --stage adhoc --status DONE --worker codex-b --message d --quiet )"
+  { [ "$(rc_of unkorph2)" = 1 ] \
+    && out_of unkorph2 | grep -q 'ERROR: --supersede could not select owned pendings' \
+    && grep -q '^    response: null$' "$UNKORPHLOG"; } \
+    && ok "T-UNK-SUPERSEDE-REFUSES --supersede refuses an UNOWNED (legacy 'unknown') pending and leaves it OPEN" \
+    || bad "T-UNK-SUPERSEDE-REFUSES rc=$(rc_of unkorph2) still_open=$(grep -c '^    response: null$' "$UNKORPHLOG") $(out_of unkorph2 | tr '\n' ' ')"
+  run_in_pane "$DS:0.0" unkorph3 "( cd $UNKR && $UNKENV $BRIDGE log-response --slug unkorph --to claude-opus --stage fix-code --response done )"
+  { [ "$(rc_of unkorph3)" = 0 ] \
+    && ! out_of unkorph3 | grep -q 'ERR_NO_MATCH' \
+    && ! grep -q '^    response: null$' "$UNKORPHLOG" \
+    && grep -q 'response: "done"' "$UNKORPHLOG"; } \
+    && ok "T-UNK-SUPERSEDE-REFUSES log-response IS the recovery: it closes the unknown-session row" \
+    || bad "T-UNK-SUPERSEDE-REFUSES recovery rc=$(rc_of unkorph3) rows=[$(sed -n 's/^    \(response:.*\)$/\1/p' "$UNKORPHLOG" | tr '\n' ' ')] $(out_of unkorph3 | tr '\n' ' ')"
 
   # ── T-UNK-STALL (:9300 / :9302) ────────────────────────────────────────────────
   unk_fixture unkstall unknown

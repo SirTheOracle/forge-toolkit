@@ -1954,6 +1954,7 @@ for lp in glob.glob(os.path.join(dev,"proposals","*","forge-log.yml")):
     for e in es:
         if isinstance(e,dict) and e.get("response") is None:
             s=str(e.get("session") or ""); i=str(e.get("incarnation") or "")
+            if s=="unknown": s=""  # LEGACY-SENTINEL
             if (not s or not sess or s==sess) and (not i or not inc or i==str(inc)):
                 print("open-pending:%s" % os.path.basename(os.path.dirname(lp))); break
 # P2-4: scan ALL callback files (qualified AND legacy/unqualified names) and select by the
@@ -3332,6 +3333,15 @@ cmd_log() {
     # stall-check-status can filter by session. Empty -> "unknown" (NOT the
     # context sentinel): the never-skip-legacy filter keys on empty/"unknown" to
     # keep in-flight upgrades closeable. See final-plan §4.3.
+    # R2 (#27 residual A): this is now true at EVERY legacy-permissive reader. Each carries
+    # the sentinel marker comment and T-SESSION-LOCKSTEP ENUMERATES them, so a new reader
+    # added without one fails the suite rather than silently reopening the class. Two
+    # classes are DELIBERATELY excluded and must never be normalised: the five strict
+    # callback binders, which tie one callback to one specific pending by equality, and
+    # the single truthiness selector in _callback_selected_pending_superseded, which
+    # carries no equality operator at all. (Both literals are omitted here on purpose:
+    # T-SESSION-LOCKSTEP greps this file, and a comment quoting either token would inflate
+    # its counts.)
     local session
     session="$(_resolve_session)"
     [ -z "$session" ] && session="unknown"
@@ -3659,6 +3669,7 @@ for lp in glob.glob(os.path.join(base,"*","forge-log.yml")):
     for e in es:
         if not (isinstance(e,dict) and e.get("response") is None and c(str(e.get("to") or ""))==wk): continue
         es_s=str(e.get("session") or ""); es_i=str(e.get("incarnation") or "")
+        if es_s=="unknown": es_s=""  # LEGACY-SENTINEL
         # never-skip-legacy: an entry with no session/incarnation still matches; only a
         # CONFIRMED different session/incarnation is skipped.
         if es_s and sess and es_s!=sess: continue
@@ -4132,6 +4143,7 @@ rows=[]; mixed=False
 for e in entries:
     if not isinstance(e,dict) or e.get('response') is not None or e.get('stage')!=stage or not e.get('parked_at'): continue
     es=str(e.get('session') or ''); ei=str(e.get('incarnation') or '')
+    if es=='unknown': es=''  # LEGACY-SENTINEL
     if actor_i:
         if es==actor_s and ei==actor_i: rows.append(e)
         elif not ei and (not es or es==actor_s): mixed=True
@@ -5468,8 +5480,12 @@ PYEOF
             echo "  A prior stage was never closed. Close it first — a worker callback, or for a local"
             echo "  to:claude stage run:"
             echo "    ~/bin/forge-bridge log-response --slug $slug --to claude --stage <stage> --response \"FORGE_DONE: <stage> — ...\""
-            echo "  then retry; or re-run this dispatch with --supersede to auto-close the open entry(ies)"
-            echo "  (FORGE_SUPERSEDED) and dispatch anew."
+            echo "  then retry. The SAME log-response is the recovery for a LEGACY or UNOWNED pending"
+            echo "  (empty or 'unknown' session, or another session/incarnation's row): pass --to <worker>"
+            echo "  --stage <stage> for it."
+            echo "  --supersede is NOT that recovery. It selects only pendings this session+incarnation"
+            echo "  owns and refuses loudly otherwise; use it to auto-close (FORGE_SUPERSEDED) an open"
+            echo "  entry(ies) this actor owns and dispatch anew."
         } >&2
         _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=open-pending-exists worker=$worker_canonical n_pending=$n_pending"
         return 1
@@ -5658,6 +5674,7 @@ owned=[]; mixed=False
 for e in entries:
     if not isinstance(e,dict) or e.get('response') is not None: continue
     es=str(e.get('session') or ''); ei=str(e.get('incarnation') or '')
+    if es=='unknown': es=''  # LEGACY-SENTINEL
     if actor_i:
         if es==actor_s and ei==actor_i: owned.append(e)
         elif not ei and (not es or es==actor_s): mixed=True
