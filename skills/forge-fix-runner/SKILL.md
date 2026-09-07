@@ -507,8 +507,12 @@ dead-session steal or an operator force-release. Do **not** wrap the release in 
 blanket `trap EXIT` — that would release while a test process may still be live.
 
 `fix-verify` is a **lock label, not a dispatchable stage**: `infra-lock acquire`
-validates neither `--slug` nor `--stage`, so it works with no bridge change, and
-`fix-verify` has no `stage_capabilities` entry, so nothing will ever dispatch it.
+validates neither `--slug` nor `--stage`, so it works with no bridge change. It is
+deliberately absent from `stage_capabilities` so the infra-lock guard leaves it
+unguarded — absence yields rc 2, which that guard reads as "skip", so absence is *not*
+what stops a dispatch (with a template present the render would succeed). What refuses
+it is `cmd_dispatch`'s fix-stage legality gate, which reads the same rc 2 as "not a
+routable fix stage" for `fix-*` names only.
 
 Build the verification report — one row per covered issue:
 `issue # | coded ID | symptom | check (command/manual) | result | evidence`.

@@ -1,0 +1,238 @@
+# Fix-Manifest Schema
+#
+# This is the **authoritative** schema for `fix-manifest.yaml`, the structured
+# orchestrator-consumable signal produced alongside `fix-issues.md` by the
+# adversarial-fix-qa skill. The SKILL.md includes a preview block; if SKILL.md
+# and this file diverge, this file wins.
+#
+# fix-manifest.yaml is what the orchestrator parses to make routing decisions.
+# fix-issues.md is the human-readable counterpart. The verdict in both files
+# MUST match (the Output Quality Gate enforces this).
+
+# ---------------------------------------------------------------------------
+# REQUIRED FIELDS
+# ---------------------------------------------------------------------------
+
+# slug: short identifier for the fix
+#   type: string
+#   required: yes
+slug: "<fix-slug>"
+
+# original_slug: the build pipeline slug if --original-slug was provided
+#   type: string | null
+#   required: yes (use null if not provided)
+original_slug: "<original-slug-or-null>"
+
+# env: which environment the fix targets
+#   type: enum
+#   required: yes
+#   allowed: prod | dev | unknown
+env: prod
+
+# verdict: the QA outcome
+#   type: enum
+#   required: yes
+#   allowed: PASS | FIX_FAILED | REGRESSION | BOTH | BLOCKED
+#   defense in depth: any other value (missing, malformed, typo) is treated
+#     as BOTH (worst case) by the Output Quality Gate
+verdict: PASS
+
+# prod_qualification: only meaningful when env=prod and verdict=PASS
+#   type: enum | null
+#   required: yes (use null for non-prod or non-PASS)
+#   allowed: ready_for_post_deploy_verification | null
+prod_qualification: ready_for_post_deploy_verification
+
+# fix_confirmation: A's verdict and method
+#   type: object
+#   required: yes
+fix_confirmation:
+  result: CONFIRMED          # CONFIRMED | PARTIAL | FAILED | NOT_RUN
+  method: repro_re_executed  # repro_re_executed | failing_path_test | both | not_applicable
+
+# counts: severity histogram across all findings (A + B, post-reconciliation)
+#   type: object with three integer fields
+#   required: yes
+counts:
+  critical: 0
+  blocking: 0
+  advisory: 0
+
+# issues: structured list of every issue raised
+#   type: list of objects
+#   required: yes (empty list permitted on PASS or BLOCKED)
+issues:
+  - id: "I1"               # unique within the manifest; CRIT-1 / BLOCK-1 / ADV-1 mapping recommended
+    agent: A               # A | B | C (synthesizer-introduced finding from Phase 2 cross-verification)
+    severity: ADVISORY     # CRITICAL | BLOCKING | ADVISORY
+    category: coverage_gap # see allowed categories below
+    summary: "<one-line description>"
+    evidence_path: "evidence/post-fix/A-4-empty-token.log"
+
+# Allowed `category` values:
+#   For agent A:
+#     symptom_only_fix
+#     non_deterministic
+#     partial_coverage
+#     test_doesnt_exercise_path
+#     coverage_gap
+#     other
+#   For agent B:
+#     regression_in_importer
+#     regression_in_caller
+#     regression_in_test
+#     edge_case_regression
+#     coverage_gap
+#     other
+#   For agent C (post-Phase-2 cross-verification finding):
+#     synthesis_correction
+#     other
+
+# dependents_checked: B's audit table
+#   type: list of objects
+#   required: yes (empty list permitted only when B explicitly identified no dependents — see qa-working-format.md)
+dependents_checked:
+  - name: "src/auth/middleware.py"
+    type: importer    # importer | caller | adjacent | full_suite
+    result: pass      # pass | fail | not_applicable
+  - name: "Full project test suite"
+    type: full_suite
+    result: pass
+
+# confidence: synthesizer's overall confidence
+#   type: enum
+#   required: yes
+#   allowed: HIGH | MEDIUM | LOW
+confidence: HIGH
+
+# blocking_items: count of CRITICAL + BLOCKING issues
+#   type: integer (≥ 0)
+#   required: yes
+#   relationship: must equal counts.critical + counts.blocking
+blocking_items: 0
+
+# stop_reason: present ONLY when verdict=BLOCKED (early-stop or stub path)
+#   type: string | null
+#   required: optional, but required when verdict=BLOCKED
+stop_reason: null
+
+# ---------------------------------------------------------------------------
+# VERDICT-vs-COUNTS CONSISTENCY (enforced by Output Quality Gate)
+# ---------------------------------------------------------------------------
+#
+# verdict: PASS
+#   - counts.critical = 0
+#   - counts.blocking = 0
+#   - fix_confirmation.result ∈ {CONFIRMED, PARTIAL}
+#   - blocking_items = 0
+#
+# verdict: FIX_FAILED
+#   - fix_confirmation.result = FAILED
+#   - counts.critical ≥ 1 (at least one CRITICAL from agent A)
+#   - blocking_items ≥ 1
+#
+# verdict: REGRESSION
+#   - fix_confirmation.result = CONFIRMED
+#   - at least one issue with agent=B and severity ∈ {BLOCKING, CRITICAL}
+#   - blocking_items ≥ 1
+#
+# verdict: BOTH
+#   - fix_confirmation.result = FAILED
+#   - at least one issue with agent=B and severity ∈ {BLOCKING, CRITICAL}
+#   - counts.critical ≥ 1
+#   - blocking_items ≥ 2
+#
+# verdict: BLOCKED
+#   - early-stop or stub path; stop_reason MUST be non-null
+#   - fix_confirmation.result = NOT_RUN
+#   - issues = []
+#   - dependents_checked = []
+#   - blocking_items = 1
+#
+# ---------------------------------------------------------------------------
+# EXAMPLES
+# ---------------------------------------------------------------------------
+
+# Example: PASS with no findings (clean dev run)
+# ---
+# slug: token-validation-truthy-check
+# original_slug: jwt-refresh-tokens
+# env: dev
+# verdict: PASS
+# prod_qualification: null
+# fix_confirmation:
+#   result: CONFIRMED
+#   method: repro_re_executed
+# counts: {critical: 0, blocking: 0, advisory: 0}
+# issues: []
+# dependents_checked:
+#   - {name: "src/auth/middleware.py", type: importer, result: pass}
+#   - {name: "Full project test suite", type: full_suite, result: pass}
+# confidence: HIGH
+# blocking_items: 0
+
+# Example: FIX_FAILED (A established the fix doesn't work)
+# ---
+# slug: token-validation-truthy-check
+# original_slug: jwt-refresh-tokens
+# env: dev
+# verdict: FIX_FAILED
+# prod_qualification: null
+# fix_confirmation:
+#   result: FAILED
+#   method: repro_re_executed
+# counts: {critical: 1, blocking: 0, advisory: 0}
+# issues:
+#   - id: CRIT-1
+#     agent: A
+#     severity: CRITICAL
+#     category: symptom_only_fix
+#     summary: "Repro still triggers — fix only addresses empty-string case, not whitespace-prefix tokens"
+#     evidence_path: "evidence/post-fix/A-1-repro-rerun.log"
+# dependents_checked:
+#   - {name: "Full project test suite", type: full_suite, result: pass}
+# confidence: HIGH
+# blocking_items: 1
+
+# Example: REGRESSION (fix works, but B found a regression)
+# ---
+# slug: token-validation-truthy-check
+# original_slug: jwt-refresh-tokens
+# env: prod
+# verdict: REGRESSION
+# prod_qualification: null
+# fix_confirmation:
+#   result: CONFIRMED
+#   method: failing_path_test
+# counts: {critical: 0, blocking: 1, advisory: 0}
+# issues:
+#   - id: BLOCK-1
+#     agent: B
+#     severity: BLOCKING
+#     category: regression_in_caller
+#     summary: "src/api/routes/refresh.py:54 now returns 500 instead of 401 for tokens that fail length check"
+#     evidence_path: "evidence/post-fix/B-3-dependent-tests.log"
+# dependents_checked:
+#   - {name: "src/auth/middleware.py", type: importer, result: pass}
+#   - {name: "src/api/routes/login.py", type: caller, result: pass}
+#   - {name: "src/api/routes/refresh.py", type: caller, result: fail}
+#   - {name: "Full project test suite", type: full_suite, result: fail}
+# confidence: HIGH
+# blocking_items: 1
+
+# Example: BLOCKED (early-stop, no QA performed)
+# ---
+# slug: token-validation-truthy-check
+# original_slug: jwt-refresh-tokens
+# env: prod
+# verdict: BLOCKED
+# prod_qualification: null
+# fix_confirmation:
+#   result: NOT_RUN
+#   method: not_applicable
+# counts: {critical: 0, blocking: 0, advisory: 0}
+# issues: []
+# dependents_checked: []
+# confidence: HIGH
+# blocking_items: 1
+# stop_reason: "fix-coder-report.md indicates STILL REPRODUCES. The fix did not work."

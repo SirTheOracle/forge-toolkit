@@ -25,6 +25,8 @@ SKILL_NAMES=(
     forge-orchestrator forge-coder forge-fix-runner fix-coder
     adversarial-proposal adversarial-lite adversarial-implementation
     adversarial-qa adversarial-verify docs-refresh proposal-reviewer command-center
+    fix-reproducer adversarial-investigate adversarial-fix-plan
+    fix-plan-reviewer adversarial-fix-qa
 )
 # NOTE: proposal-reviewer ships via codex-skills/ ONLY (no skills/ counterpart);
 # the Claude-side uninstall loop no-ops on it by the -d guard. Kept in the list
@@ -76,11 +78,29 @@ if [ "${1:-}" = "--check-drift" ]; then
         fi
     done
 
-    for skill_dir in "$SCRIPT_DIR"/skills/*/; do
-        skill_name="$(basename "$skill_dir")"; dst="$CLAUDE_SKILLS_DIR/$skill_name"
-        if [ ! -d "$dst" ]; then err "  skills/$skill_name — not installed (claude)"; DRIFT=1
+    # FORWARD: walk the DECLARED inventory, not the shipped directories. A glob over
+    # skills/*/ cannot report a skill that ships NOWHERE — it is blind to a missing skill
+    # BY CONSTRUCTION, which is how five fix-pipeline skills stayed absent from this repo
+    # while --check-drift reported green. proposal-reviewer is the one documented
+    # codex-only deviation (see the note beside SKILL_NAMES) and is skipped here by name.
+    for skill_name in "${SKILL_NAMES[@]}"; do
+        [ "$skill_name" = proposal-reviewer ] && continue
+        skill_dir="$SCRIPT_DIR/skills/$skill_name"; dst="$CLAUDE_SKILLS_DIR/$skill_name"
+        if [ ! -d "$skill_dir" ]; then err "  skills/$skill_name — DECLARED in SKILL_NAMES but no source directory in the repo"; DRIFT=1
+        elif [ ! -d "$dst" ]; then err "  skills/$skill_name — not installed (claude)"; DRIFT=1
         elif diff -rq --exclude=.DS_Store "$skill_dir" "$dst" >/dev/null 2>&1; then ok "  skills/$skill_name — identical (claude)"
         else err "  skills/$skill_name — DIFFERS from installed (claude):"; diff -rq --exclude=.DS_Store "$skill_dir" "$dst" 2>&1 | sed 's/^/      /'; DRIFT=1; fi
+    done
+    # REVERSE: a skills/ directory absent from SKILL_NAMES still INSTALLS (that loop is a
+    # glob) but never UNINSTALLS, because both uninstall loops walk SKILL_NAMES — a silent
+    # one-way door. The forward half above cannot see it.
+    for skill_dir in "$SCRIPT_DIR"/skills/*/; do
+        [ -d "$skill_dir" ] || continue
+        skill_name="$(basename "$skill_dir")"
+        case " ${SKILL_NAMES[*]} " in
+            *" $skill_name "*) ;;
+            *) err "  skills/$skill_name — present in the repo but NOT declared in SKILL_NAMES (it would install and never uninstall)"; DRIFT=1 ;;
+        esac
     done
     for skill_dir in "$SCRIPT_DIR"/codex-skills/*/; do
         [ -d "$skill_dir" ] || continue

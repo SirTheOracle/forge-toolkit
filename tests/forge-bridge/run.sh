@@ -164,6 +164,209 @@ printf '%s' "$lb" | grep -q 'legacy_file_session=bare-name' \
     || bad "T-LEGACY-HEADER bare legacy file still readable (out=$lb)"
 rm -f "$rootD/.dev/.forge-session"
 
+# ---- D1 · T-SESSION-LOCKSTEP: reader/binder lockstep (source scan, no tmux) ----
+# TWO CLASSES, ONE FIELD, OPPOSITE RULES. That is the whole point of this assertion.
+#
+#   LEGACY-PERMISSIVE READERS (11).  cmd_log stamps the literal string `unknown` into a
+#   pending row's `session:` when no session resolves. Every reader that means
+#   "skip a CONFIRMED different session, never skip a legacy/unscoped row" must
+#   therefore treat `unknown` exactly as it treats empty. Each of the eleven carries the
+#   marker `# LEGACY-SENTINEL` on its normalisation line. #27 residual A WAS this
+#   predicate being written many times and normalised zero times — and two of them were
+#   added AFTER a review of the identical predicate, which is the recurrence mechanism
+#   this assertion exists to stop. R2 added four more (QA finding A-2): the activation
+#   preflight, `_worker_open_pending_ts` (which feeds the FAIL-CLOSED reset scan AND the
+#   worker-scoped dispatch guard), `_parked_pending_select`, and `_sup_pendings`.
+#
+#   R3 (fix-plan §R3-1/§R3-2) MOVED ONE, it did not remove one — the count is still 11.
+#   `_sup_pendings` is no longer a reader of this class: its normalisation was REVERTED
+#   because it repaired no shape the producer can mint (`:418` stamps the incarnation
+#   unconditionally while `:417` charset-gates the session, so a live `unknown` row always
+#   carries a NON-empty incarnation and was never selected either way) and because it made
+#   `--supersede` hard-refuse whenever a legacy row merely COEXISTED with a pending the
+#   actor owned — one poisoning row aborting the whole selection through the selector's
+#   GLOBAL `mixed` flag (QA MAJ-1). It is now class (d) below. The eleventh marker moved to
+#   the R3-2 legacy-pending diagnostic in cmd_dispatch, which reads the same field, treats
+#   `unknown` as empty in the same way, and is the surface that now tells the operator
+#   which rows `--supersede` is leaving open.
+#
+#   CALLBACK BINDERS (5).  Strict equality with NO truthiness short-circuit. They tie
+#   ONE callback to ONE specific pending. They are NOT legacy filters and MUST NOT be
+#   normalised: doing so alters callback-admission semantics. A change that greps for
+#   `session` and "fixes them all" breaks the binders, and this half of the count is
+#   what catches it.
+#
+#   R2 (fix-plan §R2-3): COUNTING ALONE COULD NOT DELIVER GUARANTEE 1. An EIGHTH reader
+#   added with no marker changed NEITHER count, so the copy-forward mechanism the
+#   diagnosis names as the actual recurrence path went undetected — four such readers
+#   shipped while this test stayed green. D1 now ENUMERATES: every line that reads a log
+#   ROW's `session` field must be one of
+#     (a) NORMALISED — `# LEGACY-SENTINEL` on the read line or within the two lines below
+#         it (the normalisation always sits directly under the read);
+#     (b) a strict callback BINDER — the `str(...) ==` / `!=` form above; or
+#     (c) the ONE deliberate truthiness exclusion, in
+#         `_callback_selected_pending_superseded`: `str(e.get('session') or '') and …`,
+#         which carries no equality operator and is neither reader nor binder; or
+#     (d) the ONE deliberate NON-normalisation, `_sup_pendings` (fix-plan §R3-1). Keyed on
+#         a literal unique to that heredoc — `supersede is restricted to one owned open
+#         pending` — and NOT on the read line's shape, because `_parked_pending_select`
+#         carries a byte-identical read line and MUST keep failing if its own marker is
+#         ever removed. Check (a) runs first, so a marked site can never fall through here.
+#   Anything else FAILS, naming the bin/forge-bridge line. A row is bound to `e` or
+#   `entry` at every site; `hdr.get` / `cb.get` / `doc.get` / `d.get` / `h.get` / `r.get`
+#   read callback headers, journal docs and lock holders — not rows — and are out of
+#   scope by construction. `\b` is deliberately avoided (BSD grep).
+_sl_norm=$(grep -c '# LEGACY-SENTINEL' "$BRIDGE")
+_sl_bind=$(grep -cE "str\((e|cb)\.get\('session'\) or ''\) *[!=]=" "$BRIDGE")
+_sl_unclassified=""
+for _sl_n in $(grep -nE "(^|[^A-Za-z0-9_])(e|entry)\.get\([\"']session[\"']" "$BRIDGE" | cut -d: -f1); do
+    _sl_src="$(sed -n "${_sl_n}p" "$BRIDGE")"
+    printf '%s\n' "$_sl_src" | grep -qE "str\((e|cb)\.get\('session'\) or ''\) *[!=]=" && continue   # (b) binder
+    printf '%s\n' "$_sl_src" | grep -qF "str(e.get('session') or '') and " && continue               # (c) listed exclusion
+    sed -n "${_sl_n},$((_sl_n+2))p" "$BRIDGE" | grep -q '# LEGACY-SENTINEL' && continue              # (a) normalised
+    sed -n "${_sl_n},$((_sl_n+10))p" "$BRIDGE" | grep -qF 'supersede is restricted to one owned open pending' && continue  # (d) _sup_pendings
+    _sl_unclassified="$_sl_unclassified $_sl_n"
+done
+if [ "$_sl_norm" = 11 ] && [ "$_sl_bind" = 5 ] && [ -z "$_sl_unclassified" ]; then
+    ok "T-SESSION-LOCKSTEP every row-session reader is normalised, a binder, or one of the two listed exclusions (11 markers / 5 binders)"
+else
+    bad "T-SESSION-LOCKSTEP normalisers=$_sl_norm (want 11) binders=$_sl_bind (want 5) UNCLASSIFIED readers at bin/forge-bridge lines:${_sl_unclassified:- none}. The classes are NOT interchangeable: legacy-permissive READERS must treat 'unknown' as empty (cmd_log stamps it); the 5 callback BINDERS bind one callback to one pending by strict equality and must NEVER be normalised. Added a reader? Mark its normalisation '# LEGACY-SENTINEL' and bump 11. Added a binder? Bump 5. Deliberately excluding a site? Add it to class (c)/(d) above WITH a comment saying why. Do not 'fix them all'."
+fi
+
+# ---- C2 · T-CWD-DOC: the withdrawn cwd-independence promise (source + help scan) ----
+# #27 residual B was a LIVE PROMISE with no enforcement behind it: two surfaces said the
+# no-tmux commands "work from any directory" while `.dev` resolved against the current
+# one. C2 withdraws the promise; C3 makes the replacement contract executable. This test
+# pins BOTH halves of the surface, plus the R23-LOCKSTEP coupling — sites 6-7 of that
+# assertion require every LOCKED stage name to appear in the bridge file AND in the help
+# output, so a future edit to these two lines must not drop one.
+"$BRIDGE" help > "$WORK/cwd-help.txt" 2>&1
+_cwd_hdr="$(sed -n '30,52p' "$BRIDGE")"
+_cwd_help="$(cat "$WORK/cwd-help.txt")"
+_cwd_err=""
+printf '%s' "$_cwd_hdr"  | grep -qi 'work from any directory' && _cwd_err="$_cwd_err header-still-promises-any-directory"
+printf '%s' "$_cwd_help" | grep -qi 'work from any directory' && _cwd_err="$_cwd_err help-still-promises-any-directory"
+printf '%s' "$_cwd_hdr"  | grep -qi 'project root'            || _cwd_err="$_cwd_err header-omits-project-root"
+printf '%s' "$_cwd_help" | grep -qi 'PROJECT ROOT'            || _cwd_err="$_cwd_err help-omits-project-root"
+# The signal trio is governed by the same two surfaces (header :35-47, help block), so
+# withdrawing the promise there covers them — but all three names must SURVIVE the edit.
+for _sg in signal check-signals clear-signals; do
+  printf '%s' "$_cwd_hdr"  | grep -q -- "$_sg" || _cwd_err="$_cwd_err header-lost-$_sg"
+  printf '%s' "$_cwd_help" | grep -q -- "$_sg" || _cwd_err="$_cwd_err help-lost-$_sg"
+done
+# R23-LOCKSTEP sites 6-7 coupling: every locked stage name still present in both.
+_cwd_locked="$(python3 -c "
+import json,sys
+caps=json.load(open('$ROOT/config/codex-forge-runtime.json'))['stage_capabilities']
+print(' '.join(sorted(s for s,c in caps.items() if c in ('commit','live-qa'))))")"
+for _ls in $_cwd_locked; do
+  grep -q -- "$_ls" "$BRIDGE"            || _cwd_err="$_cwd_err bridge-lost-locked-$_ls"
+  grep -q -- "$_ls" "$WORK/cwd-help.txt" || _cwd_err="$_cwd_err help-lost-locked-$_ls"
+done
+[ -z "$_cwd_err" ] \
+  && ok "T-CWD-DOC both surfaces withdraw the any-directory promise, state the project-root rule, and keep every stage name" \
+  || bad "T-CWD-DOC$_cwd_err"
+
+# ---- D6 · T-CWD-LOCKSTEP: guard-insertion lockstep (source scan) ----
+# A BEHAVIOURAL loop over the eleven commands cannot prove this: a coder who omits one
+# insertion and also omits that arm of the loop passes. This asserts against the SOURCE.
+# COUNTING NOTE: `_require_root_cwd` appears 12 times in the file — 1 definition + 11
+# calls — so the call-site count MUST exclude the definition line or it is off by one on
+# day one. There was no pre-existing occurrence to account for (grep -c returned 0 at the
+# base commit).
+python3 - "$BRIDGE" <<'PY' && ok "T-CWD-LOCKSTEP the containment guard is defined once and called in all eleven guarded commands" || bad "T-CWD-LOCKSTEP (see above)"
+import re, sys
+src = open(sys.argv[1]).read()
+lines = src.splitlines()
+errs = []
+
+defs = [i for i, l in enumerate(lines) if l.startswith('_require_root_cwd() {')]
+if len(defs) != 1:
+    errs.append("_require_root_cwd must be DEFINED exactly once, found %d" % len(defs))
+
+calls = [i for i, l in enumerate(lines) if '_require_root_cwd' in l and not l.startswith('_require_root_cwd() {')]
+# Comment lines that merely NAME the helper are not call sites.
+calls = [i for i in calls if re.match(r'\s*_require_root_cwd\s', lines[i])]
+if len(calls) != 11:
+    errs.append("expected exactly 11 _require_root_cwd CALL SITES (definition excluded), found %d at lines %s"
+                % (len(calls), [i + 1 for i in calls]))
+
+# Per-command containment: the call must live between `^<name>() {` and its `^}`.
+COMMANDS = ["cmd_send", "cmd_log", "cmd_log_response", "cmd_context", "cmd_set_context",
+            "cmd_dispatch", "cmd_park", "cmd_park_resolve", "cmd_add_note", "cmd_signal",
+            "cmd_clear_signals"]
+for name in COMMANDS:
+    start = None
+    for i, l in enumerate(lines):
+        if l.startswith(name + "() {"):
+            start = i
+            break
+    if start is None:
+        errs.append("%s: function definition not found" % name)
+        continue
+    end = None
+    for j in range(start + 1, len(lines)):
+        if lines[j] == "}":
+            end = j
+            break
+    if end is None:
+        errs.append("%s: no terminating }" % name)
+        continue
+    body = "\n".join(lines[start:end])
+    if not re.search(r'^\s*_require_root_cwd\s', body, re.M):
+        errs.append("%s: NO _require_root_cwd call in its body — see fix-plan.md Changes/C3's "
+                    "eleven-command table for where it goes (cmd_dispatch's is AFTER the closing "
+                    "brace of its multi-line identity gate; cmd_signal's and cmd_clear_signals' "
+                    "are the FIRST statement, they have no require_identity at all)" % name)
+
+# cmd_log_response is a substring-prefix hazard: cmd_log's own scan must not credit it.
+for e in errs:
+    print("  T-CWD-LOCKSTEP: " + e, file=sys.stderr)
+sys.exit(1 if errs else 0)
+PY
+
+# ---- D4 · T-SKILL-SCRUB: publication scrub standing gate (public repo) ----
+# C10 moved 34 previously machine-local files into a PUBLIC repo in one commit — the
+# largest publication-surface change in this fix. A scrub failure SURVIVES A REVERT in git
+# history, so the one-time pre-`git add` scan is not enough: this makes it standing, and
+# it also covers a LATER edit to any of the five newly vendored skills.
+# --cached --others --exclude-standard, not plain ls-files: a file that is STAGED-BUT-
+# NOT-YET-COMMITTED, or newly added and not yet staged, is exactly the file this gate must
+# see. Plain `git ls-files` would pass vacuously on the very commit that introduces a leak.
+_scrub_hits="$(cd "$ROOT" && git ls-files -z --cached --others --exclude-standard skills codex-skills 2>/dev/null \
+  | xargs -0 grep -nIE '/Users/|\$HOME|promptlol|anim8e2e|feedmint|goparent' 2>/dev/null || true)"
+[ -z "$_scrub_hits" ] \
+  && ok "T-SKILL-SCRUB no absolute home path or private project name in any tracked skills/ or codex-skills/ file" \
+  || bad "T-SKILL-SCRUB publication leak in a PUBLIC repo (a revert does NOT remove it from history): $(printf '%s' "$_scrub_hits" | head -5 | tr '\n' ' ')"
+
+# ---- C9 · T-DRIFT-INVENTORY: --check-drift answers BOTH inventory questions ----
+# The old drift loop globbed skills/*/ and was therefore blind to a missing skill BY
+# CONSTRUCTION. This is the GENERIC re-expression of the archived "real-home
+# reconciliation" rule the runner addendum requires: it asserts against a SYNTHETIC HOME
+# and contains no machine-specific absolute path, because this repo is public.
+_di="$WORK/driftinv"; mkdir -p "$_di"
+_di_out="$(cd "$ROOT" && HOME="$_di" FORGE_CONFIG_DIR="$_di/.config/forge" ./install.sh --check-drift 2>&1 || true)"
+_di_err=""
+for _n in fix-reproducer adversarial-investigate adversarial-fix-plan fix-plan-reviewer adversarial-fix-qa; do
+  printf '%s' "$_di_out" | grep -q "skills/$_n — not installed" || _di_err="$_di_err missing-not-installed-line-for-$_n"
+done
+# Reverse half: a skills/<x>/ absent from SKILL_NAMES must be REPORTED. It installs (that
+# loop is still a glob) but never uninstalls, because both uninstall loops walk
+# SKILL_NAMES — a silent one-way door.
+# NOT a dot-name: `skills/*/` is a plain glob and bash leaves dotglob OFF, so a
+# `.driftprobe` directory would be invisible to the very loop under test and the probe
+# would pass vacuously.
+mkdir -p "$ROOT/skills/driftprobe-tmp"
+printf 'probe\n' > "$ROOT/skills/driftprobe-tmp/SKILL.md"
+_di_rev="$(cd "$ROOT" && HOME="$_di" FORGE_CONFIG_DIR="$_di/.config/forge" ./install.sh --check-drift 2>&1 || true)"
+rm -rf "$ROOT/skills/driftprobe-tmp"
+printf '%s' "$_di_rev" | grep -q 'NOT declared in SKILL_NAMES' || _di_err="$_di_err reverse-check-silent"
+# --check-drift is a READ-ONLY report. It must mutate nothing under the synthetic HOME.
+[ -z "$(find "$_di" -mindepth 1 2>/dev/null)" ] || _di_err="$_di_err check-drift-mutated-HOME"
+[ -z "$_di_err" ] \
+  && ok "T-DRIFT-INVENTORY --check-drift reports declared-but-absent AND present-but-undeclared, and mutates nothing" \
+  || bad "T-DRIFT-INVENTORY:$_di_err"
+
 # ---- Real-tmux section ----
 if ! command -v tmux >/dev/null 2>&1; then
     echo "SKIP: tmux unavailable — real-tmux identity tests skipped"
@@ -217,6 +420,20 @@ run_in_pane(){
 }
 rc_of(){ sed -n 's/^DONE_//p' "$WORK/out.$1" | tail -1; }
 out_of(){ cat "$WORK/out.$1"; }
+# row_state <pipeline-log> <stage> -> `open` | `closed:<response>` | `rows=<n>` | `parse-error`
+# R3: every --supersede assertion below re-reads forge-log.yml and asserts on the ROW, never
+# on rc alone — R2's own charge against round 1. rc is not enough post-R3 for a second reason:
+# a --supersede over a legacy row is now a legitimate rc-0 dispatch that ADDS a replacement
+# pending, so a bare `grep 'response: null'` would match the wrong row.
+row_state(){ python3 - "$1" "$2" <<'RSPY'
+import sys,yaml
+try: entries=(yaml.safe_load(open(sys.argv[1])) or {}).get('entries') or []
+except Exception: print('parse-error'); sys.exit(0)
+rows=[e for e in entries if isinstance(e,dict) and str(e.get('stage') or '')==sys.argv[2]]
+if len(rows)!=1: print('rows=%d' % len(rows)); sys.exit(0)
+print('open' if rows[0].get('response') is None else 'closed:%s' % rows[0].get('response'))
+RSPY
+}
 
 # T-ID-INPANE
 run_in_pane "$S1:0.0" inpane "FORGE_WATCH_TRIGGER=0 $BRIDGE identity"
@@ -709,6 +926,50 @@ else bad "T-D1-SUPERSEDE-ARCHIVE (ask not archived on supersede)"; fi
 guard_done d1sup adhoc codex-b 4 d1sup-clean || bad "D1-SUP close replacement"
 guard_require_clean "T-GUARD-HYGIENE-D1SUP" || exit 1
 
+# T-UNK-SUPERSEDE-COEXIST (fix-plan §R3-4 bullet 2) — the MAJ-1 case NO test covered.
+# R2 normalised `unknown` -> '' inside _sup_pendings. With actor_i non-empty that made a
+# legacy row satisfy `elif not ei and (not es or es==actor_s)` -> mixed=True -> exit 2. The
+# `mixed` flag is GLOBAL and is tested BEFORE `owned` is ever consulted, so ONE poisoning
+# row aborted the ENTIRE selection — including the pending the actor genuinely owned. A
+# documented terminal action (skills/forge-orchestrator/SKILL.md:722/:731/:1503,
+# docs/forge-operator-guide.md:714) began refusing on the exact log shape this fix targets,
+# naming no row, no stage, no timestamp and no recovery. §R3-1 reverted that normalisation
+# and §R3-2 put the naming in an ADDITIVE per-row diagnostic instead. This test pins the
+# restored contract in all four parts at once, so "fix them all" cannot re-break it:
+#   owned row CLOSED · legacy row NOT closed · the warning NAMES the legacy row · rc 0.
+# The legacy row carries an EMPTY incarnation on purpose (QA MIN-3): that column is still
+# live — the no-tmux unique-root-candidate arm mints it — and it is the exact shape MAJ-1
+# affected. The producer-realistic non-empty column is T-UNK-SUPERSEDE-REFUSES's job.
+COEXLOG="$GROOT/.dev/proposals/coexist/forge-log.yml"
+guard_block coexist coding codex-a 3 coexist || bad "COEXIST setup"
+cat >> "$COEXLOG" <<'EOF'
+
+  - timestamp: "2026-07-01T00:00:00Z"
+    stage: fix-code
+    from: claude
+    to: claude-opus
+    session: unknown
+    incarnation:
+    prompt: "legacy"
+    response: null
+    files: []
+EOF
+run_in_pane "$GS:0.0" coexist-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug coexist --stage adhoc --worker codex-b --supersede )"
+COEX_OWNED="$(row_state "$COEXLOG" coding)"; COEX_LEGACY="$(row_state "$COEXLOG" fix-code)"
+if [ "$(rc_of coexist-dispatch)" = 0 ] \
+   && case "$COEX_OWNED" in closed:FORGE_SUPERSEDED*) true ;; *) false ;; esac \
+   && [ "$COEX_LEGACY" = open ] \
+   && out_of coexist-dispatch | grep -q 'WARN: --supersede does NOT close the legacy-identity pending coexist/fix-code' \
+   && out_of coexist-dispatch | grep -q 'log-response --slug coexist --to claude-opus --stage fix-code'; then
+    ok "T-UNK-SUPERSEDE-COEXIST the owned pending IS closed, the coexisting legacy 'unknown' row is NOT, the warning names it, rc 0"
+else bad "T-UNK-SUPERSEDE-COEXIST rc=$(rc_of coexist-dispatch) owned=[$COEX_OWNED] legacy=[$COEX_LEGACY] $(out_of coexist-dispatch | tr '\n' ' ')"; fi
+run_in_pane "$GS:0.0" coexist-recover "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE log-response --slug coexist --to claude-opus --stage fix-code --response done )"
+[ "$(rc_of coexist-recover)" = 0 ] && [ "$(row_state "$COEXLOG" fix-code)" = "closed:done" ] \
+    && ok "T-UNK-SUPERSEDE-COEXIST the named recovery works: log-response closes the legacy row --supersede left open" \
+    || bad "T-UNK-SUPERSEDE-COEXIST recovery rc=$(rc_of coexist-recover) legacy=$(row_state "$COEXLOG" fix-code)"
+guard_done coexist adhoc codex-b 4 coexist-clean || bad "COEXIST close replacement"
+guard_require_clean "T-GUARD-HYGIENE-COEXIST" || exit 1
+
 mkdir -p "$GROOT/.dev/proposals/b15-fail"
 cat > "$GROOT/.dev/proposals/b15-fail/forge-log.yml" <<EOF
 pipeline: b15-fail
@@ -850,7 +1111,10 @@ else bad "T-ILG-MODE rc=$(rc_of ilgmode) $(out_of ilgmode | tr '\n' ' ')"; fi
 # an absolute path, so only the lookup is affected. The stub must precede ~/bin.
 mkdir -p "$WORK/ilgbadbin"; printf '#!/bin/sh\necho boom >&2\nexit 1\n' > "$WORK/ilgbadbin/forge"
 chmod +x "$WORK/ilgbadbin/forge"
-run_in_pane "$GS:0.0" ilgcfg "( cd $GROOT && PATH=$WORK/ilgbadbin:\$PATH $ILGENV $BRIDGE dispatch --slug ilg-cfg --stage fix-code --worker claude-opus --allow-blocked p0-ilg )"
+# RETARGETED (C8): the stub is injected through FORGE_FORGE_BIN, not PATH. C8 resolves
+# `forge` by absolute path precisely so a PATH shadow cannot answer a capability lookup,
+# which defeats a PATH-based stub BY DESIGN. The assertion below is unchanged.
+run_in_pane "$GS:0.0" ilgcfg "( cd $GROOT && FORGE_FORGE_BIN=$WORK/ilgbadbin/forge $ILGENV $BRIDGE dispatch --slug ilg-cfg --stage fix-code --worker claude-opus --allow-blocked p0-ilg )"
 if [ "$(rc_of ilgcfg)" = 1 ] && out_of ilgcfg | grep -q 'capability class' \
    && ! out_of ilgcfg | grep -q 'no such tmux session exists'; then
     ok "T-ILG-CFG a failed capability lookup refuses (fail-closed), never falls through"
@@ -4786,6 +5050,551 @@ PY
   tmux kill-session -t "$SMS" 2>/dev/null
 else
   echo "  (skip SEND-MAX §54: tmux unavailable)"
+fi
+
+echo "── #27 residual A: the 'unknown' legacy sentinel (real tmux) ──"
+if command -v tmux >/dev/null 2>&1; then
+  # r1 · BLOCK-LOCAL SESSION (the ACM §D idiom): every earlier real-tmux section kills
+  # its own session, so $DS is dead at this insertion point and is rebuilt here. The
+  # suite's EXIT trap already covers "${DS:-none}", so an aborted run cannot leak it.
+  DS="fbunk-$$"; UNKR="$(mkR unkroot)"
+  mk_session "$DS" 220 50 "$UNKR"
+  sleep 1
+  # DSINC: this session's own `session_created`. The producer stamps exactly this value
+  # into a row's `incarnation:` at the same moment it stamps `session: unknown`
+  # (bin/forge-bridge:418 is unconditional; :417 charset-gates the name), and tmux
+  # PRESERVES session_created across `rename-session` — which is the diagnosis's own
+  # rename-transition, and the identity shape QA measured for CRIT-1.
+  DSINC="$(tmux display-message -p -t "$DS:0.0" '#{session_created}')"
+  UNKENV="FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe"
+
+  # unk_fixture <slug> <session-value> [to] — ONE pending row, response: null, in BOTH
+  # the summary log (which has_pending_log_for and stall-check-status read) and the
+  # per-pipeline log (which the orphan guard and log-response read). printf heredocs,
+  # DELIBERATELY: these model the "pre-2026-07-11 fixture row read by today's binary"
+  # transition the diagnosis names, and a row that went through cmd_log could not carry
+  # an arbitrary session value anyway.
+  # R3/QA MIN-3: the 4th argument is the row's `incarnation:`, defaulting to EMPTY.
+  # BOTH columns are live and BOTH are covered, which is why this is a parameter and not a
+  # replacement. EMPTY is the legacy shape the diagnosis and problem-statement are about —
+  # still mintable today by the no-tmux unique-root-candidate arm — and it is the shape QA
+  # MAJ-1 turned into a hard refusal. NON-EMPTY is the only shape the diagnosed producer can
+  # emit: `bin/forge-bridge:418` stamps ID_host_incarnation unconditionally while `:417`
+  # charset-gates ID_host_session, so a live `session: unknown` row always carries an
+  # incarnation. R2's central supersede test asserted against the shape the binary CANNOT
+  # mint, which is how CRIT-1 survived two rounds green.
+  # With no 4th argument the emitted bytes are UNCHANGED, so every T-UNK-* fixture below
+  # that predates R3 is byte-identical to R2's.
+  unk_fixture(){
+    local slug="$1" sess="$2" to="${3:-claude-opus}" inc="${4:-}" incval=""
+    [ -n "$inc" ] && incval=" \"$inc\""
+    mkdir -p "$UNKR/.dev/proposals/$slug"
+    printf 'entries:\n\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: fix-code\n    from: claude\n    to: %s\n    session: %s\n    incarnation:%s\n    prompt: "p"\n    response: null\n    files: []\n' "$to" "$sess" "$incval" > "$UNKR/.dev/proposals/$slug/forge-log.yml"
+    printf 'entries:\n\n  - timestamp: "2026-07-01T00:00:00Z"\n    pipeline: %s\n    stage: fix-code\n    from: claude\n    to: %s\n    session: %s\n    incarnation:%s\n    response: null\n' "$slug" "$to" "$sess" "$incval" > "$UNKR/.dev/forge-log.yml"
+  }
+
+  # ── T-UNK-HOOK ─────────────────────────────────────────────────────────────────
+  # THE TEST-DESIGN HAZARD, recorded so nobody "simplifies" this into a test that
+  # proves nothing: the HOOK BLOCKED symptom requires a SESSION-IDENTITY TRANSITION.
+  # A test shaped "log an unknown row, then send from the same session" PASSES ON
+  # BROKEN CODE — `send` is host-pane (:2911) and require_identity's pane precondition
+  # refuses first with "requires a live forge session", so the hook at :2980-2989 is
+  # never reached. The row must be a FIXTURE carrying a different (here: sentinel)
+  # session, read back by this live one. Note also :2984 had ZERO coverage before this.
+  # H6 (diagnosis): the incarnation skip at :2657-2661 emits a BYTE-IDENTICAL HOOK
+  # BLOCKED through the same negated caller at :2983 — the fixtures carry an EMPTY
+  # incarnation so that path cannot mask this one.
+  unk_fixture unkhook unknown
+  run_in_pane "$DS:0.0" unkhook "( cd $UNKR && $UNKENV $BRIDGE send claude-opus hello-unknown )"
+  { [ "$(rc_of unkhook)" = 0 ] && ! out_of unkhook | grep -q 'HOOK BLOCKED'; } \
+    && ok "T-UNK-HOOK a 'session: unknown' pending reads as LEGACY — the send is not blocked" \
+    || bad "T-UNK-HOOK rc=$(rc_of unkhook) $(out_of unkhook | tr '\n' ' ')"
+
+  # NEGATIVE CONTROL, in the same test by design: an identical row stamped with a
+  # DIFFERENT, NAMED session from the SAME sender MUST still block. Without it the fix
+  # could pass by making every row legacy, which would delete the guard outright.
+  unk_fixture unkhook2 forge-other
+  run_in_pane "$DS:0.0" unkhook2 "( cd $UNKR && $UNKENV $BRIDGE send claude-opus hello-named )"
+  { [ "$(rc_of unkhook2)" != 0 ] && out_of unkhook2 | grep -q 'HOOK BLOCKED'; } \
+    && ok "T-UNK-HOOK negative control: a NAMED foreign session still blocks" \
+    || bad "T-UNK-HOOK negative control rc=$(rc_of unkhook2) $(out_of unkhook2 | tr '\n' ' ')"
+  rm -f "$UNKR/.dev/forge-log.yml"
+
+  # ── T-UNK-PRODUCER ─────────────────────────────────────────────────────────────
+  # The producer half, at the SHIPPED DEFAULT FORGE_IDENTITY_ENFORCE=1: a session whose
+  # NAME fails _valid_session_name (:251) still reaches cmd_log, because _forge_identity
+  # fixes ID_state in the case at :427-448 and only AFTERWARDS nulls ID_target_session
+  # at :458, while `require_identity … host-session` gates on the state alone and
+  # carries no pane precondition (:604). So `log` succeeds and stamps the literal
+  # `unknown` at :3173. This is what makes T-UNK-HOOK's trigger REAL, not hypothetical.
+  UNKBAD="fbunk+bad-$$"
+  tmux new-session -d -s "$UNKBAD" -x 200 -y 50 -c "$UNKR" -e FORGE_LAYOUT=2 2>/dev/null
+  if tmux has-session -t "$UNKBAD" 2>/dev/null; then
+    run_in_pane "$UNKBAD:0.0" unkprod "( cd $UNKR && $UNKENV $BRIDGE log --slug unkprod --stage adhoc --from claude --to codex-a --prompt p )"
+    { [ "$(rc_of unkprod)" = 0 ] \
+      && grep -q '^    session: unknown$' "$UNKR/.dev/proposals/unkprod/forge-log.yml"; } \
+      && ok "T-UNK-PRODUCER an invalid-named session still logs, stamping session: unknown (enforce default)" \
+      || bad "T-UNK-PRODUCER rc=$(rc_of unkprod) $(out_of unkprod | tr '\n' ' ')"
+
+    # ── T-UNK-SIG ────────────────────────────────────────────────────────────────
+    # Named SEPARATELY so it cannot be trimmed away with the case above. It pins the H9
+    # state/value gap as an OBSERVED FACT even though H9 is deliberately NOT fixed here
+    # (it is a class fix touching every host-session/host-degrade command; the diagnosis
+    # records it as the deeper cause and explicitly NOT the fix site). If this ever
+    # stops holding, T-UNK-HOOK's trigger has silently become vacuous.
+    run_in_pane "$UNKBAD:0.0" unksig "( cd $UNKR && $UNKENV $BRIDGE identity )"
+    { out_of unksig | grep -q 'identity_state=MATCH' \
+      && out_of unksig | grep -q 'target_session=none'; } \
+      && ok "T-UNK-SIG the H9 gap is live: identity_state=MATCH alongside target_session=none" \
+      || bad "T-UNK-SIG $(out_of unksig | tr '\n' ' ')"
+    tmux kill-session -t "$UNKBAD" 2>/dev/null
+  else
+    bad "T-UNK-PRODUCER/T-UNK-SIG could not create an invalid-named tmux session"
+  fi
+  rm -rf "$UNKR/.dev/proposals/unkprod"
+
+  # ── T-UNK-CLOSE (:4104) ────────────────────────────────────────────────────────
+  # Base behaviour: ERR_NO_MATCH:--to=claude-opus --stage=fix-code — UNCLOSEABLE.
+  unk_fixture unkclose unknown
+  run_in_pane "$DS:0.0" unkclose "( cd $UNKR && $UNKENV $BRIDGE log-response --slug unkclose --to claude-opus --stage fix-code --response done )"
+  { [ "$(rc_of unkclose)" = 0 ] && ! out_of unkclose | grep -q 'ERR_NO_MATCH'; } \
+    && ok "T-UNK-CLOSE a session-bearing log-response closes an unknown-session row" \
+    || bad "T-UNK-CLOSE rc=$(rc_of unkclose) $(out_of unkclose | tr '\n' ' ')"
+
+  # ── T-UNK-XSESSION (:4119) ─────────────────────────────────────────────────────
+  # A HEADLESS close over a candidate set of one `unknown` row plus one `forge-1` row
+  # must NOT emit ERR_XSESSION: after normalisation the set holds ONE distinct nonempty
+  # session, not two. This site is NOT named in the diagnosis — it is :4104's predicate
+  # rewritten sixteen lines later in the same heredoc, and leaving it would make
+  # cmd_log_response classify one value two ways. It needs its OWN root: a root with a
+  # live same-root session resolves to that session and is not headless.
+  UNKX="$(mkR unkxroot)"
+  mkdir -p "$UNKX/.dev/proposals/unkxs"
+  printf 'entries:\n\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: fix-code\n    from: claude\n    to: claude-opus\n    session: unknown\n    incarnation:\n    prompt: "p"\n    response: null\n    files: []\n\n  - timestamp: "2026-07-01T00:00:01Z"\n    stage: fix-code\n    from: claude\n    to: claude-opus\n    session: forge-1\n    incarnation:\n    prompt: "p"\n    response: null\n    files: []\n' > "$UNKX/.dev/proposals/unkxs/forge-log.yml"
+  unkxs="$(cd "$UNKX" && env -u TMUX -u TMUX_PANE -u TMUX_SESSION FORGE_WATCH_TRIGGER=0 "$BRIDGE" log-response --slug unkxs --response done 2>&1)"
+  ! printf '%s' "$unkxs" | grep -q 'ERR_XSESSION' \
+    && ok "T-UNK-XSESSION a headless close spanning an unknown row and a named row is not cross-session" \
+    || bad "T-UNK-XSESSION $(printf '%s' "$unkxs" | tr '\n' ' ')"
+
+  # ── T-UNK-ORPHAN (:5197) ───────────────────────────────────────────────────────
+  # Base behaviour: the guard read n_pending=0 at :5213 and the dispatch PROCEEDED —
+  # the orphan guard was BLIND to the very row it exists to see.
+  unk_fixture unkorph unknown
+  run_in_pane "$DS:0.0" unkorph "( cd $UNKR && $UNKENV FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug unkorph --stage adhoc --worker codex-b )"
+  { [ "$(rc_of unkorph)" != 0 ] && out_of unkorph | grep -q 'HOOK BLOCKED: dispatch refused' \
+    && out_of unkorph | grep -q "slug 'unkorph' has 1 open pending"; } \
+    && ok "T-UNK-ORPHAN the orphan guard now SEES an unknown-session pending and refuses" \
+    || bad "T-UNK-ORPHAN rc=$(rc_of unkorph) $(out_of unkorph | tr '\n' ' ')"
+  # ── T-UNK-SUPERSEDE-REFUSES (fix-plan §R3-2 / §R3-4; was R2-1) ─────────────────
+  # LINEAGE, so the next round does not re-break it. Round 1 asserted rc=0 and NOTHING ELSE
+  # under a label claiming a close: it measured PROCEEDS and reported CLOSES. R2 rewrote it
+  # to assert a LOUD rc-1 refusal — and was green, against a fixture the binary CANNOT MINT
+  # (empty `incarnation:` alongside `session: unknown`). R2's normalisation only ever fired
+  # on that unmintable shape, so on the REAL shape nothing changed: rc 0, DISPATCHED, row
+  # still open, and SILENT (QA CRIT-1 — round-1 A-1 verbatim). Two rounds and a plan review
+  # passed over it because the test never exercised the producer's own output.
+  #
+  # Post-R3 contract, on the PRODUCER-REALISTIC row (`session: unknown` + NON-empty
+  # `incarnation:`): `--supersede` still does not close a legacy row — that half of R2-1
+  # stands, and §R3-1 restored the selector byte-for-byte — but it is no longer SILENT. The
+  # §R3-2 diagnostic names the row (stage, worker, session, timestamp) and names
+  # `log-response` as the recovery, and `log-response` then really does close it.
+  #
+  # NO rc ASSERTION ON THE DISPATCH, deliberately: post-R3 this is a legitimate rc-0
+  # dispatch whose later stages (render / infra-lock / lane) are not what this test is
+  # about, and the §R3-2 warning is emitted before all of them. The rc-0 contract is
+  # asserted by T-UNK-SUPERSEDE-COEXIST instead, in the guard environment where a full
+  # --supersede dispatch is already proven green. Both halves here assert on the ROW, via
+  # row_state, never on rc alone — and row_state is stage-scoped because this dispatch now
+  # ADDS a replacement pending, which a bare `response: null` grep would match.
+  #
+  # WHY THE ROW CARRIES *THIS* SESSION'S INCARNATION AND NOT AN ARBITRARY ONE. Measured,
+  # not assumed: cmd_log_response's candidate filter (`:4292`) is legacy-permissive on
+  # `session` but STRICT on `incarnation` — `if ei and caller_incarnation and ei !=
+  # caller_incarnation: return False` — so a legacy `unknown` row carrying a DIFFERENT
+  # session's incarnation is not closeable by `log-response` either, and asserting that it
+  # is would put a second fiction where R2 left the first. $DSINC is the producer's OWN
+  # output on the diagnosis's rename-transition path, where the row and the recovering
+  # caller share one incarnation, so the recovery §R3-2's warning names genuinely works.
+  # The foreign-incarnation legacy row is a NARROWER, PRE-EXISTING residual: neither
+  # --supersede nor log-response reaches it. It is out of R3's scope (fix-plan §R3 "Do not
+  # attempt a third clever fix") and is recorded in fix-coder-report.md, not papered over.
+  unk_fixture unksup unknown claude-opus "$DSINC"
+  UNKSUPLOG="$UNKR/.dev/proposals/unksup/forge-log.yml"
+  run_in_pane "$DS:0.0" unksup1 "( cd $UNKR && $UNKENV FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug unksup --stage adhoc --worker codex-b --supersede )"
+  { out_of unksup1 | grep -q 'WARN: --supersede does NOT close the legacy-identity pending unksup/fix-code' \
+    && out_of unksup1 | grep -q 'session=unknown, timestamp=2026-07-01T00:00:00Z' \
+    && out_of unksup1 | grep -q 'log-response --slug unksup --to claude-opus --stage fix-code' \
+    && [ "$(row_state "$UNKSUPLOG" fix-code)" = open ]; } \
+    && ok "T-UNK-SUPERSEDE-REFUSES on the PRODUCER shape --supersede leaves the legacy row OPEN and now SAYS SO, naming the row and the recovery" \
+    || bad "T-UNK-SUPERSEDE-REFUSES rc=$(rc_of unksup1) fix-code=$(row_state "$UNKSUPLOG" fix-code) $(out_of unksup1 | tr '\n' ' ')"
+  run_in_pane "$DS:0.0" unksup2 "( cd $UNKR && $UNKENV $BRIDGE log-response --slug unksup --to claude-opus --stage fix-code --response done )"
+  { [ "$(rc_of unksup2)" = 0 ] \
+    && ! out_of unksup2 | grep -q 'ERR_NO_MATCH' \
+    && [ "$(row_state "$UNKSUPLOG" fix-code)" = "closed:done" ]; } \
+    && ok "T-UNK-SUPERSEDE-REFUSES log-response IS the recovery the warning names: it closes the unknown-session row" \
+    || bad "T-UNK-SUPERSEDE-REFUSES recovery rc=$(rc_of unksup2) fix-code=$(row_state "$UNKSUPLOG" fix-code) $(out_of unksup2 | tr '\n' ' ')"
+
+  # ── T-UNK-STALL (:9300 / :9302) ────────────────────────────────────────────────
+  unk_fixture unkstall unknown
+  run_in_pane "$DS:0.0" unkstall "( cd $UNKR && $UNKENV $BRIDGE stall-check-status )"
+  out_of unkstall | grep -q 'legacy entry, no session field' \
+    && ok "T-UNK-STALL stall-check-status surfaces the row and labels it legacy" \
+    || bad "T-UNK-STALL $(out_of unkstall | tr '\n' ' ')"
+
+  unset -f unk_fixture
+  tmux kill-session -t "$DS" 2>/dev/null
+else
+  echo "  (skip: tmux unavailable — #27 residual A)"
+fi
+
+echo "── #27 residual B: project-root containment (real tmux) ──"
+if command -v tmux >/dev/null 2>&1; then
+  # r1 · BLOCK-LOCAL SESSION (the ACM §D idiom); the EXIT trap covers "${DS:-none}".
+  DS="fbcwd-$$"; CWDR="$(mkR cwdroot)"; mkdir -p "$CWDR/sub/deep"
+  mk_session "$DS" 220 50 "$CWDR"
+  CWDINC="$(tmux display-message -p -t "$DS:0.0" '#{session_created}')"
+  sleep 1
+  CWDENV="FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe"
+  CWDNEEDLE='must be run from the project root'
+
+  # cwd_case <tag> <dir> <argv…> — run one bridge command from <dir> inside the live
+  # root-created session, so send/dispatch's host-pane identity still resolves MATCH and
+  # the CONTAINMENT guard is what refuses, not the identity gate.
+  cwd_case(){ local tag="$1" dir="$2"; shift 2
+    run_in_pane "$DS:0.0" "$tag" "( cd $dir && $CWDENV FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE $* )"; }
+
+  # ── T-CWD-REFUSE (D5′) — ALL ELEVEN guarded commands from sub/deep ──────────────
+  # MANDATORY ARGUMENT NOTE: cmd_dispatch (usage check :4996-4999) and cmd_park (usage
+  # check :6775) both validate arguments BEFORE their identity gates, so a BARE
+  # invocation refuses with a usage message and the case would pass VACUOUSLY. Those two
+  # arms carry the minimal valid flags below and MUST assert the containment message,
+  # never merely rc != 0. The other nine gate before parsing and can be invoked bare.
+  # NOTE ALSO: `park --resolve` delegates to cmd_park_resolve at :6783 and RETURNS —
+  # BEFORE cmd_park's own require_identity at :6786 — so it is guarded only through
+  # cmd_park_resolve. A test written against `park --resolve` expecting park's own guard
+  # would test nothing.
+  _cwd_bad=""
+  cwd_case cwd-ctx     "$CWDR/sub/deep" context
+  cwd_case cwd-setctx  "$CWDR/sub/deep" set-context --slug demo
+  cwd_case cwd-note    "$CWDR/sub/deep" add-note n
+  cwd_case cwd-log     "$CWDR/sub/deep" log --slug d --stage adhoc --from claude --to codex-a --prompt p
+  cwd_case cwd-send    "$CWDR/sub/deep" send claude-opus x
+  cwd_case cwd-resp    "$CWDR/sub/deep" log-response --slug d --response r
+  cwd_case cwd-disp    "$CWDR/sub/deep" dispatch --slug d --stage adhoc --worker codex-a
+  cwd_case cwd-park    "$CWDR/sub/deep" park --slug p --stage s --reason r
+  cwd_case cwd-presolve "$CWDR/sub/deep" park --resolve --slug p --stage s
+  cwd_case cwd-signal  "$CWDR/sub/deep" signal tester msg
+  cwd_case cwd-clear   "$CWDR/sub/deep" clear-signals
+  for _t in cwd-ctx cwd-setctx cwd-note cwd-log cwd-send cwd-resp cwd-disp cwd-park cwd-presolve cwd-signal cwd-clear; do
+    { [ "$(rc_of "$_t")" != 0 ] && out_of "$_t" | grep -q "$CWDNEEDLE" \
+      && out_of "$_t" | grep -q "project root: $CWDR" && out_of "$_t" | grep -q "Fix: cd $CWDR"; } \
+      || _cwd_bad="$_cwd_bad $_t(rc=$(rc_of "$_t"))"
+  done
+  [ -z "$_cwd_bad" ] \
+    && ok "T-CWD-REFUSE all eleven state-mutating commands refuse from a subdirectory, naming the root and the cd" \
+    || bad "T-CWD-REFUSE not refused with the containment message:$_cwd_bad"
+
+  # The assertion that catches a RELOCATED fork rather than only an absent one. BOTH
+  # shapes, repo-wide: `.dev` (DEV_DIR) and `signals` (SIGNAL_DIR) — the second constant
+  # is the one the diagnosis's $DEV_DIR measurement did not cover.
+  { [ -z "$(find "$CWDR" -mindepth 2 -type d -name .dev)" ] \
+    && [ -z "$(find "$CWDR" -mindepth 2 -type d -name signals)" ]; } \
+    && ok "T-CWD-REFUSE no forked .dev and no forked signals tree anywhere under the root" \
+    || bad "T-CWD-REFUSE forked tree(s): $(find "$CWDR" -mindepth 2 -type d \( -name .dev -o -name signals \) | tr '\n' ' ')"
+
+  # ── T-CWD-REFUSE exemptions — asserted BY NAME, not left implied ────────────────
+  cwd_case cwd-pre "$CWDR/sub/deep" preflight
+  { [ "$(rc_of cwd-pre)" = 0 ] && out_of cwd-pre | grep -q 'WRONG_DIRECTORY'; } \
+    && ok "T-CWD-REFUSE exemption: preflight still runs from a subdirectory and still classifies WRONG_DIRECTORY" \
+    || bad "T-CWD-REFUSE preflight exemption rc=$(rc_of cwd-pre) $(out_of cwd-pre | tr '\n' ' ')"
+  # check-signals / review-status must exit EXACTLY as they do from the root.
+  cwd_case cwd-chk-root "$CWDR" check-signals
+  cwd_case cwd-chk-sub  "$CWDR/sub/deep" check-signals
+  cwd_case cwd-rev-root "$CWDR" review-status
+  cwd_case cwd-rev-sub  "$CWDR/sub/deep" review-status
+  { [ "$(rc_of cwd-chk-root)" = "$(rc_of cwd-chk-sub)" ] \
+    && [ "$(rc_of cwd-rev-root)" = "$(rc_of cwd-rev-sub)" ] \
+    && ! out_of cwd-chk-sub | grep -q "$CWDNEEDLE" \
+    && ! out_of cwd-rev-sub | grep -q "$CWDNEEDLE"; } \
+    && ok "T-CWD-REFUSE exemption: check-signals and review-status are read-only and unguarded" \
+    || bad "T-CWD-REFUSE read-only exemption drifted (chk $(rc_of cwd-chk-root)/$(rc_of cwd-chk-sub) rev $(rc_of cwd-rev-root)/$(rc_of cwd-rev-sub))"
+  # callback must stay cwd-independent: a refusal there aborts BEFORE publishing the
+  # terminal callback and leaves an open delivery. That is why the guard is an explicit
+  # eleven-command list and not a require_identity hook.
+  mkdir -p "$CWDR/.dev/proposals/cwdcb"
+  printf 'entries:\n\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: adhoc\n    from: claude\n    to: codex-a\n    session: %s\n    incarnation: %s\n    prompt: "p"\n    response: null\n    files: []\n' "$DS" "$CWDINC" > "$CWDR/.dev/proposals/cwdcb/forge-log.yml"
+  cwd_case cwd-cb "$CWDR/sub/deep" callback --slug cwdcb --stage adhoc --status DONE --worker codex-a --message d --quiet
+  { ! out_of cwd-cb | grep -q "$CWDNEEDLE" \
+    && ! grep -q 'response: null' "$CWDR/.dev/proposals/cwdcb/forge-log.yml"; } \
+    && ok "T-CWD-REFUSE exemption: callback stays cwd-independent and still closes the pending" \
+    || bad "T-CWD-REFUSE callback exemption rc=$(rc_of cwd-cb) $(out_of cwd-cb | tr '\n' ' ')"
+
+  # From the ROOT, none of the eleven is refused by the containment guard.
+  _cwd_root_bad=""
+  cwd_case cwdr-ctx     "$CWDR" context
+  cwd_case cwdr-setctx  "$CWDR" set-context --slug demo
+  cwd_case cwdr-note    "$CWDR" add-note n
+  cwd_case cwdr-log     "$CWDR" log --slug cwdr --stage adhoc --from claude --to codex-a --prompt p
+  cwd_case cwdr-send    "$CWDR" send claude-opus x
+  cwd_case cwdr-resp    "$CWDR" log-response --slug cwdr --response r
+  cwd_case cwdr-disp    "$CWDR" dispatch --slug cwdr2 --stage adhoc --worker codex-a
+  cwd_case cwdr-park    "$CWDR" park --slug cwdr2 --stage adhoc --reason r
+  cwd_case cwdr-presolve "$CWDR" park --resolve --slug cwdr2 --stage adhoc
+  cwd_case cwdr-signal  "$CWDR" signal tester msg
+  cwd_case cwdr-clear   "$CWDR" clear-signals
+  for _t in cwdr-ctx cwdr-setctx cwdr-note cwdr-log cwdr-send cwdr-resp cwdr-disp cwdr-park cwdr-presolve cwdr-signal cwdr-clear; do
+    out_of "$_t" | grep -q "$CWDNEEDLE" && _cwd_root_bad="$_cwd_root_bad $_t"
+  done
+  [ -z "$_cwd_root_bad" ] \
+    && ok "T-CWD-REFUSE the guard is a no-op from the project root for all eleven" \
+    || bad "T-CWD-REFUSE guard fired at the ROOT for:$_cwd_root_bad"
+
+  # ── T-CWD-MODE (C3) — mirrors T-ILG-MODE (:842) ────────────────────────────────
+  # observe warns and proceeds; a TYPO is a HARD ERROR, never a silent fall-through to
+  # observe. rc 1 is also the identity-failure code, so the message assertions (including
+  # the explicit negative) are what distinguish this from a harness fault.
+  run_in_pane "$DS:0.0" cwdobs "( cd $CWDR/sub/deep && $CWDENV FORGE_CWD_GUARD_MODE=observe $BRIDGE signal tester observed-signal )"
+  { [ "$(rc_of cwdobs)" = 0 ] && out_of cwdobs | grep -q 'CWD_NOT_PROJECT_ROOT (observe mode)' \
+    && ! out_of cwdobs | grep -q "$CWDNEEDLE" && [ -d "$CWDR/sub/deep/.dev/signals" ]; } \
+    && ok "T-CWD-MODE FORGE_CWD_GUARD_MODE=observe warns and PROCEEDS (the forked write actually happens)" \
+    || bad "T-CWD-MODE observe rc=$(rc_of cwdobs) $(out_of cwdobs | tr '\n' ' ')"
+  rm -rf "$CWDR/sub/deep/.dev"
+  run_in_pane "$DS:0.0" cwdtypo "( cd $CWDR/sub/deep && $CWDENV FORGE_CWD_GUARD_MODE=enfroce $BRIDGE add-note typo-note )"
+  { [ "$(rc_of cwdtypo)" != 0 ] && out_of cwdtypo | grep -q 'FORGE_CWD_GUARD_MODE must be enforce|observe' \
+    && ! out_of cwdtypo | grep -q 'no such tmux session exists'; } \
+    && ok "T-CWD-MODE an invalid FORGE_CWD_GUARD_MODE is a hard error, never a silent observe" \
+    || bad "T-CWD-MODE typo rc=$(rc_of cwdtypo) $(out_of cwdtypo | tr '\n' ' ')"
+
+  unset -f cwd_case
+  tmux kill-session -t "$DS" 2>/dev/null
+else
+  echo "  (skip: tmux unavailable — #27 residual B)"
+fi
+
+echo "── #40 fix-route policy: tier, legality, row birth, provenance, lying-forge (real tmux) ──"
+if command -v tmux >/dev/null 2>&1; then
+  # r1 · BLOCK-LOCAL SESSION (the ACM §D idiom); the EXIT trap covers "${DS:-none}".
+  DS="fbfix-$$"; FXR="$(mkR fixroot)"
+  mk_session "$DS" 220 50 "$FXR"
+  sleep 1
+  FXP="$WORK/fix-prompts"; mkdir -p "$FXP"
+  # Every stage these cases render needs a template, or a dispatch dies at render for the
+  # WRONG reason and the case passes vacuously. fix-verify's template is deliberately
+  # PRESENT: T-FIXROUTE-VERIFY's whole point is that a present template is not what stops
+  # it — the legality gate is.
+  for _s in adhoc fix-code fix-plan fix-investigate fix-verify fix-bogus fix-zzz coding; do
+    printf 'fix-route prompt for {{slug}} at {{stage}} to {{worker}}\n' > "$FXP/$_s.txt"
+  done
+  FXLOCKS="$FXR/.dev/forge-tmp/fix-infra-locks"; mkdir -p "$FXLOCKS"
+  FXEVL="$FXR/.dev/forge-tmp/orchestrator-events.log"
+  FXENV="FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$FXP FORGE_INFRA_LOCK_DIR=$FXLOCKS FORGE_WORKER_HYGIENE_MODE=observe"
+  fx(){ local tag="$1"; shift; run_in_pane "$DS:0.0" "$tag" "( cd $FXR && $FXENV $BRIDGE $* )"; }
+  # --dry-run variant. The trailing `; echo` is a HARNESS REQUIREMENT, not a behaviour
+  # change: --dry-run ends with `printf '%s' "$rendered"` and emits NO trailing newline, so
+  # without it the pane's DONE_<rc> marker is glued onto the last rendered line and rc_of
+  # cannot parse it (the same note T-ILG-DRYRUN carries at its own call site).
+  fxdry(){ local tag="$1"; shift; run_in_pane "$DS:0.0" "$tag" "( cd $FXR && $FXENV $BRIDGE $* ; echo )"; }
+
+  # ── T-FIXROUTE-TIER (C4) ───────────────────────────────────────────────────────
+  # Not pinned to one stage name: three different fix stages, both throughput panes.
+  _fxt=""
+  fx fxt-sonnet dispatch --slug fxt --stage fix-investigate --worker claude-sonnet
+  fx fxt-codexb dispatch --slug fxt --stage fix-code --worker codex-b
+  fx fxt-plan-b dispatch --slug fxt --stage fix-plan --worker claude-sonnet
+  for _t in fxt-sonnet fxt-codexb fxt-plan-b; do
+    { [ "$(rc_of "$_t")" != 0 ] && out_of "$_t" | grep -q 'HIGH-reasoning tier (Hard Rule 22)' \
+      && out_of "$_t" | grep -q 'never route to a throughput pane'; } || _fxt="$_fxt $_t"
+  done
+  grep -q 'reason=tier-violation tier=high' "$FXEVL" || _fxt="$_fxt no-tier-violation-event"
+  # The HIGH-tier panes render.
+  fxdry fxt-opus dispatch --slug fxt --stage fix-investigate --worker claude-opus --dry-run
+  fxdry fxt-cdxa dispatch --slug fxt --stage fix-plan --worker codex-a --dry-run
+  for _t in fxt-opus fxt-cdxa; do
+    { [ "$(rc_of "$_t")" = 0 ] && out_of "$_t" | grep -q 'fix-route prompt for'; } || _fxt="$_fxt $_t"
+  done
+  [ -z "$_fxt" ] \
+    && ok "T-FIXROUTE-TIER fix-* stages refuse a throughput pane and render on claude-opus/codex-a" \
+    || bad "T-FIXROUTE-TIER:$_fxt"
+  # CONTROL: the new `default` arm is a NO-OP. An ad-hoc stage on a throughput pane still
+  # renders — a REFUSING default would break every ad-hoc dispatch, which is why the arm
+  # is an explicit no-op rather than a catch-all refusal.
+  fxdry fxt-ctl dispatch --slug fxt --stage adhoc --worker codex-b --dry-run
+  { [ "$(rc_of fxt-ctl)" = 0 ] && out_of fxt-ctl | grep -q 'fix-route prompt for'; } \
+    && ok "T-FIXROUTE-TIER control: the explicit default arm is a no-op (adhoc/codex-b still renders)" \
+    || bad "T-FIXROUTE-TIER control rc=$(rc_of fxt-ctl) $(out_of fxt-ctl | tr '\n' ' ')"
+
+  # ── T-FIXROUTE-UNKNOWN (C5) ────────────────────────────────────────────────────
+  # BASE behaviour: nothing refused it; it was stopped only by "template not found" —
+  # which is why the template EXISTS here. This is now the SOLE proof of unknown-fix-stage
+  # legality (v1's redundant cmd_log rc-2 clause is deliberately not implemented).
+  # The gate precedes template composition AND emits no event, so .dev/forge-tmp stays
+  # EMPTY — that filesystem assertion is the contract, not an incidental.
+  # SIDE-EFFECT CONTRACT, stated because the obvious oracle is UNSATISFIABLE. `no
+  # .dev/forge-tmp/* file at all` cannot be asserted for ANY dispatch-path guard:
+  # require_identity emits an unconditional IDENTITY event at the TOP of every command
+  # body, which creates .dev/forge-tmp/orchestrator-events.log before any guard can run.
+  # What C5 DOES guarantee, and what is asserted here, is the property actually under test:
+  #   * no RENDERED TEMPLATE file  — the gate precedes _render_template;
+  #   * no pending row             — it precedes cmd_log entirely;
+  #   * no event attributable to the refusal — C5 emits none of its own, so the only line
+  #     naming this slug would be one a LATER stage wrote, i.e. the gate let it through.
+  # This still fails if C5 is ever moved after template composition, which is the point.
+  rm -rf "$FXR/.dev/forge-tmp"; mkdir -p "$FXR/.dev/forge-tmp"
+  run_in_pane "$DS:0.0" fxu "( cd $FXR && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$FXP FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug fxu --stage fix-bogus --worker codex-a )"
+  { [ "$(rc_of fxu)" != 0 ] && out_of fxu | grep -q 'not a routable fix-pipeline stage' \
+    && [ -z "$(find "$FXR/.dev/forge-tmp" -type f -name '*.txt')" ] \
+    && ! grep -q 'pipeline=fxu' "$FXEVL" \
+    && [ ! -f "$FXR/.dev/proposals/fxu/forge-log.yml" ]; } \
+    && ok "T-FIXROUTE-UNKNOWN an unknown fix-* stage fails closed before template composition: no prompt, no row, no event" \
+    || bad "T-FIXROUTE-UNKNOWN rc=$(rc_of fxu) files=[$(find "$FXR/.dev/forge-tmp" -type f | tr '\n' ' ')] ev=[$(grep 'pipeline=fxu' "$FXEVL" | tr '\n' ' ')] $(out_of fxu | tr '\n' ' ')"
+  mkdir -p "$FXLOCKS" "$FXR/.dev/forge-tmp/callbacks"
+
+  # ── T-FIXROUTE-VERIFY (C5 + C11) ───────────────────────────────────────────────
+  fx fxv dispatch --slug fxv --stage fix-verify --worker codex-a
+  { [ "$(rc_of fxv)" != 0 ] && out_of fxv | grep -q 'not a routable fix-pipeline stage' \
+    && out_of fxv | grep -q 'LOCK LABEL'; } \
+    && ok "T-FIXROUTE-VERIFY fix-verify is unroutable even with a template present" \
+    || bad "T-FIXROUTE-VERIFY rc=$(rc_of fxv) $(out_of fxv | tr '\n' ' ')"
+  # CONTROL: fix-verify remains a VALID LOCK LABEL. infra-lock acquire validates neither
+  # --slug nor --stage, which is what makes the fix-runner's Shape A wrapper work.
+  fx fxv-lock infra-lock acquire --slug fxv --stage fix-verify
+  { [ "$(rc_of fxv-lock)" = 0 ]; } \
+    && ok "T-FIXROUTE-VERIFY control: fix-verify is still a valid infra-lock label" \
+    || bad "T-FIXROUTE-VERIFY lock control rc=$(rc_of fxv-lock) $(out_of fxv-lock | tr '\n' ' ')"
+  fx fxv-rel infra-lock release --slug fxv --stage fix-verify --force
+
+  # ── T-FIXLOG-ROUTE (C6) — THE TEST THAT PROVES BLOCK-1 CLOSED ──────────────────
+  # Every case is a DIRECT `forge-bridge log` run FROM THE PROJECT ROOT, so the cwd
+  # containment guard is not the refusing gate.
+  # DISCRIMINATION — BOTH HALVES ARE MANDATORY. Cases 3 and 4 assert the clause-2 event
+  # token is PRESENT; cases 1, 2 and 5 assert it is ABSENT. Without the absence half,
+  # DELETING CLAUSE 1 FROM THE IMPLEMENTATION WOULD BE UNDETECTABLE — clause 2 would
+  # refuse those same three cases and every presence assertion would still pass. Assert on
+  # the event token, never on refusal prose.
+  fxlog(){ local tag="$1" stage="$2" to="$3"
+    : > "$FXEVL"
+    run_in_pane "$DS:0.0" "$tag" "( cd $FXR && $FXENV $BRIDGE log --slug $tag --stage $stage --from claude --to $to --prompt p )"; }
+  _fxl=""
+  fxlog fxl1 fix-code claude
+  grep -q 'reason=fix-route-unprovenanced' "$FXEVL" && _fxl="$_fxl case1-clause2-fired-not-clause1"
+  fxlog fxl2 fix-plan claude-sonnet
+  grep -q 'reason=fix-route-unprovenanced' "$FXEVL" && _fxl="$_fxl case2-clause2-fired-not-clause1"
+  fxlog fxl3 fix-code claude-opus
+  grep -q 'reason=fix-route-unprovenanced' "$FXEVL" || _fxl="$_fxl case3-clause2-did-not-fire"
+  fxlog fxl4 fix-zzz claude-opus
+  grep -q 'reason=fix-route-unprovenanced' "$FXEVL" || _fxl="$_fxl case4-clause2-did-not-fire"
+  fxlog fxl5 fix-code pane-99-does-not-exist
+  grep -q 'reason=fix-route-unprovenanced' "$FXEVL" && _fxl="$_fxl case5-clause2-fired-not-clause1"
+  for _t in fxl1 fxl2 fxl3 fxl4 fxl5; do
+    [ "$(rc_of "$_t")" != 0 ] || _fxl="$_fxl $_t-not-refused"
+    # LOAD-BEARING: the guard precedes ensure_pipeline_log and BOTH row appends, so a
+    # refusal leaves no log row anywhere by construction.
+    [ -f "$FXR/.dev/proposals/$_t/forge-log.yml" ] && _fxl="$_fxl $_t-minted-a-pipeline-log"
+    grep -q "pipeline: $_t" "$FXR/.dev/forge-log.yml" 2>/dev/null && _fxl="$_fxl $_t-minted-a-summary-row"
+  done
+  [ -z "$_fxl" ] \
+    && ok "T-FIXLOG-ROUTE all five direct fix-* log routes refuse, with clause 1 / clause 2 discriminated and no row minted" \
+    || bad "T-FIXLOG-ROUTE:$_fxl"
+
+  # SPOOF CONTROL: the same direct call with the provenance env AND a same-named marker
+  # variable EXPORTED is STILL refused. This is what proves C7's file-scope initialisation
+  # is present and clause 2 unspoofable — without that initialisation an exported variable
+  # of the same name is inherited and the whole fix is void.
+  : > "$FXEVL"
+  run_in_pane "$DS:0.0" fxspoof "( cd $FXR && $FXENV FORGE_DELIVERY_ID=X _FORGE_LOG_INPROC=1 _FORGE_P_DELIVERY_ID=X $BRIDGE log --slug fxspoof --stage fix-code --from claude --to claude-opus --prompt p )"
+  { [ "$(rc_of fxspoof)" != 0 ] && grep -q 'reason=fix-route-unprovenanced' "$FXEVL" \
+    && [ ! -f "$FXR/.dev/proposals/fxspoof/forge-log.yml" ]; } \
+    && ok "T-FIXLOG-ROUTE spoof control: an EXPORTED marker cannot authorize row birth" \
+    || bad "T-FIXLOG-ROUTE spoof rc=$(rc_of fxspoof) $(out_of fxspoof | tr '\n' ' ')"
+
+  # BOUNDED-DEPARTURE CONTROLS: the guard is scoped strictly to fix-* rows. Non-fix direct
+  # rows keep the old permissive behaviour ON PURPOSE — the orchestrator's own local-stage
+  # protocol depends on it.
+  fx fxctl-coding log --slug fxctl --stage coding --from claude --to claude-sonnet --prompt p
+  { [ "$(rc_of fxctl-coding)" = 0 ] && grep -q 'stage: coding' "$FXR/.dev/proposals/fxctl/forge-log.yml"; } \
+    && ok "T-FIXLOG-ROUTE bounded departure: a direct non-fix row is still accepted" \
+    || bad "T-FIXLOG-ROUTE coding control rc=$(rc_of fxctl-coding) $(out_of fxctl-coding | tr '\n' ' ')"
+  fx fxctl-close log-response --slug fxctl --to claude-sonnet --stage coding --response done
+  { [ "$(rc_of fxctl-close)" = 0 ]; } \
+    && ok "T-FIXLOG-ROUTE bounded departure: reading and closing stay permissive" \
+    || bad "T-FIXLOG-ROUTE close control rc=$(rc_of fxctl-close) $(out_of fxctl-close | tr '\n' ' ')"
+
+  # MANDATORY IN-CHANNEL POSITIVE. Without it the guard could pass by refusing
+  # EVERYTHING, which is the dangerous direction; the failure would otherwise surface only
+  # as an infra-lock assertion elsewhere, pointing a coder at the wrong subsystem.
+  fx fxpos-acq infra-lock acquire --slug fxpos --stage fix-code
+  fx fxpos dispatch --slug fxpos --stage fix-code --worker claude-opus
+  { [ "$(rc_of fxpos-acq)" = 0 ] && [ "$(rc_of fxpos)" = 0 ] \
+    && grep -q 'stage: fix-code' "$FXR/.dev/proposals/fxpos/forge-log.yml"; } \
+    && ok "T-FIXLOG-ROUTE in-channel positive: a real dispatch still mints its fix-code pending row" \
+    || bad "T-FIXLOG-ROUTE in-channel positive rc=$(rc_of fxpos) $(out_of fxpos | tr '\n' ' ')"
+  # Release NOW, not at the end of the block: T-ILG-LIE part B acquires the fix-code lock
+  # under a different slug, and a lock held here would make part B refuse with a real
+  # INFRA_LOCK_REQUIRED instead of reaching the LANE_REQUIRED path it exists to test.
+  # The pending row stays open (the callback below closes it); releasing a lock does not
+  # touch it, and T-FIXLOG-PROV reads the LOG FILE, which also survives the release.
+  fx fxpos-rel infra-lock release --slug fxpos --stage fix-code --force
+
+  # ── T-FIXLOG-PROV (C7) ─────────────────────────────────────────────────────────
+  # The direct arm uses a NON-fix stage, because the fix-* direct path is now refused
+  # outright. The reads it exercises are stage-independent, so nothing is lost.
+  run_in_pane "$DS:0.0" fxprov "( cd $FXR && $FXENV FORGE_DELIVERY_ID=FORGED-123 FORGE_CAPABILITY_CLASS=workspace FORGE_DELIVERY_LANE=codex FORGE_ROOT_IDENTITY=FORGED FORGE_PHYSICAL_CODE_ROOT=/forged FORGE_PROMPT_SHA256=forged $BRIDGE log --slug fxprov --stage coding --from claude --to claude-opus --prompt p )"
+  _fxp=""
+  [ "$(rc_of fxprov)" = 0 ] || _fxp="$_fxp direct-log-failed"
+  for _f in delivery_id physical_code_root root_identity capability_class lane prompt_sha256; do
+    grep -qE "^    $_f: *\$" "$FXR/.dev/proposals/fxprov/forge-log.yml" || _fxp="$_fxp $_f-not-empty"
+  done
+  grep -q 'FORGED' "$FXR/.dev/proposals/fxprov/forge-log.yml" && _fxp="$_fxp forged-value-leaked"
+  [ -z "$_fxp" ] \
+    && ok "T-FIXLOG-PROV a direct log writes all six provenance fields EMPTY — public FORGE_* env is no longer authority" \
+    || bad "T-FIXLOG-PROV:$_fxp"
+
+  # PAIRED POSITIVE, still mandatory: C7 must not be able to pass by NEVER stamping, which
+  # is the dangerous failure direction (it would surface as CALLBACK_IDENTITY_CHANGED at
+  # the four admission sites, far from here). The stub broker returns delivery-test.
+  { grep -q 'delivery_id: delivery-test' "$FXR/.dev/proposals/fxpos/forge-log.yml"; } \
+    && ok "T-FIXLOG-PROV paired positive: a real dispatch DOES stamp the broker's actual delivery_id" \
+    || bad "T-FIXLOG-PROV paired positive: dispatch stamped no delivery_id ($(grep -c delivery_id "$FXR/.dev/proposals/fxpos/forge-log.yml" 2>/dev/null))"
+  # COMPANION: the forged row is not promotable — its delivery_id is EMPTY, so every
+  # consumer classifies it as LEGACY/pre-broker and the broker-reconciliation gate (which
+  # requires a non-empty pending delivery_id) is skipped entirely.
+  grep -qE '^    delivery_id: *$' "$FXR/.dev/proposals/fxprov/forge-log.yml" \
+    && ok "T-FIXLOG-PROV companion: a forged-provenance row reads as LEGACY, never as a broker delivery" \
+    || bad "T-FIXLOG-PROV companion: forged row carries a delivery_id"
+
+  # ── T-ILG-LIE (C8, = D3) ───────────────────────────────────────────────────────
+  # T-ILG-CFG covers only the FAILING stub, and failing fails CLOSED — the safe direction.
+  # The DANGEROUS direction is a shadow that SUCCEEDS WITH A WRONG ANSWER, and it had no
+  # coverage at all. The assertion is on GUARD BEHAVIOUR, not resolver output, so it
+  # cannot pass with only ONE of the two call sites wired:
+  #   part A — a lying `capability_class=workspace` must NOT disarm the infra-lock guard
+  #            (covers the call inside _stage_capability_class);
+  #   part B — a lying `lane=codex` must NOT disarm LANE_REQUIRED for a codex-* worker
+  #            (covers the call at the lane_info line).
+  # It is the only assertion that C8 accomplishes anything.
+  mkdir -p "$WORK/liebin"
+  printf '#!/bin/sh\necho capability_class=workspace\necho lane=codex\necho rollout=contain\nexit 0\n' > "$WORK/liebin/forge"
+  chmod +x "$WORK/liebin/forge"
+  run_in_pane "$DS:0.0" lieA "( cd $FXR && PATH=$WORK/liebin:\$PATH $FXENV $BRIDGE dispatch --slug fxlieA --stage fix-code --worker claude-opus --allow-blocked p0-lie )"
+  { [ "$(rc_of lieA)" = 5 ] && out_of lieA | grep -q 'INFRA_LOCK_REQUIRED'; } \
+    && ok "T-ILG-LIE a lying capability_class on PATH does not disarm the infra-lock guard" \
+    || bad "T-ILG-LIE part A rc=$(rc_of lieA) $(out_of lieA | tr '\n' ' ')"
+  fx lieB-acq infra-lock acquire --slug fxlieB --stage fix-code
+  run_in_pane "$DS:0.0" lieB "( cd $FXR && PATH=$WORK/liebin:\$PATH $FXENV $BRIDGE dispatch --slug fxlieB --stage fix-code --worker codex-a --allow-blocked p0-lie )"
+  { [ "$(rc_of lieB)" = 4 ] && out_of lieB | grep -q 'LANE_REQUIRED'; } \
+    && ok "T-ILG-LIE a lying lane on PATH does not disarm LANE_REQUIRED for a codex worker" \
+    || bad "T-ILG-LIE part B rc=$(rc_of lieB) $(out_of lieB | tr '\n' ' ')"
+  fx lieB-rel infra-lock release --slug fxlieB --stage fix-code --force
+
+  # Close the pending the in-channel positive legitimately opened, so nothing leaks.
+  tmux send-keys -t "$DS:0.1" C-c 2>/dev/null; sleep 0.3
+  run_in_pane "$DS:0.1" fxpos-close "( cd $FXR && FORGE_WATCH_TRIGGER=0 $BRIDGE callback --slug fxpos --stage fix-code --status DONE --worker claude-opus --message d --quiet )"
+
+  unset -f fx fxdry fxlog
+  tmux kill-session -t "$DS" 2>/dev/null
+else
+  echo "  (skip: tmux unavailable — #40 fix-route policy)"
 fi
 
 echo

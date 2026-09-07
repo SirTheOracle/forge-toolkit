@@ -31,7 +31,12 @@
 #   focus <pane>                — switch focus to a pane
 #   back                        — return focus to orchestrator
 #
-# No-tmux commands (file-based; work from any directory):
+# No-tmux commands (file-based; no tmux session needed — but RUN THEM FROM THE
+# PROJECT ROOT, the directory holding .claude/forge-project.yml. `.dev`,
+# `.dev/signals` and `.dev/reviews` resolve against the CURRENT directory, so a
+# subdirectory forks a second state tree the root never reads. The state-mutating
+# commands below refuse from anywhere else (FORGE_CWD_GUARD_MODE=observe warns
+# instead); check-signals, review-status and preflight are read-only and exempt:
 #   preflight                   — kickoff snapshot: pwd, branch, merge state, halt code
 #   signal <from> <message>     — file-based signal
 #   check-signals               — list pending signals
@@ -102,7 +107,27 @@ FORGE_EVIDENCE_MODE="${FORGE_EVIDENCE_MODE:-observe}"
 _EV_OBSERVE_DELIVERY=""
 _EV_T=""
 _EV_NT=""
+# #40 item 5: BOTH `forge codex-lane` call sites (:5525 and the one inside
+# _stage_capability_class) were BARE, so a `forge` earlier on PATH that SUCCEEDS WITH
+# A WRONG ANSWER silently rewrites a capability class — and :5525's answer is fed into
+# the pending row's provenance. A shadow that FAILS fails closed (the safe direction,
+# already covered by T-ILG-CFG); a shadow that LIES fails OPEN, and had no coverage.
+# HONEST SCOPE: this NARROWS the surface from PATH — exported by everything, always —
+# to one dedicated variable. Like FORGE_BROKER_BIN it stays env-overridable; it does
+# not eliminate env substitution.
+# BSD `readlink` has no -f on macOS, so walk the link chain portably (bin/forge:68-76
+# does the same). This is the file's only $0 handling.
+_forge_sibling_bin() {
+    local src="$0" dir
+    while [ -L "$src" ]; do
+        dir="$(cd "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+    done
+    printf '%s/forge' "$(cd "$(dirname "$src")" && pwd)"
+}
 FORGE_BROKER_BIN="${FORGE_BROKER_BIN:-forge-broker}"
+FORGE_FORGE_BIN="${FORGE_FORGE_BIN:-$(_forge_sibling_bin)}"
 
 # ---- Active-context-management controls (S11) ----
 # FIVE knobs, FIVE different questions. The GATE threshold above is UNTOUCHED; nothing
@@ -1929,6 +1954,7 @@ for lp in glob.glob(os.path.join(dev,"proposals","*","forge-log.yml")):
     for e in es:
         if isinstance(e,dict) and e.get("response") is None:
             s=str(e.get("session") or ""); i=str(e.get("incarnation") or "")
+            if s=="unknown": s=""  # LEGACY-SENTINEL
             if (not s or not sess or s==sess) and (not i or not inc or i==str(inc)):
                 print("open-pending:%s" % os.path.basename(os.path.dirname(lp))); break
 # P2-4: scan ALL callback files (qualified AND legacy/unqualified names) and select by the
@@ -2648,6 +2674,7 @@ for entry in data.get('entries', []):
     if entry.get('response') is not None:
         continue
     entry_session = entry.get('session', '') or ''
+    if entry_session == 'unknown': entry_session = ''  # LEGACY-SENTINEL
     # Never skip legacy (no/empty session) entries — keeps in-flight upgrades
     # closeable; only skip a CONFIRMED different-session pending.
     if entry_session and current_session and entry_session != current_session:
@@ -2787,7 +2814,70 @@ EOF
 
 SIGNAL_DIR=".dev/signals"
 
+# ---- Project-root containment guard (#27 residual B) ----
+# `.dev` (:56), `.dev/signals` (:2788) and `.dev/reviews` (:2825) are the file's
+# THREE relative directory constants. A state-MUTATING no-tmux command run from a
+# subdirectory therefore silently forks a second state tree that the root's readers
+# never see — measured: `set-context` from a subdirectory, and `signal` through the
+# second constant. The header and `help` used to promise any-directory operation;
+# that promise is withdrawn and this makes the replacement contract executable.
+#
+# NO-OP when no project root resolves. That preserves today's behaviour outside a
+# forge project, which is exactly `signal`'s documented purpose (:2786, sandboxed
+# agents), and the identity gate already refuses there.
+#
+# Called EXPLICITLY at the top of eleven command bodies, NOT from inside
+# require_identity: that gate serves 27 commands, roughly twenty of which resolve
+# their own root and are cwd-correct today, and two of which would be actively
+# HARMED — cmd_callback (:5688) is already cwd-independent by a rooted literal at
+# :5768 and a (cd "$project_root" && …) subshell at :6003, and a refusal there
+# aborts BEFORE publishing the terminal callback, leaving an open delivery. An
+# explicit list is also immune to the `|| true` rc-swallow at :8262 and :9863.
+# Deliberately INDEPENDENT of FORGE_IDENTITY_ENFORCE: that is a kill switch for
+# identity, not for cwd.
+#
+# Kill switch: FORGE_CWD_GUARD_MODE=observe warns and proceeds. Default enforce; a
+# typo is a HARD ERROR, never a silent fall-through (the FORGE_INFRA_GUARD_MODE
+# discipline at :5122-5131).
+#
+# EXEMPT BY NAME, read-only: check-signals (:2806-2816, ls/cat only — from a
+# subdirectory it prints "(no pending signals)" and returns 1, a false negative and
+# not a fork, and its one in-bridge consumer cmd_context IS guarded), review-status
+# (:2827) and the cmd_context review counters (:4364-4367, :4402-4405), and
+# preflight (:8662) — whose whole job is to REPORT cwd correctness
+# (WRONG_DIRECTORY), so guarding it would delete the command that diagnoses this
+# very condition. REVIEWS_DIR has no writer at all.
+_require_root_cwd() {
+    local _cmd="$1" _mode _root _cwd
+    _mode="${FORGE_CWD_GUARD_MODE:-enforce}"
+    case "$_mode" in
+        enforce|observe) ;;
+        *) echo "ERROR: FORGE_CWD_GUARD_MODE must be enforce|observe (got '$_mode')." >&2
+           return 1 ;;
+    esac
+    _root="$(_resolve_project_root "" 2>/dev/null)" || return 0
+    [ -n "$_root" ] || return 0
+    _cwd="$(pwd -P)"
+    [ "$_cwd" = "$_root" ] && return 0
+    if [ "$_mode" = observe ]; then
+        echo "WARN: CWD_NOT_PROJECT_ROOT (observe mode) — running '$_cmd' from '$_cwd'; .dev state is written under the CURRENT directory, not '$_root'." >&2
+        return 0
+    fi
+    {
+        echo "ERROR: '$_cmd' must be run from the project root."
+        echo "    project root: $_root"
+        echo "    current dir:  $_cwd"
+        echo "  .dev, .dev/signals and .dev/reviews resolve against the CURRENT directory,"
+        echo "  so running here would fork a second state tree the root never reads."
+        echo "  Fix: cd $_root"
+        echo "  Rollback lever (audited, not a normal setting): FORGE_CWD_GUARD_MODE=observe"
+        echo "  downgrades this refusal to a warning."
+    } >&2
+    return 1
+}
+
 cmd_signal() {
+    _require_root_cwd signal || return 1
     local from="$1"
     shift
     local msg="$*"
@@ -2816,6 +2906,11 @@ cmd_check_signals() {
 }
 
 cmd_clear_signals() {
+    # Guarded FIRST: :2819's glob matches nothing from a subdirectory and the
+    # unconditional "Signals cleared" at :2820 then reports success while the root's
+    # signals are untouched. Same false-success class as the diagnosis's executed
+    # `context` reporting "(no forge context)" with exit 0 for a live pipeline.
+    _require_root_cwd clear-signals || return 1
     rm -f "$SIGNAL_DIR"/*.signal 2>/dev/null
     echo "Signals cleared"
 }
@@ -2909,6 +3004,7 @@ _cancel_copy_mode() {
 
 cmd_send() {
     require_identity "send" host-pane || return 1
+    _require_root_cwd send || return 1
 
     local FORCE=false ALLOW_BLOCKED="" SKIP_BLOCK_GUARD=0
     while :; do
@@ -3136,6 +3232,7 @@ cmd_back() {
 
 cmd_log() {
     require_identity "log" host-session || return 1
+    _require_root_cwd log || return 1
     local slug="" stage="" from="" to="" prompt=""
 
     while [ $# -gt 0 ]; do
@@ -3155,6 +3252,74 @@ cmd_log() {
         return 1
     fi
 
+    # SINGLE-SHOT: consume the row-birth token and blank the global immediately, so the
+    # authorization cannot outlive this one call. Bounds the window to exactly this call.
+    local _inproc="$_FORGE_LOG_INPROC"; _FORGE_LOG_INPROC=""
+
+    # --- Fix-route guard at row birth (#40 item 2) ---
+    # Placed AFTER the missing-args check and BEFORE ANY FILE WRITE: the first write is
+    # ensure_pipeline_log below, and the two row appends are the only `>>` writes into a
+    # forge log in this entire file. Every other mutator operates on an EXISTING row
+    # selected by timestamp, so refusing here is the complete closure of new-row birth.
+    #
+    # SCOPED STRICTLY TO fix-* ROWS. A general --to allow-list or a general provenance
+    # requirement would break `log`/`log-response --to claude --stage proposal` — the
+    # orchestrator-local build-stage path the dispatch error text below instructs operators
+    # to use — and the 22 `log --stage {coding,adhoc,verify}` sites in the bridge suite.
+    # READING stays permissive: cmd_log_response and every reader are untouched, so
+    # historical fix-* rows (including `fix-code -> claude` fixtures) remain closeable.
+    #
+    # CLAUSE ORDER IS LOAD-BEARING, not stylistic: for `--to claude` BOTH clauses are true,
+    # and only this order decides which fires. T-FIXLOG-ROUTE discriminates on the event
+    # token and would not be deterministic if the order were swapped.
+    #
+    # HONEST LIMIT: this refuses the RECORD, not the execution. It cannot police a row
+    # appended by editing forge-log.yml directly, and it does not verify that the stamped
+    # delivery_id is live in the broker's protected state.
+    case "$stage" in
+        fix-*)
+            # Clause 1 — DESTINATION LEGALITY. Live only on the DIRECT path: after clause 2
+            # it can never fire in-process, because the tier guard in cmd_dispatch has
+            # already constrained worker_canonical to {claude-opus, codex-a} before the
+            # in-process cmd_log call. It is MESSAGE QUALITY for the direct path, NOT
+            # defence-in-depth — do not describe it as a second layer of protection.
+            local _to_canon; _to_canon="$(canonical_pane_name "$to")"
+            case "$_to_canon" in
+                claude-opus|codex-a) ;;
+                *)
+                    {
+                        echo "ERROR: fix-pipeline stage '$stage' cannot be logged to '$to' (resolves to '${_to_canon:-<unresolvable>}')."
+                        echo "  Fix stages are HIGH-reasoning tier (Hard Rule 22): only claude-opus and codex-a."
+                        echo "  Correct route:"
+                        echo "    ~/bin/forge-bridge dispatch --slug $slug --stage $stage --worker claude-opus|codex-a"
+                    } >&2
+                    return 1
+                    ;;
+            esac
+            # Clause 2 — DISPATCH ORIGIN. cmd_dispatch is the ONLY in-process cmd_log
+            # caller, so after this guard the invariant is statable: cmd_dispatch is the
+            # only producer of new fix-* pending rows. NO BYPASS FLAG AND NO ENV ESCAPE —
+            # adding one would restore the hole in a keystroke, and the failure mode this
+            # closes is prose driving a model, which would read a warning as advisory.
+            # The marker is set downstream of broker registration BY PLACEMENT; this clause
+            # does not TEST that the registration succeeded and must not be described as
+            # if it does.
+            if [ "$_inproc" != 1 ]; then
+                _emit_event ERROR "$slug" "stage=$stage reason=fix-route-unprovenanced to=$to"
+                {
+                    echo "ERROR: refusing to mint a fix-pipeline pending row outside the dispatch chain."
+                    echo "  stage '$stage' to '$to' carries no in-process dispatch provenance."
+                    echo "  For a real fix stage, DISPATCH it — that writes the row for you:"
+                    echo "    ~/bin/forge-bridge dispatch --slug $slug --stage $stage --worker claude-opus|codex-a"
+                    echo "  For a non-pipeline message to a worker pane, send it directly:"
+                    echo "    ~/bin/forge-bridge send --force $to <message>"
+                    echo "  This refuses the RECORD, not the execution: it cannot stop code that never calls the bridge."
+                } >&2
+                return 1
+            fi
+            ;;
+    esac
+
     local ts
     ts=$(timestamp)
     local escaped_prompt
@@ -3168,6 +3333,15 @@ cmd_log() {
     # stall-check-status can filter by session. Empty -> "unknown" (NOT the
     # context sentinel): the never-skip-legacy filter keys on empty/"unknown" to
     # keep in-flight upgrades closeable. See final-plan §4.3.
+    # R2 (#27 residual A): this is now true at EVERY legacy-permissive reader. Each carries
+    # the sentinel marker comment and T-SESSION-LOCKSTEP ENUMERATES them, so a new reader
+    # added without one fails the suite rather than silently reopening the class. Two
+    # classes are DELIBERATELY excluded and must never be normalised: the five strict
+    # callback binders, which tie one callback to one specific pending by equality, and
+    # the single truthiness selector in _callback_selected_pending_superseded, which
+    # carries no equality operator at all. (Both literals are omitted here on purpose:
+    # T-SESSION-LOCKSTEP greps this file, and a comment quoting either token would inflate
+    # its counts.)
     local session
     session="$(_resolve_session)"
     [ -z "$session" ] && session="unknown"
@@ -3178,9 +3352,15 @@ cmd_log() {
     local pipeline_log="$DEV_DIR/proposals/$slug/forge-log.yml"
 
     local incarnation="${ID_host_incarnation:-}"
-    local delivery_id="${FORGE_DELIVERY_ID:-}" physical_code_root="${FORGE_PHYSICAL_CODE_ROOT:-}"
-    local root_identity="${FORGE_ROOT_IDENTITY:-}" capability_class="${FORGE_CAPABILITY_CLASS:-}"
-    local delivery_lane="${FORGE_DELIVERY_LANE:-}" prompt_sha256="${FORGE_PROMPT_SHA256:-}"
+    # Provenance comes from the PROCESS-LOCAL channel initialised at file scope, never from
+    # public FORGE_* env: a separate `forge-bridge log` process cannot supply it, so a
+    # direct call writes EMPTY provenance — which every consumer already treats as
+    # pre-broker/legacy. This closes all four authority consumers without touching one of
+    # them, with no broker protocol change and no compatibility break. `incarnation` above
+    # is an IDENTITY value and is deliberately NOT part of this channel.
+    local delivery_id="$_FORGE_P_DELIVERY_ID" physical_code_root="$_FORGE_P_PHYSICAL_CODE_ROOT"
+    local root_identity="$_FORGE_P_ROOT_IDENTITY" capability_class="$_FORGE_P_CAPABILITY_CLASS"
+    local delivery_lane="$_FORGE_P_DELIVERY_LANE" prompt_sha256="$_FORGE_P_PROMPT_SHA256"
     cat >> "$pipeline_log" << EOF
 
   - timestamp: "$ts"
@@ -3489,6 +3669,7 @@ for lp in glob.glob(os.path.join(base,"*","forge-log.yml")):
     for e in es:
         if not (isinstance(e,dict) and e.get("response") is None and c(str(e.get("to") or ""))==wk): continue
         es_s=str(e.get("session") or ""); es_i=str(e.get("incarnation") or "")
+        if es_s=="unknown": es_s=""  # LEGACY-SENTINEL
         # never-skip-legacy: an entry with no session/incarnation still matches; only a
         # CONFIRMED different session/incarnation is skipped.
         if es_s and sess and es_s!=sess: continue
@@ -3704,6 +3885,7 @@ for logp in glob.glob(os.path.join(base, "*", "forge-log.yml")):
     for e in entries:
         if isinstance(e, dict) and e.get('response') is None and e.get('parked_at'):
             es=e.get('session') or ""
+            if es == "unknown": es = ""  # LEGACY-SENTINEL
             if not sess or not es or es == sess:
                 n += 1
 print(n)
@@ -3961,6 +4143,7 @@ rows=[]; mixed=False
 for e in entries:
     if not isinstance(e,dict) or e.get('response') is not None or e.get('stage')!=stage or not e.get('parked_at'): continue
     es=str(e.get('session') or ''); ei=str(e.get('incarnation') or '')
+    if es=='unknown': es=''  # LEGACY-SENTINEL
     if actor_i:
         if es==actor_s and ei==actor_i: rows.append(e)
         elif not ei and (not es or es==actor_s): mixed=True
@@ -3995,6 +4178,7 @@ _callback_selection_unchanged() {   # [--selector <fn>] <before tuple> plus sele
 
 cmd_log_response() {
     require_identity "log-response" host-degrade || return 1
+    _require_root_cwd log-response || return 1
     # Phase 1b Step 4a: target-aware response update.
     # New flags: --to <pane> (alias-normalized), --stage <stage>
     # Without --to/--stage, ambiguity guard refuses if more than one
@@ -4101,6 +4285,7 @@ def matches(e):
     # with empty session still match (mirrors :604). A headless caller (empty
     # caller_session) also matches empty-session entries — the infra-lock lifecycle.
     es = e.get('session', '') or ''
+    if es == 'unknown': es = ''  # LEGACY-SENTINEL
     if es and caller_session and es != caller_session:
         return False
     # Incarnation is a finer tiebreak BENEATH the session filter (inert until CG-6
@@ -4118,6 +4303,7 @@ candidates = [e for e in pending if matches(e)]
 if caller_session is None:
     _distinct = set((e.get('session', '') or '') for e in candidates)
     _distinct.discard('')
+    _distinct.discard('unknown')  # LEGACY-SENTINEL
     if len(_distinct) > 1:
         print("ERR_XSESSION:%d distinct sessions in the pending set; pass --target-session <name> --cross-session to disambiguate the close." % len(_distinct), file=sys.stderr)
         sys.exit(2)
@@ -4231,7 +4417,7 @@ PYEOF
     # code: this sits before the final update_context, whose rc stays the
     # function's return value (the orchestrator reads it as success/failure).
     if [ -n "$n_skipped" ] && [ "$n_skipped" -gt 0 ] 2>/dev/null; then
-        echo "WARN: log-response closed the most recent of $((n_skipped + 1)) pending entries for slug=$slug stage=$target_stage_resolved to=$target_to; $n_skipped older duplicate(s) left OPEN (ts: $skipped_ts). Run 'dispatch --supersede' or the orphan migration to close them." >&2
+        echo "WARN: log-response closed the most recent of $((n_skipped + 1)) pending entries for slug=$slug stage=$target_stage_resolved to=$target_to; $n_skipped older duplicate(s) left OPEN (ts: $skipped_ts). Close each with a repeated 'log-response --slug $slug --to $target_to --stage $target_stage_resolved' (or the orphan migration); 'dispatch --supersede' will NOT close them — it refuses more than one owned open pending." >&2
         _emit_event WARN_DUP_PENDING "$slug" "stage=$target_stage_resolved to=$target_to closed_ts=$target_ts skipped=$n_skipped skipped_ts=$skipped_ts"
     fi
 
@@ -4263,6 +4449,7 @@ for e in data.get("entries", []) or []:
     if ets==closed_ts:
         continue
     e_to=str(e.get("to") or ""); e_sess=str(e.get("session") or "")
+    if e_sess == "unknown": e_sess = ""  # LEGACY-SENTINEL
     # Only report entries matches() would have EXCLUDED (different identity) —
     # same-identity older dups are WARN_DUP_PENDING's job.
     if (to and e_to and e_to!=to) or (sess and e_sess and e_sess!=sess):
@@ -4271,7 +4458,7 @@ print(",".join(t for t in out if t))
 PY
 )
     if [ -n "$_orphan_ts" ]; then
-        echo "WARN: log-response closed $slug/$target_stage_resolved but cross-identity orphan pending(s) remain OPEN (ts: $_orphan_ts). Not auto-closed (incarnation-strict). Run 'dispatch --supersede' to clear them." >&2
+        echo "WARN: log-response closed $slug/$target_stage_resolved but cross-identity orphan pending(s) remain OPEN (ts: $_orphan_ts). Not auto-closed (incarnation-strict). Close each with 'log-response --slug $slug --to <worker> --stage $target_stage_resolved'; 'dispatch --supersede' will NOT clear them — it selects only pendings this session+incarnation owns." >&2
         _emit_event WARN_ORPHAN_PENDING "$slug" "stage=$target_stage_resolved closed_ts=$target_ts orphan_ts=$_orphan_ts"
     fi
 
@@ -4324,6 +4511,7 @@ cmd_context() {
     # "(no active pipeline)" via the __nosession__ sentinel rather than a hard refuse.
     # The single-session early-return below is preserved.
     require_identity "context" host-degrade || return 1
+    _require_root_cwd context || return 1
     local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
     # Phase 1b Step 3: prepend stall-check-status section if non-empty.
     # Inserted BEFORE the existing early-return so stale-pending warnings
@@ -4414,6 +4602,7 @@ cmd_context() {
 
 cmd_set_context() {
     require_identity "set-context" host-session || return 1
+    _require_root_cwd set-context || return 1
     local slug=""
 
     while [ $# -gt 0 ]; do
@@ -5005,6 +5194,12 @@ cmd_dispatch() {
         _emit_event ERROR "$slug" "stage=$stage reason=tmux-session-missing"
         return 1
     }
+    # AFTER the closing brace, never inside the failure branch above: dispatch
+    # resolves project_root correctly at :5058 but writes its orphan-guard log
+    # through the RELATIVE $DEV_DIR at :5179, so from a subdirectory the guard reads
+    # a forked log and goes blind — the same n_pending=0 failure as #27 residual A.
+    # The refusal converts silent-blind into loud.
+    _require_root_cwd dispatch || return 1
 
     local worker_canonical worker_pane
     worker_canonical=$(canonical_pane_name "$worker")
@@ -5023,8 +5218,10 @@ cmd_dispatch() {
     # Enforce stage->pane tier so HIGH-reasoning stages cannot be dispatched to a
     # throughput pane (and vice-versa). Placed BEFORE the --dry-run early return
     # so `dispatch --dry-run` exercises it (negative tests). Only the main
-    # build-pipeline stages are constrained; fix-pipeline / commit-review / ad-hoc
-    # stages are unlisted and fall through unconstrained. The verify "!= latest QA
+    # build-pipeline stages AND the fix-pipeline stages are constrained; commit-review,
+    # pr-review and ad-hoc names stay deliberately unconstrained through an EXPLICIT
+    # no-op `default` arm, so the vocabulary is closed by intent rather than by
+    # omission. The verify "!= latest QA
     # worker" exclusion stays in orchestrator prose — the bridge enforces tier,
     # not pipeline history.
     case "$stage" in
@@ -5053,6 +5250,27 @@ cmd_dispatch() {
             echo "ERROR: stage 'proposal' runs locally in the orchestrator (pane 0) via Agent Teams; it is not dispatchable to a worker. Run it inline, then close with 'forge-bridge log-response --to claude --stage proposal'." >&2
             return 1
             ;;
+        fix-*)
+            # #40 item 1. Makes skills/forge-orchestrator/SKILL.md:271-283 executable:
+            # every fix-pipeline stage is HIGH-reasoning tier. All eight
+            # `dispatch --stage fix-*` calls in the tree already target claude-opus.
+            case "$worker_canonical" in
+                claude-opus|codex-a) ;;
+                *)
+                    _emit_event ERROR "$slug" "stage=$stage reason=tier-violation tier=high worker=$worker_canonical"
+                    echo "ERROR: stage '$stage' is a fix-pipeline stage and is HIGH-reasoning tier (Hard Rule 22): --worker must be claude-opus or codex-a, got '$worker_canonical'. Fix stages never route to a throughput pane (claude-sonnet/codex-b)." >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            # EXPLICIT NO-OP — an omission made deliberate, not a missing arm. Unlisted
+            # non-fix stages (adhoc, commit-review, pr-review, ad-hoc names) stay
+            # unconstrained ON PURPOSE: a REFUSING default would break `--stage adhoc`
+            # dispatch, which the T-ILG suite exercises and which _stage_capability_class's
+            # rc-2 design exists to support. The arm's value is that the tier vocabulary is
+            # now closed by INTENT rather than by omission.
+            ;;
     esac
 
     local project_root
@@ -5062,6 +5280,49 @@ cmd_dispatch() {
         echo "ERROR: dispatch requires a forge-project.yml. Walk-up from cwd failed." >&2
         return 1
     fi
+
+    # --- Fix-stage legality gate (#40 items 4 and 6) ---
+    # For `fix-*` stages ONLY: rc 2 from _stage_capability_class means the stage has NO
+    # stage_capabilities entry — and `stage_capabilities` IS the fix-route vocabulary, so
+    # an unlisted fix-* name is not a routable stage. Refuse it here, BEFORE the template
+    # path is composed, before the --dry-run return and before every mutation.
+    #
+    # THIS READS rc 2 WITH THE OPPOSITE POLARITY TO THE INFRA-LOCK GUARD BELOW, AND BOTH
+    # ARE CORRECT. There, rc 2 means "ad-hoc stage name, leave it unguarded" — right,
+    # because an ad-hoc stage genuinely touches no infra and refusing would break every
+    # ad-hoc dispatch. Here, rc 2 means "not a known fix stage, refuse" — right, because
+    # the fix pipeline has a CLOSED stage vocabulary, so an unlisted fix-* name is a typo
+    # or an invented route, never a legitimate ad-hoc one. DO NOT "normalise" one to the
+    # other: collapsing two correct opposite readings of one code is precisely the defect
+    # class this change exists to fix.
+    #
+    # rc 1 is DELIBERATELY NOT refused here — it falls through to the byte-identical
+    # fail-closed below (`if [ "$_cap_rc" -eq 1 ]`), which T-ILG-CFG pins.
+    #
+    # It EMITS NO EVENT, by contract: the refusal must leave .dev/forge-tmp/ untouched,
+    # which is what T-FIXROUTE-UNKNOWN asserts. _emit_event would write
+    # .dev/forge-tmp/orchestrator-events.log and break that oracle.
+    #
+    # `fix-verify` is the load-bearing instance: it is a LOCK LABEL, deliberately absent
+    # from stage_capabilities so the infra-lock guard leaves it unguarded. Its absence is
+    # NOT what stops a dispatch — with a template present the render would succeed. THIS
+    # gate is what refuses it.
+    case "$stage" in
+        fix-*)
+            local _fix_cap _fix_rc
+            _fix_cap="$(_stage_capability_class "$stage" "$project_root")"; _fix_rc=$?
+            if [ "$_fix_rc" -eq 2 ]; then
+                {
+                    echo "ERROR: stage '$stage' is not a routable fix-pipeline stage."
+                    echo "  It has no 'stage_capabilities' entry in the forge runtime config, and that"
+                    echo "  map IS the fix-route vocabulary — an unlisted fix-* name is unroutable."
+                    echo "  'fix-verify' in particular is a LOCK LABEL, not a dispatchable stage:"
+                    echo "  'infra-lock acquire --stage fix-verify' is valid; 'dispatch --stage fix-verify' is not."
+                } >&2
+                return 1
+            fi
+            ;;
+    esac
 
     local tmpl_path="$FORGE_PROMPTS_DIR/$stage.txt"
     local rendered
@@ -5194,6 +5455,7 @@ for e in (data.get('entries') or []):
     if e.get('response') is not None:
         continue
     es = e.get('session', '') or ''
+    if es == 'unknown': es = ''  # LEGACY-SENTINEL
     if es and cur_session and es != cur_session:
         continue
     ei = str(e.get('incarnation', '') or '')
@@ -5218,8 +5480,12 @@ PYEOF
             echo "  A prior stage was never closed. Close it first — a worker callback, or for a local"
             echo "  to:claude stage run:"
             echo "    ~/bin/forge-bridge log-response --slug $slug --to claude --stage <stage> --response \"FORGE_DONE: <stage> — ...\""
-            echo "  then retry; or re-run this dispatch with --supersede to auto-close the open entry(ies)"
-            echo "  (FORGE_SUPERSEDED) and dispatch anew."
+            echo "  then retry. The SAME log-response is the recovery for a LEGACY or UNOWNED pending"
+            echo "  (empty or 'unknown' session, or another session/incarnation's row): pass --to <worker>"
+            echo "  --stage <stage> for it."
+            echo "  --supersede is NOT that recovery. It selects only pendings this session+incarnation"
+            echo "  owns and refuses loudly otherwise; use it to auto-close (FORGE_SUPERSEDED) an open"
+            echo "  entry(ies) this actor owns and dispatch anew."
         } >&2
         _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=open-pending-exists worker=$worker_canonical n_pending=$n_pending"
         return 1
@@ -5425,6 +5691,33 @@ for e in owned:
         print('%s\t%s\t%s' % (e['stage'],canonical(str(e.get('to') or '')),e['timestamp']))
 PYEOF
 ) || { echo "ERROR: --supersede could not select owned pendings" >&2; return 1; }
+        # R3-2: the strict predicate above never selects a legacy-identity pending, so
+        # --supersede leaves it OPEN — and, pre-R3, said NOTHING about it (rc 0,
+        # DISPATCHED, row still open: QA CRIT-1, round-1 A-1's symptom verbatim). Name
+        # every such row and the recovery that actually works.
+        # PURELY ADDITIVE DIAGNOSTICS. Runs AFTER the selection completes, is per-row and
+        # non-blocking, changes no rc and no control flow, and is deliberately NOT routed
+        # through the selector's global `mixed` short-circuit — routing it there is what
+        # produced MAJ-1, where one poisoning row aborted the whole selection including
+        # pendings the actor genuinely owned. Rows the actor owns ARE the selection above
+        # and are excluded here by timestamp, so they are still closed in the same run.
+        python3 - "$guard_log" "$slug" "$_sup_pendings" >&2 <<'PYEOF' || true
+import sys
+try: import yaml
+except Exception: sys.exit(0)
+path,slug,selected=sys.argv[1:4]
+sel=set(p[2] for p in (ln.split('\t') for ln in selected.splitlines()) if len(p)>=3)
+try: entries=(yaml.safe_load(open(path)) or {}).get('entries') or []
+except Exception: sys.exit(0)
+for e in entries:
+    if not isinstance(e,dict) or e.get('response') is not None: continue
+    es=str(e.get('session') or '')
+    if es not in ('','unknown'): continue   # LEGACY-SENTINEL: 'unknown' IS the empty class
+    ts=str(e.get('timestamp') or ''); st=str(e.get('stage') or '?'); to=str(e.get('to') or '?')
+    if ts and ts in sel: continue
+    print("WARN: --supersede does NOT close the legacy-identity pending %s/%s (to=%s, session=%s, timestamp=%s) — it stays OPEN." % (slug,st,to,es or '<empty>',ts or '<none>'))
+    print("WARN:   recovery for that row: forge-bridge log-response --slug %s --to %s --stage %s --response '<result>'" % (slug,to,st))
+PYEOF
         local _sup_stage _sup_to _sup_ts _sup_now _sup_n=0
         _sup_now=$(timestamp)
         while IFS=$'\t' read -r _sup_stage _sup_to _sup_ts; do
@@ -5522,7 +5815,7 @@ PYEOF
     # P0-4: supersede's replacement prompt is written only now, after its reset+close.
     [ "$supersede" = true ] && printf '%s' "$rendered" > "$prompt_file"
     local lane_info capability_class lane rollout
-    lane_info="$(forge codex-lane --root "$project_root" --stage "$stage" --worker "$worker_canonical")" || return 1
+    lane_info="$("${FORGE_FORGE_BIN:-forge}" codex-lane --root "$project_root" --stage "$stage" --worker "$worker_canonical")" || return 1
     capability_class="$(printf '%s\n' "$lane_info" | sed -n 's/^capability_class=//p')"
     lane="$(printf '%s\n' "$lane_info" | sed -n 's/^lane=//p')"
     rollout="$(printf '%s\n' "$lane_info" | sed -n 's/^rollout=//p')"
@@ -5630,9 +5923,15 @@ PYRE
     # P1-4: pre-send bookkeeping is FAIL-CLOSED — the pending log, the generation, and the
     # attempting delivery must all persist BEFORE any keystroke; any failure aborts and
     # unlocks with NO text sent (no keystroke can occur without durable attempting evidence).
-    FORGE_DELIVERY_ID="$delivery_id" FORGE_PHYSICAL_CODE_ROOT="$physical_code_root" \
-    FORGE_ROOT_IDENTITY="$root_id" FORGE_CAPABILITY_CLASS="$capability_class" \
-    FORGE_DELIVERY_LANE="$lane" FORGE_PROMPT_SHA256="$prompt_sha" \
+    # PLAIN assignments on their own lines, NEVER a command prefix. A command-prefix
+    # assignment on a SHELL FUNCTION is EXPORTED for the duration of the call (probed:
+    # bash 5.3.9 — a subprocess spawned inside the function sees it), and cmd_log spawns
+    # subprocesses. The prefix form would therefore leak the row-birth token into every one
+    # of them and make the "a separate process cannot supply it" guarantee false.
+    _FORGE_P_DELIVERY_ID="$delivery_id"; _FORGE_P_PHYSICAL_CODE_ROOT="$physical_code_root"
+    _FORGE_P_ROOT_IDENTITY="$root_id"; _FORGE_P_CAPABILITY_CLASS="$capability_class"
+    _FORGE_P_DELIVERY_LANE="$lane"; _FORGE_P_PROMPT_SHA256="$prompt_sha"
+    _FORGE_LOG_INPROC=1
     cmd_log --slug "$slug" --stage "$stage" --from claude --to "$worker_canonical" --prompt "$ref_msg" >/dev/null || {
         _emit_event ERROR "$slug" "stage=$stage reason=pending-log-failed worker=$worker_canonical"
         _worker_unlock "$worker_canonical"; return 1; }
@@ -6784,6 +7083,7 @@ cmd_park() {
     [ -n "$reason" ] || { echo "ERROR: park requires --reason" >&2; return 1; }
 
     require_identity "park" host-degrade || return 1
+    _require_root_cwd park || return 1
     local selection select_rc=0
     selection="$(_callback_mutation_select "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" BLOCKED,PARKED "$pipeline_log")" || select_rc=$?
     if [ "$select_rc" -eq 1 ]; then echo "PARK NOOP slug=$slug stage=$stage reason=no-blocked-callback"; return 0; fi
@@ -6877,6 +7177,7 @@ PY
 cmd_park_resolve() {   # <slug> <stage> <note>   (acquires the lifecycle lock)
     local slug="$1" stage="$2" note="$3"
     require_identity "park-resolve" host-degrade || return 1
+    _require_root_cwd park-resolve || return 1
     local project_root; project_root=$(_resolve_project_root "")
     [ -n "$project_root" ] || { echo "ERROR: park --resolve requires forge-project.yml" >&2; return 1; }
     local cb_dir="$project_root/.dev/forge-tmp/callbacks"
@@ -7973,7 +8274,12 @@ _infra_lock_owned_by_me() {
 _stage_capability_class() {
     local stage="$1" root="$2" out rc
     [ -n "$stage" ] && [ -n "$root" ] || return 1
-    out=$(forge codex-lane --root "$root" --stage "$stage" --worker claude 2>&1); rc=$?
+    # In-function default ONLY — see the MANDATORY CONSTRAINT above the C8 file-scope
+    # block: this body is sed-extracted into a sourced fragment by
+    # tests/forge-infra-lock/run.sh:742 and called with no file-scope globals under
+    # `set +u`, where a bare "$FORGE_FORGE_BIN" expands empty and _forge_sibling_bin is
+    # undefined. T-CAP-BROKEN's PATH-injected stub still resolves through the fallback.
+    out=$("${FORGE_FORGE_BIN:-forge}" codex-lane --root "$root" --stage "$stage" --worker claude 2>&1); rc=$?
     if [ "$rc" -eq 0 ]; then
         printf '%s\n' "$out" | sed -n 's/^capability_class=//p' | head -1
         return 0
@@ -8785,6 +9091,7 @@ EOF
 
 cmd_add_note() {
     require_identity "add-note" host-session || return 1
+    _require_root_cwd add-note || return 1
     local note="$*"
     # Per-call session-scoped pointer (shadows the static global).
     local CONTEXT_FILE; CONTEXT_FILE="$(_context_file)"
@@ -9297,6 +9604,7 @@ for entry in data.get('entries', []) or []:
     if idx is None:
         continue
     entry_session = entry.get('session', '')
+    if entry_session == 'unknown': entry_session = ''  # LEGACY-SENTINEL
     if entry_session and current_session and entry_session != current_session:
         continue  # different session; skip silently
     legacy = not bool(entry_session)
@@ -9795,6 +10103,23 @@ cmd_identity() {
 # Stripped from ANYWHERE in argv before the subcommand. --target-session without
 # --cross-session is always a usage error.
 _FORGE_TARGET=""; _FORGE_CROSS=0; _FORGE_TARGET_ROOT=""
+# ---- Dispatch provenance channel (#40 item 3) ----
+# Same PROCESS-LOCAL, NEVER-EXPORTED discipline as the three flags above, for the same
+# reason: authorization must not be inheritable from the environment. These six were
+# read straight out of public FORGE_* env inside cmd_log, so ANY caller could mint a
+# fully-provenanced pending row that four callback selectors then consumed as
+# authority. Initialising them HERE, unconditionally, before the subcommand case, is
+# what makes an exported same-named variable inert — without it the fix is void.
+_FORGE_P_DELIVERY_ID=""; _FORGE_P_PHYSICAL_CODE_ROOT=""; _FORGE_P_ROOT_IDENTITY=""
+_FORGE_P_CAPABILITY_CLASS=""; _FORGE_P_DELIVERY_LANE=""; _FORGE_P_PROMPT_SHA256=""
+# Single-shot row-birth authorization token, read by cmd_log's fix-route guard. It is
+# NOT provenance data: it answers "did in-process cmd_dispatch call me", which is a
+# DIFFERENT question from "what did the broker put in the payload". There is no line
+# guaranteeing a non-empty delivery_id at the cmd_log call site (the extraction is a
+# python one-liner and this file has no `set -e`), so a delivery_id-keyed test would
+# refuse LEGITIMATE dispatches; set-ness cannot substitute either, because the six
+# above are initialised empty right here. A dedicated marker decouples the two.
+_FORGE_LOG_INPROC=""
 _fb_argv=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -9887,7 +10212,7 @@ case "${1:-help}" in
         echo "                                Classify pane state (IDLE/ACTIVE/STALLED/PROMPTING/COMPLETED-PENDING-LOG-RESPONSE/DEAD/UNKNOWN)"
         echo "  health                        Verify all 5 panes exist and run expected worker process; exits 0 only if all OK"
         echo ""
-        echo "No-tmux commands (file-based; work from any directory, with or without a session):"
+        echo "No-tmux commands (file-based; RUN FROM THE PROJECT ROOT — .dev resolves against the current directory — with or without a session):"
         echo "  preflight                     Print kickoff snapshot (pwd, branch, merge state, halt status)"
         echo "  signal <from> <message>       Write a signal file to .dev/signals/"
         echo "  check-signals                 List pending signals"

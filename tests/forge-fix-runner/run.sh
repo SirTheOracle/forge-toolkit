@@ -125,6 +125,68 @@ for e in errs: print("  R23-LOCKSTEP: " + e, file=sys.stderr)
 sys.exit(1 if errs else 0)
 PY
 
+# ---- D2 · T-SKILL-INVENTORY: STAGE_SKILL <-> skills/ <-> SKILL_NAMES ----
+# A stage naming a skill that ships NOWHERE is the #34 failure mode, generalised. Five
+# STAGE_SKILL targets (the whole pre-code half of the fix pipeline) existed only as
+# untracked directories under the operator's ~/.claude/skills/: a fresh clone of this
+# PUBLIC repo passed --check-drift and then could not execute a single pre-code fix
+# stage — including the stage that produced this fix's own diagnosis. Vendoring them
+# fixes TODAY's instance; without this assertion the next STAGE_SKILL entry reopens it
+# and --check-drift reports green again.
+#
+# THREE DIRECTIONS, and deliberately NOT a fourth against
+# config/codex-forge-runtime.json: `proposal`, `proposal-lite`, `coding-fix` and
+# `qa-live-retry` are in STAGE_SKILL and absent from stage_capabilities, so a fourth
+# direction would fail immediately on PRE-EXISTING, UNDIAGNOSED state.
+python3 - "$ROOT" <<'PY' && ok "T-SKILL-INVENTORY every stage's skill ships, and the declared inventory is complete in both directions" || bad "T-SKILL-INVENTORY (see above)"
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+errs = []
+
+watch = (root / "bin/forge-watch").read_text()
+m = re.search(r'^STAGE_SKILL = \{(.*?)^\}', watch, re.S | re.M)
+if not m:
+    errs.append("bin/forge-watch: STAGE_SKILL map not found")
+    stage_skills = set()
+else:
+    stage_skills = set(re.findall(r":\s*'([a-z][a-z0-9-]*)'", m.group(1)))
+    if not stage_skills:
+        errs.append("bin/forge-watch: STAGE_SKILL parsed empty")
+
+inst = (root / "install.sh").read_text()
+m = re.search(r'^SKILL_NAMES=\((.*?)^\)', inst, re.S | re.M)
+if not m:
+    errs.append("install.sh: SKILL_NAMES array not found")
+    declared = set()
+else:
+    declared = set(re.findall(r'[a-z][a-z0-9-]*', m.group(1)))
+
+shipped = {p.name for p in (root / "skills").iterdir() if p.is_dir()}
+codex   = {p.name for p in (root / "codex-skills").iterdir() if p.is_dir()}
+
+# 1 — every stage's skill actually ships with a SKILL.md.
+for s in sorted(stage_skills):
+    if not (root / "skills" / s / "SKILL.md").is_file():
+        errs.append("STAGE_SKILL names '%s' but skills/%s/SKILL.md does not exist "
+                    "(bin/forge-watch dispatches this stage; vendor the skill)" % (s, s))
+
+# 2 — every shipped skills/ directory is DECLARED, or it installs and never uninstalls.
+for s in sorted(shipped - declared):
+    errs.append("skills/%s ships but is absent from install.sh SKILL_NAMES "
+                "(it would install and never uninstall)" % s)
+
+# 3 — every DECLARED name exists on one of the two sides. The `or codex-skills/` half is
+# what accommodates the documented proposal-reviewer codex-only deviation without
+# special-casing it.
+for s in sorted(declared - shipped - codex):
+    errs.append("install.sh SKILL_NAMES declares '%s' but neither skills/%s/ nor "
+                "codex-skills/%s/ exists" % (s, s, s))
+
+for e in errs:
+    print("  T-SKILL-INVENTORY: " + e, file=sys.stderr)
+sys.exit(1 if errs else 0)
+PY
+
 echo "== 2. fix-runner protocol anchors =="
 grep -q 'infra-lock acquire --slug <slug> --stage fix-code' "$RUNNER" \
   && ok "T-FR-SHAPEA step 4 wraps fix-code in Shape A" || bad "T-FR-SHAPEA missing"
