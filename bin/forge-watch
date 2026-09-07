@@ -2003,6 +2003,20 @@ def scan_attention(root, label):
     # live ages/spans, or the QUIET signature would churn every tick (the 37MB-launchd.out
     # failure class); spans/ages render live from first_at/last_at at render time.
     for ep in (e for e in episodes if e['current']):
+        # #20 — the same upper freshness bound. `current` means only "newest run for this
+        # pane", NEVER "alive": it is assigned as `cur = (i == 0)` over the run partition
+        # above, with no age or liveness input, and the wprompt/wstop ingestion applies no
+        # age filter either. So a wprompt left by a dead session stays the current run
+        # forever and EPISODE-STUCK (hot, notifies) rings on week-old residue. quiet_s is
+        # the episode's own age (NOW - last activity), i.e. the :1982 comparison on the
+        # episode's own clock. Bounding the whole condition block, not just the STUCK arm:
+        # a mid_turn episode is ALWAYS state=='in_progress', so bounding STUCK alone would
+        # reroute residue into an EPISODE-ACTIVE row reading "in progress" — a stale lie in
+        # place of a stale alert. EPISODE-SETTLED already self-guards at TASK_WINDOW_S (24h),
+        # well inside this horizon. EPISODES[] is extended ABOVE this loop, so episode
+        # history and the `forge tasks` drill-in are untouched — only live conditions expire.
+        if ep['quiet_s'] > ZOMBIE_AGE_S:
+            continue
         k = f"{ep['session']}\tp{ep['pane']}\t{ep['episode_id']}"
         if ep['mid_turn'] and ep['quiet_s'] > TASK_STUCK_S:                 # mid-turn hang
             f = add_finding('EPISODE-STUCK', root, f"{ep['session']}\tp{ep['pane']}",
@@ -2082,7 +2096,13 @@ def scan_attention(root, label):
         if os.path.exists(os.path.join(adir_p, f'response.{did}.txt')):
             continue
         a = age_s(d.get('dispatched_at'))
-        if a is not None and a > TASK_STUCK_S:
+        # #20 — upper freshness bound, mirroring the permission feed (:1982) exactly. Without
+        # it a dispatch record left behind by a dead session rings a hot TASK-STUCK row
+        # FOREVER. Skipped BEFORE task_stuck_ids so residue can never suppress a live
+        # EPISODE-STUCK at the precedence filter below (that filter reads this set).
+        if a is None or a > ZOMBIE_AGE_S:
+            continue
+        if a > TASK_STUCK_S:
             task_stuck_ids.add((root, d.get('session'), did))   # Step 4 suppression set (R1b)
             add_finding('TASK-STUCK', root, f"{d.get('session')}\t{did}",
                         f"{label} · {d.get('session')} — task {did} unanswered for {human_age(a)} "
