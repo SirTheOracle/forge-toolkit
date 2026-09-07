@@ -1,0 +1,52 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'fix-code' stage of a forge fix-pipeline.
+
+Slug: {slug}
+
+Follow the fix-coder skill at ~/.claude/skills/fix-coder/SKILL.md
+
+This is the MECHANICAL stage. You apply a vetted fix plan to the codebase exactly as written. You do NOT redesign, you do NOT re-plan, you do NOT extend scope.
+
+Project config: .claude/forge-project.yml
+Fix plan: .dev/proposals/{slug}/fix-plan.md
+Diagnosis (reference only — do NOT re-diagnose): .dev/proposals/{slug}/diagnosis.md
+
+Read fix-plan.md and execute the plan's Changes section as exact diffs. Apply Defenses + Test Plan exactly as specified. Commit each commit group with a clear conventional-commits message. After each commit group, run the test plan items relevant to that group. After all commit groups land, run the full validation suite from the plan.
+
+Hard scope rules:
+- Files outside the plan's Changes section are off-limits. If the plan touches video_prompt_service.py + the ltx23 system prompt + tests, you do NOT touch unrelated files. If a touch is required and not in the plan, STOP and report — do not silently expand scope.
+- Do NOT modify the fix-plan.md. The plan is frozen at this stage.
+- Do NOT skip Defenses. Defenses are not optional; they are part of the fix.
+- Do NOT skip tests because they are inconvenient. If a planned test fails after the production code is applied, the production code is wrong — not the test (unless the test itself has a logic error, in which case STOP and report).
+- Validate that the bug-trigger scenario is no longer reproducible (or that the test exercising the failing path passes). The plan should specify how.
+
+Report in .dev/proposals/{slug}/fix-coder-report.md:
+- Commit groups applied (N of M); list each commit hash + short message
+- Tests run: pass/fail per group; full validation result
+- Any diffs that failed to apply cleanly + what you did about it
+- Any deviations from the plan + 1-line justification per deviation
+- Files changed (full list)
+- Bug-trigger reproduction status: still-reproducible / no-longer-reproducible / not-tested-(why)
+
+End the report with two lines, exactly:
+  CONFIDENCE: HIGH/MEDIUM/LOW
+  BLOCKING_ITEMS: N
+
+CONFIDENCE rubric: "Did every planned commit group land cleanly with green tests, no scope leakage, and the bug-trigger covered?" If yes → HIGH. If you had to deviate from the plan in any non-trivial way → MEDIUM. If you couldn't land the fix → LOW.
+
+BLOCKING_ITEMS: count any planned changes you couldn't apply, any failing tests you couldn't make pass, any deviations that need user review.
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/fix-coder-report.md"
+
+If blocked (plan ambiguity, file doesn't match anchor, test is unreachable, etc.):
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{specific issue + which plan section}"
+
+Do NOT type /clear yourself — the orchestrator drives clear.

@@ -1,0 +1,45 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'qa' stage of a forge pipeline.
+
+Slug: {slug}
+
+Follow the adversarial-qa skill at ~/.codex/skills/adversarial-qa/SKILL.md
+
+Inputs:
+- .dev/proposals/{slug}/implementation.md (the changes under test)
+- .dev/proposals/{slug}/impl-review.md (SCOPE DIFF — list of OUT-OF-SCOPE touches and SHARED HELPER extensions)
+- The actual code on the feature branch (already applied by the coding stage)
+
+Outputs:
+- .dev/qa/{slug}/issues.md
+- .dev/qa/{slug}/manifest.yaml
+
+Severity levels: critical / major / minor / advisory.
+
+<<<INCLUDE _unchanged_flow_sweep>>>
+
+In .dev/qa/{slug}/issues.md, report:
+- Findings (one entry per issue) with severity, summary, reproduction steps,
+  affected files, and screenshot evidence path where applicable
+- A REGRESSION SWEEP RESULTS section listing every surface tested and every
+  surface skipped (skipped surfaces are themselves a finding)
+- Recommendation: pass / fix-and-retest / block
+
+In .dev/qa/{slug}/manifest.yaml, list:
+- Tests executed (name, command, pass/fail)
+- Screenshot artifacts (path, surface)
+- Coverage gaps if any
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+BLOCKING_ITEMS: N
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/qa/{slug}/issues.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"

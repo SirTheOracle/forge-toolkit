@@ -1,0 +1,21 @@
+UNCHANGED-FLOW REGRESSION SWEEP (include verbatim in every QA dispatch):
+  Identify the surfaces affected by the implementation, NOT just the new
+  feature. Read implementation.md and find:
+  - Every DB table whose schema or data is touched by the migration.
+  - Every route whose handler was modified, OR whose handler calls a
+    helper that was modified.
+  - Every page/component the user can navigate to that hits one of
+    those routes.
+  Then, for EACH such surface, exercise it AS A USER WOULD on PRE-FEATURE
+  data — i.e. data created before this feature existed:
+  1. Load the page WITHOUT first interacting with the new feature.
+     Confirm it renders the expected content (existing rows still
+     visible, counts still correct, status still accurate).
+  2. Re-run any flow the new feature did NOT explicitly modify
+     (auto-build, the background poller, batch operations, the
+     standard generation pass). Confirm behavior is unchanged.
+  3. For every shared helper the implementation extended: hit each
+     OUT-OF-SCOPE caller (per impl-review's SCOPE DIFF section) and
+     confirm it still produces the same output.
+  Findings from the sweep are CRITICAL or MAJOR severity — they are
+  regressions of pre-existing behavior, not gaps in the new feature.

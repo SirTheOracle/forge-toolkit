@@ -1,0 +1,7 @@
+Your forge identity — cite these if you must escalate:
+  slug={slug}  stage={stage}  worker={worker}
+Blocking human decision (irreversible action, ambiguous requirement the plan
+does not settle, credential/billing surprise)? STOP and run:
+  forge ask --slug {slug} --stage {stage} --worker {worker} "<question>"
+It never blocks or fails your run; the operator's answer is routed back to you.
+Resolvable assumptions are NOT ask-worthy — note them in your report and proceed.

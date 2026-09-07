@@ -1,0 +1,41 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'proposal-lite' stage of a forge pipeline.
+
+Slug: {slug}
+
+Follow the adversarial-lite skill at ~/.claude/skills/adversarial-lite/SKILL.md
+
+The skill spawns 3 agents across 2 rounds:
+  Round 1 — Proposer A (Sonnet) and Proposer B (Sonnet) investigate the same problem in PARALLEL with zero knowledge of each other, using complementary strategies (e.g., for bug_fix: FORWARD trace vs BACKWARD trace)
+  Round 2 — Synthesizer C (Opus) does Phase 0 independent source examination FIRST, then reads both proposals and produces final-plan.md in a single pass (no feedback loop, no critique round)
+
+This is the LIGHT version — adversarial-lite, not adversarial-proposal. Use it for bounded, low-risk bugs/features. Do NOT spawn the 4-round adversarial-proposal teammates.
+
+Inputs (READ ALL BEFORE PROPOSING):
+- .dev/proposals/{slug}/problem-statement.md (primary — contains user-locked decisions, hard constraints, source-file inventory)
+- All source files listed in the problem-statement.md "Source Files" section
+
+Outputs (the skill produces these — do not skip any):
+- .dev/proposals/{slug}/proposal-A.md (Sonnet investigator A)
+- .dev/proposals/{slug}/proposal-B.md (Sonnet investigator B)
+- .dev/proposals/{slug}/final-plan.md (Opus synthesizer C — canonical artifact for downstream stages)
+
+Honor every "Hard constraint" and "Acceptance — done-when" item in problem-statement.md. Do not introduce alternatives for items the user has already locked. Locked decisions are constraints, not options.
+
+Investigate the existing codebase (read files via the file-reading tool) to ground the plan in real patterns — do not propose abstractions that don't exist.
+
+The complexity gate in the lite skill MAY escalate to full adversarial-proposal. If it does (Step 3 PROCEED check fails), STOP and callback BLOCKED with the escalation reason. Do not silently switch skills.
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+BLOCKING_ITEMS: N
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "FORGE_DONE: proposal-lite — see .dev/proposals/{slug}/final-plan.md"
+
+If blocked (genuine ambiguity not resolved by problem-statement.md, or complexity-gate escalation):
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{specific question or escalation reason}"

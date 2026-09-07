@@ -1,0 +1,81 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'fix-qa' stage of a forge fix-pipeline.
+
+Slug: {slug}
+
+Follow the adversarial-fix-qa skill at ~/.claude/skills/adversarial-fix-qa/SKILL.md
+
+The skill spawns 3 persistent teammates (QA Confirmer A, Regression Hunter B, Synthesizer C) across 4 rounds:
+  Round 1 — A and B test the COMMITTED fix independently, with zero knowledge of each other:
+    A's job: confirm the fix actually resolves the diagnosed bug under all conditions named in diagnosis + repro
+    B's job: hunt for regressions in adjacent and downstream code affected by the fix's changes
+  Round 2 — C reviews both reports and synthesizes a unified fix-issues.md
+  Round 3 — A and B critique C's synthesis from their original contexts
+  Round 4 — C reconciles into final fix-issues.md and fix-manifest.yaml
+
+This stage TRUSTS the upstream diagnosis, plan, and code. Do NOT re-investigate. Do NOT propose alternative fixes. Do NOT modify the fix.
+
+Inputs (READ ALL BEFORE TESTING):
+- .dev/proposals/{slug}/diagnosis.md (the diagnosed root cause — A's reference for "is the bug actually closed?")
+- .dev/proposals/{slug}/fix-plan.md (the canonical plan — what was supposed to land)
+- .dev/proposals/{slug}/fix-coder-report.md (what the coder actually did)
+
+Also check the live code state:
+- git diff origin/main..HEAD  (the actual diff that landed)
+- git log --oneline origin/main..HEAD  (commit groups)
+
+Outputs (the skill produces all of these; do not skip any):
+- .dev/qa/{slug}/fix-confirmer-report.md  (A's report — fix-closes-bug verdict)
+- .dev/qa/{slug}/regression-hunter-report.md (B's report — regression findings)
+- .dev/qa/{slug}/fix-qa-synthesis.md
+- .dev/qa/{slug}/fix-qa-review-for-A.md
+- .dev/qa/{slug}/fix-qa-review-for-B.md
+- .dev/qa/{slug}/fix-qa-reconciliation-notes.md
+- .dev/qa/{slug}/fix-issues.md (canonical issue list — what downstream consumers read)
+- .dev/qa/{slug}/fix-manifest.yaml (machine-readable severity counts + issue index)
+
+The fix-issues.md MUST contain:
+- A 1-paragraph verdict (CLEAR / advisory-only / minor-only / has-critical-or-major)
+- One section per issue, each rated:
+  - CRITICAL — fix does not resolve the diagnosed bug, OR introduces a new bug at least as severe; ship-blocking
+  - MAJOR — fix resolves the bug but introduces a regression in adjacent code, OR misses an edge case the diagnosis named explicitly
+  - MINOR — small quality issue (test naming, error message, edge case not covered) that does not block ship
+  - ADVISORY — observation; no action requested
+- For each issue: which agent surfaced it (Confirmer / Regression Hunter / Synthesizer), the test/check that caught it, the specific reproducible failure or evidence, severity rationale
+- A "Fix-Closes-Bug verdict" section explicitly answering: does the committed fix resolve the diagnosed root cause? (yes / partial / no)
+- A "Regression sweep" section listing every adjacent code path B checked + its verdict (no-regression / regression-found)
+
+The fix-manifest.yaml MUST contain:
+  critical_count: N
+  major_count: N
+  minor_count: N
+  advisory_count: N
+  fix_closes_bug: yes | partial | no
+  regression_sweep_complete: yes | no
+
+End fix-issues.md with two lines, exactly:
+  CONFIDENCE: HIGH/MEDIUM/LOW
+  BLOCKING_ITEMS: N
+
+CONFIDENCE rubric: "Did all 3 teammates do substantive work (real test runs, real code reads, specific findings) and reach a unified verdict?" If yes → HIGH. If any teammate punted or the synthesis is fuzzy → MEDIUM. If the QA is shallow → LOW.
+
+BLOCKING_ITEMS: count CRITICAL + MAJOR only (these block PR).
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/qa/{slug}/fix-issues.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"
+
+Hard rules for this stage:
+- Read-only on source code. Do NOT modify the fix. Do NOT add tests to the source tree (you can write test SCRIPTS to /tmp or .dev/qa/ for your own exploration, but the QA stage does not modify committed test files).
+- Do NOT re-investigate the bug. The diagnosis is the contract.
+- Do NOT punt. If you can't reproduce or refute a concern within the time budget, file it as MINOR with "needs follow-up" rather than dropping silently.
+- Codex panes do NOT need /clear.

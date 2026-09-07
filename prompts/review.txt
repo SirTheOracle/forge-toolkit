@@ -1,0 +1,36 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'review' stage of a forge pipeline.
+
+Slug: {slug}
+
+Follow the proposal-reviewer skill at ~/.codex/skills/proposal-reviewer/SKILL.md
+
+Inputs (read all):
+- .dev/proposals/{slug}/problem-statement.md
+- .dev/proposals/{slug}/proposal-a.md
+- .dev/proposals/{slug}/proposal-b.md
+- .dev/proposals/{slug}/synthesis.md
+- .dev/proposals/{slug}/final-plan.md
+
+Output: .dev/proposals/{slug}/review-feedback.md
+
+Review the final plan adversarially. Include in the review:
+- Critical / blocking issues
+- Minor issues that should be addressed
+- Conflicts with the plan's stated approach
+- Coverage gaps in the plan
+- Items that contradict the problem statement's non-goals
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+BLOCKING_ITEMS: N
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/review-feedback.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"

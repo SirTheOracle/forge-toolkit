@@ -1,0 +1,81 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'fix-qa-retry' stage of a forge fix-pipeline.
+
+Slug: {slug}
+
+Follow the adversarial-fix-qa skill at ~/.claude/skills/adversarial-fix-qa/SKILL.md — RETRY MODE.
+
+This stage RE-VERIFIES the fix after a qa-fix loop landed additional commits to address one or more findings from the first fix-qa run. The prior fix-qa report is at `.dev/qa/{slug}/fix-issues.md` and the qa-fix work is documented at `.dev/qa/{slug}/qa-fix-report.md`. New commits since the original fix-qa are visible via `git log --oneline` against origin/main.
+
+The skill spawns 3 persistent teammates (QA Confirmer A, Regression Hunter B, Synthesizer C). In retry mode:
+  Round 1 — A and B test the UPDATED committed fix:
+    A's job: re-confirm the diagnosed bug is still resolved AND that any previously CRITICAL/MAJOR findings now show as RESOLVED (cite the fix commit + new test passing)
+    B's job: hunt for NEW regressions introduced by the qa-fix commits AND re-check any adjacent surfaces previously flagged
+  Round 2 — C reviews both reports and synthesizes
+  Round 3 — A and B critique C's synthesis
+  Round 4 — C reconciles into final fix-issues.md and fix-manifest.yaml (overwriting the prior run)
+
+Inputs (READ ALL BEFORE TESTING):
+- .dev/proposals/{slug}/diagnosis.md
+- .dev/proposals/{slug}/fix-plan.md
+- .dev/proposals/{slug}/fix-coder-report.md
+- .dev/qa/{slug}/fix-issues.md (PRIOR fix-qa output — confirm each prior CRITICAL/MAJOR is closed; advisories stay as-is)
+- .dev/qa/{slug}/qa-fix-report.md (what the qa-fix worker did to close prior findings)
+
+Also check the live code state:
+- git diff origin/main..HEAD
+- git log --oneline origin/main..HEAD
+
+Outputs (overwrites the prior fix-qa artifacts):
+- .dev/qa/{slug}/fix-confirmer-report.md
+- .dev/qa/{slug}/regression-hunter-report.md
+- .dev/qa/{slug}/fix-qa-synthesis.md
+- .dev/qa/{slug}/fix-qa-review-for-A.md
+- .dev/qa/{slug}/fix-qa-review-for-B.md
+- .dev/qa/{slug}/fix-qa-reconciliation-notes.md
+- .dev/qa/{slug}/fix-issues.md (canonical issue list, refreshed)
+- .dev/qa/{slug}/fix-manifest.yaml (refreshed)
+
+The fix-issues.md MUST contain (same shape as fix-qa, plus an explicit retry-resolution section):
+- A 1-paragraph verdict (CLEAR / advisory-only / minor-only / has-critical-or-major)
+- A "Prior findings resolution" section: for each CRITICAL/MAJOR from the prior fix-issues.md, state RESOLVED / STILL OPEN / DOWNGRADED with the test/commit evidence
+- One section per NEW or STILL-OPEN issue, rated CRITICAL / MAJOR / MINOR / ADVISORY (same severity rubric as fix-qa)
+- A "Fix-Closes-Bug verdict" section (yes / partial / no)
+- A "Regression sweep" section listing adjacent code paths B exercised
+
+The fix-manifest.yaml MUST contain:
+  critical_count: N
+  major_count: N
+  minor_count: N
+  advisory_count: N
+  fix_closes_bug: yes | partial | no
+  regression_sweep_complete: yes | no
+  retry_round: 1   # increment if a second retry ever runs
+
+End fix-issues.md with two lines, exactly:
+  CONFIDENCE: HIGH/MEDIUM/LOW
+  BLOCKING_ITEMS: N
+
+CONFIDENCE rubric: same as fix-qa.
+
+BLOCKING_ITEMS: count CRITICAL + MAJOR only.
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/qa/{slug}/fix-issues.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"
+
+Hard rules for this stage:
+- Read-only on source code. Do NOT modify the fix. Do NOT add tests to the source tree (test SCRIPTS to /tmp or .dev/qa/ are OK for exploration).
+- Do NOT re-investigate the bug. The diagnosis is the contract.
+- Do NOT relitigate ADVISORY items from the prior run unless they have escalated.
+- Do NOT punt. If a check cannot complete within the time budget, file as MINOR with "needs follow-up" rather than dropping silently.
+- Codex panes do NOT need /clear.

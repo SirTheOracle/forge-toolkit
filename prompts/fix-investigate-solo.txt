@@ -1,0 +1,64 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'fix-investigate-solo' stage — a single-worker diagnosis
+stage of a forge fix-pipeline (no agent team; you do the full analysis yourself).
+
+Slug: {slug}
+
+This stage produces a DIAGNOSIS, not a plan. Do NOT propose exact patches, do NOT
+write source code. The fix-plan stage owns patch design. You are READ-ONLY on
+source.
+
+Inputs (READ ALL FIRST):
+- .dev/proposals/{slug}/problem-statement.md — covered issue bodies + a pointer to
+  the scout routing hypothesis (NON-AUTHORITATIVE — you must re-derive independently).
+- The scout routing-plan referenced in problem-statement.md — read it for anchors,
+  but VALIDATE every claim against the real code; do not trust it.
+- .claude/forge-project.yml — project layout, services, test commands.
+- The codebase (Read/Grep) — ground EVERY claim in real file:line.
+
+Method:
+1. Read every covered issue. Extract the DISTINCT failure modes (one issue can
+   hide several). A group may cover multiple issues sharing ONE root cause — confirm
+   that shared cause actually exists in code, or flag divergence.
+2. Trace each failure mode from user-facing symptom → generation/data path →
+   render path (on-screen vs PDF/exported are often separate). Find the exact
+   file:line where each originates.
+3. For multi-issue groups, confirm the issues truly share a root cause. If an issue
+   has a cause NOT shared by the group, say so explicitly (it may need to drop).
+4. Note related fragility that shares the root cause as out-of-scope follow-ups.
+
+Output — write `.dev/proposals/{slug}/diagnosis.md` with EXACTLY these sections:
+- `Status: ACTIVE` (literal, first line after the title)
+- Verdict: CONVERGED | PARTIALLY CONVERGED | INSUFFICIENT EVIDENCE
+- Root Cause (1-paragraph diagnosed cause; for multi-issue groups, state the shared
+  cause and confirm it covers every listed issue)
+- Evidence Chain (ordered file:line citations + observed-behavior links)
+- Contributing Factors / Out-of-scope follow-ups
+- Excluded Hypotheses (candidates you ruled out + the evidence)
+- Required Data (ONLY if INSUFFICIENT EVIDENCE)
+
+Hard rules:
+- Read-only on source. Modify NO source files. Output is diagnosis.md only.
+- Every cause cites a real file:line. Do not assert causes for symbols that don't exist.
+- INSUFFICIENT EVIDENCE is a valid exit — do not force a cause.
+- Do NOT type /clear yourself — the orchestrator drives clear.
+
+End diagnosis.md with exactly two lines:
+  CONFIDENCE: HIGH/MEDIUM/LOW
+  BLOCKING_ITEMS: N
+
+CONFIDENCE rubric: "Could the fix-plan stage design a patch from this diagnosis with
+no further investigation?" yes → HIGH; actionable-but-partial → MEDIUM;
+INSUFFICIENT EVIDENCE → LOW.
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/diagnosis.md — <verdict>"
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{specific issue + what you need}"
