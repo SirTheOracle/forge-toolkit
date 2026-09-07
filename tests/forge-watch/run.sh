@@ -1936,6 +1936,47 @@ printf 'a' > "$(attn "$R")/payloads/response.cc-stuck.txt"
 assert_status_missing "TASK-STUCK" "an answered task is not stuck"
 unset FORGE_WATCH_TASK_STUCK_S
 
+echo "── #20: hot stuck rows sourced from hook records expire at ZOMBIE_AGE_S ──"        # +8
+# The permission feed drops any record past ZOMBIE_AGE_S (bin/forge-watch :1982); TASK-STUCK
+# and the current-episode conditions had a LOWER bound only, so residue left behind by a dead
+# session rang a hot row forever (#20). Fixtures straddle the 7d default horizon — the
+# constants themselves are never moved, since every other feed reads them.
+new_env tstuck20a
+R=$(mk_root proj); live_session forge-1 "$R"
+export FORGE_WATCH_TASK_STUCK_S=60
+disp "$R" forge-1 700000 cc-zombie                    # dispatched >7d ago → abandoned residue
+assert_status_missing "TASK-STUCK" "dispatch past ZOMBIE_AGE_S emits no TASK-STUCK (#20)"
+: > "$CAP"; run_check >/dev/null
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "aged-out dispatch rings nothing" || bad "aged-out dispatch still rang: $(cat "$CAP")"
+new_env tstuck20b
+R=$(mk_root proj); live_session forge-1 "$R"
+disp "$R" forge-1 3600 cc-live                        # past TASK_STUCK_S, inside the horizon
+assert_status_has "TASK-STUCK" "positive control: stalled-but-fresh dispatch still fires TASK-STUCK"
+unset FORGE_WATCH_TASK_STUCK_S
+new_env tstuck20c
+R=$(mk_root proj); live_session forge-1 "$R"
+wpromptf "$R" forge-1 1 700000 t-zombie               # mid-turn wprompt left by a dead session
+assert_status_missing "EPISODE-STUCK" "episode past ZOMBIE_AGE_S emits no EPISODE-STUCK (#20)"
+: > "$CAP"; run_check >/dev/null
+[ "$(wc -l < "$CAP")" -eq 0 ] && ok "aged-out episode rings nothing" || bad "aged-out episode still rang: $(cat "$CAP")"
+run_status --board > "$TDIR/ep20.json"
+python3 - "$TDIR/ep20.json" <<'PY' && ok "aged-out episode: no hot row, no stale 'in progress' row, history retained" || bad "aged-out episode still renders a live condition"
+import json,sys
+b=json.load(open(sys.argv[1]))
+assert not [r for r in b["hot"] if r["condition"]=="EPISODE-STUCK"], b["hot"]
+assert not [r for r in b["active"] if r["condition"]=="EPISODE-ACTIVE"], b["active"]
+assert len(b["episodes"]) == 1, b["episodes"]     # expiry bounds CONDITIONS, never history
+PY
+new_env tstuck20d
+R=$(mk_root proj); live_session forge-1 "$R"
+wpromptf "$R" forge-1 1 39000 t-hang
+assert_status_has "EPISODE-STUCK" "positive control: mid-turn hang inside the horizon still fires"
+new_env tstuck20e
+R=$(mk_root proj); live_session forge-1 "$R"
+disp "$R" forge-1 40000 did-live
+wpromptf "$R" forge-1 1 39000 t-hang claude "working" did-live
+run_status --board | python3 -c 'import json,sys;h=json.load(sys.stdin)["hot"];assert len(h)==1 and h[0]["condition"]=="TASK-STUCK", h' && ok "precedence intact: live dispatched hang stays TASK-STUCK, not EPISODE-STUCK" || bad "TASK-STUCK > EPISODE-STUCK precedence broken by the expiry cutoff"
+
 echo "── delivery: stub notifier nonzero → delivered.log rc!=0 → DELIVERY-UNVERIFIED ──"  # +2
 new_env tdel
 R=$(mk_root proj); live_session forge-1 "$R"
