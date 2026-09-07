@@ -1,0 +1,34 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+Write your final report to .dev/proposals/{slug}/incorporate-report.md BEFORE sending FORGE_DONE. The FORGE_DONE callback must be a one-line summary only; the digest agent reads the report file from disk.
+
+Read .dev/proposals/{slug}/review-feedback.md and
+.dev/proposals/{slug}/final-plan.md
+
+Merge the review feedback into final-plan.md:
+- Accept all critical/blocking items
+- Accept minor items unless they conflict with the plan's core approach
+- Note any rejected items with reasoning
+
+Write the updated final-plan.md in place.
+
+In .dev/proposals/{slug}/incorporate-report.md, report:
+- Items accepted / rejected / partially accepted
+- Key changes made to the plan
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+BLOCKING_ITEMS: N
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/incorporate-report.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"
+
+Do NOT type /clear yourself — the orchestrator drives clear.

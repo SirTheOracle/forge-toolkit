@@ -45,6 +45,38 @@ BIN_SCRIPTS=(forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-re
              forge-git-request forge-sync-main)
 MANAGED_POLICY_FILES=(codex-forge.config.toml codex-forge-runtime.json idle-prompts.yml)
 
+# Stage prompt templates. bin/forge-bridge renders $FORGE_PROMPTS_DIR/<stage>.txt for
+# every dispatch, so these ARE the pipeline's stage vocabulary — yet until now they were
+# untracked, machine-local and unmanaged by this installer, exactly the defect class the
+# five missing fix-pipeline skills were (#77 prerequisite).
+FORGE_PROMPTS_DIR="$FORGE_CONFIG_DIR/prompts"
+# A DECLARED array, not a glob over prompts/*.txt, for the same reason SKILL_NAMES is one:
+# a glob cannot report a prompt that ships NOWHERE. It is blind to a missing prompt BY
+# CONSTRUCTION, which is how 29 stage prompts stayed untracked while --check-drift
+# reported green.
+PROMPT_NAMES=(
+    _ask_escalation _git_ident _scope_diff_check _unchanged_flow_sweep
+    coding coding-fix fix-code fix-investigate fix-investigate-solo
+    fix-plan fix-plan-review fix-plan-revise fix-plan-solo fix-qa fix-qa-retry
+    fix-reproduce fix-scout impl-review implementation incorporate
+    proposal proposal-lite qa qa-fix qa-retry review verify
+)
+# EXCLUSION 1 — synthetic. `_preamble` is NOT a file and must never become one:
+# bin/forge-bridge's resolve_include special-cases the name and returns text rendered by
+# _render_preamble from .claude/forge-project.yml, never touching disk. A real
+# _preamble.txt would shadow it and silently change all 25 prompts that include it.
+SYNTHETIC_PROMPTS=(_preamble)
+# EXCLUSION 2 — quarantined, and for an unrelated reason; do not conflate it with the
+# line above. env-fix and qa-live-retry are not project-agnostic templates: they bake one
+# private project's plaintext login, database UUIDs, schema, API routes, migration
+# filenames, commit SHAs and infra names into the prompt body. This repo is PUBLIC and a
+# credential committed here is NOT undone by `git revert`, so they are deliberately not
+# vendored and are excluded from the present-but-undeclared drift direction (which would
+# otherwise report them forever). Tracked as #79 — reference it, do not redact them here:
+# the fix is moving that material into forge-project.yml and reaching it through the
+# synthetic _preamble, the way every other prompt already does.
+UNVENDORABLE_PROMPTS=(env-fix qa-live-retry)
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -135,6 +167,52 @@ if [ "${1:-}" = "--check-drift" ]; then
         err "  idle-prompts.yml — operator override differs from managed classifier"; DRIFT=1
     fi
 
+    # FORWARD · declared-but-absent. Walk PROMPT_NAMES, not a glob — same reason as the
+    # SKILL_NAMES loop above.
+    for prompt_name in "${PROMPT_NAMES[@]}"; do
+        src="$SCRIPT_DIR/prompts/$prompt_name.txt"; dst="$FORGE_PROMPTS_DIR/$prompt_name.txt"
+        if [ ! -f "$src" ]; then
+            err "  prompts/$prompt_name.txt — DECLARED in PROMPT_NAMES but no source file in the repo"; DRIFT=1
+        elif [ ! -f "$dst" ]; then
+            err "  prompts/$prompt_name.txt — not installed"; DRIFT=1
+        elif cmp -s "$src" "$dst"; then
+            ok "  prompts/$prompt_name.txt — identical"
+        else
+            err "  prompts/$prompt_name.txt — DIFFERS from repository source"; DRIFT=1
+        fi
+    done
+    # REVERSE (repo): a prompts/*.txt absent from PROMPT_NAMES would install (if the
+    # install loop globbed) and never uninstall — the same silent one-way door the skills
+    # reverse half guards. Here it is stricter: an undeclared file never installs at all,
+    # so it is dead weight that no drift direction would otherwise mention.
+    for src in "$SCRIPT_DIR"/prompts/*.txt; do
+        [ -f "$src" ] || continue
+        prompt_name="$(basename "$src" .txt)"
+        case " ${PROMPT_NAMES[*]} " in
+            *" $prompt_name "*) ;;
+            *) err "  prompts/$prompt_name.txt — present in the repo but NOT declared in PROMPT_NAMES (it would never install and never uninstall)"; DRIFT=1 ;;
+        esac
+    done
+    # REVERSE (live) · present-but-undeclared. THE direction a glob-based check misses,
+    # and the one that matters: a .txt sitting in the live prompts directory that this
+    # repo does not track is a stage whose prompt cannot be reviewed, shipped or
+    # drift-checked. Both exclusion lists are honoured here BY NAME, for the two separate
+    # reasons documented at their declarations.
+    if [ -d "$FORGE_PROMPTS_DIR" ]; then
+        for dst in "$FORGE_PROMPTS_DIR"/*.txt; do
+            [ -f "$dst" ] || continue
+            prompt_name="$(basename "$dst" .txt)"
+            case " ${PROMPT_NAMES[*]} " in *" $prompt_name "*) continue ;; esac
+            case " ${SYNTHETIC_PROMPTS[*]} " in *" $prompt_name "*) continue ;; esac
+            # Silently, not as a warning: reporting these two on every run forever is the
+            # exact noise the exclusion exists to remove. The reason lives at the
+            # UNVENDORABLE_PROMPTS declaration, where a reader who wonders why they are
+            # missing from prompts/ will look.
+            case " ${UNVENDORABLE_PROMPTS[*]} " in *" $prompt_name "*) continue ;; esac
+            err "  prompts/$prompt_name.txt — present in the live prompts directory but NOT tracked in prompts/ (add it to prompts/ and PROMPT_NAMES)"; DRIFT=1
+        done
+    fi
+
     echo ""
     if [ "$DRIFT" -eq 0 ]; then ok "No drift — repo and installed state converged."; exit 0
     else err "Drift found (see above). Re-run ./install.sh to converge, or reconcile by hand."; exit 1; fi
@@ -188,6 +266,21 @@ if [ "${1:-}" = "--uninstall" ]; then
     done
     rmdir "$MANAGED_POLICY_DIR" 2>/dev/null || true
     rmdir "$FORGE_CONFIG_DIR/managed" 2>/dev/null || true
+
+    # Remove only prompts still byte-identical to their repo source. An operator-modified
+    # prompt is preserved (same rule as the runtime classifier above), and the two
+    # quarantined files are not ours to delete — they are absent from PROMPT_NAMES, so
+    # this loop cannot see them. Installing without uninstalling is the one-way door this
+    # file's own SKILL_NAMES comments call a defect; don't reopen it here.
+    for prompt_name in "${PROMPT_NAMES[@]}"; do
+        src="$SCRIPT_DIR/prompts/$prompt_name.txt"
+        dst="$FORGE_PROMPTS_DIR/$prompt_name.txt"
+        if [ -f "$dst" ] && [ -f "$src" ] && cmp -s "$src" "$dst"; then
+            rm -f "$dst"
+            ok "  Removed prompts/$prompt_name.txt"
+        fi
+    done
+    rmdir "$FORGE_PROMPTS_DIR" 2>/dev/null || true
 
     # Remove operator-file symlinks (never a regular file — those are unmanaged)
     for pair in "${OPERATOR_FILES[@]}"; do
@@ -383,6 +476,40 @@ if [ "$refresh_runtime_classifier" -eq 1 ]; then
 else
     warn "  idle-prompts.yml — operator-modified runtime preserved (check drift before rollout)"
 fi
+
+echo ""
+
+# ── Step 3.8: Stage prompt templates ──────────────────────
+# bin/forge-bridge renders $FORGE_PROMPTS_DIR/<stage>.txt on every dispatch. Convergence
+# follows the runtime-classifier rule, not the managed-policy one: a prompt the operator
+# has edited is PRESERVED, never silently overwritten, and --check-drift reports the
+# divergence so the reconciliation is a decision rather than a surprise.
+
+info "Step 3.8: Installing stage prompt templates"
+
+mkdir -p "$FORGE_PROMPTS_DIR"
+for prompt_name in "${PROMPT_NAMES[@]}"; do
+    src="$SCRIPT_DIR/prompts/$prompt_name.txt"
+    dst="$FORGE_PROMPTS_DIR/$prompt_name.txt"
+
+    if [ ! -f "$src" ]; then
+        warn "  prompts/$prompt_name.txt — DECLARED in PROMPT_NAMES but missing from the repo, skipping"
+        continue
+    fi
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+        ok "  prompts/$prompt_name.txt — identical"
+        continue
+    fi
+    if [ -e "$dst" ]; then
+        warn "  prompts/$prompt_name.txt — operator-modified, preserving (reconcile it into $src, then re-run)"
+        continue
+    fi
+    tmp="$(mktemp "$FORGE_PROMPTS_DIR/.$prompt_name.txt.XXXXXX")"
+    cp "$src" "$tmp"
+    chmod 644 "$tmp"
+    mv "$tmp" "$dst"
+    ok "  prompts/$prompt_name.txt — installed"
+done
 
 echo ""
 

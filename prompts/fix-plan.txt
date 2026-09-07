@@ -1,0 +1,67 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'fix-plan' stage of a forge fix-pipeline.
+
+Slug: {slug}
+
+Follow the adversarial-fix-plan skill at ~/.claude/skills/adversarial-fix-plan/SKILL.md
+
+The skill spawns 3 persistent teammates (Planner A surgical, Planner B robust, Synthesizer C) across 4 rounds:
+  Round 1 — A proposes a SURGICAL fix (minimum change to stop the diagnosed cause); B proposes a ROBUST fix (cause fix + defenses against recurrence + adjacent fragility). A and B work independently with zero knowledge of each other.
+  Round 2 — C reviews both plans and synthesizes a unified fix plan
+  Round 3 — A and B critique C's synthesis from their original contexts
+  Round 4 — C reconciles into fix-plan.md
+
+This stage TRUSTS the upstream diagnosis. Do NOT re-investigate the bug. Do NOT re-validate the root cause. Plan the fix only.
+
+Inputs (READ ALL BEFORE PLANNING):
+- .dev/proposals/{slug}/diagnosis.md (the accepted root-cause report from the investigation stage)
+- .dev/proposals/{slug}/problem-statement.md (original bug description and constraints)
+
+Outputs (the skill produces all of these; do not skip any):
+- .dev/proposals/{slug}/fix-plan-A.md (surgical proposal)
+- .dev/proposals/{slug}/fix-plan-B.md (robust proposal)
+- .dev/proposals/{slug}/fix-synthesis.md
+- .dev/proposals/{slug}/fix-review-for-A.md
+- .dev/proposals/{slug}/fix-review-for-B.md
+- .dev/proposals/{slug}/fix-reconciliation-notes.md
+- .dev/proposals/{slug}/fix-plan.md (canonical artifact for downstream stages)
+
+The final fix-plan.md MUST contain these sections (the fix-coder consumes them mechanically):
+- Cause Recap (1-paragraph summary of the diagnosed root cause)
+- Changes (file-by-file edits with anchor snippets — what is changed, where, and why; each item maps to a cause-coverage row)
+- Defenses (regression-prevention measures: tests, assertions, type-narrowing, etc.)
+- Test Plan (existing tests to extend + new tests to add — specify file paths and assertion shapes)
+- Coverage Matrix (one row per diagnosed-cause item, mapping it to the change(s) that address it; mark any deliberate non-coverage as EXPLICITLY DEFERRED with rationale)
+- Rollback (one-paragraph description of how to revert this fix cleanly if it misfires)
+- Risk (honest list of what could go wrong; no hand-waving)
+
+Investigate the existing codebase (read files via the Read tool) to ground every proposed change in real file:line citations — do not propose edits to symbols that don't exist. The diagnosis.md cites file:line for every claim; cross-check at least the top-priority citations.
+
+Write your final report to .dev/proposals/{slug}/fix-plan.md BEFORE sending FORGE_DONE. The FORGE_DONE callback must be a one-line summary only; the digest agent reads the report file from disk.
+
+End the fix-plan.md with two lines, exactly:
+  CONFIDENCE: HIGH/MEDIUM/LOW
+  BLOCKING_ITEMS: N
+
+CONFIDENCE rubric for this stage: "Could fix-coder consume this plan and apply diffs mechanically without re-planning?" If yes → HIGH. If they'd need to make material judgment calls beyond the plan → MEDIUM. If the plan is speculative or has unresolved decisions → LOW.
+
+BLOCKING_ITEMS: count items the plan flags as unresolved OR depends on external decisions (e.g., "need user input on X").
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/fix-plan.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"
+
+Hard rules for this stage:
+- Read-only on source code. Do NOT modify any source files. Output is fix-plan.md only.
+- Do NOT propose fixes that contradict the diagnosis.
+- Do NOT silently expand scope. If a fragility you spot is outside the diagnosed cause, note it under "Risk" or "Out-of-scope follow-ups" — do not pull it into Changes.
+- Do NOT type /clear yourself — the orchestrator drives clear.

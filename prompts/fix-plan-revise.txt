@@ -1,0 +1,67 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'fix-plan-revise' stage of a forge fix-pipeline.
+
+Slug: {slug}
+
+Follow the adversarial-fix-plan skill at ~/.claude/skills/adversarial-fix-plan/SKILL.md — REVISE MODE.
+
+The skill spawns the 3 persistent teammates (Planner A surgical, Planner B robust, Synthesizer C) but in revise mode they DO NOT start from scratch. They:
+  Round 1 — A and B each read the existing fix-plan.md AND fix-review.md, then produce a revised proposal that addresses every CRITICAL and MAJOR review issue assigned to their lane (A keeps the surgical bias; B keeps the robust bias). MINOR/ADVISORY items: address if cheap, defer with rationale if not.
+  Round 2 — C reviews both revised proposals AND the fix-review.md, synthesizes a unified revised plan, and writes a "Review-clear matrix" mapping each review issue to the change that addresses it (or the explicit deferral).
+  Round 3 — A and B critique C's synthesis. Their critique focuses on: did C actually clear the review issues? Did C introduce NEW defects in the process of revising?
+  Round 4 — C reconciles into the FINAL revised fix-plan.md.
+
+This stage TRUSTS the upstream diagnosis. Do NOT re-investigate the bug. Do NOT relitigate items the review marked as ADVISORY or MINOR unless trivial.
+
+Inputs (READ ALL BEFORE REVISING):
+- .dev/proposals/{slug}/diagnosis.md (unchanged ground truth)
+- .dev/proposals/{slug}/problem-statement.md (unchanged constraints)
+- .dev/proposals/{slug}/fix-plan.md (the prior plan to revise)
+- .dev/proposals/{slug}/fix-review.md (the reviewer's BLOCKING + non-blocking issues — every CRITICAL and MAJOR MUST be addressed or explicitly contested with cited evidence)
+
+Outputs (the skill produces all of these; do not skip any):
+- .dev/proposals/{slug}/fix-plan-A-revised.md (revised surgical proposal)
+- .dev/proposals/{slug}/fix-plan-B-revised.md (revised robust proposal)
+- .dev/proposals/{slug}/fix-synthesis-revised.md
+- .dev/proposals/{slug}/fix-review-for-A-revised.md
+- .dev/proposals/{slug}/fix-review-for-B-revised.md
+- .dev/proposals/{slug}/fix-reconciliation-notes-revised.md
+- .dev/proposals/{slug}/fix-plan.md (OVERWRITE the canonical plan in place — fix-coder reads this path)
+
+The final fix-plan.md MUST contain all the sections from the prior version (Cause Recap, Changes, Defenses, Test Plan, Coverage Matrix, Rollback, Risk) AND a new section:
+
+- **Review-clear matrix** — one row per review issue (CRITICAL + MAJOR are mandatory; MINOR + ADVISORY optional), in the format:
+  `[severity] [review-section-cited] → addressed in [plan section / Change row]` OR
+  `[severity] [review-section-cited] → CONTESTED: [cited evidence from code that disproves the review's claim]`
+
+  Do NOT silently drop an issue. Every CRITICAL and MAJOR must appear in this matrix.
+
+Write the final fix-plan.md BEFORE sending FORGE_DONE. The FORGE_DONE callback must be a one-line summary only.
+
+End the fix-plan.md with two lines, exactly:
+  CONFIDENCE: HIGH/MEDIUM/LOW
+  BLOCKING_ITEMS: N
+
+CONFIDENCE rubric for this stage: "Has every CRITICAL and MAJOR from fix-review.md been cleared (addressed or contested with evidence)?" If yes → HIGH. If one or two have weak resolutions → MEDIUM. If reviewer's issues remain unaddressed → LOW.
+
+BLOCKING_ITEMS: count any review issues you could not resolve AND any new gaps you discovered during revision.
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/fix-plan.md (revised; N issues cleared)"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"
+
+Hard rules for this stage:
+- Read-only on source code. Output is the revised fix-plan.md only.
+- Do NOT re-investigate the bug. The diagnosis is the ground truth.
+- Do NOT silently drop a CRITICAL or MAJOR issue. Address it or explicitly contest it with cited evidence in the Review-clear matrix.
+- Do NOT expand scope beyond what the review demands. If the review didn't ask for X, don't add X — that creates new review surface area.
+- Do NOT type /clear yourself — the orchestrator drives clear.

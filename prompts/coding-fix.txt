@@ -1,0 +1,68 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'coding-fix' stage of a forge pipeline.
+
+Slug: {slug}
+
+This stage resolves QA findings produced by a prior `qa` stage. The QA report
+is at:
+
+  .dev/qa/{slug}/issues.md
+
+Coding-fix is NOT a from-scratch implementation — it is a targeted patch
+against the existing code on the current branch. The prior `coding` stage's
+report is at `.dev/proposals/{slug}/coder-report.md` if you need to see what
+was already committed.
+
+Follow the forge-coder skill at ~/.claude/skills/forge-coder/SKILL.md for the
+fix-application discipline (commit groups, validation gates, Definition of
+Done). The forge-coder phases adapt as follows:
+  - "Implementation doc" → read issues.md + final-plan.md + coder-report.md
+    + any orchestrator-written addendum at
+    `.dev/proposals/{slug}/coding-fix-addendum.md` (read it ONLY if it
+    exists; absence is fine).
+  - "Branch check" → confirm you are already on the correct feature branch
+    from the prior coding stage. Do NOT create a new branch.
+  - "Apply changes" → resolve findings per severity:
+      * critical / major: MUST resolve.
+      * minor: resolve by default; skipping requires a one-line rationale.
+      * advisory: out of scope; leave as-is.
+  - "Test each group" → standard.
+  - "Full validation" → standard.
+
+Stay strictly in scope: do NOT modify files unrelated to the QA findings.
+Honor every LOCKED constraint from the original final-plan.md (
+`.dev/proposals/{slug}/final-plan.md`).
+
+If `.dev/proposals/{slug}/coding-fix-addendum.md` exists with explicit
+fix-strategy guidance, follow it — that is the authoritative direction from
+the orchestrator over your own judgment.
+
+Report to:
+
+  .dev/proposals/{slug}/coding-fix-report.md
+
+Required sections:
+- Findings resolved (per-finding: how it was addressed, files touched)
+- Findings skipped with rationale (minor only)
+- Commits made (short hash + subject)
+- Files changed
+- Test results (pass/fail counts, which suites)
+- Definition of Done checklist
+- Open issues / deferred items
+- CONFIDENCE: HIGH/MEDIUM/LOW
+- BLOCKING_ITEMS: N
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/coding-fix-report.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{specific issue}"
+
+Do NOT type /clear yourself — the orchestrator drives clear.

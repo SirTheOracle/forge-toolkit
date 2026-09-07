@@ -1,0 +1,43 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'proposal' stage of a forge pipeline.
+
+Slug: {slug}
+
+Follow the adversarial-proposal skill at ~/.claude/skills/adversarial-proposal/SKILL.md
+
+The skill spawns 3 persistent teammates (Proposer A, Proposer B, Synthesizer C) across 4 rounds:
+  Round 1 — A and B investigate the problem independently with zero knowledge of each other
+  Round 2 — C reviews both proposals and synthesizes a unified plan
+  Round 3 — A and B critique C's synthesis from their original contexts
+  Round 4 — C reconciles into final-plan.md
+
+Inputs (READ ALL BEFORE PROPOSING):
+- .dev/proposals/{slug}/problem-statement.md (primary — contains user-locked decisions that are NOT up for debate)
+- Any source materials referenced in the problem statement (PDFs, design docs, etc.) — read these too
+
+Outputs (the skill produces all of these; do not skip any):
+- .dev/proposals/{slug}/proposal-A.md
+- .dev/proposals/{slug}/proposal-B.md
+- .dev/proposals/{slug}/synthesis.md
+- .dev/proposals/{slug}/review-for-A.md
+- .dev/proposals/{slug}/review-for-B.md
+- .dev/proposals/{slug}/reconciliation-notes.md
+- .dev/proposals/{slug}/final-plan.md (canonical artifact for downstream stages)
+
+Honor every "Hard constraint" and "Locked product decision" in problem-statement.md. Do not introduce alternatives or "what if we did X instead" detours for items the user has already locked. Locked decisions are constraints, not options.
+
+Investigate the existing codebase (read files via the file-reading tool) to ground the plan in real patterns — do not propose abstractions that don't exist. Specifically check the reference patterns listed in problem-statement.md.
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+BLOCKING_ITEMS: N
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "FORGE_DONE: proposal — see .dev/proposals/{slug}/final-plan.md"
+
+If blocked (genuine ambiguity not resolved by problem-statement.md):
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{specific question}"

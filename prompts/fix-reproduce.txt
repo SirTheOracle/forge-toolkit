@@ -1,0 +1,58 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'fix-reproduce' stage of a forge fix-pipeline.
+
+Slug: {slug}
+
+Follow the fix-reproducer skill at ~/.claude/skills/fix-reproducer/SKILL.md
+
+This is the OPTIONAL first stage. You verify a reported bug is reproducible and capture deterministic repro steps, environment state, and evidence. You are a single procedural executor — do NOT spawn sub-agents, do NOT diagnose root cause, do NOT propose fixes.
+
+Project config: .claude/forge-project.yml
+Problem statement: .dev/proposals/{slug}/problem-statement.md
+Original pipeline artifacts (read-only context, if --original-slug was set): .dev/proposals/{original-slug}/
+
+Read problem-statement.md. Branch by environment:
+- Dev path: actively try to trigger or observe the bug locally. Capture exact commands, inputs, environment, and output.
+- Prod path: gather observational evidence from the deployed environment. Do NOT perform write operations against production without explicit user confirmation during runtime.
+
+Always write .dev/proposals/{slug}/repro.md — even if NOT REPRODUCED. A documented negative result is itself input for the investigation stage.
+
+The repro.md MUST contain these sections (the investigation stage consumes them):
+- Status: REPRODUCED | NOT REPRODUCED | PARTIALLY REPRODUCED
+- Environment: env tag (dev / staging / prod), version/commit, OS, runtime, relevant config flags
+- Trigger: the exact steps / inputs / commands that produced the failure (or the closest you got)
+- Observed behavior: literal output, error messages, logs, screenshots paths
+- Expected behavior: what should have happened per the problem statement
+- Evidence: file paths, log excerpts, request IDs, timestamps
+- Initial Observations: strictly observational notes — no causal claims, no "the bug is in module X"
+- Confidence in determinism: HIGH (every attempt fails the same way) / MEDIUM (intermittent but the pattern is clear) / LOW (could not get a deterministic trigger)
+
+Hard scope rules:
+- Reproduce, do not diagnose. Capture what happens, not why. Causal claims belong to the investigation stage.
+- Always write repro.md even on NOT REPRODUCED. Mark Status accordingly.
+- Never perform write operations against production without explicit user confirmation. If a repro step would write production data, STOP and ask.
+- Environment is a first-class input. The env tag in repro.md must match what was actually used. Never silently fall back from prod to dev (or vice versa) without flagging it.
+- May read original pipeline artifacts for context. Read-only — never edit or write to anything under .dev/proposals/{original-slug}/.
+- Do NOT modify any source files. Output is repro.md only.
+- Do NOT type /clear yourself — the orchestrator drives clear.
+
+End the repro.md with two lines, exactly:
+  CONFIDENCE: HIGH/MEDIUM/LOW
+  BLOCKING_ITEMS: N
+
+CONFIDENCE rubric for this stage: "Could the investigation stage take this repro.md and start tracing causes immediately?" If yes → HIGH. If the repro is intermittent or partial but actionable → MEDIUM. If NOT REPRODUCED or no actionable evidence captured → LOW.
+
+BLOCKING_ITEMS: count any prerequisites the next stage needs that you couldn't produce (e.g., "need prod access to capture the failing request", "need user to provide the failing input").
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/repro.md"
+
+If blocked (cannot proceed without user input or missing access):
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{specific issue + what you need}"

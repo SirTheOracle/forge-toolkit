@@ -1,0 +1,65 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'fix-investigate' stage of a forge fix-pipeline.
+
+Slug: {slug}
+
+Follow the adversarial-investigate skill at ~/.claude/skills/adversarial-investigate/SKILL.md
+
+The skill spawns 3 persistent teammates (Investigator A forward-tracer, Investigator B backward-tracer, Synthesizer C) across 4 rounds:
+  Round 1 — A traces FORWARD from the bug trigger to the failure point; B traces BACKWARD from the failure point to the trigger. A and B work independently with zero knowledge of each other. Both have access to the same evidence (repro.md + problem-statement.md + codebase).
+  Round 2 — C reviews both hypotheses and synthesizes a unified diagnosis
+  Round 3 — A and B critique C's synthesis from their original contexts
+  Round 4 — C reconciles into diagnosis.md
+
+This stage produces a DIAGNOSIS, not a plan. Do NOT propose fixes. Do NOT write code. The fix-plan stage owns the patch design.
+
+Inputs (READ ALL BEFORE INVESTIGATING):
+- .dev/proposals/{slug}/problem-statement.md (original bug description and constraints)
+- .dev/proposals/{slug}/repro.md (REQUIRED if the reproduce stage ran; OPTIONAL otherwise — investigation falls back to problem-statement alone)
+- Original build pipeline artifacts (read-only context, if --original-slug was set): .dev/proposals/{original-slug}/
+
+Outputs (the skill produces all of these; do not skip any):
+- .dev/proposals/{slug}/investigation-A.md (forward-trace hypothesis)
+- .dev/proposals/{slug}/investigation-B.md (backward-trace hypothesis)
+- .dev/proposals/{slug}/diagnosis-synthesis.md
+- .dev/proposals/{slug}/diagnosis-review-for-A.md
+- .dev/proposals/{slug}/diagnosis-review-for-B.md
+- .dev/proposals/{slug}/diagnosis-reconciliation-notes.md
+- .dev/proposals/{slug}/diagnosis.md (canonical artifact for downstream stages)
+
+The final diagnosis.md MUST contain these sections (the fix-plan stage consumes them):
+- Verdict: CONVERGED | PARTIALLY CONVERGED | INSUFFICIENT EVIDENCE
+- Root Cause (1-paragraph statement of the diagnosed cause; for PARTIALLY CONVERGED list the converged-on subset; for INSUFFICIENT EVIDENCE state why)
+- Evidence Chain (ordered list of file:line citations + observed-behavior links that prove the cause)
+- Contributing Factors (related fragility / latent bugs that share root cause; for "Out-of-scope follow-ups")
+- Required Data (ONLY if INSUFFICIENT EVIDENCE — list what would resolve the ambiguity, marked `high` / `medium` / `low` priority)
+- Excluded Hypotheses (candidate causes A or B considered and ruled out, with the evidence that ruled them out)
+
+Investigate the existing codebase (read files via the Read tool) to ground every claim in real file:line citations — do not assert causes for symbols that don't exist. Cross-check repro.md trigger conditions against the actual code path.
+
+Hard rules for this stage:
+- Read-only on source code. Do NOT modify any source files. Output is diagnosis.md only.
+- Do NOT propose fixes. The fix-plan stage owns design. Note proposed-fix shapes only as "Out-of-scope follow-ups" in Contributing Factors.
+- INSUFFICIENT EVIDENCE is a legitimate exit — do not force a cause when the evidence doesn't support one. The orchestrator escalates this verdict to the user.
+- Do NOT type /clear yourself — the orchestrator drives clear.
+
+End the diagnosis.md with two lines, exactly:
+  CONFIDENCE: HIGH/MEDIUM/LOW
+  BLOCKING_ITEMS: N
+
+CONFIDENCE rubric for this stage: "Could the fix-plan stage take this diagnosis.md and design a patch with no further investigation?" If yes → HIGH. If PARTIALLY CONVERGED but the converged subset is actionable → MEDIUM. If INSUFFICIENT EVIDENCE → LOW.
+
+BLOCKING_ITEMS: count entries in Required Data (if any). 0 for CONVERGED, >0 for PARTIALLY CONVERGED or INSUFFICIENT EVIDENCE.
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/diagnosis.md"
+
+If blocked (cannot proceed; e.g., missing repro that's required for this bug class):
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{specific issue + what you need}"

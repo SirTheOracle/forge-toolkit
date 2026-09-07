@@ -367,6 +367,213 @@ printf '%s' "$_di_rev" | grep -q 'NOT declared in SKILL_NAMES' || _di_err="$_di_
   && ok "T-DRIFT-INVENTORY --check-drift reports declared-but-absent AND present-but-undeclared, and mutates nothing" \
   || bad "T-DRIFT-INVENTORY:$_di_err"
 
+# ---- 77a · stage-prompt vendoring: inventory, drift, synthetic preamble, render ----
+# All 29 stage prompts used to live ONLY in an untracked, machine-local, installer-
+# unmanaged directory: `git ls-files` returned 0 and install.sh managed none of them, so
+# a prompt edit could not be reviewed in a PR, reach a second machine, or be drift-
+# checked. 27 are now vendored under prompts/. `env-fix` and `qa-live-retry` are
+# deliberately NOT vendored (they embed another project's fixtures and a plaintext
+# credential — #79) and `_preamble` never can be (it is synthetic). Both exclusions are
+# pinned below so neither can be quietly undone.
+
+# T-PROMPT-INVENTORY · the three static inventory directions, plus both exclusions.
+python3 - "$ROOT" <<'PY' && ok "T-PROMPT-INVENTORY every stage prompt and include ships, the declared inventory agrees both ways, and both exclusions hold" || bad "T-PROMPT-INVENTORY (see above)"
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+errs = []
+
+def bash_array(text, name):
+    # `[^)]*`, not a `^\)` range: two of the three arrays are single-line, so anchoring
+    # the closing paren to a line start silently matches nothing and every downstream
+    # check degrades to a vacuous pass. None of these arrays contains a paren.
+    m = re.search(r'^%s=\(([^)]*)\)' % re.escape(name), text, re.S | re.M)
+    if not m:
+        return None
+    body = re.sub(r'#.*', '', m.group(1))
+    return set(re.findall(r'[A-Za-z_][A-Za-z0-9_-]*', body))
+
+inst = (root / "install.sh").read_text()
+declared    = bash_array(inst, "PROMPT_NAMES")
+synthetic   = bash_array(inst, "SYNTHETIC_PROMPTS")
+quarantined = bash_array(inst, "UNVENDORABLE_PROMPTS")
+for nm, val in (("PROMPT_NAMES", declared), ("SYNTHETIC_PROMPTS", synthetic),
+                ("UNVENDORABLE_PROMPTS", quarantined)):
+    if not val:
+        errs.append("install.sh: %s array not found or empty" % nm)
+declared, synthetic, quarantined = declared or set(), synthetic or set(), quarantined or set()
+
+pdir = root / "prompts"
+shipped = {p.stem for p in pdir.glob("*.txt")} if pdir.is_dir() else set()
+if not shipped:
+    errs.append("prompts/ ships no .txt files at all")
+
+# 1 — every stage bin/forge-watch can dispatch has a prompt, except the quarantined ones.
+watch = (root / "bin/forge-watch").read_text()
+m = re.search(r'^STAGE_SKILL = \{(.*?)^\}', watch, re.S | re.M)
+if not m:
+    errs.append("bin/forge-watch: STAGE_SKILL map not found")
+else:
+    stages = set(re.findall(r"'([a-z][a-z0-9-]*)'\s*:", m.group(1)))
+    if not stages:
+        errs.append("bin/forge-watch: STAGE_SKILL parsed empty")
+    for s in sorted(stages - quarantined):
+        if not (pdir / (s + ".txt")).is_file():
+            errs.append("STAGE_SKILL names stage '%s' but prompts/%s.txt does not exist "
+                        "(bin/forge-bridge renders that path on every dispatch)" % (s, s))
+
+# 2 — every include a vendored prompt asks for resolves inside prompts/. `_preamble` is
+# exempt BY NAME: resolve_include returns it before touching disk.
+INC = re.compile(r'<<<INCLUDE\s+(\S+?)\s*>>>')
+for p in sorted(pdir.glob("*.txt")):
+    for name in INC.findall(p.read_text()):
+        if name in synthetic:
+            continue
+        if not (pdir / (name + ".txt")).is_file():
+            errs.append("prompts/%s includes '%s' but prompts/%s.txt does not exist "
+                        "(the render would exit 2)" % (p.name, name, name))
+
+# 3 — declared inventory agrees with what ships, both ways.
+for s in sorted(shipped - declared):
+    errs.append("prompts/%s.txt ships but is absent from install.sh PROMPT_NAMES "
+                "(it would never install and never uninstall)" % s)
+for s in sorted(declared - shipped):
+    errs.append("install.sh PROMPT_NAMES declares '%s' but prompts/%s.txt does not exist" % (s, s))
+
+# 4 — both exclusions hold. A synthetic or quarantined prompt must never be vendored;
+# vendoring _preamble.txt would shadow the synthetic value and silently change every
+# prompt that includes it, and vendoring the other two would publish a credential to a
+# PUBLIC repo, which a `git revert` does not undo.
+for s in sorted((synthetic | quarantined) & shipped):
+    errs.append("prompts/%s.txt exists but %s is excluded by name in install.sh — "
+                "it must NOT be vendored" % (s, s))
+for s in sorted((synthetic | quarantined) & declared):
+    errs.append("install.sh PROMPT_NAMES declares '%s', which is on an exclusion list" % s)
+if not (synthetic & {"_preamble"}):
+    errs.append("install.sh SYNTHETIC_PROMPTS no longer excludes _preamble")
+if quarantined != {"env-fix", "qa-live-retry"}:
+    errs.append("install.sh UNVENDORABLE_PROMPTS changed from {env-fix, qa-live-retry} "
+                "to %s — if #79 is fixed, vendor them and update this test together"
+                % sorted(quarantined))
+
+for e in errs:
+    print("  T-PROMPT-INVENTORY: " + e, file=sys.stderr)
+sys.exit(1 if errs else 0)
+PY
+
+# T-PROMPT-DRIFT · both live directions under a SYNTHETIC HOME, mutating nothing real.
+_dp="$WORK/promptdrift"; mkdir -p "$_dp/.config/forge/prompts"
+_dp_env() { HOME="$_dp" FORGE_CONFIG_DIR="$_dp/.config/forge" ./install.sh --check-drift 2>&1; }
+_dp_err=""
+# Forward · declared-but-absent: nothing installed, so every declared prompt is reported.
+_dp_out="$(cd "$ROOT" && _dp_env || true)"
+_dp_declared="$(printf '%s' "$_dp_out" | grep -c 'prompts/.*— not installed' || true)"
+[ "$_dp_declared" -ge 27 ] || _dp_err="$_dp_err declared-but-absent-reported-only-$_dp_declared"
+# Reverse · present-but-undeclared: an untracked live .txt MUST be reported.
+printf 'probe\n' > "$_dp/.config/forge/prompts/driftprobe-tmp.txt"
+_dp_out="$(cd "$ROOT" && _dp_env || true)"
+printf '%s' "$_dp_out" | grep -q 'prompts/driftprobe-tmp.txt — present in the live prompts directory but NOT tracked' \
+  || _dp_err="$_dp_err live-undeclared-silent"
+# The exclusion (#79): both quarantined files, planted live, must NOT be reported at all.
+# Without this the drift report names them on every run forever, which is why they are
+# excluded BY NAME rather than by a glob.
+printf 'x\n' > "$_dp/.config/forge/prompts/env-fix.txt"
+printf 'x\n' > "$_dp/.config/forge/prompts/qa-live-retry.txt"
+_dp_out="$(cd "$ROOT" && _dp_env || true)"
+printf '%s' "$_dp_out" | grep -qE 'prompts/(env-fix|qa-live-retry)\.txt' \
+  && _dp_err="$_dp_err quarantined-pair-reported"
+# And they must not have been vendored in the first place.
+for _q in env-fix qa-live-retry; do
+  [ -f "$ROOT/prompts/$_q.txt" ] && _dp_err="$_dp_err vendored-$_q"
+done
+[ -f "$ROOT/prompts/_preamble.txt" ] && _dp_err="$_dp_err vendored-_preamble"
+# Reverse (repo) · a prompts/*.txt absent from PROMPT_NAMES MUST be reported: a new
+# unmanaged prompt cannot be allowed to pass silently. NOT a dot-name — `prompts/*.txt`
+# is a plain glob and bash leaves dotglob OFF, so a dot-file would be invisible to the
+# very loop under test and the probe would pass vacuously.
+printf 'probe\n' > "$ROOT/prompts/driftprobe-tmp.txt"
+_dp_out="$(cd "$ROOT" && _dp_env || true)"
+rm -f "$ROOT/prompts/driftprobe-tmp.txt"
+printf '%s' "$_dp_out" | grep -q 'prompts/driftprobe-tmp.txt — present in the repo but NOT declared in PROMPT_NAMES' \
+  || _dp_err="$_dp_err repo-undeclared-silent"
+# --check-drift is READ-ONLY: it must not add, remove or alter anything under the
+# synthetic HOME. Compare a full manifest, not just emptiness — files were planted above.
+_dp_before="$WORK/promptdrift-before.txt"; _dp_after="$WORK/promptdrift-after.txt"
+( cd "$_dp" && find . -type f -exec cksum {} \; | sort ) > "$_dp_before"
+_dp_out="$(cd "$ROOT" && _dp_env || true)"
+( cd "$_dp" && find . -type f -exec cksum {} \; | sort ) > "$_dp_after"
+cmp -s "$_dp_before" "$_dp_after" || _dp_err="$_dp_err check-drift-mutated-HOME"
+[ -z "$_dp_err" ] \
+  && ok "T-PROMPT-DRIFT --check-drift reports declared-but-absent, live-undeclared and repo-undeclared, stays silent on the #79 pair, and mutates nothing" \
+  || bad "T-PROMPT-DRIFT:$_dp_err"
+
+# The two renderer tests below drive the REAL renderer out of bin/forge-bridge via the
+# FNS extraction idiom, so they cannot drift from the shipped code. dispatch --dry-run is
+# not usable here: it refuses on session identity outside a forge pane.
+PFNS="$WORK/prompt-fns.sh"
+sed -n '/^_render_preamble()/,/^}$/p; /^_render_template()/,/^}$/p' "$BRIDGE" > "$PFNS"
+bash -n "$PFNS" && ok "T-PROMPT-EXTRACT renderer extraction parses" || bad "T-PROMPT-EXTRACT renderer extraction does not parse"
+# shellcheck disable=SC1090
+. "$PFNS"
+_pr_root="$WORK/prompt-root"; mkdir -p "$_pr_root/.claude"
+cat > "$_pr_root/.claude/forge-project.yml" <<'YML'
+project:
+  name: promptprobe
+services:
+  backend:
+    working_dir: "."
+    port: 8123
+YML
+
+# T-PROMPT-PREAMBLE · _preamble stays synthetic, and an ordinary miss still fails closed.
+_pp_err=""
+FORGE_PROMPTS_DIR="$ROOT/prompts"
+_pp_tmpl="$WORK/pp-tmpl.txt"; printf '<<<INCLUDE _preamble>>>\nBODY {slug}\n' > "$_pp_tmpl"
+_pp_out="$(_render_template "$_pp_tmpl" pp-slug coding claude-opus 1 "$_pr_root" 2>&1)"; _pp_rc=$?
+[ "$_pp_rc" -eq 0 ] || _pp_err="$_pp_err preamble-render-rc=$_pp_rc"
+# The preamble is GENERATED from forge-project.yml, so its content proves the synthetic
+# path ran — no _preamble.txt exists anywhere for it to have been read from.
+printf '%s' "$_pp_out" | grep -q 'Environment setup (run before any other commands)' \
+  || _pp_err="$_pp_err preamble-text-missing"
+printf '%s' "$_pp_out" | grep -q "Working directory: $_pr_root" || _pp_err="$_pp_err preamble-not-project-specific"
+printf '%s' "$_pp_out" | grep -q 'Backend port: 8123' || _pp_err="$_pp_err preamble-not-from-yml"
+[ -f "$ROOT/prompts/_preamble.txt" ] && _pp_err="$_pp_err _preamble.txt-exists"
+# An ORDINARY missing include must still fail closed: stderr message + exit 2. This is the
+# behaviour C4 forbids vendoring from changing.
+_pp_miss="$WORK/pp-miss.txt"; printf '<<<INCLUDE _no_such_include>>>\n' > "$_pp_miss"
+_pp_mout="$(_render_template "$_pp_miss" pp-slug coding claude-opus 1 "$_pr_root" 2>&1)"; _pp_mrc=$?
+[ "$_pp_mrc" -eq 2 ] || _pp_err="$_pp_err missing-include-rc=$_pp_mrc-not-2"
+printf '%s' "$_pp_mout" | grep -q 'ERROR: include not found: _no_such_include' \
+  || _pp_err="$_pp_err missing-include-message-changed"
+[ -z "$_pp_err" ] \
+  && ok "T-PROMPT-PREAMBLE _preamble still resolves synthetically from forge-project.yml, and an ordinary missing include still exits 2" \
+  || bad "T-PROMPT-PREAMBLE:$_pp_err"
+
+# T-PROMPT-RENDER · vendoring is self-contained and changed no rendered byte.
+_prr_err=""; _prr_n=0
+for _t in "$ROOT"/prompts/*.txt; do
+  [ -f "$_t" ] || continue
+  _prr_n=$((_prr_n+1))
+  FORGE_PROMPTS_DIR="$ROOT/prompts"
+  _prr_a="$(_render_template "$_t" rslug coding claude-opus 1 "$_pr_root" 2>/dev/null)" \
+    || { _prr_err="$_prr_err render-failed:$(basename "$_t")"; continue; }
+  # Deterministic: same inputs, same bytes.
+  _prr_b="$(_render_template "$_t" rslug coding claude-opus 1 "$_pr_root" 2>/dev/null)"
+  [ "$_prr_a" = "$_prr_b" ] || _prr_err="$_prr_err nondeterministic:$(basename "$_t")"
+  # Byte-identical BEFORE vs AFTER vendoring: render the same stage from the live
+  # directory the prompts were vendored out of. Skipped on a machine that has none
+  # (fresh clone), which is why the self-containment half above carries no such guard.
+  _prr_live="$HOME/.config/forge/prompts/$(basename "$_t")"
+  if [ -f "$_prr_live" ]; then
+    FORGE_PROMPTS_DIR="$HOME/.config/forge/prompts"
+    _prr_c="$(_render_template "$_prr_live" rslug coding claude-opus 1 "$_pr_root" 2>/dev/null)"
+    [ "$_prr_a" = "$_prr_c" ] || _prr_err="$_prr_err live-differs:$(basename "$_t")"
+  fi
+done
+[ "$_prr_n" -ge 27 ] || _prr_err="$_prr_err rendered-only-$_prr_n-prompts"
+[ -z "$_prr_err" ] \
+  && ok "T-PROMPT-RENDER all $_prr_n vendored prompts render from prompts/ alone, deterministically and byte-identically to the live originals" \
+  || bad "T-PROMPT-RENDER:$_prr_err"
+
 # ---- Real-tmux section ----
 if ! command -v tmux >/dev/null 2>&1; then
     echo "SKIP: tmux unavailable — real-tmux identity tests skipped"

@@ -1,0 +1,38 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'coding' stage of a forge pipeline.
+
+Slug: {slug}
+
+Follow the forge-coder skill at ~/.claude/skills/forge-coder/SKILL.md
+Project config: .claude/forge-project.yml
+Implementation doc: .dev/proposals/{slug}/implementation.md
+
+Execute all phases: validation → branch check → apply changes →
+test each group → full validation → report.
+
+Write coder-report.md to .dev/proposals/{slug}/
+
+Report in .dev/proposals/{slug}/coder-report.md:
+- Commit groups applied (N of M)
+- Tests: pass/fail per group
+- Full validation results
+- Any diffs that failed to apply
+- Files changed
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+BLOCKING_ITEMS: N
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/coder-report.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"
+
+Do NOT type /clear yourself — the orchestrator drives clear.

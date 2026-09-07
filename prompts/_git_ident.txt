@@ -1,0 +1,5 @@
+Before any commit in this dispatch, set the repo-local ident:
+  git -C "$PROJECT_ROOT" config user.name  "{worker} (forge pane {worker_pane})"
+  git -C "$PROJECT_ROOT" config user.email "{worker}@forge.local"
+
+DO NOT run `git config --global` or `git config --add`.

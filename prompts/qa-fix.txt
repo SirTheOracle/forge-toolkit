@@ -1,0 +1,32 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+Write your final report to .dev/qa/{slug}/qa-fix-report.md BEFORE sending FORGE_DONE. The FORGE_DONE callback must be a one-line summary only; the digest agent reads the report file from disk.
+
+QA findings to resolve are in .dev/qa/{slug}/issues.md.
+Severity rules:
+  - critical / major: resolve, must be fixed
+  - minor: resolve by default; skip an individual minor finding
+    only with a one-line rationale captured in your report
+  - advisory: out of scope for this loop, leave as-is
+
+In .dev/qa/{slug}/qa-fix-report.md, report:
+- Findings resolved (list)
+- Findings skipped with rationale (list, minor only)
+- Files changed
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+BLOCKING_ITEMS: N
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/qa/{slug}/qa-fix-report.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"
+
+Do NOT type /clear yourself — the orchestrator drives clear.

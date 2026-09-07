@@ -1,0 +1,24 @@
+SCOPE DIFF CHECK (load-bearing — do not skip):
+The problem statement defines what the feature is allowed to change.
+The implementation MUST NOT silently expand it. For every file
+modified in implementation.md:
+1. Determine which code paths/flows that file participates in. Use
+   grep to find callers if it is a helper.
+2. Classify each touched code path:
+   (a) IN-SCOPE — explicitly named in the problem statement, OR an
+       unavoidable consequence of an in-scope change.
+   (b) OUT-OF-SCOPE — touches a flow the problem statement does
+       NOT ask to change (standard generation passes, batch flows,
+       auto-build, the background poller, unrelated stages, OR any
+       "non-goal" the problem statement explicitly lists).
+   (c) SHARED HELPER — a function/list/enum the implementation
+       extends that has callers outside the feature scope. For
+       these, enumerate every caller via grep and classify each
+       caller as IN or OUT of scope.
+3. For each OUT-OF-SCOPE touch, ask: "Is this strictly necessary
+   or incidental scope-creep?" Only the former is acceptable.
+4. For each SHARED HELPER extension: the safe pattern is to ADD a
+   NEW helper for the new use case rather than extend the existing
+   one. Flag any case where a shared helper is extended without
+   confirming every existing caller still gets the original
+   semantic and behavior.

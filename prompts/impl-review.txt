@@ -1,0 +1,45 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+Write your final report to .dev/proposals/{slug}/impl-review.md BEFORE sending FORGE_DONE. The FORGE_DONE callback must be a one-line summary only; the digest agent reads the report file from disk.
+
+Review .dev/proposals/{slug}/implementation.md against
+.dev/proposals/{slug}/final-plan.md AND
+.dev/proposals/{slug}/problem-statement.md
+
+Check:
+- Every plan item has a corresponding implementation step
+- Coverage matrix has no GAPs
+- Diffs reference correct file paths and function signatures
+- Test specs cover the plan's acceptance criteria
+- Commit groups are ordered correctly (migrations before code, etc.)
+
+<<<INCLUDE _scope_diff_check>>>
+
+In .dev/proposals/{slug}/impl-review.md, report:
+- Plan items covered vs missed
+- Coverage matrix status
+- Issues found (blocking vs advisory)
+- SCOPE DIFF section: list every OUT-OF-SCOPE touch and every
+  SHARED HELPER extension with full caller analysis. Mark each
+  ACCEPTABLE / NEEDS-REWORK with one-line reasoning.
+- Recommendation: proceed / fix needed
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+BLOCKING_ITEMS: N
+  (Out-of-scope touches without strict necessity, AND shared-helper
+  extensions where any out-of-scope caller would change behavior,
+  count as BLOCKING.)
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/impl-review.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"
+
+Do NOT type /clear yourself — the orchestrator drives clear.

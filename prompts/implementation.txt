@@ -1,0 +1,36 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+You are executing the 'implementation' stage of a forge pipeline.
+
+Slug: {slug}
+
+Follow the adversarial-implementation skill at ~/.codex/skills/adversarial-implementation/SKILL.md
+
+Inputs:
+- .dev/proposals/{slug}/final-plan.md (the source plan)
+- .dev/proposals/{slug}/problem-statement.md (scope guardrails)
+
+Output: .dev/proposals/{slug}/implementation.md
+
+Produce a vetted implementation document with:
+- Exact code diffs (old_string → new_string blocks) per file
+- Commit groups in the order they should be applied (migrations before code, etc.)
+- Test specifications for every plan item
+- A coverage matrix proving every plan item is addressed (no GAPs)
+- Riskiest changes called out
+
+Stay strictly inside the problem statement's scope. Do not silently expand to
+adjacent flows that the plan does not name.
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+BLOCKING_ITEMS: N
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "see .dev/proposals/{slug}/implementation.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"

@@ -1,0 +1,31 @@
+<<<INCLUDE _preamble>>>
+
+<<<INCLUDE _git_ident>>>
+
+<<<INCLUDE _ask_escalation>>>
+
+Note: this skill refers to "lead" — in forge usage, "lead" = the orchestrator in pane 1.
+
+Follow adversarial-verify skill at
+~/.claude/skills/adversarial-verify/SKILL.md
+Slug: {slug}
+Project config: .claude/forge-project.yml
+Manifest: .dev/qa/{slug}/manifest.yaml
+
+Write `.dev/qa/{slug}/verification-report.yaml`.
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+BLOCKING_ITEMS: N
+
+When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "CLEAR"
+  or
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
+    --message "ISSUES_REMAIN"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
+    --message "{issue}"
+
+Do NOT type /clear yourself — the orchestrator drives clear.
