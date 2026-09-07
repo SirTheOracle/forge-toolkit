@@ -178,6 +178,18 @@ rm -f "$rootD/.dev/.forge-session"
 #   preflight, `_worker_open_pending_ts` (which feeds the FAIL-CLOSED reset scan AND the
 #   worker-scoped dispatch guard), `_parked_pending_select`, and `_sup_pendings`.
 #
+#   R3 (fix-plan §R3-1/§R3-2) MOVED ONE, it did not remove one — the count is still 11.
+#   `_sup_pendings` is no longer a reader of this class: its normalisation was REVERTED
+#   because it repaired no shape the producer can mint (`:418` stamps the incarnation
+#   unconditionally while `:417` charset-gates the session, so a live `unknown` row always
+#   carries a NON-empty incarnation and was never selected either way) and because it made
+#   `--supersede` hard-refuse whenever a legacy row merely COEXISTED with a pending the
+#   actor owned — one poisoning row aborting the whole selection through the selector's
+#   GLOBAL `mixed` flag (QA MAJ-1). It is now class (d) below. The eleventh marker moved to
+#   the R3-2 legacy-pending diagnostic in cmd_dispatch, which reads the same field, treats
+#   `unknown` as empty in the same way, and is the surface that now tells the operator
+#   which rows `--supersede` is leaving open.
+#
 #   CALLBACK BINDERS (5).  Strict equality with NO truthiness short-circuit. They tie
 #   ONE callback to ONE specific pending. They are NOT legacy filters and MUST NOT be
 #   normalised: doing so alters callback-admission semantics. A change that greps for
@@ -194,7 +206,12 @@ rm -f "$rootD/.dev/.forge-session"
 #     (b) a strict callback BINDER — the `str(...) ==` / `!=` form above; or
 #     (c) the ONE deliberate truthiness exclusion, in
 #         `_callback_selected_pending_superseded`: `str(e.get('session') or '') and …`,
-#         which carries no equality operator and is neither reader nor binder.
+#         which carries no equality operator and is neither reader nor binder; or
+#     (d) the ONE deliberate NON-normalisation, `_sup_pendings` (fix-plan §R3-1). Keyed on
+#         a literal unique to that heredoc — `supersede is restricted to one owned open
+#         pending` — and NOT on the read line's shape, because `_parked_pending_select`
+#         carries a byte-identical read line and MUST keep failing if its own marker is
+#         ever removed. Check (a) runs first, so a marked site can never fall through here.
 #   Anything else FAILS, naming the bin/forge-bridge line. A row is bound to `e` or
 #   `entry` at every site; `hdr.get` / `cb.get` / `doc.get` / `d.get` / `h.get` / `r.get`
 #   read callback headers, journal docs and lock holders — not rows — and are out of
@@ -207,12 +224,13 @@ for _sl_n in $(grep -nE "(^|[^A-Za-z0-9_])(e|entry)\.get\([\"']session[\"']" "$B
     printf '%s\n' "$_sl_src" | grep -qE "str\((e|cb)\.get\('session'\) or ''\) *[!=]=" && continue   # (b) binder
     printf '%s\n' "$_sl_src" | grep -qF "str(e.get('session') or '') and " && continue               # (c) listed exclusion
     sed -n "${_sl_n},$((_sl_n+2))p" "$BRIDGE" | grep -q '# LEGACY-SENTINEL' && continue              # (a) normalised
+    sed -n "${_sl_n},$((_sl_n+10))p" "$BRIDGE" | grep -qF 'supersede is restricted to one owned open pending' && continue  # (d) _sup_pendings
     _sl_unclassified="$_sl_unclassified $_sl_n"
 done
 if [ "$_sl_norm" = 11 ] && [ "$_sl_bind" = 5 ] && [ -z "$_sl_unclassified" ]; then
-    ok "T-SESSION-LOCKSTEP every row-session reader is normalised, a binder, or the one listed exclusion (11 markers / 5 binders)"
+    ok "T-SESSION-LOCKSTEP every row-session reader is normalised, a binder, or one of the two listed exclusions (11 markers / 5 binders)"
 else
-    bad "T-SESSION-LOCKSTEP normalisers=$_sl_norm (want 11) binders=$_sl_bind (want 5) UNCLASSIFIED readers at bin/forge-bridge lines:${_sl_unclassified:- none}. The classes are NOT interchangeable: legacy-permissive READERS must treat 'unknown' as empty (cmd_log stamps it); the 5 callback BINDERS bind one callback to one pending by strict equality and must NEVER be normalised. Added a reader? Mark its normalisation '# LEGACY-SENTINEL' and bump 11. Added a binder? Bump 5. Deliberately excluding a site? Add it to class (c) above WITH a comment saying why. Do not 'fix them all'."
+    bad "T-SESSION-LOCKSTEP normalisers=$_sl_norm (want 11) binders=$_sl_bind (want 5) UNCLASSIFIED readers at bin/forge-bridge lines:${_sl_unclassified:- none}. The classes are NOT interchangeable: legacy-permissive READERS must treat 'unknown' as empty (cmd_log stamps it); the 5 callback BINDERS bind one callback to one pending by strict equality and must NEVER be normalised. Added a reader? Mark its normalisation '# LEGACY-SENTINEL' and bump 11. Added a binder? Bump 5. Deliberately excluding a site? Add it to class (c)/(d) above WITH a comment saying why. Do not 'fix them all'."
 fi
 
 # ---- C2 · T-CWD-DOC: the withdrawn cwd-independence promise (source + help scan) ----
@@ -402,6 +420,20 @@ run_in_pane(){
 }
 rc_of(){ sed -n 's/^DONE_//p' "$WORK/out.$1" | tail -1; }
 out_of(){ cat "$WORK/out.$1"; }
+# row_state <pipeline-log> <stage> -> `open` | `closed:<response>` | `rows=<n>` | `parse-error`
+# R3: every --supersede assertion below re-reads forge-log.yml and asserts on the ROW, never
+# on rc alone — R2's own charge against round 1. rc is not enough post-R3 for a second reason:
+# a --supersede over a legacy row is now a legitimate rc-0 dispatch that ADDS a replacement
+# pending, so a bare `grep 'response: null'` would match the wrong row.
+row_state(){ python3 - "$1" "$2" <<'RSPY'
+import sys,yaml
+try: entries=(yaml.safe_load(open(sys.argv[1])) or {}).get('entries') or []
+except Exception: print('parse-error'); sys.exit(0)
+rows=[e for e in entries if isinstance(e,dict) and str(e.get('stage') or '')==sys.argv[2]]
+if len(rows)!=1: print('rows=%d' % len(rows)); sys.exit(0)
+print('open' if rows[0].get('response') is None else 'closed:%s' % rows[0].get('response'))
+RSPY
+}
 
 # T-ID-INPANE
 run_in_pane "$S1:0.0" inpane "FORGE_WATCH_TRIGGER=0 $BRIDGE identity"
@@ -893,6 +925,50 @@ if [ "$(rc_of d1sup-dispatch)" = 0 ] \
 else bad "T-D1-SUPERSEDE-ARCHIVE (ask not archived on supersede)"; fi
 guard_done d1sup adhoc codex-b 4 d1sup-clean || bad "D1-SUP close replacement"
 guard_require_clean "T-GUARD-HYGIENE-D1SUP" || exit 1
+
+# T-UNK-SUPERSEDE-COEXIST (fix-plan §R3-4 bullet 2) — the MAJ-1 case NO test covered.
+# R2 normalised `unknown` -> '' inside _sup_pendings. With actor_i non-empty that made a
+# legacy row satisfy `elif not ei and (not es or es==actor_s)` -> mixed=True -> exit 2. The
+# `mixed` flag is GLOBAL and is tested BEFORE `owned` is ever consulted, so ONE poisoning
+# row aborted the ENTIRE selection — including the pending the actor genuinely owned. A
+# documented terminal action (skills/forge-orchestrator/SKILL.md:722/:731/:1503,
+# docs/forge-operator-guide.md:714) began refusing on the exact log shape this fix targets,
+# naming no row, no stage, no timestamp and no recovery. §R3-1 reverted that normalisation
+# and §R3-2 put the naming in an ADDITIVE per-row diagnostic instead. This test pins the
+# restored contract in all four parts at once, so "fix them all" cannot re-break it:
+#   owned row CLOSED · legacy row NOT closed · the warning NAMES the legacy row · rc 0.
+# The legacy row carries an EMPTY incarnation on purpose (QA MIN-3): that column is still
+# live — the no-tmux unique-root-candidate arm mints it — and it is the exact shape MAJ-1
+# affected. The producer-realistic non-empty column is T-UNK-SUPERSEDE-REFUSES's job.
+COEXLOG="$GROOT/.dev/proposals/coexist/forge-log.yml"
+guard_block coexist coding codex-a 3 coexist || bad "COEXIST setup"
+cat >> "$COEXLOG" <<'EOF'
+
+  - timestamp: "2026-07-01T00:00:00Z"
+    stage: fix-code
+    from: claude
+    to: claude-opus
+    session: unknown
+    incarnation:
+    prompt: "legacy"
+    response: null
+    files: []
+EOF
+run_in_pane "$GS:0.0" coexist-dispatch "( cd $GROOT && FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_WORKER_HYGIENE_MODE=observe $BRIDGE dispatch --slug coexist --stage adhoc --worker codex-b --supersede )"
+COEX_OWNED="$(row_state "$COEXLOG" coding)"; COEX_LEGACY="$(row_state "$COEXLOG" fix-code)"
+if [ "$(rc_of coexist-dispatch)" = 0 ] \
+   && case "$COEX_OWNED" in closed:FORGE_SUPERSEDED*) true ;; *) false ;; esac \
+   && [ "$COEX_LEGACY" = open ] \
+   && out_of coexist-dispatch | grep -q 'WARN: --supersede does NOT close the legacy-identity pending coexist/fix-code' \
+   && out_of coexist-dispatch | grep -q 'log-response --slug coexist --to claude-opus --stage fix-code'; then
+    ok "T-UNK-SUPERSEDE-COEXIST the owned pending IS closed, the coexisting legacy 'unknown' row is NOT, the warning names it, rc 0"
+else bad "T-UNK-SUPERSEDE-COEXIST rc=$(rc_of coexist-dispatch) owned=[$COEX_OWNED] legacy=[$COEX_LEGACY] $(out_of coexist-dispatch | tr '\n' ' ')"; fi
+run_in_pane "$GS:0.0" coexist-recover "( cd $GROOT && FORGE_WATCH_TRIGGER=0 $BRIDGE log-response --slug coexist --to claude-opus --stage fix-code --response done )"
+[ "$(rc_of coexist-recover)" = 0 ] && [ "$(row_state "$COEXLOG" fix-code)" = "closed:done" ] \
+    && ok "T-UNK-SUPERSEDE-COEXIST the named recovery works: log-response closes the legacy row --supersede left open" \
+    || bad "T-UNK-SUPERSEDE-COEXIST recovery rc=$(rc_of coexist-recover) legacy=$(row_state "$COEXLOG" fix-code)"
+guard_done coexist adhoc codex-b 4 coexist-clean || bad "COEXIST close replacement"
+guard_require_clean "T-GUARD-HYGIENE-COEXIST" || exit 1
 
 mkdir -p "$GROOT/.dev/proposals/b15-fail"
 cat > "$GROOT/.dev/proposals/b15-fail/forge-log.yml" <<EOF
@@ -4984,6 +5060,12 @@ if command -v tmux >/dev/null 2>&1; then
   DS="fbunk-$$"; UNKR="$(mkR unkroot)"
   mk_session "$DS" 220 50 "$UNKR"
   sleep 1
+  # DSINC: this session's own `session_created`. The producer stamps exactly this value
+  # into a row's `incarnation:` at the same moment it stamps `session: unknown`
+  # (bin/forge-bridge:418 is unconditional; :417 charset-gates the name), and tmux
+  # PRESERVES session_created across `rename-session` — which is the diagnosis's own
+  # rename-transition, and the identity shape QA measured for CRIT-1.
+  DSINC="$(tmux display-message -p -t "$DS:0.0" '#{session_created}')"
   UNKENV="FORGE_WATCH_TRIGGER=0 FORGE_WORKER_HYGIENE_MODE=observe"
 
   # unk_fixture <slug> <session-value> [to] — ONE pending row, response: null, in BOTH
@@ -4992,11 +5074,23 @@ if command -v tmux >/dev/null 2>&1; then
   # DELIBERATELY: these model the "pre-2026-07-11 fixture row read by today's binary"
   # transition the diagnosis names, and a row that went through cmd_log could not carry
   # an arbitrary session value anyway.
+  # R3/QA MIN-3: the 4th argument is the row's `incarnation:`, defaulting to EMPTY.
+  # BOTH columns are live and BOTH are covered, which is why this is a parameter and not a
+  # replacement. EMPTY is the legacy shape the diagnosis and problem-statement are about —
+  # still mintable today by the no-tmux unique-root-candidate arm — and it is the shape QA
+  # MAJ-1 turned into a hard refusal. NON-EMPTY is the only shape the diagnosed producer can
+  # emit: `bin/forge-bridge:418` stamps ID_host_incarnation unconditionally while `:417`
+  # charset-gates ID_host_session, so a live `session: unknown` row always carries an
+  # incarnation. R2's central supersede test asserted against the shape the binary CANNOT
+  # mint, which is how CRIT-1 survived two rounds green.
+  # With no 4th argument the emitted bytes are UNCHANGED, so every T-UNK-* fixture below
+  # that predates R3 is byte-identical to R2's.
   unk_fixture(){
-    local slug="$1" sess="$2" to="${3:-claude-opus}"
+    local slug="$1" sess="$2" to="${3:-claude-opus}" inc="${4:-}" incval=""
+    [ -n "$inc" ] && incval=" \"$inc\""
     mkdir -p "$UNKR/.dev/proposals/$slug"
-    printf 'entries:\n\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: fix-code\n    from: claude\n    to: %s\n    session: %s\n    incarnation:\n    prompt: "p"\n    response: null\n    files: []\n' "$to" "$sess" > "$UNKR/.dev/proposals/$slug/forge-log.yml"
-    printf 'entries:\n\n  - timestamp: "2026-07-01T00:00:00Z"\n    pipeline: %s\n    stage: fix-code\n    from: claude\n    to: %s\n    session: %s\n    incarnation:\n    response: null\n' "$slug" "$to" "$sess" > "$UNKR/.dev/forge-log.yml"
+    printf 'entries:\n\n  - timestamp: "2026-07-01T00:00:00Z"\n    stage: fix-code\n    from: claude\n    to: %s\n    session: %s\n    incarnation:%s\n    prompt: "p"\n    response: null\n    files: []\n' "$to" "$sess" "$incval" > "$UNKR/.dev/proposals/$slug/forge-log.yml"
+    printf 'entries:\n\n  - timestamp: "2026-07-01T00:00:00Z"\n    pipeline: %s\n    stage: fix-code\n    from: claude\n    to: %s\n    session: %s\n    incarnation:%s\n    response: null\n' "$slug" "$to" "$sess" "$incval" > "$UNKR/.dev/forge-log.yml"
   }
 
   # ── T-UNK-HOOK ─────────────────────────────────────────────────────────────────
@@ -5091,32 +5185,55 @@ if command -v tmux >/dev/null 2>&1; then
     && out_of unkorph | grep -q "slug 'unkorph' has 1 open pending"; } \
     && ok "T-UNK-ORPHAN the orphan guard now SEES an unknown-session pending and refuses" \
     || bad "T-UNK-ORPHAN rc=$(rc_of unkorph) $(out_of unkorph | tr '\n' ' ')"
-  # ── T-UNK-SUPERSEDE-REFUSES (R2-1) ─────────────────────────────────────────────
-  # RENAMED from "T-UNK-ORPHAN --supersede closes the unknown-session pending", which
-  # asserted rc=0 and NOTHING ELSE while its label claimed a close: it measured PROCEEDS
-  # and reported CLOSES. Pre-R2 the run returned rc 0, printed DISPATCHED, closed nothing
-  # and left TWO open pendings — a green test certifying a fiction.
+  # ── T-UNK-SUPERSEDE-REFUSES (fix-plan §R3-2 / §R3-4; was R2-1) ─────────────────
+  # LINEAGE, so the next round does not re-break it. Round 1 asserted rc=0 and NOTHING ELSE
+  # under a label claiming a close: it measured PROCEEDS and reported CLOSES. R2 rewrote it
+  # to assert a LOUD rc-1 refusal — and was green, against a fixture the binary CANNOT MINT
+  # (empty `incarnation:` alongside `session: unknown`). R2's normalisation only ever fired
+  # on that unmintable shape, so on the REAL shape nothing changed: rc 0, DISPATCHED, row
+  # still open, and SILENT (QA CRIT-1 — round-1 A-1 verbatim). Two rounds and a plan review
+  # passed over it because the test never exercised the producer's own output.
   #
-  # Post-R2 contract (fix-plan §R2-1, DECIDED BY THE RUNNER — do not re-litigate):
-  # `--supersede` selects only pendings the acting session+incarnation OWNS. A normalised
-  # `unknown` row is legacy, therefore UNOWNED, so the attempt must FAIL CLOSED and
-  # LOUDLY — it must neither close the row nor dispatch over it. `log-response` is the
-  # recovery (already named at the guard's own :5470), and it works. Both halves are
-  # asserted, and both re-read forge-log.yml and assert on `response:` — never on rc alone.
-  UNKORPHLOG="$UNKR/.dev/proposals/unkorph/forge-log.yml"
-  run_in_pane "$DS:0.0" unkorph2 "( cd $UNKR && $UNKENV FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug unkorph --stage adhoc --worker codex-b --supersede )"
-  { [ "$(rc_of unkorph2)" = 1 ] \
-    && out_of unkorph2 | grep -q 'ERROR: --supersede could not select owned pendings' \
-    && grep -q '^    response: null$' "$UNKORPHLOG"; } \
-    && ok "T-UNK-SUPERSEDE-REFUSES --supersede refuses an UNOWNED (legacy 'unknown') pending and leaves it OPEN" \
-    || bad "T-UNK-SUPERSEDE-REFUSES rc=$(rc_of unkorph2) still_open=$(grep -c '^    response: null$' "$UNKORPHLOG") $(out_of unkorph2 | tr '\n' ' ')"
-  run_in_pane "$DS:0.0" unkorph3 "( cd $UNKR && $UNKENV $BRIDGE log-response --slug unkorph --to claude-opus --stage fix-code --response done )"
-  { [ "$(rc_of unkorph3)" = 0 ] \
-    && ! out_of unkorph3 | grep -q 'ERR_NO_MATCH' \
-    && ! grep -q '^    response: null$' "$UNKORPHLOG" \
-    && grep -q 'response: "done"' "$UNKORPHLOG"; } \
-    && ok "T-UNK-SUPERSEDE-REFUSES log-response IS the recovery: it closes the unknown-session row" \
-    || bad "T-UNK-SUPERSEDE-REFUSES recovery rc=$(rc_of unkorph3) rows=[$(sed -n 's/^    \(response:.*\)$/\1/p' "$UNKORPHLOG" | tr '\n' ' ')] $(out_of unkorph3 | tr '\n' ' ')"
+  # Post-R3 contract, on the PRODUCER-REALISTIC row (`session: unknown` + NON-empty
+  # `incarnation:`): `--supersede` still does not close a legacy row — that half of R2-1
+  # stands, and §R3-1 restored the selector byte-for-byte — but it is no longer SILENT. The
+  # §R3-2 diagnostic names the row (stage, worker, session, timestamp) and names
+  # `log-response` as the recovery, and `log-response` then really does close it.
+  #
+  # NO rc ASSERTION ON THE DISPATCH, deliberately: post-R3 this is a legitimate rc-0
+  # dispatch whose later stages (render / infra-lock / lane) are not what this test is
+  # about, and the §R3-2 warning is emitted before all of them. The rc-0 contract is
+  # asserted by T-UNK-SUPERSEDE-COEXIST instead, in the guard environment where a full
+  # --supersede dispatch is already proven green. Both halves here assert on the ROW, via
+  # row_state, never on rc alone — and row_state is stage-scoped because this dispatch now
+  # ADDS a replacement pending, which a bare `response: null` grep would match.
+  #
+  # WHY THE ROW CARRIES *THIS* SESSION'S INCARNATION AND NOT AN ARBITRARY ONE. Measured,
+  # not assumed: cmd_log_response's candidate filter (`:4292`) is legacy-permissive on
+  # `session` but STRICT on `incarnation` — `if ei and caller_incarnation and ei !=
+  # caller_incarnation: return False` — so a legacy `unknown` row carrying a DIFFERENT
+  # session's incarnation is not closeable by `log-response` either, and asserting that it
+  # is would put a second fiction where R2 left the first. $DSINC is the producer's OWN
+  # output on the diagnosis's rename-transition path, where the row and the recovering
+  # caller share one incarnation, so the recovery §R3-2's warning names genuinely works.
+  # The foreign-incarnation legacy row is a NARROWER, PRE-EXISTING residual: neither
+  # --supersede nor log-response reaches it. It is out of R3's scope (fix-plan §R3 "Do not
+  # attempt a third clever fix") and is recorded in fix-coder-report.md, not papered over.
+  unk_fixture unksup unknown claude-opus "$DSINC"
+  UNKSUPLOG="$UNKR/.dev/proposals/unksup/forge-log.yml"
+  run_in_pane "$DS:0.0" unksup1 "( cd $UNKR && $UNKENV FORGE_PROMPTS_DIR=$GPROMPTS $BRIDGE dispatch --slug unksup --stage adhoc --worker codex-b --supersede )"
+  { out_of unksup1 | grep -q 'WARN: --supersede does NOT close the legacy-identity pending unksup/fix-code' \
+    && out_of unksup1 | grep -q 'session=unknown, timestamp=2026-07-01T00:00:00Z' \
+    && out_of unksup1 | grep -q 'log-response --slug unksup --to claude-opus --stage fix-code' \
+    && [ "$(row_state "$UNKSUPLOG" fix-code)" = open ]; } \
+    && ok "T-UNK-SUPERSEDE-REFUSES on the PRODUCER shape --supersede leaves the legacy row OPEN and now SAYS SO, naming the row and the recovery" \
+    || bad "T-UNK-SUPERSEDE-REFUSES rc=$(rc_of unksup1) fix-code=$(row_state "$UNKSUPLOG" fix-code) $(out_of unksup1 | tr '\n' ' ')"
+  run_in_pane "$DS:0.0" unksup2 "( cd $UNKR && $UNKENV $BRIDGE log-response --slug unksup --to claude-opus --stage fix-code --response done )"
+  { [ "$(rc_of unksup2)" = 0 ] \
+    && ! out_of unksup2 | grep -q 'ERR_NO_MATCH' \
+    && [ "$(row_state "$UNKSUPLOG" fix-code)" = "closed:done" ]; } \
+    && ok "T-UNK-SUPERSEDE-REFUSES log-response IS the recovery the warning names: it closes the unknown-session row" \
+    || bad "T-UNK-SUPERSEDE-REFUSES recovery rc=$(rc_of unksup2) fix-code=$(row_state "$UNKSUPLOG" fix-code) $(out_of unksup2 | tr '\n' ' ')"
 
   # ── T-UNK-STALL (:9300 / :9302) ────────────────────────────────────────────────
   unk_fixture unkstall unknown

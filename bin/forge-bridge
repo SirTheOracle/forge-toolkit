@@ -4417,7 +4417,7 @@ PYEOF
     # code: this sits before the final update_context, whose rc stays the
     # function's return value (the orchestrator reads it as success/failure).
     if [ -n "$n_skipped" ] && [ "$n_skipped" -gt 0 ] 2>/dev/null; then
-        echo "WARN: log-response closed the most recent of $((n_skipped + 1)) pending entries for slug=$slug stage=$target_stage_resolved to=$target_to; $n_skipped older duplicate(s) left OPEN (ts: $skipped_ts). Run 'dispatch --supersede' or the orphan migration to close them." >&2
+        echo "WARN: log-response closed the most recent of $((n_skipped + 1)) pending entries for slug=$slug stage=$target_stage_resolved to=$target_to; $n_skipped older duplicate(s) left OPEN (ts: $skipped_ts). Close each with a repeated 'log-response --slug $slug --to $target_to --stage $target_stage_resolved' (or the orphan migration); 'dispatch --supersede' will NOT close them — it refuses more than one owned open pending." >&2
         _emit_event WARN_DUP_PENDING "$slug" "stage=$target_stage_resolved to=$target_to closed_ts=$target_ts skipped=$n_skipped skipped_ts=$skipped_ts"
     fi
 
@@ -4458,7 +4458,7 @@ print(",".join(t for t in out if t))
 PY
 )
     if [ -n "$_orphan_ts" ]; then
-        echo "WARN: log-response closed $slug/$target_stage_resolved but cross-identity orphan pending(s) remain OPEN (ts: $_orphan_ts). Not auto-closed (incarnation-strict). Run 'dispatch --supersede' to clear them." >&2
+        echo "WARN: log-response closed $slug/$target_stage_resolved but cross-identity orphan pending(s) remain OPEN (ts: $_orphan_ts). Not auto-closed (incarnation-strict). Close each with 'log-response --slug $slug --to <worker> --stage $target_stage_resolved'; 'dispatch --supersede' will NOT clear them — it selects only pendings this session+incarnation owns." >&2
         _emit_event WARN_ORPHAN_PENDING "$slug" "stage=$target_stage_resolved closed_ts=$target_ts orphan_ts=$_orphan_ts"
     fi
 
@@ -5674,7 +5674,6 @@ owned=[]; mixed=False
 for e in entries:
     if not isinstance(e,dict) or e.get('response') is not None: continue
     es=str(e.get('session') or ''); ei=str(e.get('incarnation') or '')
-    if es=='unknown': es=''  # LEGACY-SENTINEL
     if actor_i:
         if es==actor_s and ei==actor_i: owned.append(e)
         elif not ei and (not es or es==actor_s): mixed=True
@@ -5692,6 +5691,33 @@ for e in owned:
         print('%s\t%s\t%s' % (e['stage'],canonical(str(e.get('to') or '')),e['timestamp']))
 PYEOF
 ) || { echo "ERROR: --supersede could not select owned pendings" >&2; return 1; }
+        # R3-2: the strict predicate above never selects a legacy-identity pending, so
+        # --supersede leaves it OPEN — and, pre-R3, said NOTHING about it (rc 0,
+        # DISPATCHED, row still open: QA CRIT-1, round-1 A-1's symptom verbatim). Name
+        # every such row and the recovery that actually works.
+        # PURELY ADDITIVE DIAGNOSTICS. Runs AFTER the selection completes, is per-row and
+        # non-blocking, changes no rc and no control flow, and is deliberately NOT routed
+        # through the selector's global `mixed` short-circuit — routing it there is what
+        # produced MAJ-1, where one poisoning row aborted the whole selection including
+        # pendings the actor genuinely owned. Rows the actor owns ARE the selection above
+        # and are excluded here by timestamp, so they are still closed in the same run.
+        python3 - "$guard_log" "$slug" "$_sup_pendings" >&2 <<'PYEOF' || true
+import sys
+try: import yaml
+except Exception: sys.exit(0)
+path,slug,selected=sys.argv[1:4]
+sel=set(p[2] for p in (ln.split('\t') for ln in selected.splitlines()) if len(p)>=3)
+try: entries=(yaml.safe_load(open(path)) or {}).get('entries') or []
+except Exception: sys.exit(0)
+for e in entries:
+    if not isinstance(e,dict) or e.get('response') is not None: continue
+    es=str(e.get('session') or '')
+    if es not in ('','unknown'): continue   # LEGACY-SENTINEL: 'unknown' IS the empty class
+    ts=str(e.get('timestamp') or ''); st=str(e.get('stage') or '?'); to=str(e.get('to') or '?')
+    if ts and ts in sel: continue
+    print("WARN: --supersede does NOT close the legacy-identity pending %s/%s (to=%s, session=%s, timestamp=%s) — it stays OPEN." % (slug,st,to,es or '<empty>',ts or '<none>'))
+    print("WARN:   recovery for that row: forge-bridge log-response --slug %s --to %s --stage %s --response '<result>'" % (slug,to,st))
+PYEOF
         local _sup_stage _sup_to _sup_ts _sup_now _sup_n=0
         _sup_now=$(timestamp)
         while IFS=$'\t' read -r _sup_stage _sup_to _sup_ts; do
