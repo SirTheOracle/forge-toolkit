@@ -398,9 +398,10 @@ cmd_dispatch() {
     local ans_mode="" ans_slug="" ans_stage=""
     if [ -n "$answers" ]; then
         local af; af="$(mktemp "${TMPDIR:-/tmp}/forge-answers.XXXXXX")"
-        FORGE_ANS_SESSION="$session" python3 - "$root" "$answers" "$af" <<'PY' \
+        FORGE_ANS_SESSION="$session" FORGE_ANS_TEXT="$instr" \
+        python3 - "$root" "$answers" "$af" <<'PY' \
             || { rm -f "$af"; exit 1; }
-import os, sys, json, re
+import os, sys, json, re, hashlib, datetime
 root, ask_id, af = sys.argv[1], sys.argv[2], sys.argv[3]
 want_session = os.environ.get("FORGE_ANS_SESSION", "")
 if not re.fullmatch(r"ask-[0-9A-Za-z-]+", ask_id):
@@ -425,6 +426,41 @@ try:
     os.replace(src, arch)          # atomic exactly-once claim (archive-not-delete)
 except OSError:
     sys.exit(f"forge: answer: ask {ask_id} could not be claimed (already answered / race)")
+# 77b Step 7: the ask record has carried question_sha256 since it was written; the ANSWER
+# never joined it, so an operator ruling existed only in the dispatch event stream,
+# unaddressable and unlinked to the question it answered. Persisting it here converts a
+# ledger row with `source: operator, source_ref: ask-<id>` from an assertion into a
+# CHECKABLE CLAIM, verified by `forge-bridge constraint-check` check 5.
+#
+# STORED UNREDACTED, DELIBERATELY. Three reasons, and the third is the decisive one:
+#   1. Redaction would break check 5's substring test for CORRECT rows.
+#   2. The dispatch block below already writes .dev/attention/payloads/<did>.txt with the
+#      RAW instruction at 0600, in this same tree, on this same invocation — so a control
+#      here would read as safety and provide none.
+#   3. `redact()` (the SECRETS + KV pair) lives in exactly three places and those three
+#      are a lockstep set. A fourth copy here would break it. Pinned by
+#      T-ANS-NO-FOURTH-REDACT.
+# Residual, stated not solved: a pasted credential now sits in two .dev/attention/ files
+# instead of one. The real fix is one shared redaction helper reachable from all three
+# sites, which would protect the payload file too; that is larger than this change.
+#
+# AFTER the claim, never instead of it: a failed enrichment leaves a claimed, answer-less
+# record and warns. Reordering would reopen the double-answer race.
+_ans = os.environ.get("FORGE_ANS_TEXT", "")
+try:
+    rec["answer"] = _ans
+    rec["answer_sha256"] = hashlib.sha256(_ans.encode("utf-8", "replace")).hexdigest()
+    rec["answered_at"] = datetime.datetime.now(
+        datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _atmp = arch + f".tmp.{os.getpid()}"
+    with open(_atmp, "w") as f:
+        json.dump(rec, f, indent=2)
+    os.chmod(_atmp, 0o600)
+    os.replace(_atmp, arch)
+except OSError as ex:
+    sys.stderr.write(f"forge: warning: ask {ask_id} was claimed but the answer could not "
+                     f"be persisted ({ex}); constraint-check cannot verify quotes against "
+                     f"it.\n")
 with open(af, "w") as f:
     f.write("\t".join(str(rec.get(k) or "") for k in ("mode", "slug", "stage")))
 PY
