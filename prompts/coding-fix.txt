@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 You are executing the 'coding-fix' stage of a forge pipeline.
 
 Slug: {slug}

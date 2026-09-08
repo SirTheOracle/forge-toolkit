@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 You are executing the 'fix-plan-revise' stage of a forge fix-pipeline.
 
 Slug: {slug}

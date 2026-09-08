@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 Write your final report to .dev/proposals/{slug}/incorporate-report.md BEFORE sending FORGE_DONE. The FORGE_DONE callback must be a one-line summary only; the digest agent reads the report file from disk.
 
 Read .dev/proposals/{slug}/review-feedback.md and

@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 You are executing the 'fix-investigate-solo' stage — a single-worker diagnosis
 stage of a forge fix-pipeline (no agent team; you do the full analysis yourself).
 

@@ -527,6 +527,36 @@ services:
     working_dir: "."
     port: 8123
 YML
+# 77b: every non-`_` prompt now carries <<<INCLUDE _operator_constraints>>>, which is a
+# SYNTHETIC rendered per slug from .dev/proposals/<slug>/constraints.yml and which FAILS
+# CLOSED (exit 2) when that ledger is missing, unparseable or schema-invalid. Without a
+# real ledger here every carrier prompt reports `render-failed:` — so the fixture plants
+# one, and the render test therefore EXERCISES the synthetic rather than routing around
+# it. Slug `rslug` matches the slug the loop below renders with.
+mkdir -p "$_pr_root/.dev/proposals/rslug"
+cat > "$_pr_root/.dev/proposals/rslug/constraints.yml" <<'YML'
+schema: forge-constraints/1
+constraints:
+  - id: C1
+    source: operator
+    verbatim: "nothing is filtered out on the tool's own initiative"
+    source_ref: "chat"
+    asked_about: "the detail view"
+    principle: "the tool advises, the operator decides"
+    binds: "every list and render path, not only the one the question named"
+    scope: user-visible
+    check: "reach the surface through every entry path and assert no row is withheld"
+    status: OPEN
+  - id: C2
+    source: derived
+    verbatim: null
+    source_ref: "measurement, round 2"
+    rederive: "printf 'probe\\n'"
+    principle: "the live row shape is the one the producer mints unconditionally"
+    scope: internal
+    check: "run rederive and compare before citing this row"
+    status: OPEN
+YML
 
 # T-PROMPT-PREAMBLE · _preamble stays synthetic, and an ordinary miss still fails closed.
 _pp_err=""
@@ -566,8 +596,14 @@ for _t in "$ROOT"/prompts/*.txt; do
   # Byte-identical BEFORE vs AFTER vendoring: render the same stage from the live
   # directory the prompts were vendored out of. Skipped on a machine that has none
   # (fresh clone), which is why the self-containment half above carries no such guard.
+  # The live comparison is scoped to prompts whose live copy still MATCHES the repo
+  # source. install.sh Step 3.8 PRESERVES an operator-modified live prompt rather than
+  # overwriting it, so an edited prompt stays divergent until the operator deletes the
+  # live copy and re-installs — and asserting byte-identity across that window would make
+  # the suite red for a reason that is not a defect. Where live and repo DO match, the
+  # render must still match: that is the #77a guarantee and it is retained in full.
   _prr_live="$HOME/.config/forge/prompts/$(basename "$_t")"
-  if [ -f "$_prr_live" ]; then
+  if [ -f "$_prr_live" ] && cmp -s "$_t" "$_prr_live"; then
     FORGE_PROMPTS_DIR="$HOME/.config/forge/prompts"
     _prr_c="$(_render_template "$_prr_live" rslug coding claude-opus 1 "$_pr_root" 2>/dev/null)"
     [ "$_prr_a" = "$_prr_c" ] || _prr_err="$_prr_err live-differs:$(basename "$_t")"
