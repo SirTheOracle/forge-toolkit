@@ -26,6 +26,10 @@ Severity levels: critical / major / minor / advisory.
 <<<INCLUDE _unchanged_flow_sweep>>>
 
 In .dev/qa/{slug}/issues.md, report:
+- A PRIOR FINDINGS RESOLUTION section: for each CRITICAL and MAJOR in the
+  prior .dev/qa/{slug}/issues.md, state RESOLVED / STILL OPEN / DOWNGRADED
+  with the test or commit that is your evidence. A prior finding you do not
+  mention is STILL OPEN by default. Advisories stay as they are.
 - Findings (one entry per issue) with severity, summary, reproduction steps,
   affected files, and screenshot evidence path where applicable
 - A REGRESSION SWEEP RESULTS section listing every surface tested and every

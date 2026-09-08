@@ -43,6 +43,8 @@ Outputs (the skill produces all of these; do not skip any):
 - .dev/qa/{slug}/fix-issues.md (canonical issue list — what downstream consumers read)
 - .dev/qa/{slug}/fix-manifest.yaml (machine-readable severity counts + issue index)
 
+<<<INCLUDE _unchanged_flow_sweep>>>
+
 The fix-issues.md MUST contain:
 - A 1-paragraph verdict (CLEAR / advisory-only / minor-only / has-critical-or-major)
 - One section per issue, each rated:

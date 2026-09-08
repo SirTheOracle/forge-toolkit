@@ -1,13 +1,27 @@
 UNCHANGED-FLOW REGRESSION SWEEP (include verbatim in every QA dispatch):
-  Identify the surfaces affected by the implementation, NOT just the new
-  feature. Read implementation.md and find:
-  - Every DB table whose schema or data is touched by the migration.
-  - Every route whose handler was modified, OR whose handler calls a
-    helper that was modified.
-  - Every page/component the user can navigate to that hits one of
-    those routes.
+  Identify the surfaces affected by the change, NOT just the new behaviour.
+  START FROM THE DIFF, not from the plan:
+
+      git diff --name-only <the dispatch baseline>..HEAD
+
+  That list is non-empty by construction after any coder stage. CLASSIFY
+  EVERY FILE IN IT — one line each, none omitted. You may write "no
+  persistent stores affected"; you may not write "no files changed" when
+  the diff lists eleven. Then read the canonical plan artifact for this
+  lane (`implementation.md`, `fix-plan.md`, or the plan the coder applied)
+  and find:
+  - Every PERSISTENT STORE the change touches — a DB table, a cache, a
+    state file, a log format, an on-disk artifact schema.
+  - Every ENTRY POINT whose handler was modified, or which calls a helper
+    that was modified — an HTTP route, a CLI subcommand, a hook, a
+    scheduled job, a background poller.
+  - Every USER-REACHABLE SURFACE reached through one of those — a page or
+    component, a terminal output, a status board, a notification.
+  The nouns above are EXAMPLES of the abstraction, not the whole list. A
+  project with no database still has persistent stores; a project with no
+  web frontend still has user-reachable surfaces.
   Then, for EACH such surface, exercise it AS A USER WOULD on PRE-FEATURE
-  data — i.e. data created before this feature existed:
+  data — i.e. data created before this change existed:
   1. Load the page WITHOUT first interacting with the new feature.
      Confirm it renders the expected content (existing rows still
      visible, counts still correct, status still accurate).
@@ -19,3 +33,12 @@ UNCHANGED-FLOW REGRESSION SWEEP (include verbatim in every QA dispatch):
      confirm it still produces the same output.
   Findings from the sweep are CRITICAL or MAJOR severity — they are
   regressions of pre-existing behavior, not gaps in the new feature.
+
+  ENTRY-PATH ENUMERATION. Before testing, list every entry path from
+  which a user can reach the changed behaviour — every route, command,
+  background job, batch flow and alternative affordance, not only the one
+  the spec names. Exercise each. A path you list and do not exercise is a
+  NOT-EXERCISED row in your CONSTRAINT CHECK section, and you must say so.
+  A PATH THE SPEC NEVER MENTIONS IS THE MOST IMPORTANT ONE ON YOUR LIST —
+  the spec is the artifact under suspicion, so its silence about a path is
+  evidence about the spec, not evidence about the path.

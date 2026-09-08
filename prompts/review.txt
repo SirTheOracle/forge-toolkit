@@ -14,22 +14,39 @@ Follow the proposal-reviewer skill at ~/.codex/skills/proposal-reviewer/SKILL.md
 
 Inputs (read all):
 - .dev/proposals/{slug}/problem-statement.md
-- .dev/proposals/{slug}/proposal-a.md
-- .dev/proposals/{slug}/proposal-b.md
-- .dev/proposals/{slug}/synthesis.md
+- .dev/proposals/{slug}/proposal-A.md
+- .dev/proposals/{slug}/proposal-B.md
+- .dev/proposals/{slug}/proposal-C.md
+- .dev/proposals/{slug}/constraints.yml (the operator's recorded rulings — see SPEC FIDELITY below)
 - .dev/proposals/{slug}/final-plan.md
 
 Output: .dev/proposals/{slug}/review-feedback.md
 
-Review the final plan adversarially. Include in the review:
+FIRST SECTION, before anything else — `SPEC FIDELITY`. Its verdict is `ACCEPT` or
+`REJECT: <clause>`:
+- Read `.dev/proposals/{slug}/constraints.yml` beside `problem-statement.md`.
+- Wherever the problem statement's prose RESTATES a `verbatim` rather than quoting it,
+  and the restatement narrows, widens or reframes it, that is a finding.
+- Wherever a `principle` does not follow from its `verbatim`, or a `binds` merely
+  repeats its `asked_about`, that is a finding.
+- You may return `REJECT: <clause>` on the PROBLEM STATEMENT itself, not only on the
+  plan. It was written by the actor whose translation you are checking, and every other
+  stage in this pipeline validates against it rather than against the operator.
+- `REJECT` is a pipeline stop condition. It escalates to the operator via `forge ask` —
+  it does not go back to the orchestrator that wrote the clause.
+
+Then review the final plan adversarially. Include in the review:
 - Critical / blocking issues
 - Minor issues that should be addressed
 - Conflicts with the plan's stated approach
 - Coverage gaps in the plan
 - Items that contradict the problem statement's non-goals
 
+<<<INCLUDE _scope_diff_check>>>
+
 CONFIDENCE: HIGH/MEDIUM/LOW
 BLOCKING_ITEMS: N
+NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 When complete:
   ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \

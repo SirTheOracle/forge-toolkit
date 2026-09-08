@@ -45,6 +45,8 @@ Outputs (overwrites the prior fix-qa artifacts):
 - .dev/qa/{slug}/fix-issues.md (canonical issue list, refreshed)
 - .dev/qa/{slug}/fix-manifest.yaml (refreshed)
 
+<<<INCLUDE _unchanged_flow_sweep>>>
+
 The fix-issues.md MUST contain (same shape as fix-qa, plus an explicit retry-resolution section):
 - A 1-paragraph verdict (CLEAR / advisory-only / minor-only / has-critical-or-major)
 - A "Prior findings resolution" section: for each CRITICAL/MAJOR from the prior fix-issues.md, state RESOLVED / STILL OPEN / DOWNGRADED with the test/commit evidence
