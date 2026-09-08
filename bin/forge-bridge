@@ -1327,6 +1327,81 @@ if hit: print("%s|%s" % (hit.get("head","unknown"), hit.get("branch","unknown"))
 PY
 }
 
+# _constraints_report_path <root> <slug> <stage>
+#   Report-side selector for `constraint-check` (#77b Step 6 check 3). Echoes an ABSOLUTE
+#   report path, or `UNKNOWN:<reason>` — and UNKNOWN NEVER REFUSES, the same design
+#   invariant the evidence framework uses.
+#
+#   NO NEW REGISTRY. There is no stage->report map in this file and the plan's H11 warns
+#   that five registries already disagree. 22 of the 23 stage prompts end their DONE
+#   callback with `--message "…see .dev/<path>"`, and cmd_log_response stores that string
+#   in the entry's `response:` field — so the path is ALREADY IN THE LOG. `verify` is the
+#   one stage that names none (it answers CLEAR / ISSUES_REMAIN); it grades
+#   UNKNOWN:no-report-path and is never refused.
+#
+#   The ENTRY is chosen by _evidence_stage_record's selector in `ts` mode: order by
+#   DISPATCH time, latest entry regardless of open/closed, UNKNOWN:stage-in-flight when
+#   open. Deliberately NOT a closed-only query (:1335-1339 below: "most recently closed"
+#   is not derivable) and deliberately NOT bin/forge-watch's closed_max_ts fold.
+_constraints_report_path() {   # <root> <slug> <stage>
+    local root="$1" slug="$2" stage="$3"
+    local ts; ts="$(_evidence_stage_record "$root" "$slug" "$stage" ts)"
+    case "$ts" in UNKNOWN:*) printf '%s' "$ts"; return 0 ;; esac
+    FORGE_CRP_TS="$ts" python3 - "$root/.dev/proposals/$slug/forge-log.yml" "$root" <<'PY'
+import os,re,sys
+ts=os.environ["FORGE_CRP_TS"]
+raw=open(sys.argv[1],errors="replace").read(); root=sys.argv[2]
+starts=[(m.start(), m.group(1)) for m in re.finditer(r'^\s*-\s+timestamp:\s*"([^"]+)"', raw, re.M)]
+blk=None
+for i,(off,t) in enumerate(starts):
+    if t == ts:
+        blk = raw[off:(starts[i+1][0] if i+1 < len(starts) else len(raw))]
+if blk is None:
+    print("UNKNOWN:no-entry"); raise SystemExit(0)
+m = re.search(r'^\s+response:\s*(.*)$', blk, re.M)
+p = re.search(r'(\.dev/[^\s"\']+\.(?:md|ya?ml))', m.group(1) if m else "")
+print(os.path.join(root, p.group(1)) if p else "UNKNOWN:no-report-path")
+PY
+}
+
+# _constraints_prev_stage <root> <slug> <this_stage>
+#   The stage of the latest forge-log entry that is NOT <this_stage>, ordered by DISPATCH
+#   timestamp — the same ordering _evidence_stage_record uses and for the same reason
+#   (:1335-1339: no close timestamp exists, so "most recently closed" is not derivable).
+#   Deliberately NOT a stage-sequence table: the bridge has no such registry, and a linear
+#   one would get the qa-fix loop and fix-plan-revise wrong. Empty output means "no
+#   predecessor", which makes the successor check a no-op.
+_constraints_prev_stage() {   # <root> <slug> <this_stage>
+    local plog="$1/.dev/proposals/$2/forge-log.yml"
+    [ -f "$plog" ] || { printf ''; return 0; }
+    FORGE_CPS_SELF="$3" python3 - "$plog" <<'PY'
+import os,re,sys
+self_stage=os.environ.get("FORGE_CPS_SELF","")
+raw=open(sys.argv[1],errors="replace").read()
+starts=[(m.start(),m.group(1)) for m in re.finditer(r'^\s*-\s+timestamp:\s*"([^"]+)"',raw,re.M)]
+entries=[]
+for i,(off,ts) in enumerate(starts):
+    blk=raw[off:(starts[i+1][0] if i+1<len(starts) else len(raw))]
+    m=re.search(r'^\s+stage:\s*(\S+)\s*$',blk,re.M)
+    if m: entries.append((ts,m.group(1)))
+# BOUND: only an entry PRECEDING this stage's own latest entry can be its predecessor.
+# Without the bound the predicate INVERTS on a loop. With `coding -> qa` on the log,
+# re-dispatching `coding` selects `qa` — a report written AFTER the stage now being re-run
+# — and demands that it confirmed the ledger. `qa`'s report exists, so UNKNOWN does not
+# save it and the refusal is real. Re-dispatching an earlier stage is exactly what the
+# qa-fix loop and fix-plan-revise do, so this is not a corner case. A stage with no prior
+# entry has no bound, which is the ordinary forward case.
+mine=[ts for ts,st in entries if st==self_stage]
+bound=max(mine) if mine else None
+best=None
+for ts,st in entries:
+    if st==self_stage: continue
+    if bound is not None and ts>=bound: continue
+    if best is None or ts>best[0]: best=(ts,st)
+print(best[1] if best else "")
+PY
+}
+
 # For (slug, stage): take the forge-log entry with the LATEST dispatch `timestamp:`,
 # REGARDLESS of open/closed.
 #   - entry still open (response: null) -> "UNKNOWN:stage-in-flight"
@@ -1346,14 +1421,29 @@ PY
 #   stage that was contradicted, re-dispatched, and is still running would be graded against
 #   its OLD closed entry and would refuse FOREVER. The two predicates are deliberately
 #   different because they answer different questions.
-_evidence_stage_record() {   # <root> <slug> <stage>
-    local root="$1" slug="$2" stage="$3"
+# MODE (optional 4th arg), added for #77b Step 6's report-side set-equality check:
+#   ""   (default) — the EVIDENCE record, exactly as before. Zero behaviour change.
+#   "ts"           — the SELECTED DISPATCH TIMESTAMP only; the evidence lookup is
+#                    skipped. constraint-check needs the SELECTOR (which entry is this
+#                    stage's latest, and is it still open) and NOT the evidence record:
+#                    `EVIDENCE:` lines are emitted only by _ev_record_callback, for
+#                    coding-class stages, so the default mode would return
+#                    UNKNOWN:no-evidence-record ALWAYS for review / impl-review /
+#                    fix-plan-review / fix-qa and make that half inert.
+# ONE fold, TWO consumers — deliberately NOT a second copy of the predicate. The
+# "DO NOT UNIFY THESE TWO FOLDS" warning above is about bin/forge-watch's closed_max_ts,
+# a DIFFERENT predicate answering a different question; it does not argue against a
+# second reader of THIS one.
+_evidence_stage_record() {   # <root> <slug> <stage> [mode: ""|ts]
+    local root="$1" slug="$2" stage="$3" mode="${4:-}"
     local plog="$root/.dev/proposals/$slug/forge-log.yml"
     local ev="$root/.dev/forge-tmp/orchestrator-events.log"
     [ -f "$plog" ] || { printf 'UNKNOWN:no-log'; return 0; }
-    FORGE_EVS_STAGE="$stage" FORGE_EVS_SLUG="$slug" FORGE_EVS_EV="$ev" python3 - "$plog" <<'PY'
+    FORGE_EVS_STAGE="$stage" FORGE_EVS_SLUG="$slug" FORGE_EVS_EV="$ev" \
+    FORGE_EVS_MODE="$mode" python3 - "$plog" <<'PY'
 import os,re,sys
 stage=os.environ["FORGE_EVS_STAGE"]; slug=os.environ["FORGE_EVS_SLUG"]; ev=os.environ["FORGE_EVS_EV"]
+mode=os.environ.get("FORGE_EVS_MODE","")
 raw=open(sys.argv[1],errors="replace").read()
 # Defensive regex parse, not yaml.safe_load: legacy log-response emissions produced bad
 # `files:` indentation and yaml raises on them (the same fallback _render_status_file uses).
@@ -1368,6 +1458,7 @@ for i,(off,ts) in enumerate(starts):
 if best is None: print("UNKNOWN:no-entry"); raise SystemExit(0)
 ts,closed=best
 if not closed: print("UNKNOWN:stage-in-flight"); raise SystemExit(0)
+if mode == "ts": print(ts); raise SystemExit(0)
 rec=None
 try:
     for ln in open(ev,errors="replace"):
@@ -1425,7 +1516,12 @@ META={"git-state":(0,"evidence"),"baseline-ancestry":(0,"evidence"),
       "committed":(0,"evidence"),"clean-tree":(0,"evidence"),
       "report-consistent":(1,"evidence"),"tests":(1,"claim"),
       "merge-state":(2,"evidence"),"pushed":(2,"local-ref"),
-      "merge-detail":(2,"evidence")}
+      "merge-detail":(2,"evidence"),
+      # 77b P31: defence in depth. Tier 1 / evidence provenance, like report-consistent:
+      # it is a bridge-side re-read of the ledger, never anything a worker asserted. It
+      # RECORDS in both modes and can REFUSE in neither until FORGE_EVIDENCE_MODE is
+      # flipped, which it never has been. Stated, not counted as enforcement (plan H5).
+      "constraint-ledger":(1,"evidence")}
 now=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
 checks=[]
 for arg in sys.argv[1:]:
@@ -3361,6 +3457,7 @@ cmd_log() {
     local delivery_id="$_FORGE_P_DELIVERY_ID" physical_code_root="$_FORGE_P_PHYSICAL_CODE_ROOT"
     local root_identity="$_FORGE_P_ROOT_IDENTITY" capability_class="$_FORGE_P_CAPABILITY_CLASS"
     local delivery_lane="$_FORGE_P_DELIVERY_LANE" prompt_sha256="$_FORGE_P_PROMPT_SHA256"
+    local constraints_sha256="$_FORGE_P_CONSTRAINTS_SHA"
     cat >> "$pipeline_log" << EOF
 
   - timestamp: "$ts"
@@ -3370,6 +3467,7 @@ cmd_log() {
     capability_class: $capability_class
     lane: $delivery_lane
     prompt_sha256: $prompt_sha256
+    constraints_sha256: $constraints_sha256
     stage: $stage
     from: $from
     to: $to
@@ -5330,6 +5428,29 @@ sys.stdout.write(text)
 PYEOF
 }
 
+# _constraint_carrier_stage <stage> — 0 if this stage carries the operator ledger.
+#
+# TEMPLATE-DERIVED, NOT A STAGE-NAME LIST. A stage is a carrier iff its template asks for
+# <<<INCLUDE _operator_constraints>>>. Three reasons, and the third is the decisive one:
+#  1. It tracks the EXEMPT set automatically, so it cannot rot against prompts/.
+#  2. It is semantically exact: the question the guard answers is "will this dispatch
+#     carry the ledger?", and the template is what decides that.
+#  3. Every existing dispatch test runs against synthetic FORGE_PROMPTS_DIR fixtures
+#     whose one-line templates carry no <<<INCLUDE>>> at all
+#     (tests/forge-bridge/run.sh:952, :956-958, :1412), under project roots with no
+#     ledger. A hard-coded {coding,qa,fix-code,qa-fix} list would refuse all ten T-ILG
+#     dispatches. This predicate is correctly INERT for them rather than switched off.
+#
+# KNOWN LIMIT, bounded rather than hidden: a LIVE prompt that has lost the include leaves
+# that stage unguarded. T-CC1 pins the repo side; `install.sh --check-drift` reports the
+# live side. It also means the guard goes live only when the operator converges live
+# prompts — see the Definition of Done.
+_constraint_carrier_stage() {   # <stage>
+    local t="$FORGE_PROMPTS_DIR/$1.txt"
+    [ -f "$t" ] || return 1
+    grep -q '<<<INCLUDE _operator_constraints>>>' "$t"
+}
+
 # dispatch — render a stage prompt, write it, log, send.
 #   forge-bridge dispatch --slug <s> --stage <s> --worker <w>
 #                          [--clear] [--dry-run]
@@ -5499,6 +5620,92 @@ cmd_dispatch() {
             ;;
     esac
 
+    # --- Operator-constraint ledger guard (#77b Step 6, enforcement half) ---
+    #
+    # PLACEMENT: BEFORE the render, and therefore before the --dry-run early return. This
+    # is NOT a departure from the INFRA_LOCK template below; it is that template's own
+    # rule applied. The lock block at :5358-5382 distinguishes ARGUMENT LEGALITY (checked
+    # before the return — Hard Rule 22's tier guard) from a RESOURCE PRECONDITION (checked
+    # after it — the lock itself). A ledger is an INPUT THE RENDER CONSUMES, so it must be
+    # checked before the consumer.
+    #
+    # THE ALTERNATIVE IS UNREACHABLE CODE, and that is why this moved. A stage is a carrier
+    # iff its template asks for the include; a carrier's render therefore always calls
+    # _render_operator_constraints; a missing or invalid ledger makes that exit 2 and the
+    # dispatch dies at :5341 with `template-render-failed`. A ledger check sitting after
+    # the --dry-run return could never fire, taking its GUARD_BLOCK event, its remedy text
+    # and its mode lever with it. Check 3 (the successor's report) IS a state precondition
+    # and stays in the infra-lock position below.
+    #
+    # CARRIER PREDICATE IS TEMPLATE-DERIVED, NOT A STAGE-NAME LIST — see
+    # _constraint_carrier_stage. Three existing fixtures depend on that and T-CG-DERIVED
+    # pins it.
+    #
+    # "Zero mutation" means zero STATE: no pending, no lock, no worker reset, no keystroke,
+    # and on this path not even a rendered prompt. One GUARD_BLOCK audit event IS written,
+    # by design.
+    #
+    # Kill switch: FORGE_CONSTRAINTS_MODE=observe warns and proceeds — and is ALSO honoured
+    # inside _render_operator_constraints, which renders a loud placeholder instead of
+    # failing, so the lever works on both halves. Default ENFORCE (plan F6:
+    # FORGE_EVIDENCE_MODE shipped `observe`, has never been flipped, and that whole
+    # framework still refuses nothing). A typo is a HARD ERROR, never a silent
+    # fall-through — the same discipline as FORGE_INFRA_GUARD_MODE.
+    local _cg_mode="${FORGE_CONSTRAINTS_MODE:-enforce}"
+    case "$_cg_mode" in
+        enforce|observe) ;;
+        *) _emit_event ERROR "$slug" "stage=$stage reason=constraints-mode-invalid mode=$(_sanitize_event_value "$_cg_mode")"
+           echo "ERROR: FORGE_CONSTRAINTS_MODE must be enforce|observe (got '$_cg_mode')." >&2
+           return 1 ;;
+    esac
+    if _constraint_carrier_stage "$stage"; then
+        # (1) --source-prompt sends RAW FILE BYTES: _render_template is never called, so
+        # NO include resolves — including the ledger. A carrier routed here would silently
+        # ship a constraint-free prompt, which is the exact silence this change removes.
+        # Costs nothing today: the one executable caller is
+        # bin/forge-dispatch-pr-review:240 with --stage pr-review, not a carrier (F14).
+        if [ -n "$source_prompt" ]; then
+            _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=source-prompt-on-carrier-stage mode=$_cg_mode worker=$worker_canonical"
+            {
+                echo "CONSTRAINTS_REQUIRED: --source-prompt is not available for stage '$stage'."
+                echo "  That path sends raw file bytes and resolves NO includes, so the stage"
+                echo "  would run without the operator constraint ledger it is required to carry."
+                echo "  Dispatch it normally:"
+                echo "    ~/bin/forge-bridge dispatch --slug $slug --stage $stage --worker $worker_canonical"
+            } >&2
+            return 6
+        fi
+        # (2) Ledger validity. ONE call to the single source of the schema: on success its
+        # stdout is the rendered block, from which the P6 version anchor is read back —
+        # never recomputed, so the digest the stage is shown and the digest the log records
+        # are the same number by construction.
+        local _cg_block _cg_rc
+        _cg_block="$(_render_operator_constraints "$project_root" "$slug" 2>&1)"; _cg_rc=$?
+        if [ "$_cg_rc" -ne 0 ]; then
+            _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=constraints-ledger-invalid mode=$_cg_mode worker=$worker_canonical"
+            if [ "$_cg_mode" = observe ]; then
+                echo "WARN: CONSTRAINT_LEDGER_REQUIRED (observe mode) — dispatching '$stage' WITHOUT a valid operator constraint ledger." >&2
+                printf '%s\n' "$_cg_block" >&2
+            else
+                {
+                    echo "CONSTRAINT_LEDGER_REQUIRED: stage '$stage' carries the operator's constraints into its prompt, and slug='$slug' has no valid ledger."
+                    printf '%s\n' "$_cg_block" | sed 's/^/    /'
+                    echo "  Scaffold one from the problem statement:"
+                    echo "    ~/bin/forge-bridge constraints init --slug $slug"
+                    echo "  Then SOURCE every row: replace 'inferred' with 'operator' plus the"
+                    echo "  operator's VERBATIM words, state what each ruling BINDS (wider than"
+                    echo "  what it was asked about), and give each row a check. Re-run:"
+                    echo "    ~/bin/forge-bridge constraint-check --slug $slug"
+                    echo "  Rollback lever (audited, not a normal setting): FORGE_CONSTRAINTS_MODE=observe"
+                    echo "  downgrades this refusal to a warning."
+                } >&2
+                return 6
+            fi
+        else
+            _FORGE_P_CONSTRAINTS_SHA="$(printf '%s\n' "$_cg_block" | sed -n 's/.*ledger_hash: \([0-9a-f]\{16\}\).*/\1/p' | head -1)"
+        fi
+    fi
+
     local tmpl_path="$FORGE_PROMPTS_DIR/$stage.txt"
     local rendered
     if [ -n "$source_prompt" ]; then
@@ -5602,6 +5809,47 @@ PY
             fi
             ;;
     esac
+
+    # --- Operator-constraint report-side set equality (#77b Step 6 check 3) ---
+    # Evaluated at the SUCCESSOR stage's dispatch, using _evidence_stage_record's SELECTOR
+    # in `ts` mode (:1349): order by DISPATCH time, latest entry regardless of open/closed,
+    # UNKNOWN:stage-in-flight when open.
+    #   - NOT a closed-only query: :1335-1339 states "most recently closed" is not
+    #     derivable, because _patch_response_by_ts writes no close timestamp.
+    #   - NOT collapsed into bin/forge-watch's closed_max_ts fold: :1344-1348 carries an
+    #     explicit "DO NOT UNIFY THESE TWO FOLDS" warning. That warning is about THAT fold,
+    #     and does not argue against a second reader of this one.
+    # Because the selector is a QUERY and not a mode-gated policy, this half is LIVE
+    # WITHOUT flipping FORGE_EVIDENCE_MODE.
+    #
+    # PLACEMENT, and it differs from Step 80's on purpose: this is a RESOURCE/STATE
+    # precondition (did the previous stage's report confirm the ledger?), so it belongs
+    # after the --dry-run early return, exactly where the infra-lock guard sits. Step 80's
+    # half is an INPUT check and had to move above the render. Do not merge them.
+    #
+    # $_cg_mode is already validated and in scope from Step 80's block above.
+    if _constraint_carrier_stage "$stage"; then
+        local _cg_prev
+        _cg_prev="$(_constraints_prev_stage "$project_root" "$slug" "$stage")"
+        if [ -n "$_cg_prev" ] && _constraint_carrier_stage "$_cg_prev"; then
+            if ! cmd_constraint_check --slug "$slug" --stage "$_cg_prev" >/dev/null 2>&1; then
+                _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=constraints-predecessor-unconfirmed prev=$_cg_prev mode=$_cg_mode worker=$worker_canonical"
+                if [ "$_cg_mode" = observe ]; then
+                    echo "WARN: CONSTRAINT_LEDGER_REQUIRED (observe mode) — predecessor stage '$_cg_prev' did not confirm every ledger id." >&2
+                else
+                    {
+                        echo "CONSTRAINT_LEDGER_REQUIRED: predecessor stage '$_cg_prev' did not confirm the ledger."
+                        cmd_constraint_check --slug "$slug" --stage "$_cg_prev" 2>&1 | sed 's/^/    /'
+                        echo "  Re-dispatch '$_cg_prev' with a complete CONSTRAINT CHECK section, or record"
+                        echo "  the operator's ruling on the discrepancy before advancing."
+                        echo "  Rollback lever (audited, not a normal setting): FORGE_CONSTRAINTS_MODE=observe"
+                        echo "  downgrades this refusal to a warning."
+                    } >&2
+                    return 6
+                fi
+            fi
+        fi
+    fi
 
     # --- Slug-scoped dispatch guard (orphan-log-entries fix) ---
     # Refuse to dispatch a new stage while ANY pending (response: null) entry
@@ -7412,6 +7660,294 @@ cmd_park_resolve() {   # <slug> <stage> <note>   (acquires the lifecycle lock)
     echo "PARK RESOLVED slug=$slug stage=$stage"
 }
 
+# ---- Operator-constraint ledger: scaffold (#77b Step 6, day-one migration) ----
+# Every scaffolded row is `source: inferred` / `status: OPEN`, deliberately NOT
+# `operator`: a scaffolded ledger must be VISIBLY UNVERIFIED. Refuses to overwrite an
+# existing ledger — an operator-authored ledger is the artifact this whole change exists
+# to protect.
+cmd_constraints() {
+    local sub="${1:-}"; shift || true
+    local slug=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug) slug="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    case "$sub" in
+        init) ;;
+        *) echo "Usage: forge-bridge constraints init --slug <s>" >&2; return 1 ;;
+    esac
+    [ -n "$slug" ] || { echo "Usage: forge-bridge constraints init --slug <s>" >&2; return 1; }
+    local pr; pr="$(_resolve_project_root "")"
+    [ -n "$pr" ] || { echo "ERROR: constraints init requires a forge-project.yml. Walk-up from cwd failed." >&2; return 1; }
+    local dir="$pr/.dev/proposals/$slug"
+    local out="$dir/constraints.yml"
+    if [ -e "$out" ]; then
+        echo "REFUSED: $out already exists. Edit it, or remove it deliberately first." >&2
+        return 1
+    fi
+    mkdir -p "$dir" || { echo "ERROR: could not create $dir" >&2; return 1; }
+    FORGE_CI_SLUG="$slug" python3 - "$dir/problem-statement.md" "$out" <<'PY'
+import os, re, sys
+ps, out = sys.argv[1], sys.argv[2]
+slug = os.environ["FORGE_CI_SLUG"]
+lines = []
+if os.path.exists(ps):
+    text = open(ps, errors="replace").read()
+    # Candidate obligations: imperative / prohibitive sentences. A HEURISTIC, not a parse
+    # — which is exactly why every row it emits is `source: inferred`.
+    pat = re.compile(r'(?im)^[\s>*\-]*((?:[^\n]*?\b(?:must|must not|never|always|do not|'
+                     r'shall|required to|is forbidden)\b[^\n]*))$')
+    seen = set()
+    for mm in pat.finditer(text):
+        s = " ".join(mm.group(1).split()).strip(" -*>")
+        s = re.sub(r'^#+\s*', '', s)
+        if len(s) < 12 or len(s) > 220 or s in seen:
+            continue
+        seen.add(s)
+        lines.append(s)
+        if len(lines) >= 12:
+            break
+tmp = out + ".tmp.%d" % os.getpid()
+with open(tmp, "w") as f:
+    f.write("schema: forge-constraints/1\n")
+    f.write("# SCAFFOLDED by `forge-bridge constraints init` from problem-statement.md.\n")
+    f.write("# EVERY ROW IS source: inferred AND status: OPEN. That is deliberate: nothing\n")
+    f.write("# here has been traced to a thing the operator actually said. Before this slug\n")
+    f.write("# is worth trusting, for each row either (a) replace `inferred` with `operator`,\n")
+    f.write("# add the operator's VERBATIM words and a source_ref, and state what it BINDS,\n")
+    f.write("# or (b) delete the row. An `inferred` row is a QUESTION, not a ruling.\n")
+    if not lines:
+        f.write("constraints: []\n")
+        f.write("none_recorded_reason: >-\n")
+        f.write("  SCAFFOLD PLACEHOLDER — no obligation-shaped sentence was found in\n")
+        f.write("  problem-statement.md. Replace this with a real reason, or add rows.\n")
+    else:
+        f.write("constraints:\n")
+        for i, s in enumerate(lines, 1):
+            f.write("  - id: C%d\n" % i)
+            f.write("    source: inferred\n")
+            f.write("    verbatim: null\n")
+            f.write("    source_ref: \"problem-statement.md\"\n")
+            f.write("    asked_about: \"TODO — what was the question this answered?\"\n")
+            f.write("    principle: %s\n" % ("\"" + s.replace('"', "'") + "\""))
+            f.write("    binds: \"TODO — state the SCOPE this binds; it should be WIDER than asked_about\"\n")
+            f.write("    scope: internal\n")
+            f.write("    check: \"TODO — how would a stage confirm this?\"\n")
+            f.write("    status: OPEN\n")
+os.replace(tmp, out)
+print(out)
+PY
+}
+
+# ---- Operator-constraint ledger: check (#77b Step 6) ----
+#
+# Lifts the SHAPE of skills/forge-fix-runner/scripts/queue.py:897-963 (check_packets): it
+# validates STRUCTURE, NOT SEMANTICS. It does not judge whether a constraint is satisfied;
+# it asserts that a place to record the answer exists for every obligation, in both
+# directions. Exit 0 = structurally sound, exit 1 = findings on stdout.
+#
+#   checks 1-2  required fields; operator=>verbatim, derived=>rederive. DELEGATED to
+#               _render_operator_constraints so the schema is stated ONCE.
+#   check 3     exact set equality, both directions, between ledger ids and ids confirmed
+#               in a stage report. Only when --stage/--report are supplied.
+#   check 4     a `scope: user-visible` row's confirmation must name the entry paths
+#               exercised and the observed user-visible result.
+#   check 5     a `source: operator` row with `source_ref: ask-<id>` must have its
+#               `verbatim` be a SUBSTRING of the recorded answer. The only check in this
+#               design that verifies a quote rather than trusting it — see cmd_dispatch's
+#               --answers persistence in bin/forge.
+#   P18         an ADVISORY grep worklist of unchanged-path phrasings near a conditional.
+#               Low precision is fine BY DESIGN: the rule in _scope_diff_check blocks, the
+#               grep does not. It is printed, never counted.
+cmd_constraint_check() {
+    local slug="" stage="" report="" pr_override="" pr
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug)   slug="$2";   shift 2 ;;
+            --stage)  stage="$2";  shift 2 ;;
+            --report) report="$2"; shift 2 ;;
+            # Callers already holding a resolved root pass it rather than making this
+            # command walk up from CWD. cmd_verify_decision never cds and never runs
+            # _require_root_cwd, so re-resolving there is a dependency on the caller's
+            # working directory that nothing guarantees.
+            --project-root) pr_override="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$slug" ] || { echo "Usage: forge-bridge constraint-check --slug <s> [--stage <s>] [--report <path>]" >&2; return 1; }
+    pr="${pr_override:-$(_resolve_project_root "")}"
+    [ -n "$pr" ] || { echo "ERROR: constraint-check requires a forge-project.yml. Walk-up from cwd failed." >&2; return 1; }
+
+    # Checks 1-2, via the single source of the schema.
+    local _cc_out _cc_rc
+    _cc_out="$(FORGE_CONSTRAINTS_MODE=enforce _render_operator_constraints "$pr" "$slug" 2>&1)"; _cc_rc=$?
+    if [ "$_cc_rc" -ne 0 ]; then
+        printf '%s\n' "$_cc_out"
+        return 1
+    fi
+
+    # Report side (checks 3, 4, 5) plus the P18 advisory worklist. If no report is named
+    # and no stage is given, checks 1-2 alone are the whole answer.
+    if [ -z "$stage" ] && [ -z "$report" ]; then
+        echo "constraint-check: ledger for slug '$slug' is structurally sound."
+        return 0
+    fi
+    if [ -z "$report" ] && [ -n "$stage" ]; then
+        report="$(_constraints_report_path "$pr" "$slug" "$stage")"
+    fi
+    case "$report" in
+        UNKNOWN:*|"")
+            # UNKNOWN NEVER REFUSES — the same design invariant the evidence framework
+            # uses. A guard that refused on "I could not find the report" would block
+            # every pipeline whose stage wrote somewhere unexpected, which is how a rule
+            # gets routed around within a week.
+            echo "constraint-check: ledger sound; report side UNKNOWN (${report:-no-report}) — not graded."
+            return 0 ;;
+    esac
+    [ -f "$report" ] || { echo "constraint-check: ledger sound; report side UNKNOWN (report-missing:$report) — not graded."; return 0; }
+
+    FORGE_CCK_LEDGER="$pr/.dev/proposals/$slug/constraints.yml" \
+    FORGE_CCK_REPORT="$report" FORGE_CCK_ROOT="$pr" FORGE_CCK_STAGE="$stage" \
+    python3 <<'PY'
+import os, re, sys, json, glob, yaml
+
+ledger = os.environ["FORGE_CCK_LEDGER"]; report = os.environ["FORGE_CCK_REPORT"]
+root = os.environ["FORGE_CCK_ROOT"]; stage = os.environ.get("FORGE_CCK_STAGE", "")
+doc = yaml.safe_load(open(ledger)) or {}
+rows = doc.get("constraints") or []
+text = open(report, errors="replace").read()
+
+errs = []
+
+# The CONSTRAINT CHECK region: from the heading to the next heading or EOF. Region-scoped
+# so a constraint id merely MENTIONED in prose elsewhere cannot satisfy the set equality.
+m = re.search(r'(?im)^\s*#*\s*CONSTRAINT\s+CHECK\b.*$', text)
+region = text[m.end():] if m else ""
+if m:
+    nxt = re.search(r'(?m)^\s*#{1,6}\s+\S', region)
+    if nxt:
+        region = region[:nxt.start()]
+
+VERDICTS = ("PASS", "VIOLATED", "NOT-EXERCISED", "NOT-APPLICABLE")
+graded = {}
+for line in region.splitlines():
+    mm = re.match(r'\s*[-*|]?\s*`?([A-Za-z][A-Za-z0-9_.-]{0,31})`?\s*[:|\-]\s*.*?\b(%s)\b'
+                  % "|".join(VERDICTS), line)
+    if mm:
+        graded[mm.group(1)] = (mm.group(2), line.strip())
+
+# --- check 3: exact set equality, BOTH directions -------------------------------------
+ledger_ids = {str(r.get("id") or "").strip() for r in rows if isinstance(r, dict)}
+ledger_ids.discard("")
+if not m:
+    errs.append("the report names no CONSTRAINT CHECK section at all: %s" % report)
+for cid in sorted(ledger_ids - set(graded)):
+    errs.append("constraint %s is in the ledger but has NO row in the report's "
+                "CONSTRAINT CHECK section — it could never be confirmed, so this stage "
+                "cannot have validated against it" % cid)
+# Direction 2 is a HYGIENE check on a LOOSE regex, and a loose regex that BLOCKS is a
+# refusal waiting to fire on prose: inside the region, a sentence like
+# "Note: every row below reads PASS because the ledger is empty" captures `Note` as an id.
+# Direction 1 (a ledger id with no row) is the load-bearing half and stays blocking;
+# direction 2 blocks only for tokens SHAPED like ids and reports the rest.
+ID_SHAPE = re.compile(r'^[A-Za-z]{1,4}[0-9]+$')
+for cid in sorted(set(graded) - ledger_ids):
+    if ID_SHAPE.match(cid):
+        errs.append("the report grades '%s', which is not an id in the ledger" % cid)
+    else:
+        print("constraint-check: NOTE: ignored non-id token '%s' on a verdict line" % cid)
+
+by_id = {str(r.get("id") or "").strip(): r for r in rows if isinstance(r, dict)}
+EXECUTORS = {"coding", "coding-fix", "fix-code", "qa-fix"}
+for cid, (verdict, line) in sorted(graded.items()):
+    r = by_id.get(cid) or {}
+    # --- check 4: a user-visible PASS must name entry paths AND an observed result ----
+    if verdict == "PASS" and str(r.get("scope") or "").strip() == "user-visible":
+        low = line.lower()
+        named_path = any(k in low for k in ("entry path", "route", "command", "page",
+                                            "screen", "surface", "cli", "url"))
+        observed = any(k in low for k in ("observed", "screenshot", "rendered",
+                                          "transcript", "saw", "shows"))
+        if not (named_path and observed):
+            errs.append("constraint %s is scope:user-visible and graded PASS, but its "
+                        "row names no entry path and/or no observed user-visible result. "
+                        "Unit and integration evidence alone grades NOT-EXERCISED." % cid)
+    # --- executor stages may never self-certify a PASS -------------------------------
+    if verdict == "PASS" and stage in EXECUTORS:
+        errs.append("constraint %s is graded PASS by '%s', which APPLIES a plan rather "
+                    "than judging one. An executor's rows may read VIOLATED or "
+                    "NOT-APPLICABLE only — a mechanical executor asserting that a "
+                    "constraint holds is self-certification." % (cid, stage))
+
+# --- check 5: an ask-sourced verbatim must be a substring of the recorded answer ------
+for r in rows:
+    if not isinstance(r, dict):
+        continue
+    if str(r.get("source") or "").strip() != "operator":
+        continue
+    ref = str(r.get("source_ref") or "").strip()
+    if not ref.startswith("ask-"):
+        continue
+    arch = os.path.join(root, ".dev", "attention", "archive", ref + ".json")
+    if not os.path.exists(arch):
+        errs.append("constraint %s cites %s, but no archived ask record exists at "
+                    ".dev/attention/archive/%s.json — the quote cannot be verified"
+                    % (r.get("id"), ref, ref))
+        continue
+    try:
+        rec = json.load(open(arch))
+    except Exception as ex:
+        errs.append("constraint %s: archived ask %s is unreadable (%s)"
+                    % (r.get("id"), ref, ex))
+        continue
+    answer = rec.get("answer")
+    if not answer:
+        # MIGRATION, and it is answered the way this plan answers R4 everywhere else:
+        # UNKNOWN never refuses. Every ask archived BEFORE answer persistence shipped has
+        # no `answer` field, by construction, and an operator citing an ask answered
+        # earlier in the same pipeline is doing something entirely reasonable. Blocking
+        # here would refuse the next dispatch with `enforce` as the default and `observe`
+        # as the only escape — the exact day-one cliff the separate-commit ordering and
+        # `constraints init` exist to avoid. A quote that CANNOT be checked is reported and
+        # left to a reviewer; it is not evidence that the quote is wrong.
+        # The genuinely-missing-record branch above stays BLOCKING: citing an ask id that
+        # does not exist IS a fabrication, and it is distinguishable from this case.
+        print("constraint-check: NOTE: %s cites %s, whose archived record predates answer "
+              "persistence — the quote is unverifiable, not wrong" % (r.get("id"), ref))
+        continue
+    v = str(r.get("verbatim") or "").strip()
+    if v and v not in answer:
+        errs.append("constraint %s: `verbatim` is NOT a substring of the recorded answer "
+                    "for %s. The quote is not what the operator wrote." % (r.get("id"), ref))
+
+# --- P18: ADVISORY unchanged-path worklist. Printed, never counted. -------------------
+PHRASES = re.compile(r'(?i)\b(byte-identical|unchanged|unaffected|retained|'
+                     r'exactly as (?:today|before)|no behaviour change|no behavior change)\b')
+COND = re.compile(r'(?i)\b(when|if|unless|while|until|absent|missing|not set)\b')
+worklist = []
+for cand in sorted(glob.glob(os.path.join(os.path.dirname(ledger), "*.md"))):
+    for i, line in enumerate(open(cand, errors="replace"), 1):
+        if PHRASES.search(line) and COND.search(line):
+            worklist.append("%s:%d: %s" % (os.path.relpath(cand, root), i, line.strip()[:160]))
+
+if worklist:
+    print("ADVISORY — unchanged-path phrasings near a conditional. Low precision is")
+    print("intentional: the BLOCKING rule lives in _scope_diff_check section 5; this list")
+    print("is a worklist, not a verdict. Each one needs a NAMED TEST or it is BLOCKING.")
+    for w in worklist[:40]:
+        print("  " + w)
+    if len(worklist) > 40:
+        print("  … %d more" % (len(worklist) - 40))
+    print("")
+
+for e in errs:
+    print("constraint-check: " + e)
+sys.exit(1 if errs else 0)
+PY
+}
+
 cmd_verify_decision() {
     require_identity "verify-decision" host-session || return 1
     # P0-9: enforce-only terminal command. In observe it must NOT persist the new terminal
@@ -7540,6 +8076,25 @@ PY
         esac
     done
 
+    # Case 3 — the operator constraint ledger (#77b P31). DEFENCE IN DEPTH. The grade is
+    # computed in BOTH modes and rides the decision artifact; the CONTRIBUTION TO _ev_block
+    # is gated explicitly on _evidence_enforcing rather than left to the Step 9 gate,
+    # because _ev_block ALSO sets _ev_verd=contradicted unconditionally in both modes at
+    # the EVIDENCE emit below. An observe-mode verdict change described as inert would be
+    # the overclaiming this issue is about.
+    # $pr is passed rather than re-resolved: cmd_constraint_check's _resolve_project_root
+    # walks up from CWD, and this command never cds and never runs _require_root_cwd.
+    local _ev_cl="UNKNOWN:not-checked"
+    if cmd_constraint_check --slug "$slug" --project-root "$pr" >/dev/null 2>&1; then
+        _ev_cl="PASS:ledger-structurally-sound"
+    else
+        _ev_cl="FAIL:ledger-invalid-or-absent"
+        if _evidence_enforcing; then
+            _ev_block="$_ev_block constraint-ledger=invalid-or-absent"
+            _ev_cmd="~/bin/forge-bridge constraint-check --slug $slug"
+        fi
+    fi
+
     # Delivery grade. `committed-local` is GREEN: the orchestrator is FORBIDDEN to push, so it
     # is the highest machine-reachable state for most pipelines. There is deliberately NO
     # `pushed-unmerged` tier — refs/remotes/origin/<branch> is a possibly-stale local ref and
@@ -7567,6 +8122,7 @@ PY
     local _ev_art _ev_sha _ev_verd
     _ev_art="$(_ev_artifact_write "$pr" "$slug" verify "$callback_id" decision \
                    "git-state=$_ev_gs" "clean-tree=$_ev_tree" "merge-state=$_ev_merge" \
+                   "constraint-ledger=$_ev_cl" \
                    "pushed=$_ev_push" "merge-detail=INFO:${_ev_ms_detail}	_merge_state_probe $pr	0")"
     _ev_sha="$(shasum -a 256 "$_ev_art" 2>/dev/null | awk '{print $1}')"
     _ev_verd="$(_ev_verdict "git-state=$_ev_gs" "clean-tree=$_ev_tree" "merge-state=$_ev_merge")"
@@ -10287,6 +10843,11 @@ _FORGE_TARGET=""; _FORGE_CROSS=0; _FORGE_TARGET_ROOT=""
 # what makes an exported same-named variable inert — without it the fix is void.
 _FORGE_P_DELIVERY_ID=""; _FORGE_P_PHYSICAL_CODE_ROOT=""; _FORGE_P_ROOT_IDENTITY=""
 _FORGE_P_CAPABILITY_CLASS=""; _FORGE_P_DELIVERY_LANE=""; _FORGE_P_PROMPT_SHA256=""
+# 77b P6: the ledger version anchor, hashed over the CANONICALISED ROWS (not the file),
+# so "which ledger version did stage N validate against?" is answerable from the log. It
+# rides this channel for the same reason the six above do: a separate `forge-bridge log`
+# process must not be able to mint it.
+_FORGE_P_CONSTRAINTS_SHA=""
 # Single-shot row-birth authorization token, read by cmd_log's fix-route guard. It is
 # NOT provenance data: it answers "did in-process cmd_dispatch call me", which is a
 # DIFFERENT question from "what did the broker put in the payload". There is no line
@@ -10364,6 +10925,8 @@ case "${1:-help}" in
     alias-self-test)     shift; cmd_alias_self_test "$@" ;;
     identity)            cmd_identity ;;
     health)              cmd_health ;;
+    constraint-check)    shift; cmd_constraint_check "$@" ;;
+    constraints)         shift; cmd_constraints "$@" ;;
     verify-decision)     shift; cmd_verify_decision "$@" ;;
     finalize)            shift; cmd_finalize "$@" ;;
     hygiene-status)      shift; cmd_hygiene_status "$@" ;;
@@ -10431,6 +10994,21 @@ case "${1:-help}" in
         echo "                                Render digest prompt to .dev/forge-tmp/ for ad-hoc Agent dispatch"
         echo "  emit <TYPE> --slug <s> [--stage <s>] [key=value …]"
         echo "                                Orchestrator-driven heartbeat emit (TYPE: DISPATCH|WAIT|CALLBACK|DIGEST|STAGE|STALL|ERROR|COMPLETE|USAGE|RESET|HYGIENE_DECISION|HYGIENE_ABANDON|HYGIENE_BYPASSED|RESET_UNAVAILABLE|OBSERVE_ONLY)"
+        echo "  constraints init --slug <s>   Scaffold .dev/proposals/<s>/constraints.yml from problem-statement.md."
+        echo "                                Every scaffolded row is source: inferred / status: OPEN — a scaffolded"
+        echo "                                ledger is VISIBLY UNVERIFIED. Refuses to overwrite an existing ledger."
+        echo "  constraint-check --slug <s> [--stage <s>] [--report <path>]"
+        echo "                                Structural check of the operator constraint ledger (never semantic):"
+        echo "                                required fields; operator=>verbatim, derived=>rederive; with --stage,"
+        echo "                                exact set equality both ways between ledger ids and ids confirmed in"
+        echo "                                that stage's report; a user-visible PASS must name entry paths and an"
+        echo "                                observed result; an ask-sourced verbatim must be a substring of the"
+        echo "                                recorded answer. Also prints an ADVISORY unchanged-path worklist."
+        echo "                                dispatch REFUSES a carrier stage whose slug has no valid ledger"
+        echo "                                (CONSTRAINT_LEDGER_REQUIRED, exit 6). A stage is a carrier iff its"
+        echo "                                template asks for <<<INCLUDE _operator_constraints>>>."
+        echo "                                Rollback lever (audited, not a normal setting): FORGE_CONSTRAINTS_MODE=observe"
+        echo "                                downgrades the refusal to a warning at BOTH the render and the guard."
         echo "  verify-decision --slug <s> --callback-id <id> --pending-timestamp <ts>"
         echo "                                Bind verify/DONE to .dev/qa/<slug>/verification-report.yaml, hash it, transition terminal state; prints FINALIZE_READY"
         echo "  finalize --slug <s> [--dry-run]  Clear all four workers (proven) + publish the single bare COMPLETE via a durable outbox"
