@@ -61,10 +61,13 @@ The fix-manifest.yaml MUST contain:
   advisory_count: N
   fix_closes_bug: yes | partial | no
   regression_sweep_complete: yes | no
+  not_covered:            # one entry per axis / surface / entry path NOT exercised;
+    - <axis or surface>   # use [] only when every axis was exercised, and say so in prose
 
-End fix-issues.md with two lines, exactly:
+End fix-issues.md with three lines, exactly:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric: "Did all 3 teammates do substantive work (real test runs, real code reads, specific findings) and reach a unified verdict?" If yes → HIGH. If any teammate punted or the synthesis is fuzzy → MEDIUM. If the QA is shallow → LOW.
 

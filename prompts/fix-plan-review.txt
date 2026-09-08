@@ -49,9 +49,10 @@ The fix-review.md MUST contain:
   - ADVISORY — observation, not a request
 - For each issue: cite the fix-plan.md section, state the problem, state what specifically would need to change for you to clear it. Do NOT propose the fix yourself — describe the gap.
 - A 1-line `BLOCKING_ITEMS` count = number of CRITICAL + MAJOR (these block advancement)
-- End with two lines, exactly:
+- End with three lines, exactly:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric: "If I cleared this plan as-is, would the resulting fix actually resolve the diagnosed bug without regression?" If yes → HIGH (typically with 0 CRITICAL + 0 MAJOR). If you have concerns but the plan is mostly sound → MEDIUM. If the plan is fundamentally off → LOW.
 

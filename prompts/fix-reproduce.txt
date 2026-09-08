@@ -45,9 +45,10 @@ Hard scope rules:
 - Do NOT modify any source files. Output is repro.md only.
 - Do NOT type /clear yourself — the orchestrator drives clear.
 
-End the repro.md with two lines, exactly:
+End the repro.md with three lines, exactly:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric for this stage: "Could the investigation stage take this repro.md and start tracing causes immediately?" If yes → HIGH. If the repro is intermittent or partial but actionable → MEDIUM. If NOT REPRODUCED or no actionable evidence captured → LOW.
 

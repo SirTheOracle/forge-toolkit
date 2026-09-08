@@ -55,10 +55,12 @@ Hard rules for this stage:
 - Hypotheses are routing metadata only — never treated as ground truth by downstream stages.
 - Do NOT type /clear yourself — the orchestrator drives clear.
 
-End routing-plan.md with exactly three lines:
+End routing-plan.md with exactly five lines:
   CONFIDENCE: HIGH/MEDIUM/LOW
   GROUPS: N
   CROSS_SERVICE_SUSPECTED: yes/no
+  BLOCKING_ITEMS: N   (count services you could not route, and any group whose dominant cause you could not identify)
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric: "Could the runner act on this routing plan — set labels, write problem statements, dispatch — without re-scouting?" If yes → HIGH. If the grouping is sound but one or more dominant causes need the fix-investigate stage to confirm → MEDIUM. If the evidence can't yet support a reliable grouping → LOW (and explain what's missing).
 

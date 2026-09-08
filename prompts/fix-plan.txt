@@ -48,9 +48,10 @@ Investigate the existing codebase (read files via the Read tool) to ground every
 
 Write your final report to .dev/proposals/{slug}/fix-plan.md BEFORE sending FORGE_DONE. The FORGE_DONE callback must be a one-line summary only; the digest agent reads the report file from disk.
 
-End the fix-plan.md with two lines, exactly:
+End the fix-plan.md with three lines, exactly:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric for this stage: "Could fix-coder consume this plan and apply diffs mechanically without re-planning?" If yes → HIGH. If they'd need to make material judgment calls beyond the plan → MEDIUM. If the plan is speculative or has unresolved decisions → LOW.
 

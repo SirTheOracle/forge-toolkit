@@ -34,6 +34,7 @@ In .dev/proposals/{slug}/impl-review.md, report:
 
 CONFIDENCE: HIGH/MEDIUM/LOW
 BLOCKING_ITEMS: N
+NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
   (Out-of-scope touches without strict necessity, AND shared-helper
   extensions where any out-of-scope caller would change behavior,
   count as BLOCKING.)

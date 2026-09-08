@@ -52,9 +52,10 @@ Hard rules:
   with `NEEDS PRODUCT DECISION:`; still design everything that does not depend on it.
 - Do NOT type /clear yourself — the orchestrator drives clear.
 
-End fix-plan.md with exactly two lines:
+End fix-plan.md with exactly three lines:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N   (count NEEDS-PRODUCT-DECISION items + anything unresolvable)
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 When complete:
   ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \

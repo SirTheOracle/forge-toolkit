@@ -52,9 +52,10 @@ Hard rules for this stage:
 - INSUFFICIENT EVIDENCE is a legitimate exit — do not force a cause when the evidence doesn't support one. The orchestrator escalates this verdict to the user.
 - Do NOT type /clear yourself — the orchestrator drives clear.
 
-End the diagnosis.md with two lines, exactly:
+End the diagnosis.md with three lines, exactly:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric for this stage: "Could the fix-plan stage take this diagnosis.md and design a patch with no further investigation?" If yes → HIGH. If PARTIALLY CONVERGED but the converged subset is actionable → MEDIUM. If INSUFFICIENT EVIDENCE → LOW.
 
