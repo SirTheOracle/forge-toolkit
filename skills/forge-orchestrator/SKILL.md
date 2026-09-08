@@ -579,6 +579,116 @@ You pick the slug. Don't ask the user unless it matters.
 
 ---
 
+## The Spec Boundary
+
+**You are the only actor that sees the operator's raw words and also the actor
+that writes the spec. That is the unchecked translation this section exists to
+expose. Quote; do not summarise.**
+
+Every stage downstream of you validates against `problem-statement.md`. None of
+them validates against what the operator actually said, because none of them can
+see it. A one-clause reframing here propagates through investigation, planning,
+plan review, coding, QA and regression measurement with *increasing* confidence,
+because every later stage is correctly doing its job against a corrupted premise.
+
+### The ledger — `.dev/proposals/{slug}/constraints.yml`
+
+Every build- and fix-pipeline slug has one. `forge-bridge dispatch` **refuses** a
+carrier stage whose slug has no valid ledger, and the bytes are delivered into
+every carrier prompt by the synthetic `<<<INCLUDE _operator_constraints>>>`.
+
+```yaml
+schema: forge-constraints/1
+constraints:
+  - id: C1
+    source: operator            # operator | derived | inferred
+    verbatim: "<the operator's own words, quoted, not paraphrased>"
+    source_ref: "ask-<id>"      # ask-<id> | payload-<did> | packet:#<n> | chat
+    asked_about: "<the narrow thing the question was about>"
+    principle: "<the general rule the ruling implies>"
+    binds: "<the SCOPE this rule governs — expected to be WIDER than asked_about>"
+    scope: user-visible         # user-visible | internal
+    check: "<how a stage would confirm it>"
+    status: OPEN                # OPEN | CONFIRMED | REJECTED
+```
+
+Field by field, each tied to a named failure:
+
+- **`verbatim` and `principle` are separate fields** so the translation you
+  perform becomes a diffable pair carried into every prompt. This buys
+  **visibility, not correctness** — you type both. Say so; do not sell it as more.
+- **`asked_about` / `binds`** exist because rulings get applied at the scope of
+  the question that was asked. `binds` is expected to be wider. **A `binds` that
+  merely repeats its `asked_about` is itself a finding**, and reviewers are
+  instructed to report it.
+- **`source: derived`** means *your reading of a measurement*, and REQUIRES a
+  `rederive:` command that regenerates it. A derived claim consumed as a measured
+  one is its own failure class.
+- **`scope: user-visible`** gates the end-to-end walk. A project with no
+  user-visible surface produces zero such rows and pays zero cost. Such a row may
+  be graded `PASS` only on a real-product observation — a screenshot, a rendered
+  page, a CLI transcript. Unit and integration evidence alone grades
+  `NOT-EXERCISED`.
+- **An empty ledger is legal** as `constraints: []` plus a mandatory
+  `none_recorded_reason:`. Silence is not a pass; an empty ledger with a stated
+  reason is one a reviewer can attack.
+
+**The ledger is single-writer: you.** Any stage may *propose* a row via a
+`BLOCKED` callback — that is a review event, not a worker write. The content hash
+recorded on every dispatch (`constraints_sha256:` in `forge-log.yml`) makes
+"which version did stage N validate against?" answerable from the log, so this
+needs no seal/verify-seal treatment.
+
+**Fix lane: the ledger is GENERATED, not authored.** For `forge-fix-runner`-driven
+slugs, `packets/<gid>.md` **is** the problem statement and already holds verbatim
+issue bodies. Generate one `source: operator` row per covered issue,
+`source_ref: "packet:#<n>"`, `verbatim` sliced from that issue's body, `check`
+seeded from its `verification_targets` row. Slicing a quote out of a free-form
+issue body is a heuristic, not a parse: **emit `source: inferred` on any row you
+cannot cleanly attribute.** A bad quote manufactures exactly the false authority
+this mechanism exists to prevent.
+
+### Two obligations on you
+
+1. **Embed the frame-challenge clause in the `proposal` spawn message.** The
+   `proposal` stage is orchestrator-local and renders no template, so the ledger
+   cannot reach it mechanically. Paste this into every Round 1 proposer prompt:
+
+   > Before proposing, read `constraints.yml` beside `problem-statement.md`.
+   > Wherever the statement's prose *restates* a `verbatim` rather than quoting
+   > it, and the restatement narrows, widens or reframes it, that is a finding.
+   > Wherever a `principle` does not follow from its `verbatim`, or a `binds`
+   > merely repeats its `asked_about`, that is a finding. You may return
+   > `REJECT: <clause>` on the problem statement itself. It was written by the
+   > actor whose translation you are checking.
+
+2. **`REJECT` is a stop condition and it does not come back to you.** It is
+   stop condition **#8 in Pipeline Mode** and **#9 in Fix Pipeline Mode** (that
+   list already carried an eighth item). Escalate to the OPERATOR with
+   `forge ask`, quoting the rejected clause and the ledger row it contradicts.
+   Returning a rejected spec to the actor that wrote it costs a round and repairs
+   nothing.
+
+### Enforcement is code, not prose
+
+- The synthetic include fails closed: a missing, unparseable, schema-invalid or
+  oversized ledger exits 2 at render.
+- `dispatch` refuses a carrier stage with no valid ledger
+  (`CONSTRAINT_LEDGER_REQUIRED`, exit 6), and refuses `--source-prompt` for one.
+- At the next stage's dispatch, the bridge checks **exact set equality both
+  directions** between ledger ids and the ids the previous stage's report graded.
+- `FORGE_CONSTRAINTS_MODE=observe` is a **rollback lever, audited, not a normal
+  setting**.
+
+**What none of that reaches.** A constraint stated conversationally in pane 0 has
+no durable record to anchor to, and that is the majority case. Ask-sourced rows
+are mechanically verifiable; chat-sourced rows rest on your good faith. And
+nothing surfaces an instruction you never recognised as a constraint — the ledger
+cannot contain what its author did not see. Both limits are real; do not report
+around them.
+
+---
+
 ## The Log Is the Source of Truth
 
 There is no `forge-state.yml`. Pipeline progress is determined by reading
