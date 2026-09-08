@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 Note: this skill refers to "lead" — in forge usage, "lead" = the orchestrator in pane 1.
 
 Follow adversarial-verify skill at
@@ -16,6 +20,7 @@ Write `.dev/qa/{slug}/verification-report.yaml`.
 
 CONFIDENCE: HIGH/MEDIUM/LOW
 BLOCKING_ITEMS: N
+NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 When complete:
   ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \

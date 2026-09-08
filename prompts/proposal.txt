@@ -21,9 +21,11 @@ Inputs (READ ALL BEFORE PROPOSING):
 Outputs (the skill produces all of these; do not skip any):
 - .dev/proposals/{slug}/proposal-A.md
 - .dev/proposals/{slug}/proposal-B.md
-- .dev/proposals/{slug}/synthesis.md
+- .dev/proposals/{slug}/proposal-C.md
 - .dev/proposals/{slug}/review-for-A.md
 - .dev/proposals/{slug}/review-for-B.md
+- .dev/proposals/{slug}/feedback-A.md
+- .dev/proposals/{slug}/feedback-B.md
 - .dev/proposals/{slug}/reconciliation-notes.md
 - .dev/proposals/{slug}/final-plan.md (canonical artifact for downstream stages)
 
@@ -33,6 +35,7 @@ Investigate the existing codebase (read files via the file-reading tool) to grou
 
 CONFIDENCE: HIGH/MEDIUM/LOW
 BLOCKING_ITEMS: N
+NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 When complete:
   ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \

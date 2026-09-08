@@ -339,6 +339,50 @@ _scrub_hits="$(cd "$ROOT" && git ls-files -z --cached --others --exclude-standar
   && ok "T-SKILL-SCRUB no absolute home path or private project name in any tracked skills/ or codex-skills/ file" \
   || bad "T-SKILL-SCRUB publication leak in a PUBLIC repo (a revert does NOT remove it from history): $(printf '%s' "$_scrub_hits" | head -5 | tr '\n' ' ')"
 
+# ---- #77b · the operator's answer joins the question it answered (T-ANS-*) ----
+_ans_err=""
+_ans_fwd="$(sed -n '/answer lifecycle (Phase B/,/^    fi$/p' "$ROOT/bin/forge")"
+printf '%s' "$_ans_fwd" | grep -q 'FORGE_ANS_TEXT' || _ans_err="$_ans_err answer-text-not-passed-in"
+printf '%s' "$_ans_fwd" | grep -q 'rec\["answer"\]' || _ans_err="$_ans_err no-answer-field"
+printf '%s' "$_ans_fwd" | grep -q 'rec\["answer_sha256"\]' || _ans_err="$_ans_err no-answer_sha256"
+printf '%s' "$_ans_fwd" | grep -q 'rec\["answered_at"\]' || _ans_err="$_ans_err no-answered_at"
+printf '%s' "$_ans_fwd" | grep -q '0o600' || _ans_err="$_ans_err archive-not-0600"
+# The enrichment must come AFTER the atomic claim, never instead of it: os.replace(src,arch)
+# IS the exactly-once gate, and reordering would reopen the double-answer race.
+_ans_ci="$(printf '%s' "$_ans_fwd" | grep -n 'os.replace(src, arch)' | head -1 | cut -d: -f1)"
+_ans_ai="$(printf '%s' "$_ans_fwd" | grep -n 'rec\["answer"\]' | head -1 | cut -d: -f1)"
+{ [ -n "$_ans_ci" ] && [ -n "$_ans_ai" ] && [ "$_ans_ai" -gt "$_ans_ci" ]; } \
+  || _ans_err="$_ans_err enrichment-not-after-claim"
+# The sha256 must be over the RAW text, so it stays comparable with instruction_sha256,
+# which is also over raw.
+printf '%s' "$_ans_fwd" | grep -q 'hashlib.sha256(_ans.encode' || _ans_err="$_ans_err sha-not-over-raw"
+[ -z "$_ans_err" ] \
+  && ok "T-ANS-PERSIST the --answers claim block records answer / answer_sha256 / answered_at at 0600, after the atomic claim" \
+  || bad "T-ANS-PERSIST:$_ans_err"
+
+# T-D1-NO-PHANTOM-ANSWER  NEGATIVE, and deliberately so. forge-bridge log-response archives
+# asks via _archive_resolved_asks — a DIFFERENT binary and a different path. An ask archived
+# there closed because the STAGE ENDED, not because the operator answered, so writing an
+# `answer` field there would fabricate a ruling that never happened. Written to hold whether
+# or not T-D1-ARCHIVE-ON-CLOSE itself passes.
+_d1p="$(sed -n '/_archive_resolved_asks/,/^}$/p' "$ROOT/bin/forge-bridge")"
+if printf '%s' "$_d1p" | grep -qE '"answer"|answer_sha256|answered_at'; then
+  bad "T-D1-NO-PHANTOM-ANSWER the log-response archive path writes an answer field — an ask closed because its STAGE ended was never answered by anyone"
+else
+  ok "T-D1-NO-PHANTOM-ANSWER the log-response archive path records no answer (only the --answers path does)"
+fi
+
+# T-ANS-NO-FOURTH-REDACT  Step 90 stores the answer UNREDACTED, and one of its three reasons
+# is that a fourth copy of the SECRETS/KV pair would break a live three-copy lockstep
+# (bin/forge x2, bin/forge-cc-hook x1). A justification that rests on a count is only a
+# justification while something counts it. If a shared redaction helper is ever introduced —
+# which is the right long-term fix, because it would protect the raw payload file too — this
+# assertion is what tells you to revisit Step 90's decision rather than silently keep it.
+_red_n="$(grep -rc 'SECRETS = re.compile' "$ROOT/bin" 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')"
+[ "$_red_n" = 3 ] \
+  && ok "T-ANS-NO-FOURTH-REDACT the SECRETS/KV redaction pair still has exactly 3 copies under bin/" \
+  || bad "T-ANS-NO-FOURTH-REDACT found $_red_n copies of the redaction pair, expected 3 — if this went UP, a fourth transcription was added; if DOWN, they were unified and Step 90's third reason no longer holds"
+
 # ---- C9 · T-DRIFT-INVENTORY: --check-drift answers BOTH inventory questions ----
 # The old drift loop globbed skills/*/ and was therefore blind to a missing skill BY
 # CONSTRUCTION. This is the GENERIC re-expression of the archived "real-home
@@ -450,6 +494,12 @@ for s in sorted((synthetic | quarantined) & declared):
     errs.append("install.sh PROMPT_NAMES declares '%s', which is on an exclusion list" % s)
 if not (synthetic & {"_preamble"}):
     errs.append("install.sh SYNTHETIC_PROMPTS no longer excludes _preamble")
+if not (synthetic & {"_operator_constraints"}):
+    errs.append("install.sh SYNTHETIC_PROMPTS no longer excludes _operator_constraints — "
+                "it is rendered PER SLUG from .dev/proposals/<slug>/constraints.yml, so a "
+                "real _operator_constraints.txt would not merely shadow a synthetic, it "
+                "would substitute STALE, SLUG-BLIND text for live operator constraints in "
+                "every carrier prompt. Every carrier's render would also stop resolving it")
 if quarantined != {"env-fix", "qa-live-retry"}:
     errs.append("install.sh UNVENDORABLE_PROMPTS changed from {env-fix, qa-live-retry} "
                 "to %s — if #79 is fixed, vendor them and update this test together"
@@ -467,7 +517,18 @@ _dp_err=""
 # Forward · declared-but-absent: nothing installed, so every declared prompt is reported.
 _dp_out="$(cd "$ROOT" && _dp_env || true)"
 _dp_declared="$(printf '%s' "$_dp_out" | grep -c 'prompts/.*— not installed' || true)"
-[ "$_dp_declared" -ge 27 ] || _dp_err="$_dp_err declared-but-absent-reported-only-$_dp_declared"
+# 28 since #77b added prompts/_constraint_check.txt to PROMPT_NAMES. The bound is `-ge`, so
+# a stale floor still passes — which is exactly why it must be raised with the inventory
+# rather than left behind it.
+[ "$_dp_declared" -ge 28 ] || _dp_err="$_dp_err declared-but-absent-reported-only-$_dp_declared"
+# The two synthetics must never be reported as live-undeclared: they are excluded BY NAME,
+# and a regression there would produce a drift report that names them on every run forever.
+printf 'x\n' > "$_dp/.config/forge/prompts/_preamble.txt"
+printf 'x\n' > "$_dp/.config/forge/prompts/_operator_constraints.txt"
+_dp_out="$(cd "$ROOT" && _dp_env || true)"
+printf '%s' "$_dp_out" | grep -qE 'prompts/(_preamble|_operator_constraints)\.txt' \
+  && _dp_err="$_dp_err synthetic-reported-as-undeclared"
+rm -f "$_dp/.config/forge/prompts/_preamble.txt" "$_dp/.config/forge/prompts/_operator_constraints.txt"
 # Reverse · present-but-undeclared: an untracked live .txt MUST be reported.
 printf 'probe\n' > "$_dp/.config/forge/prompts/driftprobe-tmp.txt"
 _dp_out="$(cd "$ROOT" && _dp_env || true)"
@@ -510,7 +571,11 @@ cmp -s "$_dp_before" "$_dp_after" || _dp_err="$_dp_err check-drift-mutated-HOME"
 # FNS extraction idiom, so they cannot drift from the shipped code. dispatch --dry-run is
 # not usable here: it refuses on session identity outside a forge pane.
 PFNS="$WORK/prompt-fns.sh"
-sed -n '/^_render_preamble()/,/^}$/p; /^_render_template()/,/^}$/p' "$BRIDGE" > "$PFNS"
+# _render_operator_constraints is extracted TOO: _render_template calls it, and an
+# extraction that omits it yields rc 127 and a `render-failed:` for every carrier prompt
+# with a diagnostic that points nowhere near the cause. That function deliberately uses a
+# literal '.dev' rather than $DEV_DIR precisely so it survives this isolation.
+sed -n '/^_render_preamble()/,/^}$/p; /^_render_operator_constraints()/,/^}$/p; /^_render_template()/,/^}$/p' "$BRIDGE" > "$PFNS"
 bash -n "$PFNS" && ok "T-PROMPT-EXTRACT renderer extraction parses" || bad "T-PROMPT-EXTRACT renderer extraction does not parse"
 # shellcheck disable=SC1090
 . "$PFNS"
@@ -522,6 +587,36 @@ services:
   backend:
     working_dir: "."
     port: 8123
+YML
+# 77b: every non-`_` prompt now carries <<<INCLUDE _operator_constraints>>>, which is a
+# SYNTHETIC rendered per slug from .dev/proposals/<slug>/constraints.yml and which FAILS
+# CLOSED (exit 2) when that ledger is missing, unparseable or schema-invalid. Without a
+# real ledger here every carrier prompt reports `render-failed:` — so the fixture plants
+# one, and the render test therefore EXERCISES the synthetic rather than routing around
+# it. Slug `rslug` matches the slug the loop below renders with.
+mkdir -p "$_pr_root/.dev/proposals/rslug"
+cat > "$_pr_root/.dev/proposals/rslug/constraints.yml" <<'YML'
+schema: forge-constraints/1
+constraints:
+  - id: C1
+    source: operator
+    verbatim: "nothing is filtered out on the tool's own initiative"
+    source_ref: "chat"
+    asked_about: "the detail view"
+    principle: "the tool advises, the operator decides"
+    binds: "every list and render path, not only the one the question named"
+    scope: user-visible
+    check: "reach the surface through every entry path and assert no row is withheld"
+    status: OPEN
+  - id: C2
+    source: derived
+    verbatim: null
+    source_ref: "measurement, round 2"
+    rederive: "printf 'probe\\n'"
+    principle: "the live row shape is the one the producer mints unconditionally"
+    scope: internal
+    check: "run rederive and compare before citing this row"
+    status: OPEN
 YML
 
 # T-PROMPT-PREAMBLE · _preamble stays synthetic, and an ordinary miss still fails closed.
@@ -562,8 +657,14 @@ for _t in "$ROOT"/prompts/*.txt; do
   # Byte-identical BEFORE vs AFTER vendoring: render the same stage from the live
   # directory the prompts were vendored out of. Skipped on a machine that has none
   # (fresh clone), which is why the self-containment half above carries no such guard.
+  # The live comparison is scoped to prompts whose live copy still MATCHES the repo
+  # source. install.sh Step 3.8 PRESERVES an operator-modified live prompt rather than
+  # overwriting it, so an edited prompt stays divergent until the operator deletes the
+  # live copy and re-installs — and asserting byte-identity across that window would make
+  # the suite red for a reason that is not a defect. Where live and repo DO match, the
+  # render must still match: that is the #77a guarantee and it is retained in full.
   _prr_live="$HOME/.config/forge/prompts/$(basename "$_t")"
-  if [ -f "$_prr_live" ]; then
+  if [ -f "$_prr_live" ] && cmp -s "$_t" "$_prr_live"; then
     FORGE_PROMPTS_DIR="$HOME/.config/forge/prompts"
     _prr_c="$(_render_template "$_prr_live" rslug coding claude-opus 1 "$_pr_root" 2>/dev/null)"
     [ "$_prr_a" = "$_prr_c" ] || _prr_err="$_prr_err live-differs:$(basename "$_t")"
@@ -573,6 +674,246 @@ done
 [ -z "$_prr_err" ] \
   && ok "T-PROMPT-RENDER all $_prr_n vendored prompts render from prompts/ alone, deterministically and byte-identically to the live originals" \
   || bad "T-PROMPT-RENDER:$_prr_err"
+
+# ---- #77b · the _operator_constraints synthetic (T-OC-SYNTHETIC) ----
+# Drives the REAL _render_operator_constraints out of $PFNS, so it cannot drift from the
+# shipped code. The synthetic's ONLY job is to fail CLOSED: _preamble returns empty on a
+# miss because a project without forge-project.yml is a legitimate state, but a stage about
+# to run WITHOUT the operator's words is #77's failure verbatim. Each shape below is a
+# different way a ledger can be wrong, and every one must exit 2.
+_oc_root="$WORK/oc-root"; mkdir -p "$_oc_root/.dev/proposals/ocslug"
+_oc_led="$_oc_root/.dev/proposals/ocslug/constraints.yml"
+_oc_err=""
+_oc_case(){  # <label> <expect-rc>  — ledger content already written
+  local _l="$1" _want="$2" _out _rc
+  _out="$(_render_operator_constraints "$_oc_root" ocslug 2>&1)"; _rc=$?
+  [ "$_rc" = "$_want" ] || _oc_err="$_oc_err $_l:rc=$_rc-want-$_want"
+  printf '%s' "$_out"
+}
+# 1 · missing file
+rm -f "$_oc_led"
+_oc_out="$(_oc_case missing 2)"
+printf '%s' "$_oc_out" | grep -q 'constraint ledger not found' || _oc_err="$_oc_err missing-msg"
+printf '%s' "$_oc_out" | grep -q 'constraints init --slug ocslug' || _oc_err="$_oc_err missing-remedy"
+# 2 · unparseable YAML
+printf 'schema: forge-constraints/1\nconstraints:\n  - id: [unclosed\n' > "$_oc_led"
+_oc_case unparseable 2 >/dev/null
+# 3 · wrong schema key
+printf 'schema: nope/1\nconstraints: []\nnone_recorded_reason: r\n' > "$_oc_led"
+_oc_case wrong-schema 2 >/dev/null
+# 4 · a row missing a required field (no `check:`)
+printf 'schema: forge-constraints/1\nconstraints:\n  - id: C1\n    source: inferred\n    principle: p\n    scope: internal\n' > "$_oc_led"
+_oc_case missing-field 2 >/dev/null
+# 5 · source: operator with no verbatim
+printf 'schema: forge-constraints/1\nconstraints:\n  - id: C1\n    source: operator\n    principle: p\n    scope: internal\n    check: c\n' > "$_oc_led"
+_oc_out="$(_oc_case operator-no-verbatim 2)"
+printf '%s' "$_oc_out" | grep -q "requires a non-empty 'verbatim'" || _oc_err="$_oc_err operator-msg"
+# 6 · source: derived with no rederive
+printf 'schema: forge-constraints/1\nconstraints:\n  - id: C1\n    source: derived\n    principle: p\n    scope: internal\n    check: c\n' > "$_oc_led"
+_oc_out="$(_oc_case derived-no-rederive 2)"
+printf '%s' "$_oc_out" | grep -q "requires a non-empty 'rederive'" || _oc_err="$_oc_err derived-msg"
+# 7 · empty ledger with no none_recorded_reason — silence is NOT a pass
+printf 'schema: forge-constraints/1\nconstraints: []\n' > "$_oc_led"
+_oc_out="$(_oc_case empty-no-reason 2)"
+printf '%s' "$_oc_out" | grep -q 'none_recorded_reason' || _oc_err="$_oc_err empty-msg"
+# 8 · over the 6000-byte cap
+{ printf 'schema: forge-constraints/1\nconstraints:\n'
+  i=1; while [ "$i" -le 40 ]; do
+    printf '  - id: C%d\n    source: inferred\n    principle: "%s"\n    scope: internal\n    check: "%s"\n' \
+      "$i" "$(printf 'p%.0s' $(seq 1 120))" "$(printf 'c%.0s' $(seq 1 120))"
+    i=$((i+1)); done; } > "$_oc_led"
+_oc_out="$(_oc_case over-cap 2)"
+printf '%s' "$_oc_out" | grep -q 'over the 6000-byte cap' || _oc_err="$_oc_err cap-msg"
+# 9 · POSITIVE: a valid ledger renders, and carries a NAMED, greppable ledger_hash.
+cat > "$_oc_led" <<'YML'
+schema: forge-constraints/1
+constraints:
+  - id: C1
+    source: operator
+    verbatim: "nothing is filtered out on the tool's own initiative"
+    source_ref: "chat"
+    asked_about: "the detail view"
+    principle: "the tool advises, the operator decides"
+    binds: "every list and render path"
+    scope: user-visible
+    check: "reach the surface through every entry path"
+    status: OPEN
+YML
+_oc_out="$(_oc_case valid 0)"
+printf '%s' "$_oc_out" | grep -q 'OPERATOR CONSTRAINTS' || _oc_err="$_oc_err valid-header"
+printf '%s' "$_oc_out" | grep -q "nothing is filtered out on the tool's own initiative" \
+  || _oc_err="$_oc_err valid-verbatim-missing"
+# THE VERSION ANCHOR IS SINGLE-SOURCE (P6). cmd_dispatch reads this token back out of this
+# block rather than recomputing it, which is what makes the digest a stage is SHOWN and the
+# constraints_sha256 the LOG RECORDS the same number. A second canonicalisation anywhere
+# would diverge silently with no oracle, so pin the token's shape here.
+printf '%s' "$_oc_out" | grep -Eq 'ledger_hash: [0-9a-f]{16}' || _oc_err="$_oc_err no-ledger_hash-token"
+_oc_h1="$(printf '%s' "$_oc_out" | sed -n 's/.*ledger_hash: \([0-9a-f]\{16\}\).*/\1/p' | head -1)"
+# A COMMENT MUST NOT MOVE THE HASH; a VALUE MUST. That is the difference between hashing the
+# canonicalised rows and hashing the file, and it is the whole reason the plan specifies rows.
+printf '# a comment that changes nothing\n' >> "$_oc_led"
+_oc_h2="$(_render_operator_constraints "$_oc_root" ocslug 2>&1 | sed -n 's/.*ledger_hash: \([0-9a-f]\{16\}\).*/\1/p' | head -1)"
+[ "$_oc_h1" = "$_oc_h2" ] || _oc_err="$_oc_err hash-moved-on-comment"
+sed -i.bak 's/the tool advises, the operator decides/the tool decides/' "$_oc_led"; rm -f "$_oc_led.bak"
+_oc_h3="$(_render_operator_constraints "$_oc_root" ocslug 2>&1 | sed -n 's/.*ledger_hash: \([0-9a-f]\{16\}\).*/\1/p' | head -1)"
+[ "$_oc_h1" != "$_oc_h3" ] || _oc_err="$_oc_err hash-did-not-move-on-value-change"
+# 10 · THE ROLLBACK LEVER, at the render site. This is the case a guard-only lever cannot
+# reach: rendering happens BEFORE cmd_dispatch's --dry-run return and before every guard, so
+# a lever that existed only at the guard would be advertised in help text and be inoperative
+# for exactly the situation it exists for. Do not delete this to "simplify" the renderer.
+rm -f "$_oc_led"
+_oc_obs="$(FORGE_CONSTRAINTS_MODE=observe _render_operator_constraints "$_oc_root" ocslug 2>&1)"; _oc_orc=$?
+[ "$_oc_orc" = 0 ] || _oc_err="$_oc_err observe-rc=$_oc_orc-not-0"
+printf '%s' "$_oc_obs" | grep -q 'OPERATOR CONSTRAINTS — UNAVAILABLE' || _oc_err="$_oc_err observe-no-placeholder"
+_oc_bad="$(FORGE_CONSTRAINTS_MODE=enfroce _render_operator_constraints "$_oc_root" ocslug 2>&1)"; _oc_brc=$?
+[ "$_oc_brc" = 2 ] || _oc_err="$_oc_err badmode-rc=$_oc_brc-not-2"
+printf '%s' "$_oc_bad" | grep -q 'must be enforce|observe' || _oc_err="$_oc_err badmode-msg"
+[ -z "$_oc_err" ] \
+  && ok "T-OC-SYNTHETIC the ledger renderer fails closed on all eight bad shapes, renders a valid ledger with a single-source ledger_hash, and honours the observe lever at the RENDER site" \
+  || bad "T-OC-SYNTHETIC:$_oc_err"
+
+# ---- #77b · constraint-check, the closing gate (T-CCK-*) ----
+# Structure, not semantics — the check_packets ambition level. It never judges whether a
+# constraint is SATISFIED; it asserts that a place to record the answer exists for every
+# obligation, in both directions, and that an ask-sourced quote is really a quote.
+_cck_root="$WORK/cck-root"; mkdir -p "$_cck_root/.claude" "$_cck_root/.dev/proposals/cck"
+cat > "$_cck_root/.claude/forge-project.yml" <<'YML'
+project:
+  name: cckprobe
+YML
+cat > "$_cck_root/.dev/proposals/cck/constraints.yml" <<'YML'
+schema: forge-constraints/1
+constraints:
+  - id: C1
+    source: operator
+    verbatim: "nothing is filtered out on the tool's own initiative"
+    source_ref: "ask-20990101T000000Z-abcdef"
+    asked_about: "the detail view"
+    principle: "the tool advises, the operator decides"
+    binds: "every list and render path"
+    scope: user-visible
+    check: "reach the surface through every entry path"
+    status: OPEN
+  - id: C2
+    source: inferred
+    principle: "the log format does not change"
+    scope: internal
+    check: "diff a rendered log line before and after"
+    status: OPEN
+YML
+# C1 cites this ask from the moment the ledger is written, so the archived record must
+# exist from the start too — otherwise every report-side case below (2-6) spuriously
+# trips check 5's "no archived ask record exists" before case 7 ever gets to it.
+mkdir -p "$_cck_root/.dev/attention/archive"
+printf '{"ask_id":"ask-20990101T000000Z-abcdef","answer":"nothing is filtered out on the tool%ss own initiative, anywhere"}\n' "'" \
+  > "$_cck_root/.dev/attention/archive/ask-20990101T000000Z-abcdef.json"
+_cck(){ ( cd "$_cck_root" && "$BRIDGE" constraint-check "$@" 2>&1 ); }
+_cck_err=""
+# 1 · checks 1-2 alone: the ledger is structurally sound.
+_cck --slug cck >/dev/null 2>&1 || _cck_err="$_cck_err sound-ledger-refused"
+# 2 · check 3, direction 1 — a ledger id with NO row in the report is BLOCKING. This is the
+#     check_packets property: an obligation with nowhere to record the answer could never
+#     have been confirmed, so the stage cannot have validated against it.
+printf 'CONSTRAINT CHECK\n- C1: PASS — entry path /detail, observed all rows rendered\n' \
+  > "$_cck_root/.dev/proposals/cck/report-a.md"
+_cck_o="$(_cck --slug cck --stage review --report "$_cck_root/.dev/proposals/cck/report-a.md")"
+{ printf '%s' "$_cck_o" | grep -q 'C2 is in the ledger but has NO row'; } \
+  || _cck_err="$_cck_err seteq-dir1-missed"
+# 3 · check 3, direction 2 — an ID-SHAPED token the ledger does not have is BLOCKING…
+printf 'CONSTRAINT CHECK\n- C1: PASS — entry path /detail, observed all rows rendered\n- C2: NOT-APPLICABLE — internal\n- C9: PASS\n' \
+  > "$_cck_root/.dev/proposals/cck/report-b.md"
+_cck_o="$(_cck --slug cck --stage review --report "$_cck_root/.dev/proposals/cck/report-b.md")"
+{ printf '%s' "$_cck_o" | grep -q "grades 'C9'"; } || _cck_err="$_cck_err seteq-dir2-missed"
+# 4 · …but a PROSE token is NOT. A loose regex that blocks is a refusal waiting to fire on a
+#     sentence, and a rule that fires on good writing gets routed around within a week.
+printf 'CONSTRAINT CHECK\n- C1: PASS — entry path /detail, observed all rows rendered\n- C2: NOT-APPLICABLE — internal\nNote: every row above reads PASS or NOT-APPLICABLE.\n' \
+  > "$_cck_root/.dev/proposals/cck/report-c.md"
+_cck --slug cck --stage review --report "$_cck_root/.dev/proposals/cck/report-c.md" >/dev/null 2>&1 \
+  || _cck_err="$_cck_err prose-token-blocked"
+# 5 · check 4 — a scope: user-visible PASS that names no entry path and no observed result
+#     grades NOT-EXERCISED. Unit and integration evidence alone is not a walk of the product.
+printf 'CONSTRAINT CHECK\n- C1: PASS — unit tests green\n- C2: NOT-APPLICABLE — internal\n' \
+  > "$_cck_root/.dev/proposals/cck/report-d.md"
+_cck_o="$(_cck --slug cck --stage review --report "$_cck_root/.dev/proposals/cck/report-d.md")"
+{ printf '%s' "$_cck_o" | grep -q 'names no entry path'; } || _cck_err="$_cck_err uservisible-pass-accepted"
+# 6 · the executor never-PASS clause: coding/coding-fix/fix-code/qa-fix may record VIOLATED
+#     or NOT-APPLICABLE only. A mechanical executor asserting a constraint HOLDS is
+#     self-certification, which the bridge's evidence rule exists to prevent.
+_cck_o="$(_cck --slug cck --stage coding --report "$_cck_root/.dev/proposals/cck/report-b.md")"
+{ printf '%s' "$_cck_o" | grep -q 'APPLIES a plan rather than judging one'; } \
+  || _cck_err="$_cck_err executor-pass-accepted"
+# 7 · check 5 — the ONLY check in this design that verifies a quote rather than trusting it.
+# (Archive already seeded with the correct answer above, before case 2, so cases 2-6
+# don't spuriously trip check 5; re-write it here so this case reads standalone too.)
+mkdir -p "$_cck_root/.dev/attention/archive"
+printf '{"ask_id":"ask-20990101T000000Z-abcdef","answer":"nothing is filtered out on the tool%ss own initiative, anywhere"}\n' "'" \
+  > "$_cck_root/.dev/attention/archive/ask-20990101T000000Z-abcdef.json"
+printf 'CONSTRAINT CHECK\n- C1: PASS — entry path /detail, observed all rows rendered\n- C2: NOT-APPLICABLE — internal\n' \
+  > "$_cck_root/.dev/proposals/cck/report-e.md"
+_cck --slug cck --stage review --report "$_cck_root/.dev/proposals/cck/report-e.md" >/dev/null 2>&1 \
+  || _cck_err="$_cck_err quote-substring-refused"
+printf '{"ask_id":"ask-20990101T000000Z-abcdef","answer":"do whatever seems best"}\n' \
+  > "$_cck_root/.dev/attention/archive/ask-20990101T000000Z-abcdef.json"
+_cck_o="$(_cck --slug cck --stage review --report "$_cck_root/.dev/proposals/cck/report-e.md")"
+{ printf '%s' "$_cck_o" | grep -q 'NOT a substring of the recorded answer'; } \
+  || _cck_err="$_cck_err bad-quote-accepted"
+# 8 · MIGRATION: a record archived BEFORE answer persistence shipped carries no `answer`
+#     field, by construction. That is UNKNOWN, not a lie, and UNKNOWN NEVER REFUSES — the
+#     same invariant every other selector in the bridge uses. Blocking here would refuse the
+#     next dispatch of any slug citing an ask answered before this change landed, which is
+#     the day-one cliff the separate-commit ordering exists to avoid.
+printf '{"ask_id":"ask-20990101T000000Z-abcdef"}\n' \
+  > "$_cck_root/.dev/attention/archive/ask-20990101T000000Z-abcdef.json"
+_cck_o="$(_cck --slug cck --stage review --report "$_cck_root/.dev/proposals/cck/report-e.md")"
+if _cck --slug cck --stage review --report "$_cck_root/.dev/proposals/cck/report-e.md" >/dev/null 2>&1 \
+   && printf '%s' "$_cck_o" | grep -q 'predates answer persistence'; then :
+else _cck_err="$_cck_err pre-migration-record-blocked"; fi
+# 9 · …but a CITED ask that does not exist at all stays BLOCKING. Citing an ask id that was
+#     never asked IS a fabrication, and it is distinguishable from case 8.
+rm -f "$_cck_root/.dev/attention/archive/ask-20990101T000000Z-abcdef.json"
+_cck_o="$(_cck --slug cck --stage review --report "$_cck_root/.dev/proposals/cck/report-e.md")"
+{ printf '%s' "$_cck_o" | grep -q 'no archived ask record exists'; } \
+  || _cck_err="$_cck_err missing-ask-accepted"
+# 10 · UNKNOWN never refuses: no --stage and no --report means checks 1-2 are the whole
+#      answer, and an unlocatable report is not graded rather than blocking.
+_cck --slug cck >/dev/null 2>&1 || _cck_err="$_cck_err bare-check-refused"
+_cck_o="$(_cck --slug cck --stage neverdispatched)"
+_cck --slug cck --stage neverdispatched >/dev/null 2>&1 || _cck_err="$_cck_err unknown-refused"
+[ -z "$_cck_err" ] \
+  && ok "T-CCK constraint-check: set equality both ways, prose tolerated, user-visible PASS gated on a real observation, executor never-PASS, quotes verified, and UNKNOWN never refuses" \
+  || bad "T-CCK:$_cck_err"
+
+# T-CI-SCAFFOLD  `constraints init` answers the day-one cliff (R4) together with the
+# separate-commit ordering. Every scaffolded row must be source: inferred / status: OPEN —
+# deliberately NOT `operator`, so a scaffolded ledger is VISIBLY UNVERIFIED. A scaffold that
+# minted `operator` rows would manufacture the exact false authority the mechanism prevents.
+_ci_root="$WORK/ci-root"; mkdir -p "$_ci_root/.claude" "$_ci_root/.dev/proposals/cislug"
+cat > "$_ci_root/.claude/forge-project.yml" <<'YML'
+project:
+  name: ciprobe
+YML
+cat > "$_ci_root/.dev/proposals/cislug/problem-statement.md" <<'MD'
+# Probe
+The tool must never withhold a row on its own initiative.
+Rendering shall not change for pre-existing data.
+MD
+_ci_err=""
+( cd "$_ci_root" && "$BRIDGE" constraints init --slug cislug >/dev/null 2>&1 ) || _ci_err="$_ci_err init-failed"
+_ci_led="$_ci_root/.dev/proposals/cislug/constraints.yml"
+[ -f "$_ci_led" ] || _ci_err="$_ci_err no-ledger-written"
+grep -q '^schema: forge-constraints/1$' "$_ci_led" 2>/dev/null || _ci_err="$_ci_err no-schema"
+grep -q 'source: operator' "$_ci_led" 2>/dev/null && _ci_err="$_ci_err scaffold-minted-an-operator-row"
+grep -q 'source: inferred' "$_ci_led" 2>/dev/null || _ci_err="$_ci_err no-inferred-row"
+grep -q 'status: OPEN' "$_ci_led" 2>/dev/null || _ci_err="$_ci_err no-open-status"
+# It must be STRUCTURALLY VALID immediately: a scaffold that cannot pass constraint-check is
+# not a migration path, it is a second failure.
+( cd "$_ci_root" && "$BRIDGE" constraint-check --slug cislug >/dev/null 2>&1 ) || _ci_err="$_ci_err scaffold-not-valid"
+# And it must refuse to overwrite: an operator-authored ledger is the artifact this whole
+# change exists to protect.
+( cd "$_ci_root" && "$BRIDGE" constraints init --slug cislug >/dev/null 2>&1 ) && _ci_err="$_ci_err overwrote-existing"
+[ -z "$_ci_err" ] \
+  && ok "T-CI-SCAFFOLD constraints init writes a structurally-valid, visibly-unverified ledger and refuses to overwrite one" \
+  || bad "T-CI-SCAFFOLD:$_ci_err"
 
 # ---- Real-tmux section ----
 if ! command -v tmux >/dev/null 2>&1; then
@@ -1337,6 +1678,118 @@ else bad "T-ILG-CFG rc=$(rc_of ilgcfg) $(out_of ilgcfg | tr '\n' ' ')"; fi
 guard_done ilg-pos fix-code claude-opus 1 ilg-pos-clean || bad "T-ILG cleanup: close ilg-pos"
 guard_done ilg-ws  adhoc    codex-b     4 ilg-ws-clean  || bad "T-ILG cleanup: close ilg-ws"
 guard_done ilg-obs fix-code claude-opus 1 ilg-obs-clean || bad "T-ILG cleanup: close ilg-obs"
+
+# ---- #77b constraint-ledger dispatch guard (T-CG-*) ----
+# CGENV deliberately does NOT set FORGE_CONSTRAINTS_MODE: these cases exercise the DEFAULT,
+# which is `enforce` (plan F6 — an `observe` default is what made the evidence framework a
+# monument). The guard sits BEFORE the render, so unlike T-ILG these cases never reach
+# _render_template at all on the refusal path.
+CGENV="FORGE_WATCH_TRIGGER=0 FORGE_PROMPTS_DIR=$GPROMPTS FORGE_INFRA_LOCK_DIR=$ILGLOCKS FORGE_WORKER_HYGIENE_MODE=observe"
+mkdir -p "$GPROMPTS"
+# CARRIER fixture — carries the include, so _constraint_carrier_stage is TRUE for `review`.
+printf '<<<INCLUDE _operator_constraints>>>\nP0 constraint guard prompt for {{slug}} at {{stage}}\n' > "$GPROMPTS/review.txt"
+# NON-CARRIER fixture for a stage name that IS a carrier in prompts/ — the predicate must
+# follow the TEMPLATE, not the name.
+printf 'P0 non-carrier prompt for {{slug}} at {{stage}}\n' > "$GPROMPTS/incorporate.txt"
+
+# T-CG-DERIVED  THE PREDICATE IS TEMPLATE-DERIVED. This is the assertion the whole design
+# rests on: ten T-ILG dispatches run real carrier stage NAMES (fix-code, qa, qa-fix, coding)
+# against one-line fixtures with no <<<INCLUDE>>> at all, and they must stay unguarded. A
+# stage-name list would refuse all ten. Without this test that inertness is an accident
+# nobody would notice breaking.
+run_in_pane "$GS:0.0" cgd "( cd $GROOT && $CGENV $BRIDGE dispatch --slug cg-derived --stage incorporate --worker codex-a --allow-blocked p0-cg )"
+! out_of cgd | grep -q 'CONSTRAINT_LEDGER_REQUIRED' \
+  && ok "T-CG-DERIVED a carrier-NAMED stage whose live template lacks the include is not guarded (the predicate follows the template)" \
+  || bad "T-CG-DERIVED guarded a template with no include: $(out_of cgd | tr '\n' ' ')"
+
+# T-CG-1  NEGATIVE: a carrier template with NO ledger refuses — exit 6, remedy printed, and
+# NO pending row written. The refusal must precede every state mutation.
+run_in_pane "$GS:0.0" cg1 "( cd $GROOT && $CGENV $BRIDGE dispatch --slug cg-neg --stage review --worker codex-a --allow-blocked p0-cg )"
+if [ "$(rc_of cg1)" = 6 ] && out_of cg1 | grep -q 'CONSTRAINT_LEDGER_REQUIRED' \
+   && out_of cg1 | grep -q 'constraints init --slug cg-neg' \
+   && [ ! -f "$GROOT/.dev/proposals/cg-neg/forge-log.yml" ]; then
+    ok "T-CG-1 a carrier stage with no ledger refuses (exit 6, no pending, remedy printed)"
+else bad "T-CG-1 rc=$(rc_of cg1) $(out_of cg1 | tr '\n' ' ')"; fi
+
+# T-CG-2  NEGATIVE: a schema-invalid ledger refuses too. PARSING IS NOT VALIDATING — a
+# ledger that loads as YAML but whose operator row carries no verbatim is a row whose quote
+# does not exist, which is the false authority this whole mechanism exists to prevent.
+mkdir -p "$GROOT/.dev/proposals/cg-bad"
+printf 'schema: forge-constraints/1\nconstraints:\n  - id: C1\n    source: operator\n    principle: p\n    scope: internal\n    check: c\n' > "$GROOT/.dev/proposals/cg-bad/constraints.yml"
+run_in_pane "$GS:0.0" cg2 "( cd $GROOT && $CGENV $BRIDGE dispatch --slug cg-bad --stage review --worker codex-a --allow-blocked p0-cg )"
+{ [ "$(rc_of cg2)" = 6 ] && out_of cg2 | grep -q "requires a non-empty 'verbatim'"; } \
+  && ok "T-CG-2 source: operator without a verbatim is refused (schema, not just parse)" \
+  || bad "T-CG-2 rc=$(rc_of cg2) $(out_of cg2 | tr '\n' ' ')"
+
+# T-CG-3  POSITIVE: a valid ledger passes, the dispatch reaches cmd_log, and the ledger's
+# content hash is recorded ON THE ENTRY. This is P6's only mechanical oracle, and P6 is the
+# change's riskiest line — it must not be the one asserted by a checklist box.
+mkdir -p "$GROOT/.dev/proposals/cg-pos"
+printf 'schema: forge-constraints/1\nconstraints:\n  - id: C1\n    source: operator\n    verbatim: "no filtering at all"\n    source_ref: chat\n    asked_about: "the detail view"\n    principle: "the tool advises, the operator decides"\n    binds: "every render path"\n    scope: internal\n    check: "assert no row is withheld"\n    status: OPEN\n' > "$GROOT/.dev/proposals/cg-pos/constraints.yml"
+run_in_pane "$GS:0.0" cg3 "( cd $GROOT && $CGENV $BRIDGE dispatch --slug cg-pos --stage review --worker codex-a --allow-blocked p0-cg )"
+if ! out_of cg3 | grep -q 'CONSTRAINT_LEDGER_REQUIRED' \
+   && [ -f "$GROOT/.dev/proposals/cg-pos/forge-log.yml" ] \
+   && grep -Eq '^    constraints_sha256: [0-9a-f]{16}$' "$GROOT/.dev/proposals/cg-pos/forge-log.yml"; then
+    ok "T-CG-3 a valid ledger passes the guard and its content hash lands on the dispatch entry"
+else bad "T-CG-3 rc=$(rc_of cg3) $(out_of cg3 | tr '\n' ' ')"; fi
+
+# T-CG-4  NON-REGRESSION: an ad-hoc stage is never guarded. Its template has no include and
+# `adhoc` is not a prompt in the repo either, so both halves of the predicate say no.
+run_in_pane "$GS:0.0" cg4 "( cd $GROOT && $CGENV $BRIDGE dispatch --slug cg-ws --stage adhoc --worker codex-b --allow-blocked p0-cg )"
+! out_of cg4 | grep -q 'CONSTRAINT_LEDGER_REQUIRED' \
+  && ok "T-CG-4 a non-carrier stage (adhoc) is not guarded" \
+  || bad "T-CG-4 guarded a non-carrier stage: $(out_of cg4 | tr '\n' ' ')"
+
+# T-CG-DRYRUN  PLACEMENT PIN, and it deliberately asserts the OPPOSITE of T-ILG-DRYRUN.
+# The ledger is an INPUT THE RENDER CONSUMES, so its guard sits BEFORE the --dry-run return:
+# a dry run of a ledger-less carrier could not have produced a valid prompt anyway, and
+# refusing it with the remedy text beats dying at render with a bare include error. The
+# infra LOCK is a resource precondition and stays after the return. Do not "restore
+# symmetry" by moving either one.
+# A bare trailing `; echo` (T-ILG-DRYRUN's idiom) would clobber $? with echo's own rc=0,
+# which is invisible there (0 is also T-ILG-DRYRUN's expected rc) but not here, where
+# cgdry2 expects 6. Capture $? before the newline and re-exit it from the subshell.
+run_in_pane "$GS:0.0" cgdry "( cd $GROOT && $CGENV $BRIDGE dispatch --slug cg-pos --stage review --worker codex-a --dry-run; _cgdry_rc=\$?; echo; exit \$_cgdry_rc )"
+if [ "$(rc_of cgdry)" = 0 ] && out_of cgdry | grep -q 'OPERATOR CONSTRAINTS' \
+   && ! out_of cgdry | grep -q 'CONSTRAINT_LEDGER_REQUIRED'; then
+    ok "T-CG-DRYRUN --dry-run with a valid ledger renders the constraint block and is not refused"
+else bad "T-CG-DRYRUN(valid) rc=$(rc_of cgdry) $(out_of cgdry | tr '\n' ' ')"; fi
+run_in_pane "$GS:0.0" cgdry2 "( cd $GROOT && $CGENV $BRIDGE dispatch --slug cg-neg --stage review --worker codex-a --dry-run; _cgdry_rc=\$?; echo; exit \$_cgdry_rc )"
+if [ "$(rc_of cgdry2)" = 6 ] && out_of cgdry2 | grep -q 'CONSTRAINT_LEDGER_REQUIRED'; then
+    ok "T-CG-DRYRUN --dry-run of a ledger-less carrier is refused by the guard, not by a bare render error"
+else bad "T-CG-DRYRUN(missing) rc=$(rc_of cgdry2) $(out_of cgdry2 | tr '\n' ' ')"; fi
+
+# T-CG-OBS  KILL SWITCH, at the GUARD. Its render-site twin is T-OC-SYNTHETIC case 10; both
+# are needed, because the render runs first and a lever at only one site is inoperative for
+# half the cases.
+run_in_pane "$GS:0.0" cgobs "( cd $GROOT && $CGENV FORGE_CONSTRAINTS_MODE=observe $BRIDGE dispatch --slug cg-obs --stage review --worker codex-a --allow-blocked p0-cg )"
+{ [ "$(rc_of cgobs)" != 6 ] && out_of cgobs | grep -q 'observe mode'; } \
+  && ok "T-CG-OBS FORGE_CONSTRAINTS_MODE=observe warns and proceeds" \
+  || bad "T-CG-OBS rc=$(rc_of cgobs) $(out_of cgobs | tr '\n' ' ')"
+
+# T-CG-MODE  a typo'd mode is a HARD ERROR, never a silent fall-through to observe. Same
+# discipline as FORGE_INFRA_GUARD_MODE; the whole value of a rollback lever is that you
+# cannot enable it by accident.
+run_in_pane "$GS:0.0" cgmode "( cd $GROOT && $CGENV FORGE_CONSTRAINTS_MODE=enfroce $BRIDGE dispatch --slug cg-pos --stage review --worker codex-a --allow-blocked p0-cg )"
+{ [ "$(rc_of cgmode)" = 1 ] && out_of cgmode | grep -q 'FORGE_CONSTRAINTS_MODE must be enforce|observe'; } \
+  && ok "T-CG-MODE an invalid FORGE_CONSTRAINTS_MODE is a hard error" \
+  || bad "T-CG-MODE rc=$(rc_of cgmode) $(out_of cgmode | tr '\n' ' ')"
+
+# T-CG-SRC  --source-prompt resolves NO include (F14), so it is refused for a carrier stage
+# even with a perfectly valid ledger. Refused BEFORE the render, so --dry-run cannot slip a
+# constraint-free prompt through either.
+mkdir -p "$GROOT/.dev/forge-tmp"; printf 'raw bytes\n' > "$GROOT/.dev/forge-tmp/cg-src.txt"
+run_in_pane "$GS:0.0" cgsrc "( cd $GROOT && $CGENV $BRIDGE dispatch --slug cg-pos --stage review --worker codex-a --source-prompt $GROOT/.dev/forge-tmp/cg-src.txt --dry-run )"
+{ [ "$(rc_of cgsrc)" = 6 ] && out_of cgsrc | grep -q 'source-prompt is not available'; } \
+  && ok "T-CG-SRC --source-prompt is refused for a carrier stage, even with --dry-run" \
+  || bad "T-CG-SRC rc=$(rc_of cgsrc) $(out_of cgsrc | tr '\n' ' ')"
+
+# T-CG cleanup, in the T-ILG idiom: the cases that legitimately PASS the guard open REAL
+# pendings, and guard_require_clean below scans every proposal for `response: null`.
+guard_done cg-derived incorporate codex-a 3 cg-derived-clean || bad "T-CG cleanup: close cg-derived"
+guard_done cg-pos     review      codex-a 3 cg-pos-clean     || bad "T-CG cleanup: close cg-pos"
+guard_done cg-ws      adhoc       codex-b 4 cg-ws-clean      || bad "T-CG cleanup: close cg-ws"
+guard_done cg-obs     review      codex-a 3 cg-obs-clean     || bad "T-CG cleanup: close cg-obs"
 
 if [ "$(rc_of b17-dispatch)" = 0 ] && guard_capture_has 4 'codex-b-adhoc-b17-next.txt' \
    && grep -Eq 'GUARD_BLOCK: pipeline=multi stage=\? boundary=dispatch reason=allow-blocked-bypass n=1 .*bypassed=b17-hold.*allow_reason=p0-b17' "$GROOT/.dev/forge-tmp/orchestrator-events.log" \
@@ -5072,6 +5525,16 @@ mk_session "$GV9S" 220 50 "$GV9C"
   # ── T-EV-ACK-NOOP: a CLEAN slug (no seeded contradiction) — the escape is inert and
   # cannot downgrade a clean run. ──
   gv9clean
+  # 77b P31: verify-decision's new constraint-ledger check (Step 86) runs unconditionally,
+  # and this fixture predates it — without a ledger here, a MISSING one is itself a fresh
+  # contradiction under FORGE_EVIDENCE_MODE=enforce, which is exactly what this test exists
+  # to prove does NOT happen. Same treatment T-PROMPT-RENDER needed at Step 34.
+  mkdir -p "$GV9C/.dev/proposals/ev9c"
+  cat > "$GV9C/.dev/proposals/ev9c/constraints.yml" <<'YML'
+schema: forge-constraints/1
+constraints: []
+none_recorded_reason: "T-EV-ACK-NOOP fixture — no operator constraints for this probe"
+YML
   run_in_pane "$GV9S:0.1" gv9c-log "( cd $GV9C && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug ev9c --stage verify --from claude --to codex-a --prompt p )"
   tmux send-keys -t "$GV9S:0.2" C-c 2>/dev/null; sleep 0.3
   run_in_pane "$GV9S:0.3" gv9c-cb "( cd $GV9C && $GV9ENF $BRIDGE callback --slug ev9c --stage verify --status DONE --worker codex-a --message ok --quiet )"

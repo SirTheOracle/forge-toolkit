@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 You are executing the 'fix-qa' stage of a forge fix-pipeline.
 
 Slug: {slug}
@@ -39,6 +43,8 @@ Outputs (the skill produces all of these; do not skip any):
 - .dev/qa/{slug}/fix-issues.md (canonical issue list — what downstream consumers read)
 - .dev/qa/{slug}/fix-manifest.yaml (machine-readable severity counts + issue index)
 
+<<<INCLUDE _unchanged_flow_sweep>>>
+
 The fix-issues.md MUST contain:
 - A 1-paragraph verdict (CLEAR / advisory-only / minor-only / has-critical-or-major)
 - One section per issue, each rated:
@@ -57,10 +63,13 @@ The fix-manifest.yaml MUST contain:
   advisory_count: N
   fix_closes_bug: yes | partial | no
   regression_sweep_complete: yes | no
+  not_covered:            # one entry per axis / surface / entry path NOT exercised;
+    - <axis or surface>   # use [] only when every axis was exercised, and say so in prose
 
-End fix-issues.md with two lines, exactly:
+End fix-issues.md with three lines, exactly:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric: "Did all 3 teammates do substantive work (real test runs, real code reads, specific findings) and reach a unified verdict?" If yes → HIGH. If any teammate punted or the synthesis is fuzzy → MEDIUM. If the QA is shallow → LOW.
 

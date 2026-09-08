@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 You are executing the 'fix-qa-retry' stage of a forge fix-pipeline.
 
 Slug: {slug}
@@ -41,6 +45,8 @@ Outputs (overwrites the prior fix-qa artifacts):
 - .dev/qa/{slug}/fix-issues.md (canonical issue list, refreshed)
 - .dev/qa/{slug}/fix-manifest.yaml (refreshed)
 
+<<<INCLUDE _unchanged_flow_sweep>>>
+
 The fix-issues.md MUST contain (same shape as fix-qa, plus an explicit retry-resolution section):
 - A 1-paragraph verdict (CLEAR / advisory-only / minor-only / has-critical-or-major)
 - A "Prior findings resolution" section: for each CRITICAL/MAJOR from the prior fix-issues.md, state RESOLVED / STILL OPEN / DOWNGRADED with the test/commit evidence
@@ -55,11 +61,14 @@ The fix-manifest.yaml MUST contain:
   advisory_count: N
   fix_closes_bug: yes | partial | no
   regression_sweep_complete: yes | no
+  not_covered:            # one entry per axis / surface / entry path NOT exercised;
+    - <axis or surface>   # use [] only when every axis was exercised, and say so in prose
   retry_round: 1   # increment if a second retry ever runs
 
-End fix-issues.md with two lines, exactly:
+End fix-issues.md with three lines, exactly:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric: same as fix-qa.
 

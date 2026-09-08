@@ -1,7 +1,9 @@
 SCOPE DIFF CHECK (load-bearing — do not skip):
-The problem statement defines what the feature is allowed to change.
-The implementation MUST NOT silently expand it. For every file
-modified in implementation.md:
+The problem statement defines what the work is allowed to change.
+The artifact under review MUST NOT silently expand it. "The artifact
+under review" is `implementation.md`, `final-plan.md` or `fix-plan.md`
+— whichever one THIS stage reviews. For every file it names as
+modified:
 1. Determine which code paths/flows that file participates in. Use
    grep to find callers if it is a helper.
 2. Classify each touched code path:
@@ -22,3 +24,14 @@ modified in implementation.md:
    one. Flag any case where a shared helper is extended without
    confirming every existing caller still gets the original
    semantic and behavior.
+5. UNCHANGED-PATH CLAIMS. Find every clause in the artifact asserting
+   that behaviour is retained, unaffected, byte-identical or unchanged
+   when some condition does not hold. Tabulate three columns: the
+   claim, the path it exempts, and the NAMED TEST that exercises that
+   path. A claim with no named test is BLOCKING. A claim whose path
+   you cannot locate is ALSO BLOCKING — an exemption you cannot find
+   is broader than it looks, and "everything below runs byte-identically
+   to before" over an entry path nobody walked is the exact clause that
+   documented a shipped defect in writing and was read past.
+   Stating that prior behaviour is retained is GOOD practice and is not
+   itself a finding; the missing test is the finding.

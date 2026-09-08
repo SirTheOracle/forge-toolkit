@@ -1,0 +1,39 @@
+CONSTRAINT CHECK (load-bearing — do not skip):
+The OPERATOR CONSTRAINTS block above is the operator's own words, not a paraphrase of
+them. Before you report DONE, add a `CONSTRAINT CHECK` section to your report with one
+row per constraint id, and one of exactly four verdicts:
+
+- `PASS` — you exercised the behaviour this constraint governs and it holds. Cite the
+  check you ran. A row whose `scope` is `user-visible` may read `PASS` only when it is
+  backed by a REAL-PRODUCT observation: a screenshot, a rendered page, a CLI transcript
+  of the actual surface. Unit and integration evidence alone grades `NOT-EXERCISED`.
+- `VIOLATED` — the work contradicts it. **This is a BLOCKING item regardless of what any
+  upstream artifact says.** An upstream artifact that authorised the violation is a
+  *second* finding: name it, with its file and section.
+- `NOT-EXERCISED` — you did not test the behaviour this constraint governs. State why.
+- `NOT-APPLICABLE` — this constraint's `scope` gives your stage nothing to confirm. Say
+  which scope and why your stage cannot reach it.
+
+If a constraint's `Binds` scope is contradicted by a mechanism its `Asked about` scope
+does not name, that is `VIOLATED`, not an out-of-scope observation. `Binds` is expected to
+be WIDER than `Asked about`; a `Binds` that merely repeats its `Asked about` is itself a
+finding — report it.
+
+If the ledger is empty, quote its `none_recorded_reason` in your CONSTRAINT CHECK section
+and say whether you believe it. Silence is not a pass.
+
+**If your stage APPLIES a plan rather than judging one** (`coding`, `coding-fix`,
+`fix-code`, `qa-fix`): a constraint that contradicts your plan is **not** licence to
+deviate. Stop, record `VIOLATED`, and escalate with `forge ask`. Editing off-plan to
+satisfy a constraint is the failure the SCOPE DIFF CHECK exists to catch. **Your rows may
+read `VIOLATED` or `NOT-APPLICABLE` only, never `PASS`** — a mechanical executor asserting
+that a constraint holds is self-certification, which the bridge's evidence rule (a
+worker's `--status DONE` is a CLAIM, never evidence) exists to prevent.
+
+`NOT-EXERCISED` counts toward your `BLOCKING_ITEMS` count **only for `scope: user-visible`
+rows**. On `scope: internal` rows the honest declaration belongs on your `NOT_COVERED:`
+line instead of halting the pipeline.
+
+Report every id in the ledger, including ones you graded `NOT-APPLICABLE`. An id you omit
+is indistinguishable from an id you forgot, and the bridge checks set equality in both
+directions.

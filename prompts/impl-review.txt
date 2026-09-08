@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 Write your final report to .dev/proposals/{slug}/impl-review.md BEFORE sending FORGE_DONE. The FORGE_DONE callback must be a one-line summary only; the digest agent reads the report file from disk.
 
 Review .dev/proposals/{slug}/implementation.md against
@@ -30,6 +34,7 @@ In .dev/proposals/{slug}/impl-review.md, report:
 
 CONFIDENCE: HIGH/MEDIUM/LOW
 BLOCKING_ITEMS: N
+NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
   (Out-of-scope touches without strict necessity, AND shared-helper
   extensions where any out-of-scope caller would change behavior,
   count as BLOCKING.)

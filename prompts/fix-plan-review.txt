@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 You are executing the 'fix-plan-review' stage of a forge fix-pipeline.
 
 Slug: {slug}
@@ -34,6 +38,8 @@ Attack the plan from these angles. Be specific — vague feedback is useless. Fo
 6. **Test plan integrity** — do the tests actually exercise the failure mode from the diagnosis? Or do they test peripheral concerns? Are any tests self-validating (assert example against itself)?
 7. **Risk honesty** — does the Risk section hand-wave, or does it name concrete failure modes? Anything the plan glosses over that you'd lose sleep about?
 
+<<<INCLUDE _scope_diff_check>>>
+
 Output: write your review to `.dev/proposals/{slug}/fix-review.md` BEFORE sending FORGE_DONE. The FORGE_DONE callback must be a one-line summary only; the digest agent reads the report file from disk.
 
 The fix-review.md MUST contain:
@@ -45,9 +51,10 @@ The fix-review.md MUST contain:
   - ADVISORY — observation, not a request
 - For each issue: cite the fix-plan.md section, state the problem, state what specifically would need to change for you to clear it. Do NOT propose the fix yourself — describe the gap.
 - A 1-line `BLOCKING_ITEMS` count = number of CRITICAL + MAJOR (these block advancement)
-- End with two lines, exactly:
+- End with three lines, exactly:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric: "If I cleared this plan as-is, would the resulting fix actually resolve the diagnosed bug without regression?" If yes → HIGH (typically with 0 CRITICAL + 0 MAJOR). If you have concerns but the plan is mostly sound → MEDIUM. If the plan is fundamentally off → LOW.
 

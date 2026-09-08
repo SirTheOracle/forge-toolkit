@@ -2,6 +2,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 You are executing the 'proposal-lite' stage of a forge pipeline.
 
 Slug: {slug}
@@ -31,6 +35,7 @@ The complexity gate in the lite skill MAY escalate to full adversarial-proposal.
 
 CONFIDENCE: HIGH/MEDIUM/LOW
 BLOCKING_ITEMS: N
+NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 When complete:
   ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \

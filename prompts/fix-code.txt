@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 You are executing the 'fix-code' stage of a forge fix-pipeline.
 
 Slug: {slug}
@@ -33,9 +37,10 @@ Report in .dev/proposals/{slug}/fix-coder-report.md:
 - Files changed (full list)
 - Bug-trigger reproduction status: still-reproducible / no-longer-reproducible / not-tested-(why)
 
-End the report with two lines, exactly:
+End the report with three lines, exactly:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric: "Did every planned commit group land cleanly with green tests, no scope leakage, and the bug-trigger covered?" If yes → HIGH. If you had to deviate from the plan in any non-trivial way → MEDIUM. If you couldn't land the fix → LOW.
 

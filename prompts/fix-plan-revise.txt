@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 You are executing the 'fix-plan-revise' stage of a forge fix-pipeline.
 
 Slug: {slug}
@@ -43,9 +47,10 @@ The final fix-plan.md MUST contain all the sections from the prior version (Caus
 
 Write the final fix-plan.md BEFORE sending FORGE_DONE. The FORGE_DONE callback must be a one-line summary only.
 
-End the fix-plan.md with two lines, exactly:
+End the fix-plan.md with three lines, exactly:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric for this stage: "Has every CRITICAL and MAJOR from fix-review.md been cleared (addressed or contested with evidence)?" If yes → HIGH. If one or two have weak resolutions → MEDIUM. If reviewer's issues remain unaddressed → LOW.
 

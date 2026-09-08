@@ -4,6 +4,10 @@
 
 <<<INCLUDE _ask_escalation>>>
 
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
 You are executing the 'fix-investigate-solo' stage — a single-worker diagnosis
 stage of a forge fix-pipeline (no agent team; you do the full analysis yourself).
 
@@ -48,9 +52,10 @@ Hard rules:
 - INSUFFICIENT EVIDENCE is a valid exit — do not force a cause.
 - Do NOT type /clear yourself — the orchestrator drives clear.
 
-End diagnosis.md with exactly two lines:
+End diagnosis.md with exactly three lines:
   CONFIDENCE: HIGH/MEDIUM/LOW
   BLOCKING_ITEMS: N
+  NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 CONFIDENCE rubric: "Could the fix-plan stage design a patch from this diagnosis with
 no further investigation?" yes → HIGH; actionable-but-partial → MEDIUM;

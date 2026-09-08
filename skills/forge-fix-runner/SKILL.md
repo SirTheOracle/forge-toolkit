@@ -200,6 +200,25 @@ by `packet-check`), verbatim issue bodies after:
 row, and no row names an issue the bucket does not cover** — an issue with no row
 could never earn its `Closes`.
 
+**Packet → constraint ledger.** Every fix-pipeline slug needs
+`.dev/proposals/<slug>/constraints.yml` before its first dispatch; `forge-bridge
+dispatch` refuses a carrier stage without one. In this lane it is **generated, not
+authored**, because the packet already holds verbatim operator text:
+
+- one row per covered issue, `source: operator`, `source_ref: "packet:#<n>"`;
+- `verbatim` sliced from that issue's body — the sentence stating the obligation, not
+  a summary of it;
+- `check` seeded from that issue's `verification_targets` row;
+- `principle` is the general rule the issue implies; `binds` is the scope it governs,
+  which is expected to be WIDER than the one surface the issue names;
+- `scope: user-visible` only when the issue names a surface a person can reach.
+
+**Slicing a quote out of a free-form issue body is a heuristic, not a parse. Emit
+`source: inferred` on any row you cannot cleanly attribute.** A confident-looking
+`verbatim` that is not what the reporter wrote manufactures exactly the false authority
+the mechanism exists to prevent — and an `inferred` row is honest, reviewable, and still
+carried into every stage prompt.
+
 One record per bucket in `deal.json` (mirrored into `plan.md` prose):
 
 ```yaml

@@ -398,4 +398,396 @@ PY
 )
 EOF
 
+echo "== 3. Operator-constraint carriage (#77b) =="
+while IFS= read -r line; do
+  case "$line" in
+    OK\|*)  ok  "${line#OK|}"  ;;
+    BAD\|*) bad "${line#BAD|}" ;;
+    *)      [ -n "$line" ] && printf '%s\n' "$line" ;;
+  esac
+done <<EOF
+$(FORGE_TEST_CLAUDE_SKILLS_DIR="${FORGE_TEST_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}" \
+  python3 - "$ROOT" <<'PY'
+import os, pathlib, re, subprocess, sys
+
+root = pathlib.Path(sys.argv[1])
+pdir = root / "prompts"
+failures = 0
+
+def _read_or_none(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+def ok(msg):  print("OK|" + msg)
+def bad(msg):
+    global failures
+    failures += 1
+    print("BAD|" + msg)
+
+INC = re.compile(r'<<<INCLUDE\s+(\S+?)\s*>>>')
+prompts = sorted(pdir.glob("*.txt"))
+stage_prompts = [p for p in prompts if not p.name.startswith("_")]
+includes = {p.stem: set(INC.findall(p.read_text())) for p in prompts}
+
+# ---- T-CC0 · deployment topology (P0/P35) --------------------------------------------
+# A test that pins a tracked file enforces NOTHING unless the tracked file is the file that
+# executes. Six deployed skills were stale copies while this suite was green.
+#
+# TWO QUESTIONS, DELIBERATELY SEPARATED, because conflating them is what makes this test
+# either useless or permanently red:
+#
+#   TOPOLOGY (always FAILS)  — is this deployment LINKED to this repository at all?
+#       fails on: absent; a dangling symlink; a symlink resolving outside every work tree
+#       of this repository; a regular-file copy whose bytes match NO checkout of this
+#       repository. That last is the unmanaged / hand-edited / abandoned deployment — the
+#       only class nothing else in the toolkit can see.
+#   FRESHNESS (ADVISORY by default) — is it THIS checkout's content?
+#       Reported, counted, and never fatal unless FORGE_TEST_SKILL_STRICT=1.
+#
+# WHY FRESHNESS CANNOT BE THE DEFAULT FAILURE. Measured: all three symlinked deployments
+# point at the PRIMARY checkout, which sits on its own branch — currently behind this
+# base — so `skills/forge-fix-runner/SKILL.md` there differs from the copy here.
+# `forge-fix-runner` is correctly symlinked AND serving stale bytes. A $ROOT-relative
+# oracle would therefore give a different verdict depending on which checkout ran the
+# suite and would go red for every skill whenever any worktree sits on a feature branch.
+# A test that is red for reasons unrelated to the defect gets disabled, and a topology
+# assertion that inherits "validates against the artifact rather than the reality" would be
+# this issue's own failure inside the test written to prevent it.
+#
+# WHY "MATCHES SOME CHECKOUT" IS TOO WEAK TO BE THE ONLY RULE, also measured: this
+# repository has seven work trees on various branches, and FOUR of the six known-stale
+# copies match one of them. A bare repo-scoped content rule would downgrade
+# `adversarial-proposal` — the load-bearing one, the entire reason P0 exists — to an
+# advisory. Hence the strict lever: it is the mechanical gate for P0.
+#
+#   P0 GATE:  FORGE_TEST_SKILL_STRICT=1 bash tests/adversarial-skills/run.sh
+#             run from the checkout being shipped. Every advisory becomes a failure.
+#             The Definition of Done requires this to pass ONCE, on the merge commit.
+#
+# Content drift against THIS checkout is already reported by `./install.sh --check-drift`
+# (it printed DIFFERS throughout the six-week drift; nobody ran it). This test's new value
+# is the topology class, plus a gate that can be demanded in a checklist.
+# §11 U13 states this boundary; do not quietly widen or narrow either half.
+deployed_root = pathlib.Path(os.environ["FORGE_TEST_CLAUDE_SKILLS_DIR"])
+strict = os.environ.get("FORGE_TEST_SKILL_STRICT") == "1"
+inst = (root / "install.sh").read_text()
+m = re.search(r'^SKILL_NAMES=\(([^)]*)\)', inst, re.S | re.M)
+skill_names = set(re.findall(r'[A-Za-z][A-Za-z0-9_-]*', re.sub(r'#.*', '', m.group(1)))) if m else set()
+
+def repo_worktrees(r):
+    """Every work tree of THIS repository, resolved. Falls back to the single checkout if
+    git is unavailable — which degrades the topology half to $ROOT-relative, and says so
+    rather than degrading silently."""
+    try:
+        out = subprocess.run(["git", "-C", str(r), "worktree", "list", "--porcelain"],
+                             capture_output=True, text=True, timeout=20)
+        paths = [ln.split(" ", 1)[1].strip() for ln in out.stdout.splitlines()
+                 if ln.startswith("worktree ")]
+        return ([os.path.realpath(x) for x in paths] or [os.path.realpath(str(r))]), bool(paths)
+    except Exception:
+        return [os.path.realpath(str(r))], False
+
+trees, enumerated = repo_worktrees(root)
+if not skill_names:
+    bad("T-CC0 install.sh SKILL_NAMES not found or empty")
+elif not deployed_root.is_dir():
+    ok("T-CC0 SKIPPED (no deployment root on this host)")
+else:
+    if not enumerated:
+        print("  T-CC0 note: `git worktree list` unavailable — topology is being judged "
+              "against this checkout alone, which can produce false failures.")
+    bad_ones, stale = [], []
+    for name in sorted(skill_names):
+        srcd = root / "skills" / name
+        if not srcd.is_dir():
+            continue            # codex-only (proposal-reviewer); the installer skips it too
+        dst = deployed_root / name
+        if not dst.exists():
+            bad_ones.append("%s: NOT DEPLOYED" % name)
+            continue
+        # The symlink may be on the directory OR on SKILL.md; both topologies exist here.
+        link = dst if dst.is_symlink() else (dst / "SKILL.md")
+        here = srcd / "SKILL.md"
+        if link.is_symlink():
+            target = os.path.realpath(str(link))
+            if not os.path.exists(target):
+                bad_ones.append("%s: symlink is DANGLING (%s)" % (name, target))
+                continue
+            if not any(target.startswith(w + os.sep) for w in trees):
+                bad_ones.append("%s: symlink resolves OUTSIDE every work tree of this "
+                                "repository (%s)" % (name, target))
+                continue
+            if here.is_file() and open(target, "rb").read() != here.read_bytes():
+                stale.append("%s: correctly symlinked into a checkout of this repo, but "
+                             "that checkout's bytes differ from this one — a symlink is "
+                             "topology, not freshness" % name)
+            continue
+        dmd = dst / "SKILL.md"
+        if not dmd.is_file():
+            bad_ones.append("%s: deployed directory has no SKILL.md" % name)
+            continue
+        dbytes = dmd.read_bytes()
+        if not any(_read_or_none(os.path.join(w, "skills", name, "SKILL.md")) == dbytes
+                   for w in trees):
+            bad_ones.append("%s: deployed SKILL.md is a COPY matching NO checkout of this "
+                            "repository — unmanaged, and nothing links it back" % name)
+        elif here.is_file() and dbytes != here.read_bytes():
+            stale.append("%s: copy matches another checkout of this repo, not this one — "
+                         "managed but STALE relative to the checkout under test" % name)
+    for s in stale:
+        print("  T-CC0 %s: %s" % ("STRICT" if strict else "advisory", s))
+    if strict:
+        bad_ones += stale
+    if bad_ones:
+        bad("T-CC0 deployment topology: " + "; ".join(bad_ones))
+    else:
+        ok("T-CC0 every deployed SKILL_NAMES entry is linked to this repository (%d work "
+           "trees considered); %d stale-content %s"
+           % (len(trees), len(stale), "failures" if strict else "advisories — run with "
+              "FORGE_TEST_SKILL_STRICT=1 to gate on them"))
+
+# ---- T-CC1 · both includes on every non-underscore prompt (P36) -----------------------
+# The EXEMPT set FAILS SAFE: a stage nobody thinks about defaults to CARRYING the ledger
+# (noise), never to omitting it (silence). Curation is only fatal when its default is
+# silence. Each entry needs a WRITTEN REASON here, and this is the only place one lives.
+EXEMPT = {
+    "proposal": "orchestrator-local and NOT dispatchable — cmd_dispatch refuses "
+                "--stage proposal outright, so this template renders no includes and an "
+                "include here would never resolve. The frame-challenge clause reaches "
+                "that stage through skills/adversarial-proposal/SKILL.md and the "
+                "orchestrator's Spec Boundary section instead.",
+}
+miss = []
+for p in stage_prompts:
+    need = {"_operator_constraints", "_constraint_check"}
+    have = includes[p.stem]
+    if p.stem in EXEMPT:
+        if need & have:
+            miss.append("%s is EXEMPT but carries %s" % (p.name, sorted(need & have)))
+        continue
+    absent = sorted(need - have)
+    if absent:
+        miss.append("%s is missing %s" % (p.name, absent))
+for name in sorted(set(EXEMPT) - {p.stem for p in stage_prompts}):
+    miss.append("EXEMPT names '%s', which is not a stage prompt — a stale exemption is "
+                "an exemption nobody re-justified" % name)
+if miss:
+    bad("T-CC1 include carriage: " + "; ".join(miss))
+else:
+    ok("T-CC1 every non-underscore prompt carries both operator-constraint includes, or "
+       "is EXEMPT with a written reason (%d carriers, %d exempt)"
+       % (len(stage_prompts) - len(EXEMPT), len(EXEMPT)))
+
+# ---- T-CC2 · the prose include still says the load-bearing things (P37) ---------------
+# The synthetic half fails CLOSED; the tracked prose half does NOT — a prompt missing
+# _constraint_check still renders, just meaninglessly. This wording pin plus T-CC1 are
+# the only things closing that asymmetry.
+cc = (pdir / "_constraint_check.txt")
+if not cc.is_file():
+    bad("T-CC2 prompts/_constraint_check.txt does not exist")
+else:
+    body = " ".join(cc.read_text().split())
+    need = [
+        ("PASS", "the PASS verdict"),
+        ("VIOLATED", "the VIOLATED verdict"),
+        ("NOT-EXERCISED", "the NOT-EXERCISED verdict"),
+        ("NOT-APPLICABLE", "the NOT-APPLICABLE verdict"),
+        ("BLOCKING item regardless of what any upstream artifact says",
+         "the clause that VIOLATED outranks any upstream artifact"),
+        ("never `PASS`", "the executor never-PASS clause"),
+        ("scope: user-visible", "the user-visible BLOCKING_ITEMS scoping"),
+        ("REAL-PRODUCT observation", "the real-product-observation rule for user-visible PASS"),
+        ("none_recorded_reason", "the empty-ledger clause"),
+        ("Binds", "the binds-vs-asked_about clause"),
+    ]
+    gone = [why for lit, why in need if lit not in body]
+    if gone:
+        bad("T-CC2 _constraint_check.txt no longer states: " + "; ".join(gone))
+    else:
+        ok("T-CC2 _constraint_check.txt still states all four verdicts, that VIOLATED "
+           "outranks upstream artifacts, and the executor never-PASS clause")
+
+# ---- T-CC3 / T-CC4 · exact include sets (P38, P39) ------------------------------------
+for inc, expected, tid in (
+        ("_unchanged_flow_sweep", {"qa", "qa-retry", "fix-qa", "fix-qa-retry"}, "T-CC3"),
+        ("_scope_diff_check", {"impl-review", "review", "fix-plan-review"}, "T-CC4")):
+    actual = {s for s, v in includes.items() if inc in v}
+    if actual != expected:
+        bad("%s %s is included by %s, expected exactly %s"
+            % (tid, inc, sorted(actual), sorted(expected)))
+    else:
+        ok("%s %s is included by exactly %s" % (tid, inc, sorted(expected)))
+
+# ---- T-CC5 · every declared Input is somebody's declared Output (P40) -----------------
+# REGION-SCOPED on the CONSUMER side only. Prompts name paths in prose and conditionally,
+# and a noisy test gets disabled — so this accepts lower recall for near-zero false
+# positives, exactly as the plan requires.
+#
+#   consumer side  a .dev path inside an `Inputs…:` heading region (heading line through
+#                  the first blank line followed by a non-indented line).
+#   producer side  a .dev path named ANYWHERE in a prompt OTHER than inside that prompt's
+#                  own Inputs region, or anywhere in a skills/*/SKILL.md. Deliberately
+#                  loose: producers declare their artifacts in an `Outputs:` block, in an
+#                  inline `Output: write your review to …` sentence, AND in their DONE
+#                  callback --message, and a heading-only producer side false-positives on
+#                  repro.md, fix-review.md and fix-coder-report.md, which are all real.
+#                  Excluding a prompt's OWN Inputs region is what stops review.txt from
+#                  "producing" the very names it dangles on.
+#
+# PROTOTYPED against the tree before being designed in: it reports EXACTLY TWO errors
+# today — review.txt's proposal-a.md and proposal-b.md — both Group A defects, and zero
+# after Group A lands. Neither vacuous nor over-broad, measured rather than asserted.
+DEVPATH = re.compile(r'(\.dev/[^\s"\'`,)]+\.(?:md|ya?ml))')
+
+def input_regions(text):
+    out = []
+    for mm in re.finditer(r'(?m)^Inputs?\b[^\n]*:\s*$', text):
+        rest = text[mm.start():]
+        nxt = re.search(r'(?m)^\s*$\n(?=\S)', rest)
+        out.append(rest[:nxt.start()] if nxt else rest)
+    return out
+
+per = {}
+for p in prompts:
+    t = p.read_text()
+    ins = set()
+    for r in input_regions(t):
+        ins |= set(DEVPATH.findall(r))
+    per[p.name] = (ins, set(DEVPATH.findall(t)) - ins)
+
+skilltext = "\n".join(f.read_text() for f in sorted((root / "skills").rglob("SKILL.md")))
+skill_named = {os.path.basename(x) for x in DEVPATH.findall(skilltext)}
+
+# A FILE MAY NOT SATISFY ITS OWN INPUTS. Without this exclusion a prompt that names an
+# artifact in its Inputs block AND mentions it once anywhere else in its own body would
+# "produce" it, and the assertion would go vacuous for exactly the prompts most likely to
+# reference something that does not exist. review.txt is the live example: it names
+# constraints.yml in both its Inputs block and its SPEC FIDELITY section.
+dangling = []
+for n, (ins, _own) in per.items():
+    produced = skill_named | {os.path.basename(x)
+                              for m, (_i, outs) in per.items() if m != n for x in outs}
+    for path in sorted(ins):
+        if os.path.basename(path) not in produced:
+            dangling.append("%s inputs '%s' — no OTHER prompt and no skill declares it as "
+                            "an output" % (n, os.path.basename(path)))
+dangling = sorted(set(dangling))
+if dangling:
+    bad("T-CC5 dangling artifact references: " + "; ".join(dangling))
+else:
+    ok("T-CC5 every .dev path named under an Inputs: heading is declared as an output by "
+       "some OTHER prompt or by a skill (%d prompts checked)" % len(per))
+
+# ---- T-CC6 · the shadow trap (P41) ---------------------------------------------------
+syn = re.search(r'^SYNTHETIC_PROMPTS=\(([^)]*)\)', inst, re.S | re.M)
+syn_set = set(re.findall(r'[A-Za-z_][A-Za-z0-9_-]*', re.sub(r'#.*', '', syn.group(1)))) if syn else set()
+pn = re.search(r'^PROMPT_NAMES=\(([^)]*)\)', inst, re.S | re.M)
+pn_set = set(re.findall(r'[A-Za-z_][A-Za-z0-9_-]*', re.sub(r'#.*', '', pn.group(1)))) if pn else set()
+probs = []
+if "_operator_constraints" not in syn_set:
+    probs.append("_operator_constraints is NOT in SYNTHETIC_PROMPTS — 22 prompts would "
+                 "fail to render")
+if "_operator_constraints" in pn_set:
+    probs.append("_operator_constraints is in PROMPT_NAMES — the installer would try to "
+                 "ship a file for a synthetic")
+if (pdir / "_operator_constraints.txt").exists():
+    probs.append("prompts/_operator_constraints.txt EXISTS — it would shadow the "
+                 "synthetic and substitute STALE, SLUG-BLIND text for live operator "
+                 "constraints in every carrier prompt")
+if "_preamble" not in syn_set:
+    probs.append("_preamble is no longer in SYNTHETIC_PROMPTS")
+if probs:
+    bad("T-CC6 shadow trap: " + "; ".join(probs))
+else:
+    ok("T-CC6 _operator_constraints is synthetic, undeclared in PROMPT_NAMES, and has no "
+       "shadowing file on disk")
+
+# ---- T-CC7 · inventory bidirectionality, and the digest DEFERRAL as a tripwire (P42) --
+# There is no DIGEST_NAMES array and no tracked digests/: digest vendoring is EXPLICITLY
+# DEFERRED by the plan (F8 — nine fix stages have no template to vendor, so the honest
+# task is "author nine and vendor sixteen", which is a project). Inventing a digest
+# inventory here would either fail immediately or pass vacuously, and a vacuous assertion
+# with a confident label is the failure this whole issue is about.
+#
+# So this asserts the state the plan DECLARES, as a live tripwire: while neither exists it
+# passes and SAYS SO; the moment either appears, BOTH must exist and agree both ways.
+shipped = {p.stem for p in prompts}
+inv = []
+for s in sorted(shipped - pn_set - syn_set):
+    inv.append("prompts/%s.txt ships but is absent from PROMPT_NAMES" % s)
+for s in sorted(pn_set - shipped):
+    inv.append("PROMPT_NAMES declares '%s' but prompts/%s.txt does not exist" % (s, s))
+has_dn = re.search(r'^DIGEST_NAMES=\(', inst, re.M) is not None
+tracked_digests = sorted((root / "digests").glob("*.txt")) if (root / "digests").is_dir() else []
+if has_dn != bool(tracked_digests):
+    inv.append("digest vendoring is HALF done: DIGEST_NAMES=%s, tracked digests=%d. "
+               "Vendor both or neither — a declared-but-absent digest inventory is the "
+               "defect PROMPT_NAMES exists to prevent" % (has_dn, len(tracked_digests)))
+if inv:
+    bad("T-CC7 inventory: " + "; ".join(inv))
+elif not has_dn and not tracked_digests:
+    ok("T-CC7 PROMPT_NAMES agrees with prompts/ both ways; digest vendoring deferred "
+       "(F8) — tripwire armed")
+else:
+    ok("T-CC7 PROMPT_NAMES and DIGEST_NAMES both agree with the repo, both ways")
+
+# ---- T-CC8 · NOT_COVERED: on every non-underscore prompt (P43) ------------------------
+nc = [p.name for p in stage_prompts if "NOT_COVERED:" not in p.read_text()]
+if nc:
+    bad("T-CC8 these stage prompts do not require a NOT_COVERED: line: " + ", ".join(sorted(nc)))
+else:
+    ok("T-CC8 all %d non-underscore prompts require a NOT_COVERED: line" % len(stage_prompts))
+# and the contract line it rides on
+bi = [p.name for p in stage_prompts if "BLOCKING_ITEMS:" not in p.read_text()]
+if bi:
+    bad("T-CC8 these stage prompts still have no BLOCKING_ITEMS: line: " + ", ".join(sorted(bi)))
+else:
+    ok("T-CC8 all %d non-underscore prompts carry the BLOCKING_ITEMS: contract line"
+       % len(stage_prompts))
+
+# ---- T-CC9 · qa / qa-retry lockstep, SECTION-SCOPED (P44) -----------------------------
+# The two files were byte-identical, which is WHY the build lane's retry stage could not
+# report whether the QA fix loop closed anything. qa-retry now carries a PRIOR FINDINGS
+# RESOLUTION section that qa must NOT have, so byte-identity is the wrong assertion. The
+# lockstep region is: identical include sets, and an identical contract tail from
+# `CONFIDENCE:` to EOF. This change makes several synchronised edits across two
+# hand-maintained files with nothing else detecting asymmetry.
+qa, qr = pdir / "qa.txt", pdir / "qa-retry.txt"
+if not (qa.is_file() and qr.is_file()):
+    bad("T-CC9 qa.txt / qa-retry.txt missing")
+else:
+    probs = []
+    if includes["qa"] != includes["qa-retry"]:
+        probs.append("include sets differ: qa=%s qa-retry=%s"
+                     % (sorted(includes["qa"]), sorted(includes["qa-retry"])))
+    def tail(p):
+        t = p.read_text()
+        i = t.find("CONFIDENCE: HIGH/MEDIUM/LOW")
+        return t[i:] if i >= 0 else None
+    ta, tb = tail(qa), tail(qr)
+    if ta is None or tb is None:
+        probs.append("one of them no longer carries the CONFIDENCE contract line")
+    elif ta != tb:
+        probs.append("the contract tail from CONFIDENCE: to EOF has drifted")
+    if "PRIOR FINDINGS RESOLUTION" not in qr.read_text():
+        probs.append("qa-retry.txt lost its PRIOR FINDINGS RESOLUTION section — the "
+                     "build lane's retry stage is back to being unable to report whether "
+                     "the QA fix loop closed anything")
+    if "PRIOR FINDINGS RESOLUTION" in qa.read_text():
+        probs.append("qa.txt gained a PRIOR FINDINGS RESOLUTION section; there are no "
+                     "prior findings on a first QA pass")
+    if probs:
+        bad("T-CC9 qa/qa-retry lockstep: " + "; ".join(probs))
+    else:
+        ok("T-CC9 qa.txt and qa-retry.txt agree in their lockstep sections, and differ "
+           "only where they must")
+
+sys.exit(1 if failures else 0)
+PY
+)
+EOF
+
 printf '\nPASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"; [ "$FAIL" = 0 ]
