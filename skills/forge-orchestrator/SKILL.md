@@ -127,6 +127,12 @@ surface to the user:
    - `forge-resume` — re-enter pipeline mode at the next stage if a
      `forge-pause` is in effect for the active slug. No-op if no
      paused pipeline exists.
+8. **A `SPEC FIDELITY` verdict of `REJECT: <clause>`** from `review`, or a
+   `REJECT: <clause>` returned by a Round 1 proposer. The spec itself is
+   contested. **Escalate to the OPERATOR via `forge ask`, not back to
+   yourself** — you wrote the clause, and returning a rejected spec to its
+   author costs a round and repairs nothing. Quote the rejected clause and
+   the ledger row it contradicts in the ask. See **The Spec Boundary**.
 
 **Completion condition** — *distinct from interruption*: the pipeline
 reaches the end of the sequence successfully. Stop after `verify` and
@@ -345,6 +351,12 @@ when."
    another worker, and never substitute *yourself*), preflight HALT,
    infra-lock timeout or conflict, and explicit user interrupt (`forge-stop`,
    `forge-pause`, `forge-resume`).
+9. **A `SPEC FIDELITY` verdict of `REJECT: <clause>`** — from `fix-plan-review`,
+   or from any stage whose `CONSTRAINT CHECK` section rates a row `VIOLATED`
+   against the packet the ledger was generated from. The spec itself is
+   contested. **Escalate to the OPERATOR via `forge ask`, not back to
+   yourself.** (This is #9 here and #8 in Pipeline Mode, because this list
+   already carried an eighth item; the condition is the same one.)
 
 ---
 

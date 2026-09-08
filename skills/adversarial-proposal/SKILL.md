@@ -140,6 +140,22 @@ Two `Agent(team_name=..., name="proposer-a", ...)` calls in a single message. Ea
 
 Then the lead waits — teammate "done" messages arrive as new conversation turns. **Waiting is not idling.** Apply the **output watchdog** (§"Error Handling") at this and every later wait: poll for bytes on disk at `{output_dir}/proposal-A.md` and `{output_dir}/proposal-B.md`, **timeout 5 minutes per proposer**, then ping once. A silent inbox is not evidence of work.
 
+**Every Round 1 proposer prompt must also embed the frame-challenge clause, verbatim:**
+
+> Before proposing, read `constraints.yml` beside `problem-statement.md`. Wherever the
+> statement's prose *restates* a `verbatim` rather than quoting it, and the restatement
+> narrows, widens or reframes it, that is a finding. Wherever a `principle` does not
+> follow from its `verbatim`, or a `binds` merely repeats its `asked_about`, that is a
+> finding. You may return `REJECT: <clause>` on the problem statement itself. It was
+> written by the actor whose translation you are checking.
+
+This is not optional politeness toward the problem statement. `problem-statement.md` is
+authored by the orchestrator, which is also the only actor that saw the operator's raw
+words — an unchecked translation. A proposer that adopts the statement's framing without
+testing it against the ledger has demonstrated the defect rather than found it. A
+`REJECT: <clause>` verdict is a pipeline stop condition and escalates to the operator via
+`forge ask`, not back to the orchestrator that wrote the clause.
+
 ### Step 3 — Gates after Round 1
 
 **Quality**: each proposal has required sections, ≥1 confidence annotation, ≥3 concrete code references. Failure → `SendMessage(to="proposer-a|b", message="revise: <specific>")`. Teammate resumes with full context.
