@@ -28,7 +28,8 @@ def redact(data):
                   r'\1[REDACTED]', text)
     text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----',
                   '[REDACTED PRIVATE KEY]', text, flags=re.S)
-    text = re.sub(r'(?i)(\b(?:[A-Za-z0-9_-]*?(?:api[_-]?key|token|secret|password)|authorization)\b["\x27]?\s*[=:]\s*)(?:"[^"]*"|\x27[^\x27]*\x27|[^\s,;}]+)',
+    text = re.sub(r'(?i)(\b[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|authorization)[A-Za-z0-9_-]*\b["\x27]?\s*[=:]\s*)'
+                  r'(?:"[^"]*"(?=\s|[,;}]|$)|\x27[^\x27]*\x27(?=\s|[,;}]|$)|[^\s,;}]+)',
                   r'\1[REDACTED]', text)
     text = re.sub(r'(?i)(--(?:api[_-]?key|token|secret|password)\s+)(?:"[^"]*"|\x27[^\x27]*\x27|\S+)', r'\1[REDACTED]', text)
     text = re.sub(r'(?i)\b(Bearer|Basic)\s+[^\s"\x27]+', r'\1 [REDACTED]', text)

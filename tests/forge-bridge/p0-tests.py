@@ -173,6 +173,20 @@ python3(){ :; }
         self.assertLess(time.monotonic()-before, 2)
         self.assertIn('timed out', result['unavailable'])
 
+    def test_redaction_infix_key_names_and_embedded_quotes(self):
+        # F-1: sensitive term as an infix component of an underscore-joined identifier.
+        self.assertNotIn(b'wJalrXUtnFEMI', h.redact(
+            b'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'))
+        self.assertNotIn(b'sekritvalue123', h.redact(b'db_secret_key=sekritvalue123'))
+        # F-2: a quoted value containing an embedded quote must be fully masked,
+        # not truncated at the first embedded quote with a plaintext tail surviving.
+        clean = h.redact(b'token: "abc"def123456789"')
+        self.assertNotIn(b'def123456789', clean)
+        self.assertNotIn(b'"abc"def123456789"', clean)
+        # F-3: underscore-joined Authorization variant without a Bearer/Basic scheme.
+        self.assertNotIn(b'abcSecretValue1234567890', h.redact(
+            b'Proxy_Authorization: abcSecretValue1234567890'))
+
 
     def test_tracked_missing_or_mode_changed_file_refuses(self):
         with tempfile.TemporaryDirectory() as directory:
