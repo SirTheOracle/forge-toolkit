@@ -1,0 +1,12 @@
+bin/forge
+bin/forge-bridge
+bin/forge-broker
+bin/forge-cc-hook
+bin/forge-dispatch-pr-review
+bin/forge-dispatch-review
+bin/forge-git-request
+bin/forge-issue-sync
+bin/forge-stall-install-regex
+bin/forge-start
+bin/forge-sync-main
+bin/forge-watch
