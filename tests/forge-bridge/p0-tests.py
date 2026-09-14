@@ -124,7 +124,16 @@ class P0Tests(unittest.TestCase):
                 h.inventory(root)
             # In a checkout, Git is the inventory; ignored backups never count.
             subprocess.run(['git', '-C', str(root), 'init', '-q'], check=True)
-            (root / '.gitignore').write_text('*.bak\n')
+            # Mirror the repo's real backup ignores: the global-edit protocol writes
+            # <tool>.bak-pre-<label>-<timestamp>, which '*.bak' alone does not match (#97).
+            (root / '.gitignore').write_text('*.bak\n*.bak-*\n')
+            protocol_backup = root / 'bin/forge.bak-pre-fixture-20260101T000000Z'
+            protocol_backup.write_text('#!/bin/bash\n# SECRETS = re.compile\n')
+            protocol_backup.chmod(0o755)
+            ignored = subprocess.run(['git', '-C', str(root), 'check-ignore', '-q',
+                                      str(protocol_backup.relative_to(root))])
+            self.assertEqual(ignored.returncode, 0,
+                             'protocol-style backup must be ignored by the fixture .gitignore')
             subprocess.run(['git', '-C', str(root), 'add', '.gitignore', 'bin'], check=True)
             self.assertEqual(h.inventory(root), 3)
             extra.write_text('#!/bin/bash\n# SECRETS = re.compile\n'); extra.chmod(0o755)
