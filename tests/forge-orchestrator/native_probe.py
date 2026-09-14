@@ -439,7 +439,9 @@ def session_command(codex, model=None):
     if model:
         argv.extend(["--model", model])
     argv.append("Continue P1 on the current feat/orchestrator-p1-native-probes branch. "
-                "Read tests/forge-orchestrator/README.md and the P1 section of "
+                "Stay in this existing worktree and Forge session. Read "
+                ".dev/proposals/codex-claude-orchestrator-parity-current-head-reconcile/p1-handoff.md "
+                "when present, tests/forge-orchestrator/README.md, and the P1 section of "
                 ".dev/proposals/codex-claude-orchestrator-parity-current-head-reconcile/final-plan.md. "
                 "The probe harness exists, but native acceptance is not complete. "
                 "Verify the effective permission policy first. Request narrowly scoped host "

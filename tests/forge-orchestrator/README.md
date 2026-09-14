@@ -12,14 +12,26 @@ worker pass, a protected-helper qualification, or a P1 completion verdict.
 ## Restart with scoped approvals
 
 When the current session enforces `approval_policy=never`, approval in chat cannot
-change that execution policy. From a normal operator terminal in this checkout:
+change that execution policy. Keep the existing worktree and Forge session.
+Use the current client's permission control first: Ask for approval in the
+desktop app, or `/permissions` in the CLI. If a fresh conversation is required,
+reopen it against the same existing worktree and read the local
+`.dev/proposals/codex-claude-orchestrator-parity-current-head-reconcile/p1-handoff.md`.
+
+For a CLI process restart only, exit Codex to the shell in the **same Forge pane**
+and run the optional helper there. Do not close/recreate the whole tmux session or
+start another checkout. Confirm that the pane has no active worker delivery and
+is appropriate for an attended operator experiment before changing its policy:
 
 ```bash
 bash tests/forge-orchestrator/native-probe.sh session
 ```
 
-This explicitly starts a new Codex conversation in this worktree and supplies the
-P1 continuation task. Add `--model NAME` to choose a model, or `--print` to inspect
+This starts a new Codex conversation in the invoking terminal/pane, pins this
+worktree, inherits the tmux environment, and supplies the P1 continuation task.
+It does not create or switch tmux sessions, panes or worktrees. Desktop app users
+can stay in the desktop app; the CLI helper is optional, not a migration step.
+Add `--model NAME` to choose a model, or `--print` to inspect
 the command without starting anything. It applies `config/codex-p1-session.toml`
 as CLI overrides: on-request approvals reviewed by the user, workspace-write,
 network denied and no additional writable roots. It does not edit global config,
@@ -43,8 +55,15 @@ harness tests and existing Codex worker policy smoke also pass.
 
 The launcher uses the documented [CLI configuration overrides](https://learn.chatgpt.com/docs/config-file/config-advanced)
 and [on-request approval mode](https://learn.chatgpt.com/docs/agent-approvals-security).
+The current-client permission controls are described in [Permissions](https://learn.chatgpt.com/docs/permission-modes).
 
 ## Run the bounded automatic portion
+
+The current preparation command requires an external disposable packet. The
+2026-09-14 session now requires worktree-local work and evidence: adapt the fixture
+layout and prove protection for its in-worktree operator package before following
+the external-packet example below. The example remains the original harness
+interface, not authorization to disregard the new locality requirement.
 
 Run from an operator terminal that can execute Codex's OS sandbox. No environment
 activation, credential copying, policy bypass or installer is needed.

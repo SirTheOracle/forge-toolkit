@@ -234,6 +234,8 @@ class ProbeTests(unittest.TestCase):
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertEqual(argv[argv.index("--model") + 1], "chosen-model")
         self.assertIn("native acceptance is not complete", argv[-1])
+        self.assertIn("p1-handoff.md", argv[-1])
+        self.assertIn("Stay in this existing worktree and Forge session", argv[-1])
 
     def test_session_requires_a_terminal_and_has_inspect_only_mode(self):
         argv = [str(HERE / "native-probe.sh"), "session", "--codex", sys.executable]
