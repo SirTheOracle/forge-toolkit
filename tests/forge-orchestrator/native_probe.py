@@ -106,8 +106,8 @@ def file_identity(path):
             "sha256": digest(path), "mode": path.stat().st_mode & 0o777}
 
 
-def copy_package(base, source):
-    package = base / "operator" / "package"
+def copy_package(base, source, operator=None):
+    package = (operator or base / "operator") / "package"
     files = git(source, "ls-files", "-z", "--", *PACKAGE_ROOTS).split("\0")
     for relative in filter(None, files):
         src = source / relative
@@ -119,7 +119,7 @@ def copy_package(base, source):
         dst.chmod(0o755 if os.access(src, os.X_OK) else 0o644)
     fixtures = package / "p1"
     fixtures.mkdir(parents=True)
-    for name in ("canary.py", "native-cases.json", "digest.txt"):
+    for name in ("canary.py", "package_access.py", "native-cases.json", "digest.txt"):
         shutil.copyfile(HERE / "fixtures" / name, fixtures / name)
     # The marker is only in the file to be loaded, never in the launch prompt.
     (fixtures / "SKILL.md").write_text(
@@ -136,14 +136,14 @@ def copy_package(base, source):
     return package
 
 
-def make_cases(base, root, name):
+def make_cases(base, root, name, operator=None):
     common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     git_dir = Path(git(root, "rev-parse", "--absolute-git-dir"))
     root_id = hashlib.sha256((str(root) + "\0" + str(git_dir)).encode()).hexdigest()
     authority = common / "forge" / "broker-v1" / "roots" / root_id
     locations = {
         "workspace": root / ("p1-control-" + name),
-        "operator-package": base / "operator" / ("p1-canary-" + name),
+        "operator-package": (operator or base / "operator") / ("p1-canary-" + name),
         "broker-profile": authority / "orchestrator" / ("p1-canary-" + name),
         "broker-state": authority / ("p1-canary-" + name),
         "git-dir": git_dir / ("p1-canary-" + name),
@@ -175,16 +175,28 @@ def make_cases(base, root, name):
             "nonce": secrets.token_hex(16), "cases": cases}
 
 
-def prepare(directory, source=SOURCE):
+def prepare(directory, source=SOURCE, in_worktree=False):
     source = source.resolve()
     directory = Path(directory).expanduser()
     base = directory.parent.resolve() / directory.name
-    if inside(base, source) or inside(source, base):
+    packet_id = secrets.token_hex(16)
+    fixture_parent = source / ".dev" / "forge-p1"
+    operator = base / "operator"
+    if in_worktree:
+        if (not inside(base, fixture_parent) or base == fixture_parent
+                or not inside(base, source)
+                or not no_symlink_components(directory)
+                or not no_symlink_components(fixture_parent)):
+            raise ValueError("in-worktree packets must be below the physical .dev/forge-p1 directory")
+        operator = source / ".codex/forge-p1" / (base.name + "-" + packet_id) / "operator"
+        if not no_symlink_components(operator):
+            raise ValueError("protected operator path contains a symlink")
+    elif inside(base, source) or inside(source, base):
         raise ValueError("probe directory must be outside the source checkout")
     if base.exists() or base.is_symlink():
         raise ValueError("probe directory must be new; prior evidence is never overwritten")
     base.mkdir(mode=0o700)
-    package = copy_package(base, source)
+    package = copy_package(base, source, operator)
     primary = base / "workspaces" / "primary"
     nested_primary = base / "workspaces" / "primary-nested"
     init_repo(primary)
@@ -194,7 +206,7 @@ def prepare(directory, source=SOURCE):
     git(primary, "worktree", "add", "--quiet", "-b", "linked", str(linked))
     git(nested_primary, "worktree", "add", "--quiet", "-b", "nested", str(nested_linked))
     roots = (primary, linked, nested_primary, nested_linked)
-    topologies = {name: make_cases(base, root, name) for name, root in zip(TOPOLOGIES, roots)}
+    topologies = {name: make_cases(base, root, name, operator) for name, root in zip(TOPOLOGIES, roots)}
     (base / "plans").mkdir()
     for name, plan in topologies.items():
         write_json(base / "plans" / (name + ".json"), plan)
@@ -209,7 +221,8 @@ def prepare(directory, source=SOURCE):
                 "and executed helper paths require native closure review before host effects."}
     write_json(base / "package.json", manifest)
     required = json.loads((HERE / "fixtures" / "native-cases.json").read_text())
-    packet = {"schema": SCHEMA, "directory": str(base), "id": secrets.token_hex(16),
+    packet = {"schema": SCHEMA, "directory": str(base), "id": packet_id,
+              "layout": "in-worktree-protected-candidate" if in_worktree else "external",
               "package_manifest_sha256": digest(base / "package.json"),
               "topologies": {name: {"root": plan["root"], "plan_sha256": digest(
                   base / "plans" / (name + ".json"))} for name, plan in topologies.items()},
@@ -225,7 +238,7 @@ def load_packet(directory):
     base = Path(directory).expanduser().resolve(strict=True)
     if not no_symlink_components(base):
         raise ValueError("packet directory must not contain symlink components")
-    for relative in ("packet.json", "package.json", "plans", "operator/package"):
+    for relative in ("packet.json", "package.json", "plans"):
         path = base / relative
         if not no_symlink_components(path) or not inside(path, base):
             raise ValueError("packet path was redirected")
@@ -236,6 +249,13 @@ def load_packet(directory):
         raise ValueError("package manifest changed")
     manifest = json.loads((base / "package.json").read_text())
     package = base / "operator/package"
+    if packet.get("layout") == "in-worktree-protected-candidate":
+        source = Path(manifest["source"])
+        if not inside(base, source / ".dev/forge-p1") or not re.fullmatch(r"[a-f0-9]{32}", packet["id"]):
+            raise ValueError("in-worktree layout identity mismatch")
+        package = source / ".codex/forge-p1" / (base.name + "-" + packet["id"]) / "operator/package"
+    if not no_symlink_components(package):
+        raise ValueError("package path was redirected")
     if manifest["package"] != str(package):
         raise ValueError("package path mismatch")
     entries = list(package.rglob("*"))
@@ -261,23 +281,26 @@ def load_packet(directory):
                 raise ValueError("topology path escaped or was redirected")
         for case in plan["cases"]:
             for field in ("path", "target", "destination"):
-                if not inside(case[field], base):
+                if not (inside(case[field], base) or inside(case[field], package.parent)):
                     raise ValueError("canary path escaped packet")
     return base, packet
 
 
 def sandbox_command(binary, root, help_text, command):
-    # The 0.153 sandbox utility explicitly rejects --strict-config. This is a
-    # sandbox primitive, not the interactive worker launch/readiness contract.
+    # The unified 0.153 utility resolves a permissions profile, independently of
+    # the top-level interactive --sandbox/approval flags. Without -P it can run
+    # read-only and make every negative canary appear protected.
+    if "Usage: codex sandbox [OPTIONS] [COMMAND]" in help_text:
+        return [str(binary), "sandbox", "--permission-profile", ":workspace",
+                "--cd", str(root), "--", *command]
     argv = [str(binary), "-C", str(root), "--sandbox", "workspace-write",
             "--ask-for-approval", "never", "-c", "sandbox_workspace_write.network_access=false",
             "-c", "sandbox_workspace_write.writable_roots=[]", "sandbox"]
     # 0.153 uses a unified command; older supported clients used platform subcommands.
-    if "Usage: codex sandbox [OPTIONS] [COMMAND]" not in help_text:
-        target = {"Darwin": "macos", "Linux": "linux"}.get(platform.system())
-        if not target or target not in help_text:
-            raise ValueError("unrecognized native sandbox CLI; refusing to guess")
-        argv.append(target)
+    target = {"Darwin": "macos", "Linux": "linux"}.get(platform.system())
+    if not target or target not in help_text:
+        raise ValueError("unrecognized native sandbox CLI; refusing to guess")
+    argv.append(target)
     return [*argv, "--", *command]
 
 
@@ -353,8 +376,85 @@ def public_result(result):
         "stderr_sha256": hashlib.sha256(result["stderr"].encode()).hexdigest()}
 
 
+def evaluate_package_access(manifest, positive, result):
+    if result["returncode"] != 0 or result["error"]:
+        return "BLOCKED", []
+    try:
+        observed = json.loads(result["stdout"])
+        rows = observed["files"]
+        paths = [item["path"] for item in manifest["files"].values()]
+        if (observed["schema"] != "forge-p1-package-access/1"
+                or not isinstance(rows, list)
+                or [row["path"] for row in rows] != paths):
+            raise ValueError("package access output identity mismatch")
+        control = (observed["positive_control"] == "allowed"
+                   and positive.is_file() and not positive.is_symlink()
+                   and positive.read_text() == "P1 workspace write succeeded\n")
+        unchanged = all(file_identity(item["path"]) == item
+                        for item in manifest["files"].values())
+        passed = control and unchanged and all(
+            row["write_open"] == "denied" and row["unchanged"] is True for row in rows)
+        return "PASS" if passed else "FAIL", rows
+    except (ValueError, KeyError, TypeError, OSError):
+        return "BLOCKED", []
+
+
+def package_access(directory, codex, timeout):
+    base, packet = load_packet(directory)
+    manifest = json.loads((base / "package.json").read_text())
+    package = Path(manifest["package"])
+    evidence = base / ("package-access-" + secrets.token_hex(8))
+    evidence.mkdir(mode=0o700)
+    report = {"schema": SCHEMA, "packet_id": packet["id"],
+              "package_manifest_sha256": packet["package_manifest_sha256"],
+              "p1_status": "INCOMPLETE", "provider_admitted": False,
+              "scope": "actual file write-open denial; standalone sandbox only",
+              "roots": {}}
+    binary = shutil.which(codex)
+    if not binary:
+        report.update(p1_status="BLOCKED", reason="Codex binary unavailable")
+    else:
+        report["codex"] = file_identity(binary)
+        report["python"] = file_identity(sys.executable)
+        help_result = execute([binary, "sandbox", "--help"], timeout=timeout)
+        roots = {name: Path(row["root"]) for name, row in packet["topologies"].items()}
+        if packet.get("layout") == "in-worktree-protected-candidate":
+            roots["source-worktree"] = Path(manifest["source"])
+        for name, root in roots.items():
+            # Evidence is inside the source workspace but outside fixture roots.
+            positive = (evidence if name == "source-worktree" else root) / (
+                "p1-package-positive-" + secrets.token_hex(8))
+            try:
+                if help_result["returncode"] != 0 or help_result["error"]:
+                    raise ValueError("native CLI inspection failed")
+                argv = sandbox_command(binary, root, help_result["stdout"],
+                    [sys.executable, str(package / "p1/package_access.py"),
+                     str(base / "package.json"), str(positive)])
+            except ValueError as exc:
+                report.update(p1_status="BLOCKED", reason=str(exc))
+                break
+            result = execute(argv, cwd=root, timeout=timeout)
+            status, rows = evaluate_package_access(manifest, positive, result)
+            report["roots"][name] = {"status": status, "root": str(root), "argv": argv,
+                "execution": public_result(result), "positive": str(positive), "files": rows}
+            if status != "PASS":
+                report["p1_status"] = status
+                break
+        try:
+            load_packet(base)
+            if (file_identity(binary) != report["codex"]
+                    or file_identity(sys.executable) != report["python"]):
+                raise ValueError("native executable changed during probe")
+        except (ValueError, OSError) as exc:
+            report.update(p1_status="FAIL", integrity_error=str(exc))
+    write_json(evidence / "report.json", report)
+    print(str(evidence / "report.json"))
+    return {"FAIL": 1, "INCOMPLETE": 2, "BLOCKED": 3}[report["p1_status"]]
+
+
 def run(directory, codex, timeout):
     base, packet = load_packet(directory)
+    package = Path(json.loads((base / "package.json").read_text())["package"])
     # Canary effects are intentionally retained. Never mistake a previous run's
     # files for the next run's positive controls; prepare a new packet to retry.
     (base / "run-started").open("x").close()
@@ -365,7 +465,7 @@ def run(directory, codex, timeout):
               "harness": file_identity(__file__),
               "p1_status": "INCOMPLETE", "provider_admitted": False,
               "native_cases": {provider: {case["id"]: "NOT_RUN" for case in json.loads(
-                  (base / "operator/package/p1/native-cases.json").read_text())}
+                  (package / "p1/native-cases.json").read_text())}
                   for provider in ("claude", "codex")},
               "topologies": {name: {"status": "NOT_RUN"} for name in TOPOLOGIES}}
     binary = shutil.which(codex)
@@ -390,7 +490,7 @@ def run(directory, codex, timeout):
                 plan = json.loads(plan_path.read_text())
                 try:
                     argv = sandbox_command(binary, plan["root"], help_result["stdout"],
-                                           [sys.executable, str(base / "operator/package/p1/canary.py"),
+                                           [sys.executable, str(package / "p1/canary.py"),
                                             str(plan_path)])
                 except ValueError as exc:
                     report.update(p1_status="BLOCKED", reason=str(exc))
@@ -457,10 +557,16 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     prepare_parser = sub.add_parser("prepare", help="create a new disposable evidence packet")
     prepare_parser.add_argument("--directory", required=True)
+    prepare_parser.add_argument("--in-worktree", action="store_true",
+                                help="fixtures in .dev/forge-p1, operator copy in .codex/forge-p1; native proof required")
     run_parser = sub.add_parser("run", help="run bounded native sandbox primitives; no models or host effects")
     run_parser.add_argument("--directory", required=True)
     run_parser.add_argument("--codex", default="codex")
     run_parser.add_argument("--timeout", type=float, default=20)
+    access_parser = sub.add_parser("package-access", help="probe write-open denial on actual copied files")
+    access_parser.add_argument("--directory", required=True)
+    access_parser.add_argument("--codex", default="codex")
+    access_parser.add_argument("--timeout", type=float, default=20)
     session_parser = sub.add_parser("session", help="restart from an operator terminal with P1 approvals")
     session_parser.add_argument("--codex", default="codex")
     session_parser.add_argument("--model")
@@ -468,7 +574,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "prepare":
-            print(prepare(args.directory))
+            print(prepare(args.directory, in_worktree=args.in_worktree))
             return 0
         if args.command == "session":
             argv = session_command(args.codex, args.model)
@@ -480,7 +586,8 @@ def main():
             os.execv(argv[0], argv)
         if not 0 < args.timeout <= 120:
             raise ValueError("timeout must be between 0 and 120 seconds")
-        return run(args.directory, args.codex, args.timeout)
+        runner = package_access if args.command == "package-access" else run
+        return runner(args.directory, args.codex, args.timeout)
     except (ValueError, OSError, KeyError, TypeError) as exc:
         print("P1 refused: " + str(exc), file=sys.stderr)
         return 1

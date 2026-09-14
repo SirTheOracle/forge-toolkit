@@ -1,0 +1,129 @@
+{
+  "children": {
+    "claude": "native Agent and SendMessage demonstrated; full isolation/policy acceptance incomplete",
+    "codex": "native spawn_agent fork_turns:none and followup_task demonstrated; opaque message inputs, child policy unmeasured"
+  },
+  "claude_model": "claude-fable-5-1",
+  "claude_version": "2.1.266 (Claude Code)",
+  "closure": "UNQUALIFIED: worker-writable yaml.py selected by bare Python find_spec; canary not imported",
+  "codex": {
+    "mode": 493,
+    "path": "/opt/homebrew/bin/codex",
+    "resolved_path": "/opt/homebrew/Caskroom/codex/0.153.4/bin/codex",
+    "sha256": "b973d440acac501fd2594a43e7ca9ce41e0a65b9dfb28d0d7a7837c99e1261e3"
+  },
+  "codex_model": "gpt-6-astra",
+  "codex_version": "0.153.4",
+  "date": "2026-09-14",
+  "evidence": [
+    {
+      "path": ".dev/forge-p1/native-20260914-04/run-78f37752fd907a1b/report.json",
+      "sha256": "3f364e5d4a9455d42d46927841e10657e37f89832d4739b17a412c43cac27767"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-04/package.json",
+      "sha256": "b51bbf2f69d0a31269a1f3d98c6cf16ca1ab341ebb36339fd90314e3f79a125c"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-04/package-access-5a137b4592e1c953/report.json",
+      "sha256": "8fcdbf65a4a599f5490a62a143d8a19ffa59e0e91fe419708182b69600d0eb6a"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-04/codex-worker-access-reviewed.json",
+      "sha256": "015d253d0e45a74d2c8b51de51d500e53909e4ee22283386e7eebd39bf12f088"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-04/codex-worker-access.jsonl",
+      "sha256": "102742af13fc8deb9eca5276f2de50e19f88980d76181b9567abfd83511b3ab9"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-04/closure-import-resolution.json",
+      "sha256": "0896d1798d425bf8431b4dfce3bf58b9a09eb3ad0d24998304ca11fdde3bc7e2"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-03/package.json",
+      "sha256": "1830fecdd6711abf599ac27eb82aed5df6df81872e128dba264d80b52b77c276"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-03/codex-entry.jsonl",
+      "sha256": "add3841a734dd2edbc46bfe50326eeffad73789f0fd6a9f1b1adacefd553d404"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-03/claude-entry-02.jsonl",
+      "sha256": "23bee527aa5c75e6a15276e175d588c64d83d5c82646f076a6ba9d96e045032e"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-03/codex-children.jsonl",
+      "sha256": "c35c84ae148fcf88d06234b83624b55e3677632731757dede07bfd03cdb0496c"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-03/codex-child-native-calls-reviewed.json",
+      "sha256": "8ed46a49271209b44e3620cba3a83697959b12c6f3e467f707a69c450aa037b3"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-03/claude-children.jsonl",
+      "sha256": "aa46a2ef9eb9d12e618adf8fb99b9888ce438e9d87077cd3e8cb18147684a536"
+    },
+    {
+      "path": ".dev/forge-p1/native-20260914-03/claude-followup.jsonl",
+      "sha256": "8a828b9c1938acbcedd20dc546327dc325570db169da5c78b2997443a2f9a5a2"
+    }
+  ],
+  "exact_load": {
+    "claude": "explicit-load-tool-traced; print surface",
+    "codex": "explicit-load-tool-traced; exec surface"
+  },
+  "host_control": "NOT_RUN: protection gate unmet",
+  "interactive_acceptance": "NOT_RUN",
+  "matrix": {
+    "linked": {
+      "checks": 35,
+      "status": "PASS"
+    },
+    "nested-linked": {
+      "checks": 35,
+      "status": "PASS"
+    },
+    "primary": {
+      "checks": 35,
+      "status": "PASS"
+    },
+    "primary-nested": {
+      "checks": 40,
+      "status": "PASS"
+    }
+  },
+  "native_worker": {
+    "all_denied": true,
+    "all_unchanged": true,
+    "file_count": 76,
+    "status": "PASS",
+    "surface": "native exec; same containment flags as Forge worker, model inherited; not interactive launch",
+    "trace_sha256": "102742af13fc8deb9eca5276f2de50e19f88980d76181b9567abfd83511b3ab9"
+  },
+  "p1_status": "INCOMPLETE",
+  "package_write_open": {
+    "linked": {
+      "files": 76,
+      "status": "PASS"
+    },
+    "nested-linked": {
+      "files": 76,
+      "status": "PASS"
+    },
+    "primary": {
+      "files": 76,
+      "status": "PASS"
+    },
+    "primary-nested": {
+      "files": 76,
+      "status": "PASS"
+    },
+    "source-worktree": {
+      "files": 76,
+      "status": "PASS"
+    }
+  },
+  "provider_admitted": false,
+  "schema": "forge-orchestrator-p1-measurements/1"
+}

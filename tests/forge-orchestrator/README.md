@@ -1,7 +1,7 @@
 # P1 native orchestrator experiments
 
 This is the P1 experiment harness, not provider selection or a parity release.
-Its `prepare` and `run` commands never install skills, change production
+Its `prepare`, `run` and `package-access` commands never install skills, change production
 configuration, start a provider, attach to an existing tmux server, or call a
 production broker. The automatic
 portion invokes the real Codex sandbox **without a model**. Interactive host and
@@ -10,6 +10,11 @@ their actual traces have been reviewed. A sandbox primitive pass is not a native
 worker pass, a protected-helper qualification, or a P1 completion verdict.
 
 ## Restart with scoped approvals
+
+The 2026-09-14 full-access continuation successfully runs the native OS sandbox
+in the existing worktree. No further restart or global permission-rule change is
+needed for the bounded probes. The guidance below is for a restricted session;
+full access itself does not qualify the intended reviewed-host profile.
 
 When the current session enforces `approval_policy=never`, approval in chat cannot
 change that execution policy. Keep the existing worktree and Forge session.
@@ -59,30 +64,32 @@ The current-client permission controls are described in [Permissions](https://le
 
 ## Run the bounded automatic portion
 
-The current preparation command requires an external disposable packet. The
-2026-09-14 session now requires worktree-local work and evidence: adapt the fixture
-layout and prove protection for its in-worktree operator package before following
-the external-packet example below. The example remains the original harness
-interface, not authorization to disregard the new locality requirement.
+Use `--in-worktree` to keep the fixture repositories and evidence under `.dev/forge-p1`
+and the candidate protected package under `.codex/forge-p1`. Both stay inside the
+current checkout; no existing Forge session is changed. The exact package path
+is in `package.json`. `.codex` is a measured candidate, not a protection guarantee
+for arbitrary providers or permission profiles.
 
 Run from an operator terminal that can execute Codex's OS sandbox. No environment
 activation, credential copying, policy bypass or installer is needed.
 
 ```bash
-mkdir -p "$HOME/.local/state/forge-p1"
-bash tests/forge-orchestrator/native-probe.sh prepare \
-  --directory "$HOME/.local/state/forge-p1/trial-01"
+mkdir -p .dev/forge-p1
+bash tests/forge-orchestrator/native-probe.sh prepare --in-worktree \
+  --directory .dev/forge-p1/trial-01
 bash tests/forge-orchestrator/native-probe.sh run \
-  --directory "$HOME/.local/state/forge-p1/trial-01"
+  --directory .dev/forge-p1/trial-01
+bash tests/forge-orchestrator/native-probe.sh package-access \
+  --directory .dev/forge-p1/trial-01
 ```
 
-The parent directory must exist, and the final directory must be new and outside
-the source checkout. Each packet is single-use: retain it and prepare trial-02 to
-retry. Preparation creates only disposable repositories and copied source files;
-it does not prove protection. Use an operator-owned location outside **all**
-worker writable roots. `/tmp` and `$TMPDIR` are often worker-writable and are
-suitable for hermetic tests, not a presumed protected native package. A temporary
-path is not rejected by the primitive: it should expose actual unexpected writes.
+The parent directory must exist and the final directory must be new. `run` is
+single-use: retain its evidence and prepare trial-02 to retry. `package-access`
+can be repeated; each invocation uses new evidence and positive-control paths.
+Preparation does not prove protection. Without `--in-worktree`, the original
+external-packet interface remains available, but is not appropriate for the
+current session's locality requirement. `/tmp` and `$TMPDIR` are often writable
+by workers and are not presumed protected locations.
 
 The generated `packet.json` binds the source package inventory and canary plans.
 `run-*/report.json` retains bounded execution outcomes, exact sandbox argv,
@@ -91,18 +98,21 @@ checks. Raw provider diagnostics are not retained; hashes and recognized sandbox
 errors are recorded instead. No authentication files, tokens or environment dump
 are collected. Preparation status is not a measured capability report.
 
-Exit codes for `run`: **1** failed check/integrity or invalid input; **2** primitives
+Exit codes for `run` and `package-access`: **1** failed check/integrity or invalid input; **2** primitives
 completed but P1 remains incomplete; **3** native prerequisite blocked. `prepare`
 returns **0** only for successful fixture creation. There is intentionally no
 automatic P1 PASS/admission output. Timeouts default to 20 seconds per process
 (maximum 120); the invocation-owned process group is killed on timeout. A sandbox
 launch failure stops dependent cells and cannot count as write denial.
 
-The installed 0.153 CLI uses `codex sandbox -- COMMAND`; older clients used a
-platform subcommand. The harness selects only a recognized help shape. The
-sandbox utility rejects `--strict-config`, so that flag is not used for this
-primitive. Workspace-write, never-approval, network denial and empty additional
-writable roots remain explicit. No interactive worker launch flags are changed.
+The installed 0.153.4 CLI requires
+`codex sandbox --permission-profile :workspace --cd ROOT -- COMMAND` for this
+primitive. Top-level interactive `--sandbox`/approval flags did not select the
+utility's writable profile: every positive-control write was denied. Those runs
+are failed controls, not protection evidence. The sandbox utility also rejects
+`--strict-config`. Older recognized clients retain the platform-subcommand form.
+The standalone `:workspace` profile is not an attestation of interactive worker
+settings. No Forge worker launch flags are changed.
 
 ## Automatic coverage and its limits
 
@@ -118,14 +128,34 @@ worktree Git directory, common infra-lock directory and an outside-workspace
 directory. Ordinary workspace mutations are the positive controls. The nested
 primary also tests its nested worktree's resolved Git metadata directory.
 
-The automatic portion does **not** mutate the actual `.git` pointer, execute
-profile-management verbs, or prove actual helper/config-file immutability. It
-does not measure a live worker's effective policy. Those stronger tests must be
-performed on disposable copies during the attended closure/permissions cases.
+`package-access` separately attempts write-open on every actual copied file,
+without writing bytes, for all four fixture roots and the source-worktree root
+when using the local layout. It verifies positive-control writes, exact output
+inventory, hashes and modes independently in the parent. Allowed protected opens,
+launch failures and missing observations cannot pass. This does not prove actual
+file rename/unlink denial, mutate the real `.git` pointer, exercise profile
+management, qualify transitive dependencies or measure an interactive worker.
 No future P2 registration API is pretended to exist. The source snapshot includes
 tracked `bin`, `config`, `prompts`, the canonical orchestrator and the existing
 Codex proposal/QA skills; ignored backups and personal/global digests are excluded.
 This is an initial inventory, **not** a claim of complete runtime dependency closure.
+
+## Latest measured results
+
+The full-access continuation passed 145 topology checks and actual write-open
+denial for 76 copied files from each of five roots. A separate native Codex
+`exec` run using Forge's containment flags denied all 76 opens while allowing
+the workspace positive control. Both providers explicitly read the protected
+entry through traced native tools and used real native children and follow-up.
+These are noninteractive surfaces; exact interactive/discovery, child policy,
+host approvals and integrated host-control acceptance remain incomplete.
+
+The closure review found a concrete blocker: bare `python3 -c`/stdin imports can
+resolve `yaml` from the worker-writable current directory. An inert `yaml.py`
+fixture was selected by `find_spec` without importing or executing it. Do not
+approve copied Forge host helpers until the interpreter, import paths and other
+runtime dependencies are isolated and their protection measured. See
+`skills/forge-orchestrator/references/technical.md` for results and evidence paths.
 
 ## Attended native acceptance
 

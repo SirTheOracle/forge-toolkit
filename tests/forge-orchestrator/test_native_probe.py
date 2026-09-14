@@ -57,6 +57,83 @@ class ProbeTests(unittest.TestCase):
         self.assertNotIn("bin/forge.bak-private", files)
         self.assertEqual(files["bin/forge"]["mode"], 0o755)
 
+    def test_in_worktree_packet_requires_protected_candidate_path(self):
+        parent = self.source / ".dev/forge-p1"
+        parent.mkdir(parents=True)
+        packet = probe.prepare(parent / "trial", self.source, in_worktree=True)
+        _, data = probe.load_packet(packet)
+        self.assertEqual(data["layout"], "in-worktree-protected-candidate")
+        self.assertTrue(probe.inside(packet, self.source))
+        manifest = json.loads((packet / "package.json").read_text())
+        package = Path(manifest["package"])
+        self.assertTrue(probe.inside(package, self.source / ".codex/forge-p1"))
+        self.assertFalse(probe.inside(package, packet))
+        self.assertIn("p1/package_access.py", manifest["files"])
+        with self.assertRaisesRegex(ValueError, "physical .dev"):
+            probe.prepare(self.source / "ordinary", self.source, in_worktree=True)
+        alias = self.source / ".dev/forge-p1/alias"
+        alias.symlink_to(self.base, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "physical .dev"):
+            probe.prepare(alias / "escape", self.source, in_worktree=True)
+        local_alias = parent / "local-alias"
+        local_alias.symlink_to(parent, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "physical .dev"):
+            probe.prepare(local_alias / "escape", self.source, in_worktree=True)
+
+    def test_in_worktree_package_redirection_refuses(self):
+        parent = self.source / ".dev/forge-p1"
+        parent.mkdir(parents=True)
+        packet = probe.prepare(parent / "trial", self.source, in_worktree=True)
+        manifest = json.loads((packet / "package.json").read_text())
+        package = Path(manifest["package"])
+        moved = package.with_name("moved")
+        package.rename(moved)
+        package.symlink_to(moved, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "redirected"):
+            probe.load_packet(packet)
+
+    def test_uncontained_package_access_fails_without_changing_bytes(self):
+        packet = self.prepare()
+        manifest = json.loads((packet / "package.json").read_text())
+        positive = packet / "positive"
+        result = probe.execute([sys.executable, str(HERE / "fixtures/package_access.py"),
+                                str(packet / "package.json"), str(positive)])
+        status, rows = probe.evaluate_package_access(manifest, positive, result)
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(all(row["write_open"] == "allowed" and row["unchanged"] for row in rows))
+        probe.load_packet(packet)
+
+    def test_package_access_requires_exact_rows_and_real_positive_control(self):
+        packet = self.prepare()
+        manifest = json.loads((packet / "package.json").read_text())
+        positive = packet / "positive"
+        observed = {"schema": "forge-p1-package-access/1", "positive_control": "allowed",
+                    "files": [{"path": item["path"], "write_open": "denied", "unchanged": True}
+                              for item in manifest["files"].values()]}
+        result = {"returncode": 0, "error": None, "stdout": json.dumps(observed)}
+        self.assertEqual(probe.evaluate_package_access(manifest, positive, result)[0], "FAIL")
+        positive.write_text("P1 workspace write succeeded\n")
+        self.assertEqual(probe.evaluate_package_access(manifest, positive, result)[0], "PASS")
+        observed["files"] = observed["files"][:-1]
+        result["stdout"] = json.dumps(observed)
+        self.assertEqual(probe.evaluate_package_access(manifest, positive, result)[0], "BLOCKED")
+
+    def test_package_access_launch_failure_and_tampering_are_not_passes(self):
+        packet = self.prepare()
+        manifest = json.loads((packet / "package.json").read_text())
+        result = {"returncode": 71, "error": None, "stdout": ""}
+        self.assertEqual(probe.evaluate_package_access(manifest, packet / "positive", result)[0], "BLOCKED")
+        with patch.object(probe.shutil, "which", return_value=None):
+            self.assertEqual(probe.package_access(packet, "missing", 2), 3)
+        report = json.loads(next(packet.glob("package-access-*/report.json")).read_text())
+        self.assertFalse(report["provider_admitted"])
+        self.assertEqual(report["p1_status"], "BLOCKED")
+        (packet / "operator/package/bin/forge").write_text("changed")
+        with patch.object(probe, "execute") as execute:
+            with self.assertRaisesRegex(ValueError, "bytes/path/mode"):
+                probe.package_access(packet, "codex", 2)
+            execute.assert_not_called()
+
     def test_tracked_symlink_is_refused(self):
         (self.source / "bin/link").symlink_to("forge")
         probe.git(self.source, "add", "bin/link")
@@ -114,17 +191,19 @@ class ProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "symlink"):
             probe.load_packet(packet)
 
-    def test_sandbox_argv_retains_worker_policy_and_detects_cli_shape(self):
+    def test_sandbox_argv_uses_explicit_primitive_profile_and_detects_cli_shape(self):
         command = probe.sandbox_command("/codex", self.base,
             "Usage: codex sandbox [OPTIONS] [COMMAND]...", ["/python", "canary.py"])
         self.assertEqual(command[-3:], ["--", "/python", "canary.py"])
-        self.assertIn("sandbox_workspace_write.network_access=false", command)
-        self.assertIn("sandbox_workspace_write.writable_roots=[]", command)
+        self.assertEqual(command[1:6], ["sandbox", "--permission-profile", ":workspace", "--cd", str(self.base)])
         self.assertNotIn("--strict-config", command)
-        self.assertEqual(command[command.index("--ask-for-approval") + 1], "never")
+        self.assertNotIn("--ask-for-approval", command)
         with patch.object(probe.platform, "system", return_value="Darwin"):
             old = probe.sandbox_command("/codex", self.base, "Commands: macos linux", ["/python"])
         self.assertEqual(old[-4:], ["sandbox", "macos", "--", "/python"])
+        self.assertIn("sandbox_workspace_write.network_access=false", old)
+        self.assertIn("sandbox_workspace_write.writable_roots=[]", old)
+        self.assertEqual(old[old.index("--ask-for-approval") + 1], "never")
         with self.assertRaisesRegex(ValueError, "unrecognized"):
             probe.sandbox_command("/codex", self.base, "unknown help", ["/python"])
 
