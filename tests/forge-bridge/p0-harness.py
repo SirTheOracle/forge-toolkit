@@ -24,12 +24,17 @@ def redact(data):
         if re.search(r'token|secret|password|credential|api.?key', key, re.I) and len(value) >= 4:
             data = data.replace(value.encode(), b'[REDACTED]')
     text = data.decode('latin1')
-    text = re.sub(r'(?i)(\b(?:proxy-)?authorization["\x27]?\s*[:=]\s*["\x27]?)(?:Bearer|Basic)\s+[^\s"\x27,;]+',
+    text = re.sub(r'(?i)(\b(?:proxy-)?authorization["\x27]?\s*[:=]\s*["\x27]?)(?:Bearer|Basic)\s+[^\s"\x27]+',
                   r'\1[REDACTED]', text)
     text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----',
                   '[REDACTED PRIVATE KEY]', text, flags=re.S)
+    # Value terminator is real (end of line, or end of the enclosing quoted string),
+    # never an ad-hoc punctuation class: a secret containing ',', ';' or '}' must not
+    # leave a plaintext tail after [REDACTED] (F-5). A quoted value that fails the
+    # close-quote lookahead (an embedded quote, F-2) falls through to the unquoted
+    # alternative, which then consumes to end of line rather than re-truncating.
     text = re.sub(r'(?i)(\b[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|authorization)[A-Za-z0-9_-]*\b["\x27]?\s*[=:]\s*)'
-                  r'(?:"[^"]*"(?=\s|[,;}]|$)|\x27[^\x27]*\x27(?=\s|[,;}]|$)|[^\s,;}]+)',
+                  r'(?:"[^"]*"(?=\s|[,;}]|$)|\x27[^\x27]*\x27(?=\s|[,;}]|$)|[^\r\n]+)',
                   r'\1[REDACTED]', text)
     text = re.sub(r'(?i)(--(?:api[_-]?key|token|secret|password)\s+)(?:"[^"]*"|\x27[^\x27]*\x27|\S+)', r'\1[REDACTED]', text)
     text = re.sub(r'(?i)\b(Bearer|Basic)\s+[^\s"\x27]+', r'\1 [REDACTED]', text)

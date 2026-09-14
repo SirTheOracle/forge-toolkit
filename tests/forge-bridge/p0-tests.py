@@ -187,6 +187,29 @@ python3(){ :; }
         self.assertNotIn(b'abcSecretValue1234567890', h.redact(
             b'Proxy_Authorization: abcSecretValue1234567890'))
 
+    def test_redaction_unquoted_value_has_no_plaintext_tail_after_delimiter(self):
+        # F-5: the unquoted-value path must consume to a real terminator (end of
+        # line, or end of an enclosing quoted string) rather than stopping at the
+        # first comma/semicolon/brace *inside* the secret and leaving a tail.
+        self.assertNotIn(b'def1234567890', h.redact(b'token=abc,def1234567890'))
+        self.assertNotIn(b'def1234567890', h.redact(b'token: abc;def1234567890'))
+        # An unquoted value ending in '}' adjacent to a JSON-like structure: the
+        # brace must not be treated as a safe early stop when it sits inside,
+        # rather than immediately after, the secret's own bytes.
+        self.assertNotIn(b'def1234567890', h.redact(b'token=abc}def1234567890'))
+        # Same defect class in the dedicated Authorization/Bearer path (line 27):
+        # a comma or semicolon inside the credential itself must not truncate it.
+        self.assertNotIn(b'def1234567890', h.redact(b'Authorization: Bearer abc,def1234567890'))
+        self.assertNotIn(b'def1234567890', h.redact(b'Authorization: Bearer abc;def1234567890'))
+        # F-1/F-2/F-3 repros must keep passing under the restructured terminator.
+        self.assertNotIn(b'wJalrXUtnFEMI', h.redact(
+            b'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'))
+        clean = h.redact(b'token: "abc"def123456789"')
+        self.assertNotIn(b'def123456789', clean)
+        self.assertNotIn(b'"abc"def123456789"', clean)
+        self.assertNotIn(b'abcSecretValue1234567890', h.redact(
+            b'Proxy_Authorization: abcSecretValue1234567890'))
+
 
     def test_tracked_missing_or_mode_changed_file_refuses(self):
         with tempfile.TemporaryDirectory() as directory:
