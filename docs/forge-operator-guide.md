@@ -298,6 +298,54 @@ for completion or escalation, not following along (Hard Rule 8).
 | Non-OK pane from `forge-bridge health` | `DEAD`, `WRONG_PROCESS`, `UNKNOWN` |
 | Explicit user interrupt | `forge-stop`, `forge-pause`, `forge-skip <stage>` |
 
+### The operator constraint ledger
+
+Every build- and fix-pipeline slug carries one ledger at
+`.dev/proposals/{slug}/constraints.yml` (`schema: forge-constraints/1`). It holds
+what **you** asked for, in your own words, so that every later stage works
+against the real premise instead of a paraphrase of it.
+
+`forge-bridge dispatch` **refuses** a carrier stage whose slug has no valid
+ledger — `CONSTRAINT_LEDGER_REQUIRED`, exit 6. A stage is a carrier exactly when
+its template asks for `<<<INCLUDE _operator_constraints>>>`; the ledger bytes are
+delivered into those prompts by that include.
+
+What an operator needs to know about the rows:
+
+- **`verbatim` and `principle` are separate fields.** Your words, then the
+  general rule you read into them. The pair is carried into every prompt so the
+  translation is diffable. This buys **visibility, not correctness** — the
+  orchestrator types both.
+- **`asked_about` vs `binds`.** Rulings get misapplied at the width of the
+  question that prompted them, so `binds` records the scope the rule actually
+  governs and is expected to be wider. A `binds` that merely repeats its
+  `asked_about` is itself a finding, and reviewers are told to report it.
+- **`source: derived`** means the orchestrator's *reading* of a measurement, and
+  requires a `rederive:` command that regenerates it.
+- **`scope: user-visible`** rows may be graded `PASS` only on a real-product
+  observation — a screenshot, a rendered page, a CLI transcript. Unit and
+  integration evidence alone grades `NOT-EXERCISED`.
+- **An empty ledger is legal** — `constraints: []` plus a mandatory
+  `none_recorded_reason:`. Silence is not a pass; a stated reason is something a
+  reviewer can attack.
+
+**The ledger is single-writer: the orchestrator.** A stage may *propose* a row
+through a `BLOCKED` callback — a review event, not a worker write. Each dispatch
+records a `constraints_sha256:` in `forge-log.yml`, so "which version did stage N
+validate against?" is answerable from the log.
+
+A constraint you state conversationally in pane 0 reaches nothing. If it is not
+in the ledger, it is not in the prompts.
+
+| Command | Use |
+|---|---|
+| `~/bin/forge-bridge constraints init --slug <s>` | Scaffold the ledger from `problem-statement.md`. Every scaffolded row is `source: inferred` / `status: OPEN` — visibly unverified. Refuses to overwrite an existing ledger |
+| `~/bin/forge-bridge constraint-check --slug <s> [--stage <s>]` | Structural check only, never semantic: required fields, `operator ⇒ verbatim`, `derived ⇒ rederive`, and with `--stage` exact set equality between ledger ids and the ids that stage's report confirmed |
+
+`FORGE_CONSTRAINTS_MODE=observe` is the rollback lever: it downgrades the
+refusal to a warning at both the render and the guard. It is audited, not a
+normal setting.
+
 ### Completion
 
 After `verify` returns clean:
