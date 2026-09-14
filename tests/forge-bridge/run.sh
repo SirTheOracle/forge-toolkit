@@ -936,6 +936,12 @@ grep -q 'status: OPEN' "$_ci_led" 2>/dev/null || _ci_err="$_ci_err no-open-statu
   && ok "T-CI-SCAFFOLD constraints init writes a structurally-valid, visibly-unverified ledger and refuses to overwrite one" \
   || bad "T-CI-SCAFFOLD:$_ci_err"
 
+if bash "$ROOT/tests/forge-bridge/context-notes.sh"; then
+    ok "T-CTX-NOTE-ROUNDTRIP special characters survive both context writers"
+else
+    bad "T-CTX-NOTE-ROUNDTRIP special characters survive both context writers"
+fi
+
 # ---- Real-tmux section ----
 if ! command -v tmux >/dev/null 2>&1; then
     not_run "tmux unavailable: real-tmux identity and mandatory ACM cells"
