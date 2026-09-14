@@ -1,0 +1,4 @@
+Read only .dev/proposals/{slug}/probe-artifact.md from disk.
+Summarize its decision without reading pane transcripts or starting other work.
+If the artifact is missing, say so and report at least one blocking item.
+End with CONFIDENCE: HIGH/MEDIUM/LOW and BLOCKING_ITEMS: N.

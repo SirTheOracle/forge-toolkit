@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 for suite in \
   tests/codex-policy-smoke/run.sh \
+  tests/forge-orchestrator/run.sh \
   tests/forge-broker/run.sh \
   tests/forge-worktree/run.sh \
   tests/forge-fix-runner/run.sh \
