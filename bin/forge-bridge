@@ -2803,22 +2803,6 @@ update_context() {
 
     mkdir -p "$DEV_DIR"
 
-    # Read existing notes if any
-    local existing_notes=""
-    if [ -f "$CONTEXT_FILE" ]; then
-        existing_notes=$(python3 -c "
-import yaml, sys
-try:
-    with open('$CONTEXT_FILE') as f:
-        data = yaml.safe_load(f) or {}
-    notes = data.get('notes', [])
-    for n in notes:
-        print(n)
-except:
-    pass
-" 2>/dev/null)
-    fi
-
     # Determine next stage.
     # qa, qa-fix, and qa-retry do NOT auto-advance — the orchestrator
     # decides whether to enter qa-fix (findings present), qa-retry,
@@ -2847,27 +2831,33 @@ except:
         fi
     fi
 
-    # Write context file
-    cat > "$CONTEXT_FILE" << EOF
-# Forge Context — auto-updated by forge-bridge hooks
-# Read this on session start to resume pipeline state
-active_pipeline: $slug
-last_stage_completed: $stage
-last_stage_status: $status
-last_worker: $worker
-next_stage: $next_stage
-updated_at: "$ts"
-EOF
+    python3 - "$CONTEXT_FILE" "$slug" "$stage" "$status" "$worker" "$next_stage" "$ts" <<'PYEOF' || return 1
+import sys
+import yaml
 
-    # Append notes if they exist
-    if [ -n "$existing_notes" ]; then
-        echo "notes:" >> "$CONTEXT_FILE"
-        echo "$existing_notes" | while IFS= read -r line; do
-            echo "  - \"$line\"" >> "$CONTEXT_FILE"
-        done
-    else
-        echo "notes: []" >> "$CONTEXT_FILE"
-    fi
+path, slug, stage, status, worker, next_stage, ts = sys.argv[1:]
+try:
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+except (OSError, yaml.YAMLError):
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+notes = data.get("notes", [])
+if not isinstance(notes, list):
+    notes = []
+
+with open(path, "w") as f:
+    f.write("# Forge Context — auto-updated by forge-bridge hooks\n")
+    f.write("# Read this on session start to resume pipeline state\n")
+    f.write(f"active_pipeline: {slug}\n")
+    f.write(f"last_stage_completed: {stage}\n")
+    f.write(f"last_stage_status: {status}\n")
+    f.write(f"last_worker: {worker}\n")
+    f.write(f"next_stage: {next_stage}\n")
+    f.write(f'updated_at: "{ts}"\n')
+    yaml.safe_dump({"notes": notes}, f, default_flow_style=False, sort_keys=False)
+PYEOF
 
     # Heartbeat: stage RESULT recorded (not necessarily an advance).
     # commit-review is a side-channel, not a pipeline stage transition — skip.
@@ -9838,21 +9828,23 @@ cmd_add_note() {
         return 1
     fi
 
-    python3 << PYEOF
+    python3 - "$CONTEXT_FILE" "$note" <<'PYEOF'
+import sys
 import yaml
 
-with open("$CONTEXT_FILE") as f:
+path, note = sys.argv[1:]
+with open(path) as f:
     data = yaml.safe_load(f) or {}
 
 notes = data.get("notes", [])
 if isinstance(notes, list):
-    notes.append("$note")
+    notes.append(note)
 else:
-    notes = ["$note"]
+    notes = [note]
 data["notes"] = notes
 
-with open("$CONTEXT_FILE", "w") as f:
-    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+with open(path, "w") as f:
+    yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
 
 print("Note added.")
 PYEOF
