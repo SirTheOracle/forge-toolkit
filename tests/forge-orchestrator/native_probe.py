@@ -9,11 +9,13 @@ from pathlib import Path
 import platform
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import time
+import tomllib
 
 
 HERE = Path(__file__).resolve().parent
@@ -417,6 +419,37 @@ def run(directory, codex, timeout):
     return {"FAIL": 1, "INCOMPLETE": 2, "BLOCKED": 3}[report["p1_status"]]
 
 
+def session_command(codex, model=None):
+    config = tomllib.loads((SOURCE / "config/codex-p1-session.toml").read_text())
+    expected = {"approval_policy": "on-request", "approvals_reviewer": "user",
+                "sandbox_mode": "workspace-write",
+                "sandbox_workspace_write": {"network_access": False, "writable_roots": []}}
+    if config != expected:
+        raise ValueError("P1 session policy changed; review the launcher contract before use")
+    binary = shutil.which(codex)
+    if not binary:
+        raise ValueError("Codex binary unavailable")
+    argv = [binary, "-C", str(SOURCE), "--strict-config"]
+    # These value types have the same spelling in TOML and JSON. Pass separate
+    # argv entries, not shell-evaluated config or changes to the user's config.
+    for key, value in config.items():
+        entries = {key + "." + k: v for k, v in value.items()} if isinstance(value, dict) else {key: value}
+        for name, item in entries.items():
+            argv.extend(["-c", name + "=" + json.dumps(item)])
+    if model:
+        argv.extend(["--model", model])
+    argv.append("Continue P1 on the current feat/orchestrator-p1-native-probes branch. "
+                "Read tests/forge-orchestrator/README.md and the P1 section of "
+                ".dev/proposals/codex-claude-orchestrator-parity-current-head-reconcile/final-plan.md. "
+                "The probe harness exists, but native acceptance is not complete. "
+                "Verify the effective permission policy first. Request narrowly scoped host "
+                "approvals for disposable native experiments as needed; do not disable the "
+                "sandbox or weaken worker policies. Complete remaining P1 implementation "
+                "and native acceptance, preserving live sessions and installed assets. "
+                "Record actual gaps, commit the work, and merge local main before any PR.")
+    return argv
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -426,11 +459,23 @@ def main():
     run_parser.add_argument("--directory", required=True)
     run_parser.add_argument("--codex", default="codex")
     run_parser.add_argument("--timeout", type=float, default=20)
+    session_parser = sub.add_parser("session", help="restart from an operator terminal with P1 approvals")
+    session_parser.add_argument("--codex", default="codex")
+    session_parser.add_argument("--model")
+    session_parser.add_argument("--print", action="store_true", dest="print_only")
     args = parser.parse_args()
     try:
         if args.command == "prepare":
             print(prepare(args.directory))
             return 0
+        if args.command == "session":
+            argv = session_command(args.codex, args.model)
+            if args.print_only:
+                print(shlex.join(argv))
+                return 0
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                raise ValueError("session must be started by the operator in an interactive terminal; use --print to inspect")
+            os.execv(argv[0], argv)
         if not 0 < args.timeout <= 120:
             raise ValueError("timeout must be between 0 and 120 seconds")
         return run(args.directory, args.codex, args.timeout)

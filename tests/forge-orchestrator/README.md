@@ -1,12 +1,48 @@
 # P1 native orchestrator experiments
 
 This is the P1 experiment harness, not provider selection or a parity release.
-It never installs skills, changes production configuration, starts a provider,
-attaches to an existing tmux server, or calls a production broker. The automatic
+Its `prepare` and `run` commands never install skills, change production
+configuration, start a provider, attach to an existing tmux server, or call a
+production broker. The automatic
 portion invokes the real Codex sandbox **without a model**. Interactive host and
 child-agent acceptance are separate, attended cases and remain NOT_RUN until
 their actual traces have been reviewed. A sandbox primitive pass is not a native
 worker pass, a protected-helper qualification, or a P1 completion verdict.
+
+## Restart with scoped approvals
+
+When the current session enforces `approval_policy=never`, approval in chat cannot
+change that execution policy. From a normal operator terminal in this checkout:
+
+```bash
+bash tests/forge-orchestrator/native-probe.sh session
+```
+
+This explicitly starts a new Codex conversation in this worktree and supplies the
+P1 continuation task. Add `--model NAME` to choose a model, or `--print` to inspect
+the command without starting anything. It applies `config/codex-p1-session.toml`
+as CLI overrides: on-request approvals reviewed by the user, workspace-write,
+network denied and no additional writable roots. It does not edit global config,
+project `.codex` files, credentials, hooks, or Forge worker settings.
+
+There is deliberately no blanket command allow rule. A fresh session must request
+individual approvals for host-side sandbox experiments, preparation of protected
+fixture copies and required tmux/broker operations after verifying their paths and
+dependencies. Broad approval of a worker-writable Python/shell helper would defeat
+the P1 protection experiment. Keep approvals per invocation until the copied
+helper closure has been reviewed. These settings do not make nested Seatbelt work
+inside the sandbox; they permit requesting approved host execution where policy
+allows it. Managed requirements still take precedence. Verify effective policy
+after restart before attempting the native work.
+
+Local validation on Codex 0.153.4: `doctor --json` with these overrides reports
+`config.load: ok`, `approval policy: OnRequest`, and restricted filesystem and
+network sandboxes. Doctor's aggregate exit was 1; this is validation of those
+named configuration fields, not an all-health or native P1 pass. The 22 hermetic
+harness tests and existing Codex worker policy smoke also pass.
+
+The launcher uses the documented [CLI configuration overrides](https://learn.chatgpt.com/docs/config-file/config-advanced)
+and [on-request approval mode](https://learn.chatgpt.com/docs/agent-approvals-security).
 
 ## Run the bounded automatic portion
 

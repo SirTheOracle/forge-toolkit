@@ -221,6 +221,37 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result["error"], "timeout")
         self.assertLess(result["elapsed_seconds"], 3)
 
+    def test_session_overrides_never_without_bypassing_worker_sandbox(self):
+        with patch.object(probe.shutil, "which", return_value="/opt/homebrew/bin/codex"):
+            argv = probe.session_command("codex", "chosen-model")
+        self.assertEqual(argv[:4], ["/opt/homebrew/bin/codex", "-C", str(probe.SOURCE), "--strict-config"])
+        config = dict(argv[i + 1].split("=", 1) for i, value in enumerate(argv) if value == "-c")
+        self.assertEqual(json.loads(config["approval_policy"]), "on-request")
+        self.assertEqual(json.loads(config["approvals_reviewer"]), "user")
+        self.assertEqual(json.loads(config["sandbox_mode"]), "workspace-write")
+        self.assertFalse(json.loads(config["sandbox_workspace_write.network_access"]))
+        self.assertEqual(json.loads(config["sandbox_workspace_write.writable_roots"]), [])
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "chosen-model")
+        self.assertIn("native acceptance is not complete", argv[-1])
+
+    def test_session_requires_a_terminal_and_has_inspect_only_mode(self):
+        argv = [str(HERE / "native-probe.sh"), "session", "--codex", sys.executable]
+        result = subprocess.run([*argv, "--print"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("approval_policy", result.stdout)
+        result = subprocess.run(argv, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("interactive terminal", result.stderr)
+
+    def test_session_refuses_changed_policy(self):
+        config = self.base / "config"
+        config.mkdir()
+        (config / "codex-p1-session.toml").write_text('approval_policy = "never"\n')
+        with patch.object(probe, "SOURCE", self.base):
+            with self.assertRaisesRegex(ValueError, "policy changed"):
+                probe.session_command("codex")
+
     def test_required_native_cases_have_valid_dependencies_and_both_providers(self):
         cases = json.loads((HERE / "fixtures/native-cases.json").read_text())
         ids = [c["id"] for c in cases]
