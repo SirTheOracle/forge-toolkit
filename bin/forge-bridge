@@ -5680,7 +5680,8 @@ cmd_dispatch() {
         # never recomputed, so the digest the stage is shown and the digest the log records
         # are the same number by construction.
         local _cg_block _cg_rc
-        _cg_block="$(_render_operator_constraints "$project_root" "$slug" 2>&1)"; _cg_rc=$?
+        # Guard validity is strict; the later renderer retains the configured observe mode.
+        _cg_block="$(FORGE_CONSTRAINTS_MODE=enforce _render_operator_constraints "$project_root" "$slug" 2>&1)"; _cg_rc=$?
         if [ "$_cg_rc" -ne 0 ]; then
             _emit_event GUARD_BLOCK "$slug" "stage=$stage reason=constraints-ledger-invalid mode=$_cg_mode worker=$worker_canonical"
             if [ "$_cg_mode" = observe ]; then

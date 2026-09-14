@@ -12,12 +12,21 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BRIDGE="$ROOT/bin/forge-bridge"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; NOT_RUN=0
 ok(){ PASS=$((PASS+1)); printf '  ok: %s\n' "$1"; }
 bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
+not_run(){ NOT_RUN=$((NOT_RUN+1)); printf '  NOT RUN: %s\n' "$1"; }
 
 export FORGE_WATCH_TRIGGER=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fbid.XXXXXX")"; WORK="$(cd "$WORK" && pwd -P)"
+P0_HELPER="$ROOT/tests/forge-bridge/p0-harness.py"
+P0_EVIDENCE="${FORGE_BRIDGE_EVIDENCE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/forge-bridge-evidence.XXXXXX")}"
+mkdir -p "$P0_EVIDENCE" || exit 2
+P0_EVIDENCE="$(cd "$P0_EVIDENCE" && pwd -P)" || exit 2
+case "$P0_EVIDENCE/" in "$WORK/"*) echo 'Evidence must survive WORK cleanup' >&2; exit 2 ;; esac
+printf 'bridge evidence: %s\n' "$P0_EVIDENCE"
+P0_REAL_TMUX="$(command -v tmux || true)"
+export P0_REAL_TMUX
 BROKER_STUB="$WORK/forge-broker-stub"
 cat > "$BROKER_STUB" <<'SH'
 #!/bin/bash
@@ -60,7 +69,19 @@ chmod +x "$BROKER_STUB"
 export FORGE_BROKER_BIN="$BROKER_STUB"
 export FORGE_BROKER_CAPTURE="$WORK/broker-actions.jsonl"; : > "$FORGE_BROKER_CAPTURE"
 S1="fbid1-$$"; S2="fbid2-$$"; S3="fbid3-$$"; S4="fbid4-$$"; GS="fbguard-$$"
-trap 'tmux kill-session -t "$S1" 2>/dev/null; tmux kill-session -t "$S2" 2>/dev/null; tmux kill-session -t "$S3" 2>/dev/null; tmux kill-session -t "$S4" 2>/dev/null; tmux kill-session -t "$GS" 2>/dev/null; tmux kill-session -t "${HS:-none}" 2>/dev/null; tmux kill-session -t "${DS:-none}" 2>/dev/null; tmux kill-session -t "${VS:-none}" 2>/dev/null; tmux kill-session -t "${FS:-none}" 2>/dev/null; tmux kill-session -t "${US:-none}" 2>/dev/null; tmux kill-session -t "${SW:-none}" 2>/dev/null; tmux kill-session -t "${RS:-none}" 2>/dev/null; tmux kill-session -t "${HH:-none}" 2>/dev/null; tmux kill-session -t "${SMS:-none}" 2>/dev/null; rm -rf "$WORK"' EXIT
+HS=""; DS=""; VS=""; FS=""; US=""; SW=""; RS=""; HH=""; SMS=""; RPS=""; GV9S=""; UNKBAD=""
+p0_cleanup(){
+    # Every fixture session construction variable is declared here; no global sweep.
+    local p0_session
+    for p0_session in "${S1:-}" "${S2:-}" "${S3:-}" "${S4:-}" "${GS:-}" \
+        "${HS:-}" "${DS:-}" "${VS:-}" "${FS:-}" "${US:-}" "${SW:-}" \
+        "${RS:-}" "${HH:-}" "${SMS:-}" "${RPS:-}" "${GV9S:-}" "${UNKBAD:-}"; do
+        [ -n "$p0_session" ] || continue
+        tmux kill-session -t "=$p0_session" 2>/dev/null || true
+    done
+    rm -rf "$WORK"
+}
+trap p0_cleanup EXIT
 
 # ---- Pure-helper extraction (no main dispatch) ----
 FNS="$WORK/fns.sh"
@@ -378,10 +399,10 @@ fi
 # justification while something counts it. If a shared redaction helper is ever introduced —
 # which is the right long-term fix, because it would protect the raw payload file too — this
 # assertion is what tells you to revisit Step 90's decision rather than silently keep it.
-_red_n="$(grep -rc 'SECRETS = re.compile' "$ROOT/bin" 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')"
-[ "$_red_n" = 3 ] \
-  && ok "T-ANS-NO-FOURTH-REDACT the SECRETS/KV redaction pair still has exactly 3 copies under bin/" \
-  || bad "T-ANS-NO-FOURTH-REDACT found $_red_n copies of the redaction pair, expected 3 — if this went UP, a fourth transcription was added; if DOWN, they were unified and Step 90's third reason no longer holds"
+_red_n="$(python3 "$P0_HELPER" inventory "$ROOT" 2>&1)"; _red_rc=$?
+[ "$_red_rc" = 0 ] && [ "$_red_n" = 3 ] \
+  && ok "T-ANS-NO-FOURTH-REDACT tracked executable inventory has exactly 3 copies" \
+  || bad "T-ANS-NO-FOURTH-REDACT $_red_n"
 
 # ---- C9 · T-DRIFT-INVENTORY: --check-drift answers BOTH inventory questions ----
 # The old drift loop globbed skills/*/ and was therefore blind to a missing skill BY
@@ -917,10 +938,10 @@ grep -q 'status: OPEN' "$_ci_led" 2>/dev/null || _ci_err="$_ci_err no-open-statu
 
 # ---- Real-tmux section ----
 if ! command -v tmux >/dev/null 2>&1; then
-    echo "SKIP: tmux unavailable — real-tmux identity tests skipped"
+    not_run "tmux unavailable: real-tmux identity and mandatory ACM cells"
     echo
-    printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
-    [ "$FAIL" -eq 0 ]; exit $?
+    printf 'forge-bridge: %d passed, %d failed, %d not run\n' "$PASS" "$FAIL" "$NOT_RUN"
+    exit 1
 fi
 
 echo "== real-tmux identity core =="
@@ -954,17 +975,22 @@ sleep 1
 
 # run_in_pane <pane-target> <name> <command string>  (command may not contain unescaped ")
 run_in_pane(){
-    local pane="$1" name="$2"; shift 2
-    local o="$WORK/out.$name"
-    : > "$o"
-    # FORGE_BROKER_CAPTURE must cross into the pane too. A tmux pane does not
-    # inherit this shell's exports, so without it every broker action a
-    # pane-driven bridge performs is invisible to the capture assertions — which
-    # is exactly the blind spot G-2 was raised about.
-    tmux send-keys -t "$pane" "{ export FORGE_BROKER_BIN='$BROKER_STUB' FORGE_BROKER_CAPTURE='$FORGE_BROKER_CAPTURE'; $* ; } > $o 2>&1; echo DONE_\$? >> $o" Enter
-    local i=0
-    while [ $i -lt 60 ]; do grep -q '^DONE_' "$o" 2>/dev/null && return 0; sleep 0.5; i=$((i+1)); done
-    echo "TIMEOUT" >> "$o"; return 1
+    local pane="$1" name="$2" rc; shift 2
+    python3 "$P0_HELPER" run "$WORK" "$P0_EVIDENCE" "$pane" "$name" "$*"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # Stop the whole bridge gate conservatively. There is no later direct tmux
+        # injection, assertion or setup that can use invalid output from this pane.
+        # The helper completes retained D1 before returning 124; EXIT cleanup is later.
+        bad "P0 pane gate stopped: $name (harness rc=$rc); evidence=$P0_EVIDENCE"
+        if [ "$name" = acmfloor-seed ]; then
+            for _dependent in floor boundary force unknown family callback-stdout generation; do
+                not_run "T-ACM-SEND $_dependent: floor seed has no valid marker"
+            done
+        fi
+        not_run "remaining bridge suite: pane gate stopped at $name"
+        printf 'forge-bridge: %d passed, %d failed, %d not run\n' "$PASS" "$FAIL" "$NOT_RUN"
+        exit 1
+    fi
 }
 rc_of(){ sed -n 's/^DONE_//p' "$WORK/out.$1" | tail -1; }
 out_of(){ cat "$WORK/out.$1"; }
@@ -1763,8 +1789,10 @@ else bad "T-CG-DRYRUN(missing) rc=$(rc_of cgdry2) $(out_of cgdry2 | tr '\n' ' ')
 # are needed, because the render runs first and a lever at only one site is inoperative for
 # half the cases.
 run_in_pane "$GS:0.0" cgobs "( cd $GROOT && $CGENV FORGE_CONSTRAINTS_MODE=observe $BRIDGE dispatch --slug cg-obs --stage review --worker codex-a --allow-blocked p0-cg )"
-{ [ "$(rc_of cgobs)" != 6 ] && out_of cgobs | grep -q 'observe mode'; } \
-  && ok "T-CG-OBS FORGE_CONSTRAINTS_MODE=observe warns and proceeds" \
+{ [ "$(rc_of cgobs)" = 0 ] && out_of cgobs | grep -q 'WARN: CONSTRAINT_LEDGER_REQUIRED (observe mode)' \
+  && grep -q 'GUARD_BLOCK:.*cg-obs.*reason=constraints-ledger-invalid mode=observe' "$GROOT/.dev/forge-tmp/orchestrator-events.log" \
+  && grep -q 'OPERATOR CONSTRAINTS — UNAVAILABLE' "$GROOT/.dev/forge-tmp/codex-a-review-cg-obs.txt"; } \
+  && ok "T-CG-OBS FORGE_CONSTRAINTS_MODE=observe warns, audits and delivers the placeholder" \
   || bad "T-CG-OBS rc=$(rc_of cgobs) $(out_of cgobs | tr '\n' ' ')"
 
 # T-CG-MODE  a typo'd mode is a HARD ERROR, never a silent fall-through to observe. Same
@@ -2587,11 +2615,16 @@ else
   ok "T-USAGE-DOC-OBSOLETE obsolete Codex contract removed"
 fi
 sed -n '/^4\. \*\*Usage awareness\*\*/,/^5\. \*\*If no one is available\*\*/p' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/usage-skill.txt"
-sed -n '/^4\. \*\*Usage awareness\*\*/,/^5\. \*\*If no one is available\*\*/p' "$ROOT/agents/forge-orchestrator.md" > "$WORK/usage-agent.txt"
-if [ -s "$WORK/usage-skill.txt" ] && diff -q "$WORK/usage-skill.txt" "$WORK/usage-agent.txt" >/dev/null; then
-  ok "T-USAGE-DOC-LOCKSTEP skill and agent Usage Awareness agree"
+_agent_loads_protocol(){
+  grep -Fq '**Step 0 — load the protocol.** Read' "$ROOT/agents/forge-orchestrator.md" \
+    && grep -Fq '`~/.claude/skills/forge-orchestrator/SKILL.md` in full and follow it exactly.' "$ROOT/agents/forge-orchestrator.md"
+}
+if [ -s "$WORK/usage-skill.txt" ] && _agent_loads_protocol \
+   && grep -Fq 'observed but never reset' "$WORK/usage-skill.txt" \
+   && ! grep -q '^4\. \*\*Usage awareness' "$ROOT/agents/forge-orchestrator.md"; then
+  ok "T-USAGE-DOC-LOCKSTEP canonical Usage Awareness is present and the agent loads it"
 else
-  bad "T-USAGE-DOC-LOCKSTEP skill and agent Usage Awareness drifted"
+  bad "T-USAGE-DOC-LOCKSTEP canonical Usage Awareness or agent loader contract missing"
 fi
 sed -n '/^24\. \*\*Evidence is bridge-owned/,/^---$/p' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/ev-skill.txt"
 sed -n '/^24\. \*\*Evidence is bridge-owned/,/^---$/p' "$ROOT/agents/forge-orchestrator.md"        > "$WORK/ev-agent.txt"
@@ -2601,11 +2634,11 @@ else
   bad "T-EV-DOC-LOCKSTEP Hard Rule 24 drifted"
 fi
 grep -F 'Fallback to the other HIGH pane is an availability decision (Hard Rule 9), not a usage-threshold decision; the bridge owns context hygiene' "$ROOT/skills/forge-orchestrator/SKILL.md" > "$WORK/usage-route-skill.txt"
-grep -F 'Fallback to the other HIGH pane is an availability decision (Hard Rule 9), not a usage-threshold decision; the bridge owns context hygiene' "$ROOT/agents/forge-orchestrator.md" > "$WORK/usage-route-agent.txt"
-if [ -s "$WORK/usage-route-skill.txt" ] && diff -q "$WORK/usage-route-skill.txt" "$WORK/usage-route-agent.txt" >/dev/null; then
-  ok "T-USAGE-DOC-ROUTE-LOCKSTEP skill and agent implementation routes agree"
+if [ -s "$WORK/usage-route-skill.txt" ] && _agent_loads_protocol \
+   && ! grep -Fq 'Fallback to the other HIGH pane is an availability decision' "$ROOT/agents/forge-orchestrator.md"; then
+  ok "T-USAGE-DOC-ROUTE-LOCKSTEP canonical route is present and the agent loads it"
 else
-  bad "T-USAGE-DOC-ROUTE-LOCKSTEP skill and agent implementation routes drifted"
+  bad "T-USAGE-DOC-ROUTE-LOCKSTEP canonical route or agent loader contract missing"
 fi
 
 # ═════════ Worker-context-hygiene (worker-context-hygiene proposal) ═════════
@@ -4521,7 +4554,13 @@ mk_session "$DS" 220 50 "$DCA"
   # shipped "no pending log entry targeting <worker>" guard, so seed ONE pending log entry and
   # reuse it: a send never closes the pending, and a refused send never touches it.
   run_in_pane "$DS:0.1" acmfloor-seed "( cd $DCA && FORGE_WATCH_TRIGGER=0 $BRIDGE log --slug acmf1 --stage adhoc --from claude --to codex-a --prompt p )"
-  [ "$(rc_of acmfloor-seed)" = 0 ] || bad "T-ACM-SEND floor seed failed: $(out_of acmfloor-seed | tail -1)"
+  if [ "$(rc_of acmfloor-seed)" != 0 ]; then
+    python3 "$P0_HELPER" retain "$WORK/out.acmfloor-seed" "$P0_EVIDENCE/acmfloor-seed.redacted.bin"
+    bad "T-ACM-SEND floor seed failed; full output retained in $P0_EVIDENCE/acmfloor-seed.redacted.bin"
+    for _dependent in floor boundary force unknown family callback-stdout generation; do
+      not_run "T-ACM-SEND $_dependent: floor seed did not succeed"
+    done
+  else
   run_in_pane "$DS:0.1" acmfloor "( cd $DCA && $ENF FORGE_USAGE_FIXTURE=$WORK/acm-40.txt FORGE_SEND_MIN_HEADROOM=50 $BRIDGE send codex-a hello )"
   [ "$(rc_of acmfloor)" != 0 ] && out_of acmfloor | grep -q 'below FORGE_SEND_MIN_HEADROOM=50' \
     && out_of acmfloor | grep -q 'send --force' \
@@ -4565,6 +4604,7 @@ for w,r in ws.items():
     if o.get("state")=="known" and o.get("covers_generation")==r.get("latest_generation"):
         assert o.get("callback_id"), (w,o)   # only a callback may establish coverage
 PY
+  fi  # seed success: no dependent send/assertion runs after a failed seed
   tmux kill-session -t "$DS" 2>/dev/null
 else
   echo "  (skip: tmux unavailable — ACM §E)"
@@ -6268,5 +6308,5 @@ else
 fi
 
 echo
-printf 'forge-bridge: %d passed, %d failed\n' "$PASS" "$FAIL"
-[ "$FAIL" -eq 0 ]
+printf 'forge-bridge: %d passed, %d failed, %d not run\n' "$PASS" "$FAIL" "$NOT_RUN"
+[ "$FAIL" -eq 0 ] && [ "$NOT_RUN" -eq 0 ]
