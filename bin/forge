@@ -8,7 +8,7 @@
 #   forge dispatch @<session> "<instruction>" [--sender S] [--pointer]
 #                  [--allow-api-billing] [--dry-run] [--answers <ask-id>] [--wait [--timeout N]]
 #   forge reply @<session> [<dispatch-id>] [--json|--snippet]   print a worker's answer
-#   forge spawn [name] [--root PATH] [--allow-api-billing] [--no-populate] [--force]
+#   forge spawn [name] [--root PATH] [--orchestrator claude|codex] [--allow-api-billing] [--no-populate] [--force]
 #                  ensure-semantics 5-pane session (single-root invariant)
 #   forge ask  --session-scope "<question>"                 (called BY workers)
 #   forge ask  --slug S --stage T --worker W "<question>"
@@ -1731,10 +1731,15 @@ PY
 # recorded + rendered — never a kill.
 cmd_spawn() {
     local name="" root="" allow=0 dry=false no_populate=false force=0
+    local orchestrator="" orchestrator_explicit=0
     if [ "${FORGE_SPAWN_DRY_RUN:-0}" = "1" ]; then dry=true; fi
     while [ $# -gt 0 ]; do case "$1" in
         --root)   root="$2"; shift 2 ;;
         --name)   name="$2"; shift 2 ;;
+        --orchestrator)
+            [ $# -ge 2 ] && [ -n "$2" ] || die "spawn: --orchestrator requires claude|codex"
+            [ "$orchestrator_explicit" = 0 ] || die "spawn: duplicate --orchestrator"
+            orchestrator="$2"; orchestrator_explicit=1; shift 2 ;;
         --allow-api-billing) allow=1; shift ;;
         --dry-run) dry=true; shift ;;
         --no-populate) no_populate=true; shift ;;
@@ -1742,8 +1747,22 @@ cmd_spawn() {
         --*) die "spawn: unknown flag $1" ;;
         *) if [ -z "$name" ]; then name="$1"; else die "spawn: unexpected extra arg '$1'"; fi; shift ;;
     esac; done
+    # Admission is deliberately unavailable until protected P2/P3 bindings exist.
+    # Reject even dry-run/no-populate before register, hooks, broker or tmux.
+    case "${orchestrator:-claude}" in
+        claude) ;;
+        codex) die "spawn: ORCHESTRATOR_NOT_QUALIFIED: Codex host launch requires protected P2/P3 profile and package admission; no Claude fallback" ;;
+        *) die "spawn: --orchestrator must be claude|codex" ;;
+    esac
     if [ -z "$root" ]; then root="$(pwd -P)"; fi
     root="$(cd "$root" 2>/dev/null && pwd -P)" || die "spawn: no such root '$root'"
+
+    # Do not advertise an explicit provider match from pane count alone. The
+    # protected live-binding reader is a later P2 increment; legacy omission
+    # retains its existing no-op path without restamping a running session.
+    if [ "$orchestrator_explicit" = 1 ] && [ -n "$(_spawn_session_at_root "$root")" ]; then
+        die "spawn: ORCHESTRATOR_BINDING_UNAVAILABLE: explicit provider reuse requires a protected live binding; session unchanged"
+    fi
 
     # 1. Billing preflight gates every spawn (P1e), BEFORE any mutation. In
     #    --dry-run the verdict is REPORTED in the plan (rc 2 on FAIL); the real
@@ -1773,6 +1792,8 @@ cmd_spawn() {
     local at_root="" pc=""
     at_root="$(_spawn_session_at_root "$root")"
     if [ -n "$at_root" ]; then
+        [ "$orchestrator_explicit" = 0 ] \
+            || die "spawn: ORCHESTRATOR_BINDING_UNAVAILABLE: session appeared during preflight; protected provider verification required"
         pc="$(_spawn_pane_count "$at_root")"
         if [ "${pc:-0}" -ge 5 ]; then
             if [ "$dry" = true ]; then
@@ -1809,7 +1830,11 @@ cmd_spawn() {
         local other=""
         other="$(session_root "$name" 2>/dev/null || true)"
         other="$(cd "$other" 2>/dev/null && pwd -P || true)"
-        if [ "$other" = "$root" ]; then echo "ENSURE @$name (raced; now active at $root) — no-op"; return 0; fi
+        if [ "$other" = "$root" ]; then
+            [ "$orchestrator_explicit" = 0 ] \
+                || die "spawn: ORCHESTRATOR_BINDING_UNAVAILABLE: raced session needs protected provider verification; session unchanged"
+            echo "ENSURE @$name (raced; now active at $root) — no-op"; return 0
+        fi
         die "spawn: name '$name' already exists at a DIFFERENT root ($other, not $root) — COLLISION, refusing (identity is session_path; pass a distinct --name)."
     fi
 
@@ -1833,7 +1858,8 @@ cmd_spawn() {
         fi
         rm -f "$osf"
         if [ "${#on_spawn[@]}" -eq 0 ]; then on_spawn=("$FORGE_START_BIN" --populate-existing); fi
-        if ( cd "$root" && TMUX_SESSION="$name" "${on_spawn[@]}" "$name" ); then :; else
+        if ( cd "$root" && TMUX_SESSION="$name" FORGE_ORCHESTRATOR_PROVIDER="${orchestrator:-claude}" \
+             FORGE_ORCHESTRATOR_REQUEST_VERSION=1 "${on_spawn[@]}" "$name" ); then :; else
             local prc=$?
             spawn_state_event "$root" "$name" "population-failure" "on_spawn exited $prc (session left alive)"
             printf 'forge: spawn — on_spawn FAILED (exit %s) for %s; the headless session is ALIVE and recorded to the board.\n' "$prc" "$name" >&2

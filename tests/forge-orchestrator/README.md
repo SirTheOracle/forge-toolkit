@@ -296,6 +296,11 @@ production provider is enabled by any artifact in this directory.
 
 ## Hermetic tests
 
+P2 request implementation progress and the versioned spawn-to-populate transport
+are documented in [`p2-status.md`](p2-status.md). Codex host admission remains
+unavailable until the protected P2/P3 bindings exist. The new request tests do
+not turn P1's experimental profiles into production authorization.
+
 ```bash
 bash tests/forge-orchestrator/run.sh
 ```

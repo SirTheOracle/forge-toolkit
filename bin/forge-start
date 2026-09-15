@@ -15,8 +15,8 @@
 #   └──────────────────┴──────────────────┘
 #
 # Usage:
-#   forge-start [--here] [--allow-dirty-base] [--no-attach] [name]
-#   forge-start --populate-existing <name>
+#   forge-start [--here] [--allow-dirty-base] [--no-attach] [--orchestrator claude|codex] [name]
+#   forge-start --populate-existing <name> [--orchestrator claude|codex]
 #
 # Plain starts provision a Git worktree by default, under .forge-worktrees/
 # inside the project being worked on (anchored at the main working tree, so
@@ -45,14 +45,54 @@ DIR="$(pwd)"
 POPULATE=0
 ALLOW_DIRTY=""
 FORGE_LAYOUT_VERSION="${FORGE_LAYOUT_VERSION:-2}"
+SESSION=""
+ORCHESTRATOR=""
+_ORCHESTRATOR_EXPLICIT=0
+_AUTO_NAMED=0
 
-# Plain-mode flags are shifted before the existing positional-name branch.
+# Parse every argument before even a read-only tmux call. A trailing provider
+# request must not be discarded after a positional session name.
 while [ $# -gt 0 ]; do case "$1" in
     --here) FORGE_START_WORKTREE=0; shift ;;
     --allow-dirty-base) ALLOW_DIRTY=1; shift ;;
     --no-attach) FORGE_START_ATTACH=0; shift ;;
-    *) break ;;
+    --orchestrator)
+        [ $# -ge 2 ] && [ -n "$2" ] || { echo "forge-start: --orchestrator requires claude|codex" >&2; exit 2; }
+        [ "$_ORCHESTRATOR_EXPLICIT" = 0 ] || { echo "forge-start: duplicate --orchestrator" >&2; exit 2; }
+        ORCHESTRATOR="$2"; _ORCHESTRATOR_EXPLICIT=1; shift 2 ;;
+    --populate-existing)
+        [ $# -ge 2 ] && [ -n "$2" ] && [ -z "$SESSION" ] && [ "$POPULATE" = 0 ] \
+            || { echo "forge-start: --populate-existing requires one session name" >&2; exit 2; }
+        case "$2" in --*) echo "forge-start: --populate-existing requires a session name, not a flag" >&2; exit 2 ;; esac
+        POPULATE=1; SESSION="$2"; shift 2 ;;
+    --*) echo "forge-start: unknown flag $1" >&2; exit 2 ;;
+    *) [ -n "$1" ] && [ -z "$SESSION" ] \
+           || { echo "forge-start: expected one session name" >&2; exit 2; }
+       SESSION="$1"; shift ;;
 esac; done
+
+# The spawn request is versioned transport, never evidence of host authority.
+# Ordinary standalone starts ignore ambient stamps; only populate consumes one.
+if [ "$POPULATE" = 1 ] && { [ "${FORGE_ORCHESTRATOR_PROVIDER+x}" = x ] || [ "${FORGE_ORCHESTRATOR_REQUEST_VERSION+x}" = x ]; }; then
+    [ "${FORGE_ORCHESTRATOR_REQUEST_VERSION:-}" = 1 ] \
+        || { echo "forge-start: unsupported orchestrator request transport version" >&2; exit 2; }
+    case "${FORGE_ORCHESTRATOR_PROVIDER:-}" in
+        claude|codex) ;;
+        *) echo "forge-start: invalid orchestrator request provider" >&2; exit 2 ;;
+    esac
+    if [ "$_ORCHESTRATOR_EXPLICIT" = 1 ] && [ "$ORCHESTRATOR" != "$FORGE_ORCHESTRATOR_PROVIDER" ]; then
+        echo "forge-start: contradictory orchestrator request" >&2; exit 2
+    fi
+    ORCHESTRATOR="$FORGE_ORCHESTRATOR_PROVIDER"
+fi
+ORCHESTRATOR="${ORCHESTRATOR:-claude}"
+case "$ORCHESTRATOR" in
+    claude) ;;
+    codex)
+        echo "forge-start: ORCHESTRATOR_NOT_QUALIFIED: Codex host launch requires protected P2/P3 profile and package admission; no Claude fallback" >&2
+        exit 3 ;;
+    *) echo "forge-start: --orchestrator must be claude|codex" >&2; exit 2 ;;
+esac
 
 # Test hook (addendum 4): force a mid-layout failure ONLY in populate mode so the
 # error-trap's partial-split contract is exercisable. No-op in manual mode.
@@ -89,10 +129,7 @@ _populate_trap() {
     exit 1
 }
 
-if [ "${1:-}" = "--populate-existing" ]; then
-    POPULATE=1
-    SESSION="${2:-}"
-    [ -n "$SESSION" ] || { echo "ERROR: --populate-existing requires <session>" >&2; exit 2; }
+if [ "$POPULATE" = 1 ]; then
     tmux has-session -t "$SESSION" 2>/dev/null \
         || { echo "ERROR: --populate-existing: session '$SESSION' does not exist" >&2; exit 2; }
     _pc=$(tmux list-panes -t "$SESSION" -F '#{pane_index}' 2>/dev/null | grep -c .)
@@ -100,9 +137,8 @@ if [ "${1:-}" = "--populate-existing" ]; then
         || { echo "ERROR: --populate-existing requires a 1-pane session ('$SESSION' has $_pc)" >&2; exit 2; }
     DIR="$(tmux display-message -p -t "$SESSION" '#{session_path}')"
     trap _populate_trap EXIT
-elif [ -n "${1:-}" ]; then
-    SESSION="$1"
-else
+elif [ -z "$SESSION" ]; then
+    _AUTO_NAMED=1
     COUNT=1
     while tmux has-session -t "forge-$COUNT" 2>/dev/null; do
         COUNT=$((COUNT + 1))
@@ -113,7 +149,7 @@ fi
 if [ "$POPULATE" = 0 ]; then
     # Auto-naming's loop already proved its selected name absent; explicit names
     # need the same pre-provision check without adding a second HC4 tmux call.
-    if [ -n "${1:-}" ] && tmux has-session -t "$SESSION" 2>/dev/null; then
+    if [ "$_AUTO_NAMED" = 0 ] && tmux has-session -t "$SESSION" 2>/dev/null; then
         echo "forge-start: session '$SESSION' already exists — attach with: tmux attach -t $SESSION" >&2
         exit 2
     fi
