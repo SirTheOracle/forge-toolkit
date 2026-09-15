@@ -174,10 +174,26 @@ the model's answer alone is never evidence. Exit 2 still means P1 INCOMPLETE.
 
 `host_probe.py` provides invocation-owned tmux fixtures for attended work. It
 never selects the default server. Do not send its shell `command()` into a pane
-running a native client. Native host identity/approval, child policy and loading
-transitions now have supporting evidence; the integrated dispatch, digest retry,
-ask/recovery and hook gates remain incomplete. See the technical reference and
-`evidence/2026-09-14-runtime.json` for exact coverage and limitations.
+running a native client. Use `binding(topology, index)` for a freshly observed
+native-host command binding: tmux's displayed `$N` session ID must become numeric
+`N` in the `TMUX` environment value. It validates the owned socket, session and
+actual pane ID instead of assuming pane index equals pane ID.
+The binding also carries the observed `TMUX_SESSION` name for contained worker
+asks whose native sandbox denies querying the tmux socket. This routing hint does
+not replace the bridge's identity and delivery validation.
+
+The workflow runtime also includes pinned `basename`, `cp` and `mktemp`, plus a
+P1-only `shasum -a 256 [FILE]` shim using the isolated Python runtime. This avoids
+adding Perl's runtime/import closure. Other hashing modes and multiple inputs
+are deliberately unsupported; this is not a general system utility replacement.
+
+The earlier `evidence/2026-09-14-runtime.json` covers native host identity/approval,
+child policy and loading transitions. Its workflow statuses are historical.
+
+The subsequent `evidence/2026-09-14-workflow.json` records native-host dispatch,
+digest retry and question/recovery work, including the local `forge ask` fix.
+It supersedes those workflow statuses, not the remaining loading, authority or
+hook gates. P1 is still incomplete; the native host was not worker-contained.
 
 ## Attended native acceptance
 

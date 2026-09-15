@@ -718,10 +718,16 @@ PY
     # snippet (one redaction pass feeds both the event and the callback file). A
     # bridge failure NEVER fails the worker — the attention event already carries it.
     if [ "$a_mode" = "stage" ]; then
-        ( cd "$a_root" && FORGE_INTERNAL_ASK_ORIGIN=1 "$FORGE_BRIDGE_BIN" callback \
-            --target-session "$a_sess" --cross-session \
-            --slug "$slug" --stage "$stage" --worker "$worker" \
-            --status BLOCKED --origin ask --message "$a_snip" --quiet >/dev/null 2>&1 ) \
+        ( cd "$a_root" && {
+            set -- --slug "$slug" --stage "$stage" --worker "$worker" \
+                --status BLOCKED --origin ask --message "$a_snip" --quiet
+            # Local workers use the bridge's exact-pending identity adoption when
+            # containment denies tmux. Only an explicit root is a seat relay.
+            if [ -n "$root_override" ]; then
+                set -- --target-session "$a_sess" --cross-session "$@"
+            fi
+            FORGE_INTERNAL_ASK_ORIGIN=1 "$FORGE_BRIDGE_BIN" callback "$@" >/dev/null 2>&1
+        } ) \
           || printf 'forge ask: bridge BLOCKED callback failed (ask %s still escalated via attention).\n' "$a_id" >&2
     fi
     fire_watch_check    # Step 6: surface the NEEDS-ASK escalation at ~1s

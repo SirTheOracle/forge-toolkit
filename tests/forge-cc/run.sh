@@ -3,7 +3,8 @@
 # (hermetic FORGE_CC_PANE_META branches + a real-tmux structural role-gate test).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-FORGE="$ROOT/bin/forge"; HOOK="$ROOT/bin/forge-cc-hook"
+# Optional immutable baseline copy for before/after regression comparisons.
+FORGE="${FORGE_CC_FORGE_BIN:-$ROOT/bin/forge}"; HOOK="$ROOT/bin/forge-cc-hook"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fc.XXXXXX")"; SESS="fctest-$$"
 trap 'tmux kill-session -t "$SESS" 2>/dev/null; rm -rf "$WORK"' EXIT
 PASS=0; FAIL=0

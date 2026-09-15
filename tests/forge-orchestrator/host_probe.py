@@ -57,6 +57,25 @@ class Fixture:
             raise ValueError("fixture tmux failed: " + result["stderr"][:500])
         return result
 
+    def binding(self, topology, index):
+        if type(index) is not int or index not in range(5):
+            raise ValueError("invalid fixture pane index")
+        session = self.sessions[topology]["name"]
+        observed = self.call("display-message", "-p", "-t", session + ":." + str(index),
+                             "#{socket_path}|#{pid}|#{session_id}|#{pane_id}|#{session_name}")
+        fields = observed["stdout"].strip().split("|")
+        if len(fields) != 5:
+            raise ValueError("invalid fixture tmux binding")
+        socket, pid, session_id, pane, name = fields
+        if (not Path(socket).is_absolute() or Path(socket).name != self.socket
+                or not re.fullmatch(r"[1-9][0-9]*", pid)
+                or not re.fullmatch(r"\$[0-9]+", session_id)
+                or not re.fullmatch(r"%[0-9]+", pane) or name != session):
+            raise ValueError("fixture tmux binding mismatch")
+        # tmux formats a session ID as $N, but TMUX stores the numeric N.
+        return {"TMUX": socket + "," + pid + "," + session_id[1:],
+                "TMUX_PANE": pane, "TMUX_SESSION": name}
+
     def start(self):
         existing = self.call("list-sessions", check=False)
         if existing["returncode"] == 0:

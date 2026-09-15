@@ -185,6 +185,27 @@ class ProbeTests(unittest.TestCase):
         self.assertNotEqual(result["returncode"], 0)
         self.assertIn("requires -I -S -B", result["stderr"])
 
+    def test_runtime_sha256_matches_native_for_file_and_stdin(self):
+        package = self.runtime_fixture()
+        launcher = str(package / "runtime/bin/shasum")
+        data = self.base / "input with spaces"
+        data.write_bytes(b"P1 fixture\x00\xff\n")
+        for args, stdin in (([str(data)], None), ([], data.read_bytes()), (["-"], data.read_bytes())):
+            expected = subprocess.run(["/usr/bin/shasum", "-a", "256", *args],
+                                      input=stdin, capture_output=True, check=True)
+            actual = subprocess.run([launcher, "-a", "256", *args], input=stdin,
+                                    capture_output=True, cwd=self.source)
+            self.assertEqual(actual.returncode, 0, actual.stderr)
+            self.assertEqual(actual.stdout, expected.stdout)
+
+    def test_runtime_sha256_refuses_unsupported_modes(self):
+        package = self.runtime_fixture()
+        launcher = str(package / "runtime/bin/shasum")
+        for args in ([], ["-a", "1"], ["-c", "checksums"], ["-a", "256", "one", "two"]):
+            actual = probe.execute([launcher, *args], cwd=self.source)
+            self.assertNotEqual(actual["returncode"], 0)
+            self.assertIn("supports only -a 256", actual["stderr"])
+
     def test_runtime_environment_does_not_inherit_authority_or_startup(self):
         package = self.runtime_fixture()
         with patch.dict(probe.os.environ, {"FORGE_BROKER_TEST_ENABLE": "1", "BASH_ENV": "bad",

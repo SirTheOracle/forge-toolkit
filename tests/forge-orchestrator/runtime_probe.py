@@ -12,8 +12,8 @@ import sysconfig
 
 
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-TOOLS = ("bash", "sh", "env", "git", "tmux", "awk", "cat", "date", "dirname", "grep",
-         "head", "hostname", "mkdir", "mv", "pgrep", "ps", "readlink", "rm",
+TOOLS = ("bash", "sh", "env", "git", "tmux", "awk", "basename", "cat", "cp", "date", "dirname", "grep",
+         "head", "hostname", "mkdir", "mktemp", "mv", "pgrep", "ps", "readlink", "rm",
          "sed", "sleep", "sort", "tail", "tee", "tr", "wc")
 
 
@@ -40,6 +40,12 @@ def stage(package, *, yaml_source=None):
     wrapper = runtime / "bin/python3"
     wrapper.write_text("#!/bin/sh\nexec " + shlex.join(launch) + ' "$@"\n')
     wrapper.chmod(0o755)
+    # Only the SHA-256 form used by copied helpers is supported. Keep hashing in
+    # the audited Python closure instead of adding Perl and its import paths.
+    shutil.copyfile(Path(__file__).parent / "fixtures/sha256sum.py", runtime / "sha256sum.py")
+    sha = runtime / "bin/shasum"
+    sha.write_text("#!/bin/sh\nexec " + shlex.join([*launch, str(runtime / "sha256sum.py")]) + ' "$@"\n')
+    sha.chmod(0o755)
     tools = {}
     for name in TOOLS:
         selected = shutil.which(name, path=SYSTEM_PATH)
@@ -55,6 +61,7 @@ def stage(package, *, yaml_source=None):
     metadata = {"schema": "forge-p1-runtime/1", "python": interpreter,
                 "stdlib": sysconfig.get_path("stdlib"), "tools": tools,
                 "python_flags": ["-I", "-S", "-B"],
+                "shims": {"shasum": "isolated Python; only -a 256 and at most one input"},
                 "source_yaml": str(yaml_source), "qualified": False,
                 "note": "Staged only; dependency integrity and denial require measured evidence."}
     (runtime / "runtime.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")

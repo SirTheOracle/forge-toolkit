@@ -193,7 +193,55 @@ custom sockets from validated startup context, persists that binding and refuses
 cross-socket daemon reuse. Requests cannot choose a socket. Default/legacy
 bindings remain compatible; the lifecycle action list is unchanged.
 
-### Remaining gates
+### Native workflow continuation
+
+The `workflow-20260914-01` fixture now exercises the actual Codex host, not just
+operator-driven primitives: protected entry read, scoped approval, broker start,
+infra-lock acquire and linked-root contention, contained `forge codex-launch`,
+legal dispatch, genuine callback, wait, missing-template handling and a native
+disk-only digest child. The retry selects the existing immutable `digest`
+template; it does not demonstrate replacing template bytes. The callback identity
+is unchanged and no worker redispatch occurs for that retry.
+
+This exposed and fixed a production `forge ask` defect. Local worker asks used
+cross-session callback flags, forcing tmux access denied by worker containment.
+Local asks now use the existing exact-pending self-callback path. Explicit
+`--root` relays retain cross-session validation; no identity gate, lifecycle
+action or worker policy was weakened. A newly staged protected copy was audited
+and the native worker produced its genuine delivery-bound BLOCKED callback.
+
+The native host was exited and resumed while that callback and the shared lock
+remained live. It recovered the same callback ID and pending timestamp. A public
+answer was recorded once and duplicate answering refused. Cross-root answer-side
+callback consumption still warned; the owning host continued via public commands.
+The old BLOCKED cleanup must not consume a newer DONE. This residual warning is
+not a claim of automatic cross-root cleanup parity.
+
+Fixture findings also matter for subsequent phases: TMUX requires numeric `N`,
+not the displayed `$N`; contained asks need a session routing hint; long commands
+need file-pointer sends; and visible-banner reset proof failed in a short tiled
+pane but succeeded at 100x53. No reset/send guard was bypassed. The qualified
+reset profile is disposable and uses banner transition, not a percentage-only
+pristine predicate. Production reset configuration was not changed.
+
+Claude's additional native child Read of an outside-workspace dummy token
+succeeded with default permission mode and a read-only tool allowlist. This
+demonstrates shared readability, not isolated machine authority or a complete
+child OS-policy attestation. Hooks remained disabled in these experiments.
+
+Validation: 45 targeted tests pass. The command-center suite has 238 passes and
+39 identical failures with both the immutable HEAD baseline and patched `forge`:
+38 prose synchronization assertions and one existing real-bridge relay failure.
+The suite used a dedicated tmux socket. Installed prose was not modified to make
+the comparison pass. Existing worker policy smoke passes (live gates skipped).
+
+P1 remains INCOMPLETE: genuine hook/provider attribution, remaining global and
+Claude loading cases, full child-policy reconciliation and profile-management
+authority still need evidence. Nested-parent pointer protection still fails.
+The workflow and cleanup evidence is indexed in
+`tests/forge-orchestrator/evidence/2026-09-14-workflow.json`.
+
+### Remaining gates (earlier snapshot)
 
 Native interactive protected loading and Codex reload after compaction/resume
 now have traced evidence. Separate reports cover fresh restart and local duplicate
