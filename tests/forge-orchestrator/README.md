@@ -143,6 +143,41 @@ This is an initial inventory, **not** a claim of complete runtime dependency clo
 
 ## Latest measured results
 
+The final P1 investigation disposition is recorded in
+[`evidence/p1-closeout.md`](evidence/p1-closeout.md), with all 16 categories and
+their explicit limitations. Native Codex orchestration is feasible; production
+provider selection remains P2-P6 work. Historical incomplete statuses below are
+superseded by that closeout, not converted into automatic admission.
+
+The final closure packet has 127 copied files and 2,097 audited entries. Its
+native hook observer is `fixtures/hook_capture.py`: install only its protected
+copy with an inventoried operator-owned JSON configuration containing `provider`,
+`python`, `adapter`, `root`, `environment` and `evidence`. `evidence` must already
+exist. The observer records real native input and adapter status, emits no
+decision output, and never forwards SubagentStop as parent Stop. It is not a
+production hook installer or authorization mechanism. Nonzero adapter results
+remain failures in the evidence even though the observer itself does not block.
+
+`native-worker` disables ambient hooks/plugins to isolate containment. The
+attended hook-enabled worker is a separate measured case. An opt-in candidate
+also reproduces the successful exact-pointer rule:
+
+```bash
+bash tests/forge-orchestrator/native-probe.sh native-worker \
+  --directory .dev/forge-p1/YOUR_PACKET \
+  --audit .dev/forge-p1/YOUR_PACKET/runtime-audit-ACTUAL_ID/report.json \
+  --topology primary-nested --protect-git-pointers
+```
+
+This selects a named native permission profile with exact read-only rules for
+the audited absolute `.git` files, network disabled and approvals never. It does
+not change Forge launch flags, protect future pointers, or qualify rename/unlink.
+Without the flag, the baseline nested-pointer failure remains reproducible.
+Both successful native invocations and standalone primitives still exit 2;
+the harness deliberately has no automatic whole-P1 success/admission result.
+
+### Earlier runtime/workflow measurements
+
 The runtime continuation retains the 145 canary checks and expands the copied
 package to 121 files. Native Codex execution denies all 2,088 inventoried
 package/runtime/pointer write-opens from primary and linked roots, with successful
@@ -268,4 +303,5 @@ bash tests/forge-orchestrator/run.sh
 These tests use temporary directories, synthetic subprocess results and an
 unsandboxed execution of the **canary fixture only** to check that allowed
 protected writes are detected as failures. They never launch a native provider
-and never count as native acceptance.
+and never count as native acceptance. The runner discovers every `test_*.py`,
+including host binding, hook observer, and experimental worker-profile tests.

@@ -241,6 +241,55 @@ authority still need evidence. Nested-parent pointer protection still fails.
 The workflow and cleanup evidence is indexed in
 `tests/forge-orchestrator/evidence/2026-09-14-workflow.json`.
 
+### P1 native feasibility closeout
+
+The bounded P1 investigation is complete with explicitly retained limitations.
+**Codex can orchestrate:** protected native reads, real isolated children,
+follow-up/join, reviewed host control and worker delivery were observed. This is
+not production admission or an all-green acceptance result. The complete 16-case
+matrix and phase ownership are in `tests/forge-orchestrator/evidence/p1-closeout.md`;
+hashes are in `tests/forge-orchestrator/evidence/2026-09-14-closure.json`.
+These supersede historical outstanding-experiment lists, not failed controls.
+
+Claude 2.1.272 now has actual protected Read traces after native resume,
+compaction and a new-session restart, plus changed local decoy/reinvoke controls.
+Both providers read the canonical protected skill for compatibility; its existing
+Claude-only assumptions still require P3 refactoring. Explicit entry is supported;
+automatic global discovery is not certified. Credential-free isolated global
+homes have no login. Codex's native skills/list observes changed global metadata,
+but authenticated changed-global invocation remains NOT_RUN for both providers.
+
+Native hooks from both hosts and workers now reach the protected copied adapter.
+Seven PermissionRequest results have empty decision output; native worker Stop
+does not replace host Stop. A hook-enabled gpt-5.5 worker denies all seven audited
+protected writes. Legacy host envelopes still lack provider attribution, a P4
+implementation gap. Native Codex hooks label never approvals `bypassPermissions`;
+the actual restricted permission profile and denial controls take precedence over
+that compatibility label. No bypass launch was used.
+
+Claude proposal A/B inputs and follow-ups are plaintext-traced, and its digest
+Agent receives exactly one artifact path, reads it once, and returns the digest.
+Codex native non-forked children/follow-ups work; opaque message contents remain
+unverified, never decrypted. Both providers' children can read a dummy token.
+Claude's reviewed child permits seven nonmutating protected write-opens after
+one-time command approval; Codex's child denies them without escalation. Neither
+context isolation nor task instructions imply separate machine authority.
+
+The final package contains 127 files and the runtime union 2,097 entries. A new
+native exact-pointer profile denies all opens in the nested-parent fixture where
+baseline containment fails. `native-worker --protect-git-pointers` reproduces
+that candidate; read-only globs were rejected. This does not qualify dynamic
+pointers, rename/unlink, production runtime alias closure or Forge admission.
+P2/P3 must install/protect/validate the selected profile and reject unqualified
+layouts. Profile-management verbs are new P2 work, not a missing P1 API to fake.
+
+P2/P3/P4/P4b remain necessary for an attended provider selector; P5/P6 are needed
+for full parity. P1 plus P6 is insufficient. Native feasibility is no longer a
+reason to omit Codex. All disposable clients and owned servers are stopped;
+production sessions/defaults remain unchanged. The final harness runner includes
+all 54 tests; policy smoke passes with live gates skipped. The earlier 39
+baseline-matched command-center failures are not claimed fixed or rerun here.
+
 ### Remaining gates (earlier snapshot)
 
 Native interactive protected loading and Codex reload after compaction/resume
