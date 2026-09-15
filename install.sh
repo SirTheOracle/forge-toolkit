@@ -42,7 +42,7 @@ OPERATOR_FILES=(
 # Single bin manifest (was duplicated across install/uninstall/drift).
 BIN_SCRIPTS=(forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review
              forge-stall-install-regex forge-watch forge forge-cc-hook forge-broker
-             forge-git-request forge-sync-main forge-web)
+             forge-git-request forge-sync-main forge-web forge-orchestrator-host)
 # Legacy bin symlinks resolve libraries in this source tree. P3's copied
 # candidate package must copy this same declared inventory, not glob imports.
 LIB_FILES=(lib/forge_orchestrator.py)

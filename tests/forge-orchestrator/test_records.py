@@ -73,6 +73,19 @@ class RecordTests(unittest.TestCase):
                 self.store.transition(launch, revision, generation, "failed", diagnostic="test")
         self.assertEqual(self.store.current()["record"], self.launch)
 
+    def test_unselected_disposition_retains_history_without_reconstructing_current(self):
+        self.store.reserve(self.launch, 0)
+        (self.store.path / "current.json").unlink()  # crash-before-publication fixture
+        retry = dict(self.launch, launch_id=uuid.uuid4().hex)
+        with self.assertRaises(records.Refusal):
+            self.store.reserve(retry, 0)
+        failed = self.store.disposition_unselected(self.launch)
+        self.assertEqual(failed["state"], "failed")
+        self.assertIsNone(self.store.current())
+        created = self.store.reserve(retry, 0)
+        self.assertEqual(created["reference"]["launch_id"], retry["launch_id"])
+        self.assertTrue((self.store.path / "launches" / (self.launch["launch_id"] + ".json")).exists())
+
     def test_fixed_binding_is_not_mutable(self):
         self.store.reserve(self.launch, 0)
         for field, value in (("profile_hash", "5" * 64), ("package_hash", "5" * 64),

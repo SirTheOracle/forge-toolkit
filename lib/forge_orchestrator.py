@@ -182,12 +182,16 @@ def validate_evidence(value):
             "INVALID_EVIDENCE", "supported workflow subset required")
 
 
-def validate_seat(value):
+def validate_seat(value, reserved=False):
     require(isinstance(value, dict) and value.get("role") == "orchestrator", "INVALID_SEAT", "orchestrator seat required")
     require(isinstance(value.get("provider"), str) and value["provider"] in {"claude", "codex"},
             "INVALID_PROVIDER", "claude|codex required")
-    for field in ("session", "incarnation", "session_id", "pane_id", "socket"):
+    for field in (("session", "socket") if reserved else ("session", "incarnation", "session_id", "pane_id", "socket")):
         require(isinstance(value.get(field), str) and bool(value[field]), "INVALID_SEAT", field)
+    if reserved:
+        require(not any(value.get(field) for field in ("incarnation", "session_id", "pane_id")),
+                "INVALID_SEAT", "a reservation cannot invent tmux objects")
+        return
     require(re.fullmatch(r"\$[0-9]+", value["session_id"]) is not None, "INVALID_SEAT", "session object required")
     require(re.fullmatch(r"%[0-9]+", value["pane_id"]) is not None, "INVALID_SEAT", "pane object required")
 
@@ -206,8 +210,26 @@ def validate_launch(value, root):
             require(parsed.tzinfo is not None, "INVALID_LAUNCH", "timezone required")
         except (KeyError, ValueError, TypeError) as exc:
             raise Refusal("INVALID_LAUNCH", "timestamps required") from exc
-    validate_seat(value.get("seat"))
+    reserved = value.get("construction") == "reserved"
+    require(not reserved or value["state"] in {"preparing", "failed"}, "INVALID_LAUNCH", "unbound launch cannot be ready")
+    validate_seat(value.get("seat"), reserved=reserved)
     validate_process(value.get("owner"))
+    if "construction" in value:
+        require(value["construction"] in {"reserved", "shell-created", "hook-started", "claimed"},
+                "INVALID_LAUNCH", "unknown construction phase")
+        if not reserved:
+            handoff = value.get("handoff")
+            require(isinstance(handoff, dict), "INVALID_LAUNCH", "handoff required")
+            validate_process(handoff.get("shell"))
+            require(isinstance(handoff.get("expected_hook"), list) and handoff["expected_hook"]
+                    and isinstance(handoff.get("expected_populate"), str), "INVALID_LAUNCH", "handoff closure required")
+            if value["construction"] == "claimed":
+                validate_process(handoff.get("claimant"))
+                require(isinstance(handoff.get("chain"), list), "INVALID_LAUNCH", "ancestry required")
+            if "hook_process" in handoff:
+                validate_process(handoff["hook_process"])
+            require(value["construction"] != "hook-started" or "hook_process" in handoff,
+                    "INVALID_LAUNCH", "hook process must precede hook execution")
     require(sha256(value.get("profile_hash")) and sha256(value.get("package_hash")),
             "INVALID_LAUNCH", "fixed protected input hashes required")
     validate_inputs(value.get("inputs"))
@@ -247,11 +269,12 @@ class Store:
         self.root = dict(root)
 
     @contextlib.contextmanager
-    def locked(self):
+    def locked(self, name="launch.lock"):
+        require(name in {"launch.lock", "profile.lock"}, "UNSAFE_LOCK", name)
         fd = directory(self.path, create=True)
         lock = None
         try:
-            lock = os.open("launch.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=fd)
+            lock = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=fd)
             info = os.fstat(lock)
             require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "UNSAFE_LOCK", "launch.lock")
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -274,8 +297,11 @@ class Store:
                 except FileNotFoundError:
                     return None
                 try:
-                    require(not os.listdir(launches), "UNSELECTED_LAUNCH",
-                            "retained records exist without a current reference")
+                    for name in os.listdir(launches):
+                        prior = read_at(launches, name)
+                        validate_launch(prior, self.root)
+                        require(prior["state"] == "failed" and prior.get("disposition") == "unselected-terminal",
+                                "UNSELECTED_LAUNCH", "retained records exist without a current reference")
                 finally:
                     os.close(launches)
                 return None
@@ -293,7 +319,7 @@ class Store:
         finally:
             os.close(fd)
 
-    def reserve(self, record, expected_generation):
+    def reserve(self, record, expected_generation, predecessor=None):
         validate_launch(record, self.root)
         require(record["state"] == "preparing" and record["revision"] == 1,
                 "INVALID_TRANSITION", "new launch must start preparing at revision 1")
@@ -302,14 +328,20 @@ class Store:
             current = self.current()
             generation = current["reference"]["generation"] if current else 0
             require(generation == expected_generation, "REFERENCE_CONFLICT", "current generation changed")
-            # Replacement needs the launcher's real lifecycle handoff, not a
-            # caller-supplied boolean. No replacement entry is exposed here.
-            require(current is None, "HANDOFF_REQUIRED", "prior ownership must be terminally dispositioned")
+            # The launcher establishes actual terminal ownership outside this
+            # short lock. This compare-and-swap binds that observation to the
+            # exact predecessor; it is not itself a lifecycle/authority check.
+            if current is not None:
+                require(predecessor == {"reference": current["reference"], "record_sha256": digest(current["record"])},
+                        "HANDOFF_REQUIRED", "exact terminally observed predecessor required")
             launches = directory(self.path / "launches", create=True)
             try:
                 if current is None:
-                    require(not os.listdir(launches), "UNSELECTED_LAUNCH",
-                            "retained records require operator disposition; no automatic reconstruction")
+                    for name in os.listdir(launches):
+                        prior = read_at(launches, name)
+                        validate_launch(prior, self.root)
+                        require(prior["state"] == "failed" and prior.get("disposition") == "unselected-terminal",
+                                "UNSELECTED_LAUNCH", "retained records require explicit terminal disposition")
                 # Publish the durable record before its reference. A crash in
                 # between leaves an unselected record, never a ready launch.
                 write_at(launches, record["launch_id"] + ".json", record, exclusive=True)
@@ -317,6 +349,109 @@ class Store:
                 os.close(launches)
             write_at(fd, "current.json", {"launch_id": record["launch_id"], "generation": generation + 1})
             return self.current()
+
+    def disposition_unselected(self, expected):
+        validate_launch(expected, self.root)
+        with self.locked() as directory_fd:
+            require(read_at(directory_fd, "current.json", missing=True) is None,
+                    "REFERENCE_CONFLICT", "a selected launch now exists")
+            launches = directory(self.path / "launches")
+            try:
+                name = expected["launch_id"] + ".json"
+                require(read_at(launches, name) == expected, "REVISION_CONFLICT", "unselected record changed")
+                require(expected["state"] == "preparing", "INVALID_TRANSITION", "only interrupted preparation")
+                updated = dict(expected, state="failed", revision=expected["revision"] + 1,
+                               updated_at=now(), disposition="unselected-terminal",
+                               diagnostic="explicit recovery: unselected terminal ownership independently verified")
+                validate_launch(updated, self.root)
+                write_at(launches, name, updated)
+                return updated
+            finally:
+                os.close(launches)
+
+    def preparing(self, launch_id, expected_revision, expected_generation, construction, **observed):
+        transitions = {"shell-created": (("reserved",), {"seat", "handoff"}),
+                       "hook-started": (("shell-created",), {"handoff"}),
+                       "claimed": (("shell-created", "hook-started"), {"handoff"})}
+        require(construction in transitions, "INVALID_TRANSITION", "invalid construction transition")
+        previous, fields = transitions[construction]
+        require(set(observed) == fields, "FIXED_BINDING", "unexpected construction fields")
+        with self.locked():
+            current = self.current()
+            require(current is not None and current["reference"] == {"launch_id": launch_id, "generation": expected_generation},
+                    "REFERENCE_CONFLICT", "current launch changed")
+            record = current["record"]
+            require(record["revision"] == expected_revision, "REVISION_CONFLICT", "record revision changed")
+            require(record["state"] == "preparing" and record.get("construction") in previous,
+                    "HANDOFF_ALREADY_CLAIMED", "construction handoff is one-use")
+            if "seat" in observed:
+                for key in ("provider", "role", "session", "socket"):
+                    require(record["seat"][key] == observed["seat"].get(key), "FIXED_BINDING", key)
+            updated = dict(record, **observed, construction=construction, revision=expected_revision + 1, updated_at=now())
+            validate_launch(updated, self.root)
+            launches = directory(self.path / "launches")
+            try:
+                write_at(launches, launch_id + ".json", updated)
+            finally:
+                os.close(launches)
+            return updated
+
+    def profile(self):
+        try:
+            fd = directory(self.path)
+        except FileNotFoundError:
+            return None
+        try:
+            value = read_at(fd, "profile.json", missing=True)
+            if value is None:
+                return None
+            require(value.get("schema") == "forge-orchestrator-profile/1" and value.get("root") == self.root,
+                    "INVALID_PROFILE", "unknown schema or wrong root")
+            require(number(value.get("revision")) and value["revision"] > 0 and type(value.get("enabled")) is bool,
+                    "INVALID_PROFILE", "revision and enabled state required")
+            require(isinstance(value.get("candidate"), dict), "INVALID_PROFILE", "candidate manifest required")
+            identity = digest(value)
+            snapshots = directory(self.path / "profiles")
+            try:
+                require(read_at(snapshots, identity + ".json") == value, "PROFILE_SNAPSHOT_MISMATCH", identity)
+            finally:
+                os.close(snapshots)
+            return {"sha256": identity, "profile": value}
+        finally:
+            os.close(fd)
+
+    def profile_snapshot(self, identity):
+        require(sha256(identity), "INVALID_PROFILE", "snapshot hash required")
+        fd = directory(self.path / "profiles")
+        try:
+            value = read_at(fd, identity + ".json")
+            require(digest(value) == identity and value.get("root") == self.root
+                    and value.get("schema") == "forge-orchestrator-profile/1", "PROFILE_SNAPSHOT_MISMATCH", identity)
+            return value
+        finally:
+            os.close(fd)
+
+    def publish_profile(self, candidate, expected_revision, *, enabled=True):
+        """Called only by the admitted operator entry after qualification checks."""
+        require(number(expected_revision) and type(enabled) is bool, "INVALID_REVISION", "profile revision required")
+        require(isinstance(candidate, dict) and candidate.get("root") == self.root,
+                "INVALID_PROFILE", "candidate belongs to another root")
+        with self.locked("profile.lock") as fd:
+            current = self.profile()
+            revision = current["profile"]["revision"] if current else 0
+            require(revision == expected_revision, "PROFILE_REVISION_CONFLICT", "profile revision changed")
+            if not enabled:
+                require(current is not None and candidate == current["profile"]["candidate"],
+                        "INVALID_PROFILE", "disable cannot replace approved inputs")
+            value = {"schema": "forge-orchestrator-profile/1", "root": self.root, "revision": revision + 1,
+                     "enabled": enabled, "candidate": candidate, "registered_at": now()}
+            snapshots = directory(self.path / "profiles", create=True)
+            try:
+                write_at(snapshots, digest(value) + ".json", value, exclusive=True)
+            finally:
+                os.close(snapshots)
+            write_at(fd, "profile.json", value)
+            return self.profile()
 
     def transition(self, launch_id, expected_revision, expected_generation, state, **observed):
         require(state in {"ready", "failed"}, "INVALID_TRANSITION", state)

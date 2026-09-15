@@ -41,6 +41,10 @@
 #   forge parked --resolve <slug> <stage> [--note "…"]  clear a parked item (proxies bridge)
 #   forge codex-broker status|stop [--root PATH]          inspect/drain the host broker
 #   forge orchestrator-status --root PATH               read-only protected binding (not admission)
+#   forge orchestrator-profile inspect --root PATH [--from candidate.json]
+#                  register/disable require the distinct qualified management entry
+#   forge orchestrator-recover --root PATH --launch-id ID
+#                  disposition interrupted preparation after original resources are terminal
 #
 # Dispatch REUSES `forge-bridge send claude` (the proven 3-step cmd_send split);
 # it never reimplements tmux send-keys. Every write lands under the target root's
@@ -510,6 +514,14 @@ cmd_dispatch() {
     else
         root="$(session_root "$session")" || die "no live session '$session' (session_path unresolvable)"
         root="$(cd "$root" 2>/dev/null && pwd -P)" || die "session '$session' root does not exist"
+    fi
+
+    # Refuse new execution before claiming an ask or staging a dispatch. The
+    # bridge checks again immediately before its send; recovery never implies
+    # permission to run a blocked continuation under changed host inputs.
+    if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+        /usr/bin/python3 -I "$(_toolkit_root)/bin/forge-orchestrator-host" guard \
+            --root "$root" --session "$session" >/dev/null || return $?
     fi
 
     # Routing/expectation flags for every nested forge-bridge call. EMPTY on the legacy CLI
@@ -1943,10 +1955,13 @@ _spawn_pane_count() {
 # _spawn_on_spawn_cmd <root> → on_spawn argv (one token/line) or nothing. LOUD on
 # a malformed non-null value.
 _spawn_on_spawn_cmd() {
-    python3 - "$1" <<'PY'
-import os, sys
+    python3 - "$1" "${2:-lines}" <<'PY'
+import json, os, sys
+def empty():
+    if sys.argv[2] == "json": print("[]")
+    sys.exit(0)
 fp = os.path.join(sys.argv[1], ".claude", "forge-project.yml")
-if not os.path.exists(fp): sys.exit(0)
+if not os.path.exists(fp): empty()
 try:
     import yaml
     with open(fp) as f: d = yaml.safe_load(f) or {}
@@ -1956,10 +1971,10 @@ try:
     cmd = ((d.get("forge") or {}).get("control_center") or {}).get("on_spawn")
 except Exception:
     cmd = None
-if cmd is None: sys.exit(0)
+if cmd is None: empty()
 if not (isinstance(cmd, list) and cmd and all(isinstance(x, str) for x in cmd)):
     sys.exit(f"forge: spawn — forge.control_center.on_spawn in {fp} must be a non-empty list of strings")
-print("\n".join(cmd))
+print(json.dumps(cmd) if sys.argv[2] == "json" else "\n".join(cmd))
 PY
 }
 
@@ -1987,21 +2002,41 @@ cmd_spawn() {
         --*) die "spawn: unknown flag $1" ;;
         *) if [ -z "$name" ]; then name="$1"; else die "spawn: unexpected extra arg '$1'"; fi; shift ;;
     esac; done
-    # Admission is deliberately unavailable until protected P2/P3 bindings exist.
-    # Reject even dry-run/no-populate before register, hooks, broker or tmux.
     case "${orchestrator:-claude}" in
-        claude) ;;
-        codex) die "spawn: ORCHESTRATOR_NOT_QUALIFIED: Codex host launch requires protected P2/P3 profile and package admission; no Claude fallback" ;;
+        claude|codex) ;;
         *) die "spawn: --orchestrator must be claude|codex" ;;
     esac
     if [ -z "$root" ]; then root="$(pwd -P)"; fi
     root="$(cd "$root" 2>/dev/null && pwd -P)" || die "spawn: no such root '$root'"
 
-    # Do not advertise an explicit provider match from pane count alone. The
-    # protected live-binding reader is a later P2 increment; legacy omission
-    # retains its existing no-op path without restamping a running session.
-    if [ "$orchestrator_explicit" = 1 ] && [ -n "$(_spawn_session_at_root "$root")" ]; then
-        die "spawn: ORCHESTRATOR_BINDING_UNAVAILABLE: explicit provider reuse requires a protected live binding; session unchanged"
+    local host_backend="$(_toolkit_root)/bin/forge-orchestrator-host" host_mode="legacy"
+    if [ "${orchestrator:-}" = codex ] || git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+        local -a provider_request=()
+        [ "$orchestrator_explicit" = 0 ] || provider_request=(--provider "$orchestrator")
+        host_mode="$(/usr/bin/python3 -I "$host_backend" route --root "$root" ${provider_request[@]+"${provider_request[@]}"})" || return $?
+    fi
+    if [ "$host_mode" = qualified ]; then
+        [ "$no_populate" = false ] || die "spawn: qualified launches cannot skip population/observation"
+        billing_preflight "$root" "$allow" || return $?
+        if [ -z "$name" ]; then name="forge-$(registry_alias_for "$root")-$(basename "$root")"; fi
+        name="$(sanitize_name "$name")"
+        local -a host_flags=()
+        [ "$dry" = false ] || host_flags=(--dry-run)
+        /usr/bin/python3 -I "$host_backend" spawn --root "$root" --session "$name" \
+            ${provider_request[@]+"${provider_request[@]}"} ${host_flags[@]+"${host_flags[@]}"}
+        return $?
+    fi
+
+    # Explicit legacy reuse needs native process and receipt corroboration,
+    # before registration or any other mutation. It never manufactures a record.
+    local legacy_existing=""
+    if [ "$orchestrator_explicit" = 1 ]; then
+        legacy_existing="$(_spawn_session_at_root "$root")"
+        if [ -n "$legacy_existing" ]; then
+            /usr/bin/python3 -I "$host_backend" legacy-ensure --root "$root" --session "$legacy_existing" --provider "$orchestrator" \
+                || die "spawn: ORCHESTRATOR_BINDING_UNAVAILABLE: legacy provider not corroborated; session unchanged"
+            return 0
+        fi
     fi
 
     # 1. Billing preflight gates every spawn (P1e), BEFORE any mutation. In
@@ -2032,8 +2067,11 @@ cmd_spawn() {
     local at_root="" pc=""
     at_root="$(_spawn_session_at_root "$root")"
     if [ -n "$at_root" ]; then
-        [ "$orchestrator_explicit" = 0 ] \
-            || die "spawn: ORCHESTRATOR_BINDING_UNAVAILABLE: session appeared during preflight; protected provider verification required"
+        if [ "$orchestrator_explicit" = 1 ]; then
+            /usr/bin/python3 -I "$host_backend" legacy-ensure --root "$root" --session "$at_root" --provider "$orchestrator" \
+                || die "spawn: ORCHESTRATOR_BINDING_UNAVAILABLE: raced provider not corroborated; session unchanged"
+            return 0
+        fi
         pc="$(_spawn_pane_count "$at_root")"
         if [ "${pc:-0}" -ge 5 ]; then
             if [ "$dry" = true ]; then
@@ -2071,8 +2109,10 @@ cmd_spawn() {
         other="$(session_root "$name" 2>/dev/null || true)"
         other="$(cd "$other" 2>/dev/null && pwd -P || true)"
         if [ "$other" = "$root" ]; then
-            [ "$orchestrator_explicit" = 0 ] \
-                || die "spawn: ORCHESTRATOR_BINDING_UNAVAILABLE: raced session needs protected provider verification; session unchanged"
+            if [ "$orchestrator_explicit" = 1 ]; then
+                /usr/bin/python3 -I "$host_backend" legacy-ensure --root "$root" --session "$name" --provider "$orchestrator" \
+                    || die "spawn: ORCHESTRATOR_BINDING_UNAVAILABLE: raced provider not corroborated; session unchanged"
+            fi
             echo "ENSURE @$name (raced; now active at $root) — no-op"; return 0
         fi
         die "spawn: name '$name' already exists at a DIFFERENT root ($other, not $root) — COLLISION, refusing (identity is session_path; pass a distinct --name)."
@@ -3526,6 +3566,59 @@ case "${1:-help}" in
     codex-launch) shift; cmd_codex_launch "$@" ;;
     codex-broker) shift; cmd_codex_broker "$@" ;;
     orchestrator-status) shift; exec "$(_toolkit_root)/bin/forge-broker" orchestrator-status "$@" ;;
+    orchestrator-profile) shift; exec /usr/bin/python3 -I "$(_toolkit_root)/bin/forge-orchestrator-host" orchestrator-profile "$@" ;;
+    orchestrator-recover) shift; exec /usr/bin/python3 -I "$(_toolkit_root)/bin/forge-orchestrator-host" recover "$@" ;;
+    orchestrator-hook)
+        shift
+        [ "$#" = 2 ] && [ "$1" = --root ] || die "orchestrator-hook requires --root PATH"
+        _spawn_on_spawn_cmd "$2" json ;;
+    orchestrator-pending)
+        shift
+        [ "$#" = 2 ] && [ "$1" = --root ] || die "orchestrator-pending requires --root PATH"
+        python3 - "$2" "$(_toolkit_root)/lib/forge_orchestrator.py" <<'PY'
+import json, os, pathlib, stat, sys
+import yaml
+namespace = {'__name__': 'forge_pending_records'}
+library = pathlib.Path(sys.argv[2])
+exec(compile(library.read_bytes(), str(library), 'exec'), namespace)
+root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+base = root / '.dev/proposals'
+pending = False
+try:
+    directory = namespace['directory'](base)
+except FileNotFoundError:
+    directory = None
+if directory is not None:
+    try:
+        for child in os.listdir(directory):
+            meta = os.stat(child, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISLNK(meta.st_mode): raise SystemExit('unsafe proposal directory')
+            if not stat.S_ISDIR(meta.st_mode): continue
+            child_fd = os.open(child, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                try:
+                    fd = os.open('forge-log.yml', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=child_fd)
+                except FileNotFoundError:
+                    continue
+                with os.fdopen(fd, 'rb') as stream:
+                    info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 8 * 1024 * 1024:
+                        raise SystemExit('unsafe pending log')
+                    raw = stream.read(8 * 1024 * 1024 + 1)
+                    if len(raw) > 8 * 1024 * 1024: raise SystemExit('oversize pending log')
+                    data = yaml.safe_load(raw)
+                if not isinstance(data, dict) or not isinstance(data.get('entries'), list): raise SystemExit('invalid pending log')
+                for row in data['entries']:
+                    if not isinstance(row, dict) or (row.get('response') is not None and not isinstance(row['response'], str)):
+                        raise SystemExit('invalid pending entry')
+                    if not row.get('response'): pending = True
+            finally:
+                os.close(child_fd)
+    finally:
+        os.close(directory)
+print(json.dumps({'pending': pending}))
+PY
+        ;;
     rehome-audit) shift; cmd_rehome_audit "$@" ;;
     dispatch)  shift; cmd_dispatch "$@" ;;
     reply)     shift; cmd_reply "$@" ;;

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import datetime as dt
 import fcntl
 import hashlib
@@ -48,9 +49,26 @@ def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def process_executable(pid: int) -> Path:
+    if sys.platform == "darwin":
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        path = ctypes.create_string_buffer(4096)
+        if lib.proc_pidpath(pid, path, len(path)) <= 0:
+            raise Refusal("PROCESS_UNAVAILABLE", "kernel executable unavailable")
+        return Path(os.fsdecode(path.value)).resolve(strict=True)
+    if sys.platform.startswith("linux"):
+        return Path(os.readlink(f"/proc/{pid}/exe")).resolve(strict=True)
+    raise Refusal("PROCESS_PLATFORM_UNSUPPORTED", sys.platform)
+
+
 def runtime_identity() -> dict:
     """Observed startup inputs; full protected dependency qualification is P3."""
-    paths = {Path(__file__).resolve(), Path(sys.executable).resolve()}
+    interpreter = process_executable(os.getpid())
+    paths = {Path(__file__).resolve(), Path(sys.executable).resolve(), interpreter}
+    for relative in ("bin/forge-orchestrator-host", "lib/forge_orchestrator.py"):
+        candidate = Path(__file__).resolve().parent.parent / relative
+        if candidate.is_file():
+            paths.add(candidate.resolve())
     for module in tuple(sys.modules.values()):
         filename = getattr(module, "__file__", None)
         if filename and Path(filename).is_file():
@@ -59,7 +77,7 @@ def runtime_identity() -> dict:
              for path in sorted(paths)]
     payload = {"schema": "forge-broker-runtime/1", "protocol": CONTROL_PROTOCOL,
                "entry": str(Path(__file__).resolve()),
-               "interpreter": str(Path(sys.executable).resolve()), "files": files,
+               "interpreter": str(interpreter), "files": files,
                "process": {"pid": os.getpid(), "started": process_stamp(os.getpid())}}
     return dict(payload, sha256=sha(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()))
 
@@ -713,6 +731,28 @@ def register_delivery(root: Path, git_dir: Path, common: Path, root_id: str,
     if supplied - allowed:
         raise Refusal("CONTROL_FIELDS_DENIED", ",".join(sorted(supplied - allowed)))
     session, pane = str(request.get("session", "")), str(request.get("pane", ""))
+    # Validate new host admission in-process. Calling this daemon's own control
+    # socket here would deadlock its single control loop. Recovery is unchanged.
+    current_path = protected / "orchestrator/current.json"
+    launches_path = protected / "orchestrator/launches"
+    try:
+        claimed = tmux_field(session + ":.0", "#{@forge-provider}")
+    except Refusal:
+        claimed = ""
+    if os.path.lexists(current_path) or launches_path.exists() or claimed:
+        path = Path(__file__).resolve().parent / "forge-orchestrator-host"
+        if not path.is_file() or path.resolve() != path:
+            raise Refusal("ORCHESTRATOR_LIBRARY_UNAVAILABLE", str(path))
+        namespace = {"__name__": "forge_host_guard", "__file__": str(path)}
+        exec(compile(path.read_bytes(), str(path), "exec"), namespace)
+        if STARTUP_RUNTIME is None:
+            raise Refusal("BROKER_RUNTIME_UNAVAILABLE", "qualified startup identity required")
+        try:
+            active = {"process": namespace["process"](os.getpid(), CONTROL_PROTOCOL),
+                      "runtime_sha256": STARTUP_RUNTIME["sha256"], "protocol": CONTROL_PROTOCOL}
+            namespace["admission_guard"](namespace["Context"](str(root)), session, active)
+        except namespace["Refusal"] as exc:
+            raise Refusal(exc.code, exc.detail) from exc
     target = f"{session}:.{pane}"
     incarnation = tmux_field(target, "#{session_created}")
     pane_root = Path(tmux_field(target, "#{pane_current_path}")).resolve(strict=True)
@@ -1640,6 +1680,7 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("serve"); s.add_argument("--root", required=True); s.add_argument("--session", required=True); s.add_argument("--incarnation", required=True); s.add_argument("--mode", required=True)
     s = sub.add_parser("start"); s.add_argument("--root", required=True); s.add_argument("--session", required=True); s.add_argument("--incarnation", required=True); s.add_argument("--mode", required=True)
+    s.add_argument("--fresh", action="store_true", help="refuse reuse/reaping; this invocation must create the daemon")
     s = sub.add_parser("stop"); s.add_argument("--root", required=True); s.add_argument("--timeout", type=float, default=10.0)
     s = sub.add_parser("status"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true")
     s = sub.add_parser("control"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true"); s.add_argument("--expect-runtime-sha256")
@@ -1662,6 +1703,8 @@ def main() -> int:
                 os.kill(int(info.get("pid", 0)), 0)
                 actual = process_stamp(int(info["pid"]))
                 if actual == info.get("pid_started"):
+                    if args.fresh:
+                        raise Refusal("BROKER_ALREADY_RUNNING", "fresh construction cannot adopt or reap another daemon")
                     expected = {"session": args.session, "session_incarnation": args.incarnation,
                                 "mode": args.mode, "physical_code_root": str(root),
                                 "root_identity": root_id}

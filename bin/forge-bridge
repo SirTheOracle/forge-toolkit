@@ -3467,6 +3467,7 @@ _cancel_copy_mode() {
 cmd_send() {
     require_identity "send" host-pane || return 1
     _require_root_cwd send || return 1
+    _orchestrator_admission || return 1
 
     local FORCE=false ALLOW_BLOCKED="" SKIP_BLOCK_GUARD=0
     while :; do
@@ -3573,6 +3574,7 @@ cmd_send() {
         codex-a|codex-b|claude-opus|claude-sonnet)
             if [ "$SKIP_BLOCK_GUARD" = 1 ]; then
                 # dispatch's internal delivery — caller owns the lock + generation.
+                _orchestrator_admission || return 1
                 _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"
                 return $?
             fi
@@ -3630,6 +3632,7 @@ cmd_send() {
             # BEFORE typing; any write failure aborts with NO keystroke. send --force is the
             # no-reset continuation but STILL advances the generation so prior observation/
             # reset cannot authorize the next stage.
+            _orchestrator_admission || { _worker_unlock "$TARGET"; return 1; }
             local _g; _g="$(_hygiene_write "$_pr2" next-gen "")" || { _worker_unlock "$TARGET"; echo "HOOK BLOCKED: send refused — generation write failed for $TARGET." >&2; return 1; }
             _hygiene_write "$_pr2" delivery "$TARGET" \
                 "id=send-$(date -u +%Y%m%dT%H%M%SZ)-$$" "generation=${_g:-0}" \
@@ -3640,6 +3643,7 @@ cmd_send() {
             # ACM S1: same one-line visibility as the dispatch boundaries.
             echo "HYGIENE $TARGET: SEND_CONTINUATION — headroom=${_shr:-unknown} confidence=$_sconf (no reset, gen ${_g:-0})" >&2
             _hygiene_crash_at activity
+            _orchestrator_admission || { _worker_unlock "$TARGET"; return 1; }
             _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"; local _rc=$?
             _hygiene_crash_at send-enter
             [ "$_rc" -eq 0 ] && _hygiene_write "$_pr2" delivered "$TARGET" 2>/dev/null || true   # advisory
@@ -3649,6 +3653,7 @@ cmd_send() {
             ;;
     esac
     # Non-worker target (orchestrator pane / relay) — unchanged path.
+    _orchestrator_admission || return 1
     _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"
 }
 
@@ -3840,6 +3845,7 @@ cmd_log() {
     session="$(_resolve_session)"
     [ -z "$session" ] && session="unknown"
 
+    _orchestrator_admission || return 1
     ensure_pipeline_log "$slug"
     ensure_summary_log
 
@@ -5909,6 +5915,7 @@ cmd_dispatch() {
     # a forked log and goes blind — the same n_pending=0 failure as #27 residual A.
     # The refusal converts silent-blind into loud.
     _require_root_cwd dispatch || return 1
+    _orchestrator_admission || return 1
 
     local worker_canonical worker_pane
     worker_canonical=$(canonical_pane_name "$worker")
@@ -11565,6 +11572,14 @@ cmd_orchestrator_status() {
     # Resolve the live bridge root first. The record cannot redirect this read,
     # and a stored ready state is not sufficient for admission.
     "$(_forge_sibling_bin)" orchestrator-status --root "$ID_target_root"
+}
+
+_orchestrator_admission() {
+    # This guard is intentionally absent from callback, consume, stop and
+    # recovery paths: original delivery ownership survives new-input drift.
+    local sibling="$(_forge_sibling_bin)"
+    /usr/bin/python3 -I "$(dirname "$sibling")/forge-orchestrator-host" guard \
+        --root "$ID_target_root" --session "$ID_target_session" >/dev/null
 }
 
 # ---- Global cross-session flags (session-pin hardening P1.6) ----
