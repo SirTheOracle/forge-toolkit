@@ -48,7 +48,7 @@ BIN_SCRIPTS=(forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-re
 # Legacy bin symlinks resolve libraries in this source tree. P3's copied
 # candidate package must copy this same declared inventory, not glob imports.
 LIB_FILES=(lib/forge_orchestrator.py lib/forge_assets.py lib/forge_install.py
-           lib/forge_runtime.py lib/forge_python_entry.py lib/forge_sha256sum.py)
+           lib/forge_runtime.py lib/forge_native.py lib/forge_python_entry.py lib/forge_sha256sum.py)
 MANAGED_POLICY_FILES=(codex-forge.config.toml codex-forge-runtime.json idle-prompts.yml)
 
 # Stage prompt templates. bin/forge-bridge renders $FORGE_PROMPTS_DIR/<stage>.txt for

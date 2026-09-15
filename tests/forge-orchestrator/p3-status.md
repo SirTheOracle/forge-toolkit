@@ -42,36 +42,64 @@ orchestrate; the remaining work is production qualification, not feasibility.
   unchanged reuse, changed-helper refusal and pre-import execution sentinels.
 - `forge-orchestrator-package qualify --package PATH` records protected,
   package/binary/topology-bound **prerequisite** measurements. Native utility
-  write-open probes include owner-writable canaries and a positive workspace
-  control. Nested registered-worktree layouts remain unsupported.
+  probes include owner-writable canaries, create/overwrite/rename/unlink and
+  symlink-redirection attempts, and workspace positive controls. Both package
+  and protected authentication input directories receive canaries.
+  Nested registered-worktree layouts remain unsupported.
   Invocation-owned canaries are removed even on interruption.
+- Stable per-root, private native authentication namespaces survive package
+  restaging. `auth --package PATH` invokes the native login UI without reading,
+  copying or capturing credentials. macOS gets an inventoried keychain-locator
+  alias, not a copy of the credential store. Ambient HOME remains isolated.
+- Native instruction/configuration namespaces, including added empty directories
+  and bundled system skills, participate in identity and drift checks. Native
+  discovery aliases refuse. Codex's auxiliary code-mode executable and the
+  native sandbox executable are inventoried, together with rg and zsh.
+- Codex disables ambient hooks/plugins/shell snapshots and host skill discovery;
+  all registered project roots are explicitly untrusted. Its native config API
+  verifies those effective values. Claude uses safe mode and default permissions.
+  P4 still owns provider-aware native attention hooks.
+- `qualify --native` includes real native loading harnesses, with tool-output
+  coverage checks for the entire protocol and adapter. Codex uses its native
+  app-server lifecycle; Claude uses native Read and requires an observed compact
+  boundary. Unit tests cover evidence interpretation, not successful native model
+  execution. The copied qualifier selects its pinned worker rather than PATH,
+  refuses a different worker, and retains reports when final integrity drifts.
 
 ## Deliberately Not Admission
 
 The prerequisite report schema is `forge-orchestrator-capability/1`, not P2's
 `forge-orchestrator-qualification/1`. It always advertises an empty provider set.
-It cannot be used to register a qualified profile. The current qualifier does
-not yet implement the model-led load/reload/child, management/hook and complete
-runtime qualification runner, or produce a P2 candidate/conformance pair.
+It cannot be used to register a qualified profile. The authenticated load/reload
+harness has not run successfully yet. Native child, duplicate/concurrent legacy,
+management/hook and complete runtime qualification runners, and the production
+P2 candidate/conformance producer, remain unfinished.
 Do not relabel these not-run checks as pass or wire this report into admission.
 
 The isolated Codex configuration uses OS keyring credentials only, never copied
-auth.json or inherited API keys. A native login-status check in the private HOME
-fails because no default macOS keychain is available. Keeping private CODEX_HOME
-but restoring ordinary HOME locates the keychain and reports not logged in.
-That experiment is diagnostic only; ambient HOME is not an approved closure.
-A temporary private-HOME `Library/Keychains` alias also located the keychain
-without restoring ambient HOME, but the private CODEX_HOME still had no login.
-The diagnostic alias was removed; no authentication flow has been started.
-No credentials were read, copied or stored by these probes. Native authenticated
-verification remains blocked until a deliberate isolated authentication path is
-implemented and verified. Do not solve it by silently exposing file credentials
-to workers or by restoring ambient hooks/configuration.
+auth.json or inherited API keys. The protected keychain locator now works, but
+both private provider namespaces report logged out. A native Codex device login
+was started and expired after 15 minutes without authorization. Claude's native
+login was inspected and cancelled without entering a code. No credentials were
+read, copied or stored by the probe controller. No authentication process remains
+running. Do not restore ambient configuration to make the checks pass.
+
+In this worktree, start a fresh native login with:
+
+```sh
+python3 -B .dev/forge-p3/continue-native.py auth codex
+```
+
+Use `auth claude` for the other provider and `qualify codex` or `qualify claude`
+after login. The helper stages/verifies current copied bytes and stays in this
+worktree. Native first startup can materialize bundled skills; that correctly
+invalidates an earlier discovery snapshot and requires restaging. No permission
+restart or global installation is needed.
 
 ## Remaining P3 Acceptance
 
-1. Complete native authentication/configuration isolation without widening
-   worker/child authority or changing existing sessions.
+1. Complete the pending native logins and verify credential persistence through
+   restaging without widening worker/child authority or changing existing sessions.
 2. Implement and run authenticated fresh/duplicate/reinvoke/compact/resume/
    restart loading and native proposal/digest/local-QA child qualification on
    these exact copied bytes, including legacy/candidate concurrent rereads.
@@ -90,11 +118,19 @@ Package staging and fixture tests are not replacements for these requirements.
 ## Evidence
 
 `evidence/p3-checkpoint.json` records the latest package-bound native prerequisite
-result. Both primary and linked write-open probes tested 2,721 protected targets,
-including writable canaries, with zero opened targets and successful workspace
-positive controls. The report still says `admission: unsupported`.
+result. Both primary and linked probes tested 2,822 write-open targets and 525
+mutation attempts apiece. All were denied and workspace positive controls passed.
+Codex's effective native configuration also passes. Authentication remains
+unavailable; the report still says `admission: unsupported`.
 
-Focused package tests: 11 passed. P0 contract suite: 60 passed. Watcher: 429 passed.
+Latest focused package tests: 16 passed; native trace interpretation: 4 passed;
+assets/installer: 9 passed. The broader run before the final pinned-worker and
+native-config additions passed 165 orchestrator tests (two opt-in native skips),
+71 start checks, 31 spawn checks and hermetic worker policy, recorded under
+`.dev/forge-p2/requests-1789514100502202000/`. The final additions were then
+covered by the focused package tests and the real copied native qualifier.
+
+Prior checkpoint regression evidence: P0 contract suite: 60 passed. Watcher: 429 passed.
 Full bridge rerun: 558 passed, zero failed or not-run, recorded in
 `.dev/forge-p3/validation-1789499850198176000/forge-bridge.log`.
 The source-stable `.dev/forge-p2/requests-1789499925635407000/report.json` records

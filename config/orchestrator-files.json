@@ -117,6 +117,7 @@
     "lib/forge_orchestrator.py",
     "lib/forge_python_entry.py",
     "lib/forge_runtime.py",
+    "lib/forge_native.py",
     "lib/forge_sha256sum.py",
     "prompts/_ask_escalation.txt",
     "prompts/_constraint_check.txt",

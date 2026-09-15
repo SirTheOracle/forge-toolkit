@@ -4,12 +4,12 @@
   "admission": "unsupported",
   "supported_providers": [],
   "report": {
-    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-5a5f4700ca5c4c5b864dae9785f1dda9/report.json",
-    "sha256": "66a5b7a5e69cdb7d874ad671cb956e03a44821d093847f0d091bed627b4fc305"
+    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-dccca9a964f84d90aee1242f2bb379b3/report.json",
+    "sha256": "51699f54502cb5fe48cf7f55965de3e31bccd7e19167e5fe5534126ba1ec12f2"
   },
   "package": {
-    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/2b0340461a675106ae6c41f1242d297f081a5b0b6bbefdd79f14c7734d93c44b/package/package.json",
-    "sha256": "ad00f9275b9b2ed94b7a6c43e13aaa5083d41012ba6ad8cf0af237c1f042300d"
+    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/c0f11b3d031a2a836c5ebe944774c0afa1701de6a5ae68e1b2cf72461b630af3/package/package.json",
+    "sha256": "4eaf2901b7b38bb7cd74fae6b44b49a3efad50c44f36fcfbb04ce5987e46d4ea"
   },
   "worker": {
     "path": "/opt/homebrew/Caskroom/codex/0.153.4/bin/codex",
@@ -20,6 +20,7 @@
     "hook_transport": "not-run",
     "management_entry": "not-run",
     "native_children": "not-run",
+    "native_configuration": "pass",
     "native_loading": "not-run",
     "native_policy": "pass",
     "native_reload": "not-run",
@@ -27,14 +28,32 @@
     "runtime_closure": "not-run",
     "topology": "pass"
   },
+  "native_configuration": {
+    "features": {
+      "hooks": false,
+      "plugins": false,
+      "shell_snapshot": false,
+      "skip_host_skill_discovery": true
+    },
+    "policy": {
+      "allow_login_shell": false,
+      "approval_policy": "on-request",
+      "model": "gpt-6-astra",
+      "sandbox_mode": "workspace-write"
+    },
+    "project_untrusted": true,
+    "status": "pass"
+  },
   "observations": [
     {
       "root": ".dev/forge-p3/native-linked",
       "status": "pass",
       "result": {
         "opened": [],
-        "tested": 2721,
-        "workspace_control": true
+        "tested": 2822,
+        "workspace_control": true,
+        "mutation_attempts": 525,
+        "mutations_denied": 525
       }
     },
     {
@@ -42,14 +61,17 @@
       "status": "pass",
       "result": {
         "opened": [],
-        "tested": 2721,
-        "workspace_control": true
+        "tested": 2822,
+        "workspace_control": true,
+        "mutation_attempts": 525,
+        "mutations_denied": 525
       }
     }
   ],
   "limits": [
-    "Native sandbox utility evidence is not authenticated model policy evidence.",
-    "Native loading, children, reload, management, hook and complete runtime qualification remain required.",
-    "The current qualifier does not produce a P2 candidate/conformance pair."
+    "Native write-open utility evidence is not model policy evidence.",
+    "Authenticated native load/children/reload and runtime/management/hook closure remain required.",
+    "No credentials copied, no global discovery changed, no profile registered.",
+    "Native child, duplicate/concurrent legacy, management/hook and complete runtime runners and the P2 candidate/conformance producer remain unfinished."
   ]
 }

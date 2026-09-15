@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 from pathlib import Path
 import shlex
 import shutil
@@ -83,6 +84,13 @@ def verify(package):
     for path, target in receipt["aliases"].items():
         host.require(Path(path).is_symlink() and os.readlink(path) == target,
                      "DEPENDENCY_ALIAS_CHANGED", path)
+    if "discovery" in receipt:
+        host.require(discovery_inputs(receipt["environment"]) == receipt["discovery"],
+                     "NATIVE_DISCOVERY_CHANGED", "native configuration or instruction inputs changed")
+    if "native_inputs" in receipt["definition"]:
+        host.require([str(path) for path in runtime.provider_dependencies(receipt["worker_binaries"])] ==
+                     [item["path"] for item in receipt["definition"]["native_inputs"]],
+                     "NATIVE_RUNTIME_CHANGED", "native auxiliary executable set changed")
     host.require(receipt["runtime_inventory_sha256"] == host.records.digest([str(p) for p in runtime.dependency_files(package)]),
                  "RUNTIME_INVENTORY_DRIFT", "Python or native tool dependency set changed")
     return receipt
@@ -97,16 +105,96 @@ def alias_chain(path):
     return result
 
 
+def authentication_seed(ctx):
+    """Stable keyring namespace; never read, copy or fall back to auth.json."""
+    auth = ctx.store.path / "authentication"
+    seeds = {"codex/config.toml": 'cli_auth_credentials_store = "keyring"\n',
+             "claude/settings.json": '{}\n'}
+    for relative, contents in seeds.items():
+        path = auth / relative
+        os.close(host.records.directory(path.parent, create=True))
+        try:
+            write(path, contents)
+        except FileExistsError:
+            pass
+        host.require(host.file_bytes(path) == contents.encode(), "AUTH_CONFIG_CHANGED", str(path))
+    return {"CODEX_HOME": str(auth / "codex"), "CLAUDE_CONFIG_DIR": str(auth / "claude")}, [auth / name for name in seeds]
+
+
+def authentication(ctx, home):
+    env, inputs = authentication_seed(ctx)
+    aliases = {}
+    if sys.platform == "darwin":
+        keychains = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library/Keychains"
+        host.require(keychains.is_dir() and keychains.resolve() == keychains,
+                     "KEYCHAIN_UNAVAILABLE", "OS keychain locator is unavailable")
+        locator = home / "Library/Keychains"
+        locator.parent.mkdir(mode=0o700)
+        locator.symlink_to(keychains, target_is_directory=True)
+        aliases[str(locator)] = str(keychains)
+    return env, inputs, aliases
+
+
+def discovery_inputs(env):
+    # Native session/history/log files are mutable state, not instruction inputs.
+    # These input namespaces must remain absent or byte-identical, including
+    # empty directories and aliases. Do not traverse the OS credential store.
+    names = {
+        "HOME": (".agents", ".config", ".codex", ".claude", ".bashrc", ".bash_profile", ".profile", ".zshrc", ".zshenv",
+                 ".gitconfig", ".mcp.json", "CLAUDE.md", "AGENTS.md"),
+        "CODEX_HOME": ("config.toml", "config.d", "requirements.toml", "managed_config.toml", "hooks.json",
+                       "hooks", "rules", "skills", "plugins", "agents", "prompts", "AGENTS.md", "AGENTS.override.md"),
+        "CLAUDE_CONFIG_DIR": ("settings.json", "settings.local.json", "hooks", "rules", "skills", "plugins",
+                              "agents", "commands", "CLAUDE.md", ".mcp.json"),
+    }
+    result = []
+    for key, children in names.items():
+        if key not in env:
+            continue
+        root = Path(env[key])
+        os.close(host.records.directory(root))
+        for name in children:
+            start = root / name
+            pending = [start]
+            while pending:
+                path = pending.pop()
+                if path.is_symlink():
+                    raise host.Refusal("NATIVE_DISCOVERY_ALIAS", str(path))
+                elif path.is_dir():
+                    result.append({"path": str(path), "directory": True})
+                    pending.extend(sorted(path.iterdir(), reverse=True))
+                elif path.exists():
+                    result.append(host.file_identity(path))
+    return sorted(result, key=lambda item: item["path"])
+
+
+def authenticate(package, *, status=False):
+    receipt = verify(package)
+    provider = receipt["definition"]["provider"]
+    binary = receipt["definition"]["executable"]["path"]
+    argv = ([binary, "login", "status" if status else "--device-auth"] if provider == "codex"
+            else [binary, "auth", "status" if status else "login"])
+    # Native CLI owns credential handling and terminal prompts. Never capture
+    # tokens or seed this namespace from an existing user's credential files.
+    cp = subprocess.run(argv, env=receipt["environment"], cwd=receipt["root"]["physical_root"])
+    verify(package)
+    return cp.returncode
+
+
 def stage(ctx, provider, binary, model):
     files = source_files()
     binary = Path(binary or shutil.which(provider) or "").resolve(strict=True)
     executable = host.file_identity(binary)
     version = subprocess.check_output([str(binary), "--version"], text=True, timeout=15).strip()
     worker_binaries = {name: str(Path(shutil.which(name) or "").resolve(strict=True)) for name in ("claude", "codex")}
+    native_inputs = runtime.provider_dependencies(worker_binaries)
+    auth_env, _ = authentication_seed(ctx)
     definition = {"root": ctx.identity, "sources": files, "provider": provider, "executable": executable,
                   "version": version, "model": model, "topology_sha256": host.records.digest(host.topology(ctx)),
                   "python": host.file_identity(Path(sys.executable).resolve()),
                   "worker_binaries": {name: host.file_identity(path) for name, path in worker_binaries.items()},
+                  "native_inputs": [host.file_identity(path) for path in native_inputs],
+                  "native_discovery": discovery_inputs(auth_env),
                   "runtime_inputs_sha256": host.records.digest(runtime.inputs()),
                   "os_build": runtime.os_identity()}
     identity = host.records.digest(definition)
@@ -177,6 +265,7 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
     codex_config = 'cli_auth_credentials_store = "keyring"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\n'
     write(home / ".codex/config.toml", codex_config)
     write(home / ".claude/settings.json", '{}\n')
+    auth_env, auth_inputs, auth_aliases = authentication(ctx, home)
     entry = package / "discovery" / ("forge-candidate-" + provider + "-" + identity[:12] + ".md")
     canonical = package / "skills/forge-orchestrator/SKILL.md"
     adapter = package / ("skills/forge-orchestrator/references/" + provider + ".md")
@@ -187,12 +276,19 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
           + "Control entry: " + str(package / "bin/forge") + "\n")
     prompt = "Read and follow the explicit protected Forge entry at " + str(entry)
     if provider == "codex":
+        project_policy = ["-c", "projects={" + ",".join(json.dumps(item["root"]) + '={trust_level="untrusted"}'
+                                                       for item in host.topology(ctx)) + "}"]
         argv = [str(binary), "-C", str(ctx.root), "--strict-config", "--sandbox", "workspace-write",
-                "--ask-for-approval", "on-request", "-m", model, prompt]
+                "--ask-for-approval", "on-request", "-c", "allow_login_shell=false",
+                "-c", "shell_environment_policy.experimental_use_profile=false",
+                "--disable", "plugins", "--disable", "hooks", "--disable", "shell_snapshot",
+                "--enable", "skip_host_skill_discovery",
+                *project_policy, "-m", model, prompt]
     else:
-        argv = [str(binary), "--setting-sources", "", "--settings", str(home / ".claude/settings.json"),
+        argv = [str(binary), "--safe-mode", "--permission-mode", "default", "--setting-sources", "", "--settings", str(home / ".claude/settings.json"),
                 "--strict-mcp-config", "--mcp-config", "{}", "--model", model, prompt]
     env = runtime.environment(package, home)
+    env.update(auth_env)
     env["FORGE_ORCHESTRATOR_PROVIDER"] = provider
     # Ignore inherited shell functions/startup files before the first command,
     # then close every helper override rather than trusting pane environment.
@@ -227,16 +323,23 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
             path.chmod(0o700)
             path.write_text(''.join(lines))
             path.chmod(0o500)
-    dependencies = runtime.native_dependencies([*runtime.dependency_files(package), binary, *worker_binaries.values()])
+    dependencies = runtime.native_dependencies([*runtime.dependency_files(package), binary, *worker_binaries.values(),
+                                                *(item["path"] for item in definition["native_inputs"])])
     host.require(not dependencies["unresolved"], "RUNTIME_DEPENDENCY_UNRESOLVED", encoded(dependencies["unresolved"]))
-    aliases = dict(dependencies["aliases"])
+    aliases = dict(dependencies["aliases"], **auth_aliases)
     for path in (metadata["stdlib"], *metadata["tools"].values(), str(binary)):
         aliases.update(alias_chain(path))
     inventory = {Path(p) for p in dependencies["files"]}
     inventory.update(p for p in package.rglob("*") if p.is_file())
     inventory.update((home / ".codex/config.toml", home / ".claude/settings.json"))
+    inventory.update(auth_inputs)
+    discovery = discovery_inputs(env)
+    host.require(discovery_inputs(auth_env) == definition["native_discovery"],
+                 "NATIVE_DISCOVERY_CHANGED", "native inputs changed during staging")
+    inventory.update(Path(item["path"]) for item in discovery if "sha256" in item)
     receipt = {"schema": "forge-orchestrator-package/1", "root": ctx.identity, "definition": definition,
                "entry": str(entry), "provider_argv": argv, "environment": env,
+               "discovery": discovery,
                "worker_binaries": worker_binaries,
                "runtime_inventory_sha256": host.records.digest([str(p) for p in runtime.dependency_files(package)]),
                "files": [host.file_identity(p) for p in sorted(inventory)], "aliases": aliases,
@@ -255,7 +358,7 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
 def owned_canaries(package, targets, run):
     canaries = []
     try:
-        for directory in sorted({Path(p).parent for p in targets if package in Path(p).parents}):
+        for directory in sorted({Path(p).parent for p in targets if package.parents[2] in Path(p).parents}):
             canary = directory / (".qualification-" + run)
             write(canary, "owned write-denial canary\n", 0o600)
             canaries.append(canary)
@@ -265,30 +368,60 @@ def owned_canaries(package, targets, run):
     finally:
         for canary in canaries:
             canary.unlink(missing_ok=True)
+            for operation in ("create", "overwrite", "rename", "unlink", "symlink-redirection"):
+                canary.with_name(canary.name + "-" + operation).unlink(missing_ok=True)
 
 
 def policy_probes(package, receipt, report_dir, worker, topology, targets, run):
     with owned_canaries(package, targets, run) as canaries:
         return _policy_probes(package, receipt, report_dir, worker, topology,
-                              targets + [str(p) for p in canaries], run)
+                              targets + [str(p) for p in canaries], run, canaries)
 
 
-def _policy_probes(package, receipt, report_dir, worker, topology, targets, run):
+def _policy_probes(package, receipt, report_dir, worker, topology, targets, run, canaries=()):
     targets_file = report_dir / "targets.json"
     write(targets_file, encoded(targets))
     script = report_dir / "write_open_probe.py"
     write(script, 'import json,os,pathlib,sys\n'
           'targets=json.loads(pathlib.Path(sys.argv[1]).read_text())\n'
+          'canaries=json.loads(sys.argv[3])\n'
           'opened=[]\n'
           'for p in targets:\n'
           ' try:\n'
           '  fd=os.open(p,os.O_WRONLY); os.close(fd); opened.append(p)\n'
           ' except PermissionError: pass\n'
           'control=pathlib.Path(sys.argv[2])\n'
-          'with control.open("x") as f: f.write("workspace control")\n'
-          'control.unlink()\n'
-          'print(json.dumps({"opened":opened,"tested":len(targets),"workspace_control":True}))\n'
-          'sys.exit(bool(opened))\n')
+          'operations=[]\n'
+          'try:\n'
+          ' for i,original in enumerate(canaries):\n'
+          '  p=pathlib.Path(original)\n'
+          '  link=control/str(i)\n'
+          '  link.symlink_to(p)\n'
+          '  for name in ("create","overwrite","rename","unlink","symlink-redirection"):\n'
+          '   new=p.with_name(p.name+"-"+name)\n'
+          '   try:\n'
+          '    if name=="create":\n'
+          '     with new.open("x") as f: f.write("unexpected create")\n'
+          '     new.unlink()\n'
+          '    elif name=="overwrite": p.write_text("unexpected overwrite")\n'
+          '    elif name=="rename": p.rename(new); new.rename(p)\n'
+          '    elif name=="unlink": p.unlink(); p.write_text("restored owned canary")\n'
+          '    else: link.write_text("unexpected redirected write")\n'
+          '    denied=False\n'
+          '   except PermissionError: denied=True\n'
+          '   operations.append({"path":str(p),"operation":name,"denied":denied})\n'
+          '  link.unlink()\n'
+          ' positive=control/"positive"\n'
+          ' positive.write_text("create"); positive.write_text("overwrite")\n'
+          ' moved=control/"moved"; positive.rename(moved)\n'
+          ' link=control/"link"; link.symlink_to(moved); link.write_text("redirect")\n'
+          ' assert moved.read_text()=="redirect"\n'
+          ' link.unlink(); moved.unlink()\n'
+          'finally:\n'
+          ' for p in control.iterdir(): p.unlink()\n'
+          ' control.rmdir()\n'
+          'print(json.dumps({"opened":opened,"tested":len(targets),"workspace_control":True,"operations":operations}))\n'
+          'sys.exit(bool(opened) or any(not row["denied"] for row in operations))\n')
     metadata = json.loads((package / "runtime/runtime.json").read_text())
     env = dict(receipt["environment"])
     observations = []
@@ -299,28 +432,41 @@ def _policy_probes(package, receipt, report_dir, worker, topology, targets, run)
     if "--permission-profile" not in help_text:
         return "unsupported", observations
     for item in topology:
+        control = Path(item["root"]) / (".forge-capability-" + run)
+        control.mkdir(mode=0o700)
         argv = [str(worker), "sandbox", "--permission-profile", ":workspace", "-C", item["root"],
                 metadata["python"], "-I", "-S", "-B", str(script), str(targets_file),
-                str(Path(item["root"]) / (".forge-capability-" + run))]
+                str(control), encoded([str(p) for p in canaries])]
         try:
             cp = subprocess.run(argv, env=env, cwd=item["root"], text=True, capture_output=True, timeout=60)
             result = json.loads(cp.stdout)
-            passed = cp.returncode == 0 and result == {"opened": [], "tested": len(targets), "workspace_control": True}
+            operations = result.get("operations", [])
+            expected = {(str(path), op) for path in canaries
+                        for op in ("create", "overwrite", "rename", "unlink", "symlink-redirection")}
+            passed = (cp.returncode == 0 and result.get("opened") == [] and result.get("tested") == len(targets)
+                      and result.get("workspace_control") is True
+                      and {(row["path"], row["operation"]) for row in operations} == expected
+                      and len(operations) == len(expected) and all(row["denied"] is True for row in operations))
             observations.append({"root": item["root"], "status": "pass" if passed else "fail", "result": result,
                                  "stderr": cp.stderr, "argv": argv})
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             observations.append({"root": item["root"], "status": "fail", "error": str(exc)})
+        finally:
+            if control.exists():
+                shutil.rmtree(control)
     status = "pass" if observations and all(o["status"] == "pass" for o in observations) else "fail"
     return status, observations
 
 
-def qualify(package, worker_binary=None):
+def qualify(package, worker_binary=None, *, native=False):
     """Measure native prerequisites, retaining failures without minting admission."""
     package = Path(package).absolute()
     receipt = verify(package)
     ctx = host.Context(receipt["root"]["physical_root"])
-    worker = Path(worker_binary or shutil.which("codex") or "").resolve(strict=True)
+    worker = Path(worker_binary or receipt["worker_binaries"]["codex"]).resolve(strict=True)
     worker_identity = host.file_identity(worker)
+    host.require(str(worker) == receipt["worker_binaries"]["codex"],
+                 "WORKER_BINARY_CHANGED", "qualification must use the packaged worker executable")
     run = uuid.uuid4().hex
     report_dir = ctx.store.path / "reports" / ("capability-" + run)
     report_dir.mkdir(parents=True, mode=0o700)
@@ -351,18 +497,34 @@ def qualify(package, worker_binary=None):
         except ValueError:
             authenticated = False
     checks["authentication"] = "available" if authenticated else "unavailable"
+    loading, configuration = None, None
+    if native:
+        probes = module("forge_native", package / "lib/forge_native.py")
+        configuration = probes.configuration(receipt, report_dir)
+        checks["native_configuration"] = configuration["status"]
+        if authenticated:
+            loading = probes.loading(package, receipt, report_dir)
+            checks["native_loading"] = loading["status"]
+            checks["native_reload"] = loading["status"]
     # Native sandbox utility evidence is explicitly narrower than a model-led
     # workflow. Never sign a P2 qualification from these prerequisite checks.
     report = {"schema": "forge-orchestrator-capability/1", "root": ctx.identity,
+              "qualifier": host.file_identity(Path(__file__).absolute()),
               "package": host.file_identity(package / "package.json"), "worker": worker_identity,
               "provider": receipt["definition"]["executable"], "checks": checks,
               "topology_sha256": receipt["topology_sha256"], "observations": observations,
               "authentication": {"exit_code": cp.returncode, "diagnostic": cp.stderr.strip()},
+              "native_loading": loading,
+              "native_configuration": configuration,
               "supported_providers": [], "admission": "unsupported",
               "limits": ["Native write-open utility evidence is not model policy evidence.",
                          "Authenticated native load/children/reload and runtime/management/hook closure remain required.",
                          "No credentials copied, no global discovery changed, no profile registered."]}
-    verify(package)
+    try:
+        verify(package)
+    except (host.Refusal, host.broker.Refusal, OSError, ValueError) as exc:
+        checks["package_integrity"] = "fail"
+        report["integrity_error"] = str(exc)
     write(report_dir / "report.json", encoded(report))
     return {"report": str(report_dir / "report.json"), "checks": checks, "admission": "unsupported"}
 
@@ -380,20 +542,27 @@ def main():
     qualification = sub.add_parser("qualify")
     qualification.add_argument("--package", required=True)
     qualification.add_argument("--worker-binary")
+    qualification.add_argument("--native", action="store_true", help="run authenticated model-led loading probes")
+    login = sub.add_parser("auth", help="authenticate only the candidate's isolated native namespace")
+    login.add_argument("--package", required=True)
+    login.add_argument("--status", action="store_true")
     args = parser.parse_args()
     if args.action == "stage":
         result = stage(host.Context(args.root), args.provider, args.binary, args.model)
     elif args.action == "qualify":
-        result = qualify(args.package, args.worker_binary)
+        result = qualify(args.package, args.worker_binary, native=args.native)
+    elif args.action == "auth":
+        return authenticate(args.package, status=args.status)
     else:
         receipt = verify(args.package)
         result = {"integrity": "pass", "entry": receipt["entry"], "admission": "requires-native-qualification"}
     print(encoded(result), end="")
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except (host.Refusal, host.broker.Refusal, OSError, ValueError, subprocess.SubprocessError) as exc:
         print(encoded({"error": getattr(exc, "code", "PACKAGE_REFUSED"), "detail": str(exc)}), file=sys.stderr)
         sys.exit(2)

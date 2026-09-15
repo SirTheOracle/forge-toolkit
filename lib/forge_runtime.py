@@ -13,7 +13,7 @@ import sysconfig
 
 
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-TOOLS = ("bash", "sh", "env", "git", "tmux", "gh", "awk", "basename", "cat", "cp", "date", "dirname", "grep",
+TOOLS = ("bash", "sh", "zsh", "env", "git", "tmux", "gh", "rg", "awk", "basename", "cat", "cp", "date", "dirname", "grep",
          "head", "hostname", "mkdir", "mktemp", "mv", "pgrep", "ps", "readlink", "rm",
          "sed", "sleep", "sort", "tail", "tee", "tr", "wc", "cut", "find", "ls", "chmod", "cmp", "diff", "kill", "touch", "uname", "xargs")
 
@@ -21,11 +21,22 @@ TOOLS = ("bash", "sh", "env", "git", "tmux", "gh", "awk", "basename", "cat", "cp
 def selected_tools():
     result = {}
     for name in TOOLS:
-        selected = shutil.which(name, path=None if name in {"tmux", "gh"} else SYSTEM_PATH)
+        selected = shutil.which(name, path=None if name in {"tmux", "gh", "rg"} else SYSTEM_PATH)
         if not selected:
             raise ValueError("missing candidate runtime command: " + name)
         result[name] = selected
     return result
+
+
+def provider_dependencies(binaries):
+    """Explicit auxiliary executables used by the supported native CLI builds."""
+    paths = []
+    codex_host = Path(binaries["codex"]).parent / "codex-code-mode-host"
+    if codex_host.exists():
+        paths.append(codex_host)
+    if sys.platform == "darwin":
+        paths.append(Path("/usr/bin/sandbox-exec"))
+    return sorted(paths)
 
 
 def python_files(stdlib):
