@@ -39,6 +39,11 @@ green() { printf '\033[0;32m%s\033[0m\n' "$1"; }
 ok()  { PASS=$((PASS+1)); green "  ok: $1"; }
 bad() { FAIL=$((FAIL+1)); red   "  FAIL: $1"; }
 
+# Includes a real uniquely named tmux syntax probe; every lock and callback is isolated.
+python3 "$ROOT/tests/forge-bridge/p0-tests.py" WebInfraTargetTests WebNativeInfraTests \
+  && ok "C1 validated target infrastructure ownership" \
+  || bad "C1 validated target infrastructure ownership"
+
 [ -x "$BRIDGE" ] || { red "bin/forge-bridge not found/executable at $BRIDGE"; exit 1; }
 command -v tmux >/dev/null 2>&1 || { red "tmux required for liveness tests"; exit 1; }
 

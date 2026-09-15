@@ -5,8 +5,12 @@
 # untouched; the center's user-facing verbs live here.
 #
 # Verbs (Phase A):
-#   forge dispatch @<session> "<instruction>" [--sender S] [--pointer]
-#                  [--allow-api-billing] [--dry-run] [--answers <ask-id>] [--wait [--timeout N]]
+#   forge dispatch @<session> "<instruction>" [--sender S] [--pointer] [--dry-run]
+#                  [--allow-api-billing] [--answers <ask-id>] [--wait [--timeout N]]
+#                  [--expected-root P --expected-session-id $N --expected-incarnation N]
+#                  [-- <one literal instruction>]   `--` ends option AND @-session parsing
+#   forge web-contract-version      print forge-web-contract/1 (side-effect-free marker
+#                                   read by bin/forge-web before it enables mutations)
 #   forge reply @<session> [<dispatch-id>] [--json|--snippet]   print a worker's answer
 #   forge spawn [name] [--root PATH] [--orchestrator claude|codex] [--allow-api-billing] [--no-populate] [--force]
 #                  ensure-semantics 5-pane session (single-root invariant)
@@ -85,6 +89,49 @@ session_root() {
         tmux list-sessions -F '#{session_name}	#{session_path}' 2>/dev/null \
             | awk -F'\t' -v s="$sess" '$1==s{print $2; f=1} END{exit !f}'
     fi
+}
+
+# session_identity <session> → 'name<TAB>path<TAB>session_id<TAB>session_created';
+# nonzero if the session is not live. An ADDITIVE SIBLING of session_root(), not a widening
+# of it: the expectation checks below need the tmux OBJECT id and the creation stamp, while
+# session_root's six existing callers want exactly one field. Same FORGE_TMUX_LIST seam in
+# its four-column form — the convention bin/forge-bridge:254-262 already reads — so the
+# hermetic tests/forge-cc suite can drive both the positive and the negative cases.
+session_identity() {
+    local sess="$1" inject="${FORGE_TMUX_LIST:-}"
+    if [ -n "$inject" ]; then
+        awk -F'\t' -v s="$sess" '$1==s{printf "%s\t%s\t%s\t%s\n",$1,$2,$3,$4; f=1} END{exit !f}' "$inject"
+    else
+        tmux list-sessions \
+            -F '#{session_name}	#{session_path}	#{session_id}	#{session_created}' 2>/dev/null \
+            | awk -F'\t' -v s="$sess" '$1==s{print; f=1} END{exit !f}'
+    fi
+}
+
+# _forge_expect_check <session> <expected-root> <expected-session-id> <expected-incarnation>
+# Fail-CLOSED precondition for a browser-originated action: refuse BEFORE any write when the
+# live tmux object is not the one the operator was shown. Dies on any mismatch; on success
+# echoes the validated 'name<TAB>root<TAB>sid<TAB>created'.
+# Fields are read with `cut -f`, never `IFS=$'\t' read`: TAB is IFS whitespace, so an empty
+# session_id would silently shift session_created into its slot.
+_forge_expect_check() {
+    local sess="$1" want_root="$2" want_sid="$3" want_inc="$4"
+    local ident live_root live_sid live_inc wr
+    ident="$(session_identity "$sess")" \
+        || die "expectation failed: session '$sess' is not live (expected root=$want_root id=$want_sid created=$want_inc) — no write performed"
+    live_root="$(printf '%s' "$ident" | cut -f2)"
+    live_sid="$(printf '%s'  "$ident" | cut -f3)"
+    live_inc="$(printf '%s'  "$ident" | cut -f4)"
+    live_root="$(cd "$live_root" 2>/dev/null && pwd -P)" \
+        || die "expectation failed: session '$sess' root does not exist — no write performed"
+    wr="$(cd "$want_root" 2>/dev/null && pwd -P)" || wr="$want_root"
+    [ "$wr" = "$live_root" ] \
+        || die "expectation failed: session '$sess' is rooted at $live_root, not $wr — no write performed"
+    [ "$want_sid" = "$live_sid" ] \
+        || die "expectation failed: session '$sess' is tmux object '${live_sid:-unknown}', not '$want_sid' (same name, different session) — no write performed"
+    [ "$want_inc" = "$live_inc" ] \
+        || die "expectation failed: session '$sess' was created at '${live_inc:-unknown}', not '$want_inc' (session was recreated) — no write performed"
+    printf '%s\t%s\t%s\t%s\n' "$sess" "$live_root" "$live_sid" "$live_inc"
 }
 
 # ── naming: sanitize BY TRANSFORMATION (P4) ──────────────────────────────
@@ -345,13 +392,34 @@ cmd_preflight() {
     billing_preflight "$root" "$allow"
 }
 
-# _dispatch_fail <msg> — die; but if this dispatch is an --answers reply the ask
-# is already claimed (archived + BLOCKED callback consumed), so ANY post-claim
-# failure must tell the operator the answer is recorded and how to re-deliver.
-# Reads the caller's $answers/$session (cmd_dispatch locals) via bash dynamic scope.
+# _dispatch_fail <msg> — die; but if this dispatch is an --answers reply the ask is already
+# claimed (archived, and the BLOCKED callback consume ATTEMPTED), so ANY post-claim failure
+# must tell the operator the answer is recorded and how to re-deliver.
+# Reads the caller's $answers/$session/$ans_cleanup/$ans_cleanup_rc (cmd_dispatch locals) via
+# bash dynamic scope.
+#
+# The cleanup clause is the TRACKED outcome. The previous unconditional "callback consumed"
+# printed on exactly the path where the consume had just failed — the one place an operator
+# needs the truth — and nothing in the suite asserted its wording, so the claim was both
+# false and untested. T4(d) makes it checkable.
+#
+# IT ALSO DOES NOT OVER-CLAIM IN THE OTHER DIRECTION (review R6). "the callback is still
+# open" is an assertion about state we did not re-read: a concurrent orchestrator consume, or
+# a child interrupted after its durable `mv`, leaves it UNKNOWN. Every non-success outcome
+# therefore names the uncertainty and points at the IDEMPOTENT reconciliation command, which
+# is correct whether the callback is open or already archived.
 _dispatch_fail() {
     if [ -n "${answers:-}" ]; then
-        die "$1 AFTER the answer was recorded (ask $answers archived + callback consumed). Re-deliver with a PLAIN dispatch (no --answers): forge dispatch @$session \"<answer>\""
+        local _cl
+        case "${ans_cleanup:-none}" in
+            consumed)       _cl="BLOCKED callback consumed" ;;
+            noop)           _cl="no callback needed consuming (already archived)" ;;
+            failed)         _cl="BLOCKED callback consume did NOT report success (rc=${ans_cleanup_rc:-?}) — its state is UNKNOWN; reconcile from pane 0 with the idempotent 'forge-bridge callback-consume'" ;;
+            unknown)        _cl="BLOCKED callback consume was interrupted (rc=${ans_cleanup_rc:-?}) — its state is UNKNOWN; reconcile from pane 0 with the idempotent 'forge-bridge callback-consume'" ;;
+            not-applicable) _cl="session-scope ask: no stage callback to consume" ;;
+            *)              _cl="callback cleanup outcome unknown" ;;
+        esac
+        die "$1 AFTER the answer was recorded (ask $answers archived; $_cl). Re-deliver with a PLAIN dispatch (no --answers): forge dispatch @$session -- \"<answer>\""
     fi
     die "$1"
 }
@@ -360,8 +428,27 @@ _dispatch_fail() {
 cmd_dispatch() {
     local session="" instr="" sender="" force_pointer=false allow=0 dry=false answers=""
     local wait=false timeout="${FORGE_DISPATCH_WAIT_TIMEOUT:-180}"
+    # Expectation tuple (§1): the live tmux object the operator was shown. ALL THREE or NONE
+    # — a PARTIAL tuple silently downgrades the precondition, the exact fail-open class these
+    # flags exist to close. exp_n counts OPERANDS SEEN, not nonempty values, so an explicitly
+    # supplied empty value is an error rather than an invisible omission (review R15).
+    local exp_root="" exp_sid="" exp_inc="" exp_n=0 literal=false
+    # Tracked cleanup outcome for --answers. _dispatch_fail and the receipt both read these
+    # through bash dynamic scope, so they must exist before any _dispatch_fail call site is
+    # reachable. ans_cleanup_capture records whether the diagnostic capture itself worked —
+    # it never affects delivery (review R6).
+    local ans_cleanup=none ans_cleanup_rc=0 ans_cleanup_capture=ok
     [ "${FORGE_DISPATCH_DRY_RUN:-0}" = "1" ] && dry=true
     while [ $# -gt 0 ]; do case "$1" in
+        # `--` ends option parsing AND @-session capture: EXACTLY ONE literal instruction
+        # operand follows, used byte-for-byte. It is the only way to send text that begins
+        # with `@` (swallowed at :365) or `-` (:373 dies). MUST precede the --* arm: the glob
+        # `--*` matches the bare string `--`.
+        --) shift
+            [ "$literal" = false ] || die "dispatch: -- may be given only once"
+            [ -z "$instr" ] || die "dispatch: -- may not follow a positional instruction"
+            [ $# -eq 1 ] || die "dispatch: -- takes exactly one literal instruction argument (got $#)"
+            instr="$1"; literal=true; shift ;;
         @*) session="${1#@}"; shift ;;
         --sender) sender="$2"; shift 2 ;;
         --pointer) force_pointer=true; shift ;;
@@ -370,16 +457,67 @@ cmd_dispatch() {
         --answers) answers="$2"; shift 2 ;;
         --wait) wait=true; shift ;;
         --timeout) timeout="$2"; shift 2 ;;
+        --expected-root)
+            [ $# -ge 2 ] || die "dispatch: --expected-root requires a value"
+            exp_root="$2"; exp_n=$((exp_n + 1))
+            [ -n "$exp_root" ] || die "dispatch: --expected-root was given an empty value; omit the flag to assert nothing"
+            shift 2 ;;
+        --expected-session-id)
+            [ $# -ge 2 ] || die "dispatch: --expected-session-id requires a value"
+            exp_sid="$2"; exp_n=$((exp_n + 1))
+            # A tmux SESSION id is `$N`. `%N` is a PANE id and `@N` a window id — verified
+            # against a live server ($0, $4, $1650) and documented at
+            # tests/forge-infra-lock/run.sh:762. THE COMPLETE SUFFIX IS CHECKED: the glob
+            # '$'[0-9]* means "$", one digit, then ANYTHING, and accepts `$1garbage`
+            # (reproduced by review, R15). Strip the `$` with a parameter expansion — no
+            # subprocess, no glob — then reject any non-digit in the remainder. NEVER eval
+            # these: `$811` re-expands as `$8` then `11`.
+            local _sn="${exp_sid#\$}"
+            { [ "$_sn" != "$exp_sid" ] && [ -n "$_sn" ]; } \
+                || die "dispatch: --expected-session-id must be a tmux session id of the form \$N (got '${exp_sid:-<empty>}')"
+            case "$_sn" in
+                *[!0-9]*) die "dispatch: --expected-session-id must be a tmux session id of the form \$N — '$exp_sid' has a non-numeric suffix" ;;
+            esac
+            shift 2 ;;
+        --expected-incarnation)
+            [ $# -ge 2 ] || die "dispatch: --expected-incarnation requires a value"
+            exp_inc="$2"; exp_n=$((exp_n + 1))
+            case "$exp_inc" in
+                ''|*[!0-9]*) die "dispatch: --expected-incarnation must be the numeric session_created stamp (got '${exp_inc:-<empty>}')" ;;
+            esac
+            shift 2 ;;
         --*) die "unknown flag $1" ;;
-        *) if [ -z "$instr" ]; then instr="$1"; else instr="$instr $1"; fi; shift ;;
+        *) if [ "$literal" = true ]; then die "dispatch: unexpected argument after the literal instruction"; fi
+           if [ -z "$instr" ]; then instr="$1"; else instr="$instr $1"; fi; shift ;;
     esac; done
     [ -n "$session" ] || die "dispatch requires @<session>"
     [ -n "$instr" ]   || die "dispatch requires an instruction"
     [ -n "$sender" ]  || sender="${FORGE_SENDER:-seat}"
+    if [ "$exp_n" -ne 0 ] && [ "$exp_n" -ne 3 ]; then
+        die "dispatch: --expected-root, --expected-session-id and --expected-incarnation must be given together (got $exp_n of 3)"
+    fi
 
     local root
-    root="$(session_root "$session")" || die "no live session '$session' (session_path unresolvable)"
-    root="$(cd "$root" 2>/dev/null && pwd -P)" || die "session '$session' root does not exist"
+    if [ "$exp_n" -eq 3 ]; then
+        # Fail-closed BEFORE the atomic ask archive below: an expectation miss must never
+        # claim an ask it cannot then answer. _forge_expect_check dies on any mismatch.
+        # Assigned first and cut from the variable — NOT `… | cut -f2` — so the refusal does
+        # not depend on `pipefail` propagating a die out of a pipeline inside a command
+        # substitution.
+        local _ident; _ident="$(_forge_expect_check "$session" "$exp_root" "$exp_sid" "$exp_inc")"
+        root="$(printf '%s' "$_ident" | cut -f2)"
+    else
+        root="$(session_root "$session")" || die "no live session '$session' (session_path unresolvable)"
+        root="$(cd "$root" 2>/dev/null && pwd -P)" || die "session '$session' root does not exist"
+    fi
+
+    # Routing/expectation flags for every nested forge-bridge call. EMPTY on the legacy CLI
+    # path, so those invocations stay byte-identical to today apart from the -- boundary.
+    local -a exp_flags=()
+    if [ "$exp_n" -eq 3 ]; then
+        exp_flags=(--target-root "$root"
+                   --expected-session-id "$exp_sid" --expected-incarnation "$exp_inc")
+    fi
 
     # Billing preflight — silent on pass, loud on fail, BEFORE any write/inject.
     local bp="" brc=0
@@ -468,10 +606,75 @@ PY
         rm -f "$af"
         # Consume the worker's BLOCKED callback EXACTLY ONCE (stage-mode asks only).
         # Idempotent structured no-op if already consumed (e.g. by the orchestrator).
+        #
+        # The outcome is TRACKED, not discarded. `>/dev/null 2>&1` meant _dispatch_fail and
+        # the success receipt both claimed "callback consumed" whether or not it was, and a
+        # browser could not tell "delivered, cleanup failed" from "delivery failed".
+        #
+        # NOTHING ON THIS PATH MAY KILL THE DELIVERY. This whole block runs AFTER the atomic
+        # ask claim at :427, so an unguarded command here exits under `set -euo pipefail`
+        # (:43) before injection and before _dispatch_fail — the ask is archived and the
+        # answer is never sent. Review reproduced exactly that with a failing mktemp. Hence:
+        #   * the temp file is allocated with `|| cfile=""` and degrades to /dev/null;
+        #   * every capture command is `|| true`;
+        #   * the consume's rc is read from PIPESTATUS, never from the pipeline's rc, so a
+        #     capture failure cannot be mistaken for a consume failure;
+        #   * a failed consume still continues to injection, exactly as before.
+        #
+        # THE BOUND IS REAL, AND APPLIED AS THE BYTES ARE WRITTEN. `head -c` alone bounded
+        # only what was PRINTED; the complete child output still landed in the file. Here
+        # `head -c` writes the capped prefix and `cat` then DRAINS the remainder to /dev/null
+        # from the same pipe, so the child is never SIGPIPEd mid-write and is never killed
+        # early — it finishes and returns its real status.
+        #
+        # Routing is added ONLY when expectations were supplied (exp_flags non-empty). The
+        # legacy CLI invocation stays byte-identical, so no existing `forge dispatch
+        # --answers` acquires a new cross-session precondition. Pinned by T4(b).
         if [ "$ans_mode" = "stage" ] && [ -n "$ans_slug" ] && [ -n "$ans_stage" ]; then
-            ( cd "$root" && "$FORGE_BRIDGE_BIN" callback-consume \
-                --slug "$ans_slug" --stage "$ans_stage" --status BLOCKED >/dev/null 2>&1 ) \
-              || printf 'forge: warning: callback-consume failed for %s (answer still recorded).\n' "$answers" >&2
+            local ans_cap="${FORGE_ANSWER_CLEANUP_CAP:-8192}"
+            local cfile=""
+            cfile="$(mktemp "${TMPDIR:-/tmp}/forge-consume.XXXXXX" 2>/dev/null)" || cfile=""
+            if [ -z "$cfile" ] || ! : >"$cfile" 2>/dev/null; then
+                ans_cleanup_capture=unavailable
+                cfile=/dev/null
+            fi
+            local crc=0
+            ( cd "$root" \
+              && "$FORGE_BRIDGE_BIN" ${exp_flags[@]+"--target-session" "$session" "--cross-session" "${exp_flags[@]}"} \
+                 callback-consume --slug "$ans_slug" --stage "$ans_stage" --status BLOCKED ) 2>&1 \
+              | { head -c "$ans_cap" >"$cfile" 2>/dev/null || true; cat >/dev/null 2>&1 || true; } \
+              || crc=${PIPESTATUS[0]}
+            ans_cleanup_rc=$crc
+            if [ "$crc" -eq 0 ]; then
+                if grep -q 'CALLBACK_CONSUME NOOP' "$cfile" 2>/dev/null; then ans_cleanup=noop; else ans_cleanup=consumed; fi
+                # A capture failure with a SUCCESSFUL consume is still a successful cleanup;
+                # only the NOOP/ARCHIVED distinction is lost, so say so rather than guess.
+                [ "$ans_cleanup_capture" = ok ] || ans_cleanup=consumed
+            elif [ "$crc" -gt 128 ]; then
+                # Signal-terminated: not a bridge exit code at all. The write may or may not
+                # have happened, so the state is UNKNOWN, never "still open" (review R6).
+                ans_cleanup=unknown
+            else
+                ans_cleanup=failed
+            fi
+            printf 'forge: answer-cleanup ask=%s slug=%s stage=%s outcome=%s rc=%s capture=%s\n' \
+                "$answers" "$ans_slug" "$ans_stage" "$ans_cleanup" "$ans_cleanup_rc" "$ans_cleanup_capture" >&2
+            if [ "$ans_cleanup" = failed ] || [ "$ans_cleanup" = unknown ]; then
+                printf 'forge: answer-cleanup detail: ' >&2
+                if [ "$cfile" != /dev/null ]; then
+                    cat "$cfile" >&2 2>/dev/null || true
+                    if [ "$(wc -c <"$cfile" 2>/dev/null || echo 0)" -ge "$ans_cap" ]; then
+                        printf '\nforge: answer-cleanup detail TRUNCATED at %s bytes (the child was drained, not killed).' "$ans_cap" >&2
+                    fi
+                else
+                    printf '(diagnostic capture unavailable)' >&2
+                fi
+                printf '\n' >&2
+                printf 'forge: warning: callback-consume did not report success for %s (answer still recorded; delivery continues).\n' "$answers" >&2
+            fi
+            [ "$cfile" = /dev/null ] || rm -f "$cfile" 2>/dev/null || true
+        else
+            ans_cleanup=not-applicable
         fi
     fi
 
@@ -534,11 +737,26 @@ PY
     if [ "$dry" = true ]; then
         printf 'DRY-RUN inject → %s:0.0: %s\n' "$session" "$oneliner"
     else
-        if ! ( cd "$root" && "$FORGE_BRIDGE_BIN" send --target-session "$session" --cross-session claude "$oneliner" ); then
+        # `--` ends the bridge's GLOBAL routing-flag extraction: without it an instruction
+        # word that IS --target-session/--cross-session/--target-root is consumed by that
+        # loop at any argv position (bin/forge-bridge:10852-10861). Requires a forge-bridge
+        # that understands the boundary — see `forge-bridge web-contract-version`.
+        if ! ( cd "$root" && "$FORGE_BRIDGE_BIN" send --target-session "$session" --cross-session \
+                 ${exp_flags[@]+"${exp_flags[@]}"} -- claude "$oneliner" ); then
             _dispatch_fail "injection failed (forge-bridge send)"
         fi
-        printf 'DISPATCHED @%s pane=0 sender=%s%s\n' "$session" "$sender" \
-            "$([ -n "$answers" ] && printf ' answers=%s' "$answers")"
+        # DELIVERY SUCCEEDED here (the send returned 0). cleanup=<consumed|noop|failed|
+        # unknown|not-applicable> is an ADDITIVE receipt component so the browser can read
+        # "answer delivered, cleanup did not succeed" off an rc-0 dispatch. Only a DELIVERY
+        # failure (above) offers plain redispatch; a cleanup failure never does — the ask is
+        # archived and must never be re-answered.
+        printf 'DISPATCHED @%s pane=0 sender=%s%s%s\n' "$session" "$sender" \
+            "$([ -n "$answers" ] && printf ' answers=%s' "$answers")" \
+            "$([ -n "$answers" ] && printf ' cleanup=%s' "$ans_cleanup")"
+        if [ -n "$answers" ] && { [ "$ans_cleanup" = failed ] || [ "$ans_cleanup" = unknown ]; }; then
+            printf 'DISPATCH PARTIAL: answer delivered, callback cleanup outcome=%s (rc=%s) for %s/%s. Do NOT re-answer (the ask is archived). The callback state is UNKNOWN; reconcile from pane 0 with the idempotent command: forge-bridge callback-consume --slug %s --stage %s --status BLOCKED\n' \
+                "$ans_cleanup" "$ans_cleanup_rc" "$ans_slug" "$ans_stage" "$ans_slug" "$ans_stage" >&2
+        fi
         fire_watch_check    # Step 6: surface the new queued/accepted task at ~1s (real inject only)
         # --wait (opt-in): block until THIS dispatch's answer lands, then print it.
         # The dispatch is recorded + injected ABOVE, so a timeout never loses it.
@@ -644,6 +862,24 @@ def redact(s):
     s = SECRETS.sub("«redacted»", s or ""); return KV.sub(r"\1\2«redacted»", s)
 snippet = redact(q.strip().replace("\n", " "))[:280]   # redact BEFORE truncating
 
+# ── expanded question_text (web control center §1) ───────────────────────────
+# REDACT FIRST, CUT SECOND, on a valid UTF-8 CHARACTER boundary. The cap is a WRITE-SIDE
+# bound strictly below the web reader's 1 MiB structured-file ceiling, so the two can never
+# disagree and an oversized ask can never become UNREADABLE — which would be strictly worse
+# than today, where the 280-char snippet always renders. 64 KiB expands to at most ~6x under
+# worst-case JSON escaping (\u00XX per byte), leaving the serialized record well under
+# 400 KiB. The snippet above is retained unconditionally and an otherwise-valid escalation
+# is NEVER rejected for length.
+# question_sha256 below stays the hash of the RAW question: it is NOT an integrity check on
+# this field and must never be used to verify it (plan-review M3).
+QTEXT_MAX = 64 * 1024
+_qred = redact(q)
+_qenc = _qred.encode("utf-8", "replace")
+question_text_bytes = len(_qenc)                       # PRE-CUT redacted byte count
+question_text_truncated = question_text_bytes > QTEXT_MAX
+question_text = (_qenc[:QTEXT_MAX].decode("utf-8", "ignore")
+                 if question_text_truncated else _qred)
+
 # ── no-pending pre-check (faithful to forge-watch pending_entries) ───────────
 def has_open_pending():
     logp = os.path.join(root, ".dev", "proposals", slug, "forge-log.yml")
@@ -694,6 +930,9 @@ rec = {"schema": "cc-attention/1", "event": "ask", "variant": "ask",
        "emitted_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
        "ask_id": ask_id, "mode": mode,
        "question_snippet": snippet,
+       "question_text": question_text,
+       "question_text_truncated": question_text_truncated,
+       "question_text_bytes": question_text_bytes,
        "question_sha256": hashlib.sha256(q.encode("utf-8", "replace")).hexdigest(),
        "slug": slug or None, "stage": stage or None, "worker": worker or None}
 adir = os.path.join(root, ".dev", "attention")
@@ -3274,6 +3513,13 @@ PY
 }
 
 case "${1:-help}" in
+    # Side-effect-free capability marker (§4). FIRST arm: nothing runs before it. It
+    # advertises the COMPLETE input/expectation contract of this checkout (dispatch `--`,
+    # --expected-*, and the bridge's matching explicit-routing surface). Probers must match
+    # the exact string — an older forge dies with "unknown verb", rc 1, and an older
+    # forge-bridge prints help and exits 0, so rc alone proves nothing. It is NOT a JSON
+    # projection and must never grow fields.
+    web-contract-version) printf 'forge-web-contract/1\n' ;;
     codex-lane) shift; cmd_codex_lane "$@" ;;
     codex-doctor) shift; cmd_codex_doctor "$@" ;;
     codex-launch) shift; cmd_codex_launch "$@" ;;
@@ -3296,6 +3542,6 @@ case "${1:-help}" in
     gc)        shift; cmd_gc "$@" ;;
     recover)   shift; cmd_recover "$@" ;;
     parked)    shift; cmd_parked "$@" ;;
-    -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register worktree root-assets status board tasks gc recover parked codex-broker)" ;;
+    -h|--help|help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown verb '$1' (try: dispatch reply spawn ask preflight register worktree root-assets status board tasks gc recover parked codex-broker web-contract-version)" ;;
 esac

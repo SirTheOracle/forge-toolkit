@@ -18,6 +18,10 @@ bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 not_run(){ NOT_RUN=$((NOT_RUN+1)); printf '  NOT RUN: %s\n' "$1"; }
 
 export FORGE_WATCH_TRIGGER=0
+# Execute the C1 contract family before any native pane setup can fail or time out.
+python3 "$ROOT/tests/forge-bridge/p0-tests.py" WebBridgeContractTests WebInventoryContractTests WebNativeBridgeTests \
+  && ok "C1 web routing/lifecycle/provenance/inventory contract" \
+  || bad "C1 web routing/lifecycle/provenance/inventory contract"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fbid.XXXXXX")"; WORK="$(cd "$WORK" && pwd -P)"
 P0_HELPER="$ROOT/tests/forge-bridge/p0-harness.py"
 P0_EVIDENCE="${FORGE_BRIDGE_EVIDENCE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/forge-bridge-evidence.XXXXXX")}"

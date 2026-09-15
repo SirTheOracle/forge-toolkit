@@ -41,6 +41,10 @@ new_root(){
 }
 meta(){ printf '%s\t%s\t%s\t%s' "$1" "forge-x" "$2" "${3:-5}"; }   # pane_index, session, path, window_panes
 
+# C1 web CLI coverage is independent of later web/backend and frontend files.
+python3 "$ROOT/tests/forge-bridge/p0-tests.py" WebCCContractTests \
+  && ok "C1 web dispatch/answer contract" || bad "C1 web dispatch/answer contract"
+
 echo "── dispatch: inline schema + marker (hermetic) ──"
 new_root d1
 out=$(FORGE_TMUX_LIST="$TSV" FORGE_DISPATCH_DRY_RUN=1 "$FORGE" dispatch @forge-x "short instruction" --allow-api-billing --sender seat 2>&1)
@@ -921,7 +925,7 @@ new_root sb1
 BRIDGE_LOG="$WORK/blsb"; : > "$BRIDGE_LOG"
 FORGE_TMUX_LIST="$TSV" FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BRIDGE_LOG" \
   "$FORGE" dispatch @forge-x "rootbind probe" --allow-api-billing >/dev/null 2>&1
-grep -q -- 'send --target-session forge-x --cross-session claude' "$BRIDGE_LOG" \
+grep -q -- 'send --target-session forge-x --cross-session -- claude' "$BRIDGE_LOG" \
   && ok "seat dispatch passes --target-session/--cross-session to send" \
   || bad "seat dispatch argv wrong: $(cat "$BRIDGE_LOG")"
 grep -q 'TMUX_SESSION' "$BRIDGE_LOG" && bad "seat dispatch still leans on TMUX_SESSION" || ok "no TMUX_SESSION in the seat send path"
