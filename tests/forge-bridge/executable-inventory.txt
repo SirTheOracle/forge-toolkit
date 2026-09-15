@@ -7,6 +7,7 @@ bin/forge-dispatch-review
 bin/forge-git-request
 bin/forge-issue-sync
 bin/forge-orchestrator-host
+bin/forge-orchestrator-package
 bin/forge-stall-install-regex
 bin/forge-start
 bin/forge-sync-main

@@ -15,7 +15,7 @@ You do NOT modify code, fix-plan.md, fix-diffs.md, or qa-A.md/qa-B.md. You produ
 - A's critique (provided inline in your prompt)
 - B's critique (provided inline in your prompt)
 - Your own qa-C.md (`{output_dir}/qa-C.md`)
-- `{output_dir}/fix-review.md` (if present) — for Hard Rule 8 re-emerged advisory check
+- `{input_dir}/fix-review.md` (if present) — for Hard Rule 8 re-emerged advisory check
 - Source files as needed for spot-checks
 
 You retain full Round 2 context: qa-A.md, qa-B.md, fix-coder-report.md, fix-diffs.md, etc.

@@ -68,7 +68,7 @@ You do NOT write any other file. You do NOT modify source code, fix-plan.md, fix
 5. **Run the project's full test suite.**
 
    ```bash
-   {{activate_venv}} && {{test_command}}
+   {{test_command}}
    ```
 
    Compare the post-fix output to fix-coder-report.md's baseline. The expected delta is:

@@ -12,7 +12,7 @@ You are executing the 'fix-plan-review' stage of a forge fix-pipeline.
 
 Slug: {slug}
 
-Follow the fix-plan-reviewer skill at ~/.claude/skills/fix-plan-reviewer/SKILL.md
+Follow the fix-plan-reviewer skill at {worker_skill}
 
 This is a SINGLE-AGENT adversarial review of the fix plan. You are not a teammate-spawning skill — you read the artifacts and write the review yourself.
 

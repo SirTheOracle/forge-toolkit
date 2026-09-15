@@ -39,7 +39,7 @@ def shell(code, *args, env=None):
 class GuardTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.ledger = self.root / ".dev/proposals/p0/constraints.yml"
         self.ledger.parent.mkdir(parents=True)
         self.prompts = self.root / "prompts"; self.prompts.mkdir()

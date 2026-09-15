@@ -3846,6 +3846,11 @@ cmd_log() {
     [ -z "$session" ] && session="unknown"
 
     _orchestrator_admission || return 1
+    if [ "${FORGE_ASSETS_REQUIRED:-0}" = 1 ] && [ "$(canonical_pane_name "$to")" = claude ]; then
+        case "$stage" in
+            proposal|qa|qa-retry) prompt=$(cmd_local_render --slug "$slug" --stage "$stage") || return 2 ;;
+        esac
+    fi
     ensure_pipeline_log "$slug"
     ensure_summary_log
 
@@ -5605,12 +5610,7 @@ backend = services.get('backend') or {}
 frontend = services.get('frontend') or {}
 lines = ["Environment setup (run before any other commands):"]
 lines.append(f"  Working directory: {project_root}")
-venv = backend.get('activate_venv')
-if venv:
-    bw = backend.get('working_dir')
-    if bw and venv.startswith('source ') and not venv.startswith(f'source {bw}/'):
-        venv = f"source {bw}/" + venv[len('source '):]
-    lines.append(f"  Python venv: {venv}")
+lines.append("  Environment: direnv is already active; run commands directly, never source activation files.")
 app_env = (data.get('forge') or {}).get('app_env') or data.get('app_env')
 if app_env:
     lines.append(f"  APP_ENV: {app_env}")
@@ -5798,18 +5798,28 @@ _render_template() {
     # it is surfaced only if a template actually asks for the include.
     local oc_text oc_rc
     oc_text=$(_render_operator_constraints "$project_root" "$slug" 2>&1); oc_rc=$?
+    local worker_skill=""
+    if grep -q '{worker_skill}' "$tmpl_path"; then
+        worker_skill=$(_stage_assets "$stage" "$worker") || return 2
+    fi
     python3 - "$tmpl_path" "$FORGE_PROMPTS_DIR" "$slug" "$stage" "$worker" \
-        "$worker_pane" "$project_root" "$preamble" "$oc_rc" "$oc_text" <<'PYEOF'
+        "$worker_pane" "$project_root" "$preamble" "$oc_rc" "$oc_text" "$worker_skill" <<'PYEOF'
 import sys, os, re
 (tmpl_path, prompts_dir, slug, stage, worker, worker_pane, project_root, preamble,
  oc_rc, oc_text) = sys.argv[1:11]
 
+if os.path.realpath(tmpl_path) != os.path.abspath(tmpl_path):
+    raise SystemExit('ERROR: symlinked template: ' + tmpl_path)
 with open(tmpl_path) as f:
     text = f.read()
 
 INCLUDE_RE = re.compile(r'<<<INCLUDE\s+(\S+)\s*>>>')
 
 def resolve_include(name):
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', name):
+        raise SystemExit('ERROR: unsafe include name: ' + name)
+    if name in ('_preamble', '_operator_constraints') and os.path.lexists(os.path.join(prompts_dir, name + '.txt')):
+        raise SystemExit('ERROR: shadowed synthetic include: ' + name)
     if name == '_preamble':
         return preamble
     # Second synthetic (#77b). NOT _preamble's empty-on-miss contract: an absent,
@@ -5824,11 +5834,14 @@ def resolve_include(name):
             sys.exit(2)
         return oc_text
     path = os.path.join(prompts_dir, f"{name}.txt")
-    if not os.path.exists(path):
+    if not os.path.isfile(path) or os.path.realpath(path) != os.path.abspath(path):
         sys.stderr.write(f"ERROR: include not found: {name}\n")
         sys.exit(2)
     with open(path) as f:
-        return f.read().rstrip('\n')
+        included = f.read().rstrip('\n')
+    if INCLUDE_RE.search(included):
+        raise SystemExit('ERROR: nested include unsupported: ' + name)
+    return included
 
 # Resolve includes (single pass; nested includes are not supported by design).
 def expand(m):
@@ -5841,10 +5854,53 @@ text = (text
         .replace('{stage}', stage)
         .replace('{worker}', worker)
         .replace('{worker_pane}', str(worker_pane))
+        .replace('{worker_skill}', sys.argv[11])
         .replace('{project_root}', project_root))
 
 sys.stdout.write(text)
 PYEOF
+}
+
+_stage_assets() {
+    local sibling="$(_forge_sibling_bin)"
+    FORGE_PROMPTS_DIR="$FORGE_PROMPTS_DIR" FORGE_DIGESTS_DIR="$FORGE_DIGESTS_DIR" \
+        python3 "$(dirname "$sibling")/../lib/forge_assets.py" route --stage "$1" --worker "$2"
+}
+
+# Publish complete renders only; failed retries never truncate the prior file.
+_publish_render() {
+    local template="$1" slug="$2" stage="$3" worker="$4" pane="$5" root="$6" kind="$7"
+    case "$slug:$stage:$kind" in *[!A-Za-z0-9._:-]*) echo "ERROR: invalid render token" >&2; return 2 ;; esac
+    local rendered tmp out="$root/.dev/forge-tmp/$kind-$stage-$slug.txt"
+    rendered=$(_render_template "$template" "$slug" "$stage" "$worker" "$pane" "$root") || return 2
+    mkdir -p "$root/.dev/forge-tmp" || return 2
+    tmp=$(mktemp "$root/.dev/forge-tmp/.$kind.XXXXXX") || return 2
+    if ! printf '%s\n' "$rendered" > "$tmp" || ! mv -f "$tmp" "$out"; then
+        rm -f "$tmp"
+        return 2
+    fi
+    printf '%s\n' "$out"
+}
+
+cmd_local_render() {
+    local slug="" stage="proposal" provider="${FORGE_ORCHESTRATOR_PROVIDER:-claude}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug) slug="$2"; shift 2 ;;
+            --provider) provider="$2"; shift 2 ;;
+            --stage) stage="$2"; shift 2 ;;
+            *) echo "ERROR: unknown local-render argument: $1" >&2; return 2 ;;
+        esac
+    done
+    [ -n "$slug" ] || return 2
+    case "$stage" in proposal|qa|qa-retry) ;; *) return 2 ;; esac
+    case "$provider" in claude|codex) ;; *) return 2 ;; esac
+    local root out
+    root=$(_resolve_project_root "")
+    [ -n "$root" ] || return 2
+    _stage_assets "$stage" "$provider" >/dev/null || return 2
+    out=$(_publish_render "$FORGE_PROMPTS_DIR/$stage.txt" "$slug" "$stage" "$provider" 0 "$root" local) || return 2
+    printf 'LOCAL_PROMPT: %s\n' "$out"
 }
 
 # _constraint_carrier_stage <stage> — 0 if this stage carries the operator ledger.
@@ -6127,6 +6183,10 @@ cmd_dispatch() {
         fi
     fi
 
+    # Candidate routes are checked before reset, supersede, pending or send.
+    if [ "${FORGE_ASSETS_REQUIRED:-0}" = 1 ]; then
+        _stage_assets "$stage" "$worker_canonical" >/dev/null || return 2
+    fi
     local tmpl_path="$FORGE_PROMPTS_DIR/$stage.txt"
     local rendered
     if [ -n "$source_prompt" ]; then
@@ -7674,8 +7734,9 @@ PY
                 fi
                 _wait_emit_callback "$cb_file" "$slug" "$stage" "$worker_canonical" \
                     "$digest_template" "$project_root"
+                local digest_rc=$?
                 _render_status_file
-                return 0
+                return "$digest_rc"
             fi
         fi
 
@@ -7777,19 +7838,22 @@ print(d.get('message', '') or '')
         "$status" "$stage" "$slug" "$worker_canonical" "$message" "$_cbid" "$_selpt"
 
     if [ -n "$digest_template" ] && [ "$status" = "DONE" ]; then
+        case "$digest_template" in *[!A-Za-z0-9_-]*)
+            printf 'DIGEST_PROMPT_ERROR: invalid template name\n'; return 2 ;; esac
         local digest_tmpl="$FORGE_DIGESTS_DIR/$digest_template.txt"
         if [ ! -f "$digest_tmpl" ]; then
             _emit_event ERROR "$slug" "stage=$stage reason=digest-template-not-found template=$digest_template"
             printf 'DIGEST_PROMPT_ERROR: template not found: %s\n' "$digest_tmpl"
-            return 0
+            return 2
         fi
-        local digest_out_dir="$project_root/.dev/forge-tmp"
-        mkdir -p "$digest_out_dir"
-        local digest_out="$digest_out_dir/digest-${stage}-${slug}.txt"
+        local digest_out
         local worker_pane
         worker_pane=$(pane_index "$worker_canonical")
-        _render_template "$digest_tmpl" "$slug" "$stage" "$worker_canonical" \
-            "$worker_pane" "$project_root" > "$digest_out" || return 0
+        digest_out=$(_publish_render "$digest_tmpl" "$slug" "$stage" "$worker_canonical" \
+            "$worker_pane" "$project_root" digest) || {
+            printf 'DIGEST_PROMPT_ERROR: render failed: %s\n' "$digest_tmpl"
+            return 2
+        }
         _emit_event DIGEST "$slug" "stage=$stage template=$digest_template event=prompt-rendered out_file=$digest_out"
         printf 'DIGEST_PROMPT: %s\n' "$digest_out"
     fi
@@ -9881,6 +9945,7 @@ cmd_digest() {
         echo "Usage: forge-bridge digest --slug <s> --stage <s> --template <name> [--worker <w>]" >&2
         return 1
     fi
+    case "$template" in *[!A-Za-z0-9_-]*) echo 'DIGEST_PROMPT_ERROR: invalid template name'; return 2 ;; esac
 
     local project_root
     project_root=$(_resolve_project_root "")
@@ -9895,14 +9960,12 @@ cmd_digest() {
     worker_pane=$(pane_index "$worker")
 
     local tmpl_path="$FORGE_DIGESTS_DIR/$template.txt"
-    local out_dir="$project_root/.dev/forge-tmp"
-    mkdir -p "$out_dir"
-    local out_file="$out_dir/digest-${stage}-${slug}.txt"
-
-    _render_template "$tmpl_path" "$slug" "$stage" "$worker_canonical" \
-        "$worker_pane" "$project_root" > "$out_file" || {
+    local out_file
+    out_file=$(_publish_render "$tmpl_path" "$slug" "$stage" "$worker_canonical" \
+        "$worker_pane" "$project_root" digest) || {
         _emit_event ERROR "$slug" "stage=$stage reason=template-render-failed template=$template"
-        return 1
+        echo "DIGEST_PROMPT_ERROR: render failed: $tmpl_path"
+        return 2
     }
 
     _emit_event DIGEST "$slug" "stage=$stage template=$template event=prompt-rendered out_file=$out_file"
@@ -11762,6 +11825,7 @@ case "${1:-help}" in
     infra-lock)      shift; cmd_infra_lock "$@" ;;
     wait)            shift; cmd_wait "$@" ;;
     digest)          shift; cmd_digest "$@" ;;
+    local-render)    shift; cmd_local_render "$@" ;;
     emit)            shift; cmd_emit "$@" ;;
     stall-check)         shift; cmd_stall_check "$@" ;;
     stall-check-status)  shift; require_identity "stall-check-status" host-degrade || true; cmd_stall_check_status "$@" ;;

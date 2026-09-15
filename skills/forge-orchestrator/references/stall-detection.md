@@ -13,7 +13,7 @@ Watched external worker panes in Phase 2:
 - `claude-opus` / the claude-opus worker (pane 1) — incorporate, impl-review
 - `codex-a` / the codex-a worker (pane 3) — review and eligible implementation/review work
 - `codex-b` / the codex-b worker (pane 4) — implementation and QA work
-- `claude-sonnet` / the claude-sonnet worker (pane 2) — coding, qa-fix, verify local fallback
+- `claude-sonnet` / the claude-sonnet worker (pane 2) — coding, qa-fix, qa fallback
 
 | state                          | trigger                                                              | bridge action / orchestrator response |
 |--------------------------------|----------------------------------------------------------------------|---------------------------------------|

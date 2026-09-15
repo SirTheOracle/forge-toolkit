@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""Stage and inspect distinct protected candidates without changing live discovery."""
+from __future__ import annotations
+
+import argparse
+import ast
+from contextlib import contextmanager
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import uuid
+
+TREE = Path(__file__).resolve().parent.parent
+
+
+def module(name, path):
+    spec = importlib.util.spec_from_loader(name, loader=None, origin=str(path))
+    obj = importlib.util.module_from_spec(spec)
+    obj.__file__ = str(path)
+    exec(compile(path.read_bytes(), str(path), "exec"), obj.__dict__)
+    return obj
+
+
+host = module("host", TREE / "bin/forge-orchestrator-host")
+assets = module("assets", TREE / "lib/forge_assets.py")
+runtime = module("runtime", TREE / "lib/forge_runtime.py")
+
+
+def write(path, data, mode=0o400):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            stream.write(data.encode() if isinstance(data, str) else data)
+            stream.flush()
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def encoded(data):
+    return json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def source_files():
+    declared = json.loads((TREE / "config/orchestrator-files.json").read_text())
+    actual = set()
+    for base in declared["directories"]:
+        for path in (TREE / base).rglob("*"):
+            if "__pycache__" in path.parts or path.name == ".DS_Store":
+                continue
+            if path.is_file() or path.is_symlink():
+                actual.add(str(path.relative_to(TREE)))
+    expected = set(declared["files"])
+    host.require(actual == expected, "SOURCE_INVENTORY_DRIFT",
+                 encoded({"missing": sorted(expected - actual), "undeclared": sorted(actual - expected)}))
+    errors = assets.inventory(TREE)
+    host.require(not errors, "ASSET_REQUIRED", "\n".join(errors))
+    return [host.file_identity(TREE / name) for name in sorted(expected)]
+
+
+def verify(package):
+    package = Path(package).absolute()
+    receipt = host.read_json(package / "package.json")
+    host.require(receipt.get("schema") == "forge-orchestrator-package/1", "PACKAGE_INVALID", str(package))
+    ctx = host.Context(receipt["root"]["physical_root"])
+    host.require(ctx.identity == receipt["root"] and ctx.store.path / "candidates" in package.parents,
+                 "PACKAGE_UNPROTECTED", str(package))
+    host.require(host.records.digest(host.topology(ctx)) == receipt["topology_sha256"],
+                 "TOPOLOGY_CHANGED", "re-stage and qualify this topology")
+    host.require(receipt["os_build"] == runtime.os_identity(), "OS_RUNTIME_CHANGED", "requalify OS runtime")
+    for item in receipt["files"]:
+        host.verify_file(item)
+    declared = {i["path"] for i in receipt["files"] if package in Path(i["path"]).parents}
+    actual = {str(p) for p in package.rglob("*") if (p.is_file() or p.is_symlink()) and p != package / "package.json"}
+    host.require(actual == declared, "PACKAGE_INVENTORY_DRIFT", "candidate files added or removed")
+    for path, target in receipt["aliases"].items():
+        host.require(Path(path).is_symlink() and os.readlink(path) == target,
+                     "DEPENDENCY_ALIAS_CHANGED", path)
+    host.require(receipt["runtime_inventory_sha256"] == host.records.digest([str(p) for p in runtime.dependency_files(package)]),
+                 "RUNTIME_INVENTORY_DRIFT", "Python or native tool dependency set changed")
+    return receipt
+
+
+def alias_chain(path):
+    result = {}
+    path = Path(path).absolute()
+    for part in (*reversed(path.parents), path):
+        if part.is_symlink():
+            result[str(part)] = os.readlink(part)
+    return result
+
+
+def stage(ctx, provider, binary, model):
+    files = source_files()
+    binary = Path(binary or shutil.which(provider) or "").resolve(strict=True)
+    executable = host.file_identity(binary)
+    version = subprocess.check_output([str(binary), "--version"], text=True, timeout=15).strip()
+    worker_binaries = {name: str(Path(shutil.which(name) or "").resolve(strict=True)) for name in ("claude", "codex")}
+    definition = {"root": ctx.identity, "sources": files, "provider": provider, "executable": executable,
+                  "version": version, "model": model, "topology_sha256": host.records.digest(host.topology(ctx)),
+                  "python": host.file_identity(Path(sys.executable).resolve()),
+                  "worker_binaries": {name: host.file_identity(path) for name, path in worker_binaries.items()},
+                  "runtime_inputs_sha256": host.records.digest(runtime.inputs()),
+                  "os_build": runtime.os_identity()}
+    identity = host.records.digest(definition)
+    base = ctx.store.path / "candidates" / identity
+    package = base / "package"
+    if package.exists():
+        receipt = verify(package)
+        host.require(receipt["definition"] == definition, "PACKAGE_CHANGED", "candidate identity differs")
+        return {"package": str(package), "entry": receipt["entry"], "admission": "requires-native-qualification"}
+    # Exclusive destination: no replacing an existing candidate or legacy asset.
+    parent = host.records.directory(base.parent, create=True)
+    try:
+        os.mkdir(identity, 0o700, dir_fd=parent)
+    finally:
+        os.close(parent)
+    try:
+        return stage_contents(ctx, provider, binary, model, files, worker_binaries, definition, identity, base, package)
+    except BaseException:
+        # Only this invocation's exclusive, unpublished candidate is removable.
+        shutil.rmtree(base)
+        raise
+
+
+def stage_contents(ctx, provider, binary, model, files, worker_binaries, definition, identity, base, package):
+    package.mkdir(mode=0o700)
+    for item in files:
+        relative = Path(item["path"]).relative_to(TREE)
+        data = host.file_bytes(item["path"])
+        host.require(hashlib.sha256(data).hexdigest() == item["sha256"],
+                     "SOURCE_CHANGED", item["path"] + " changed during staging")
+        write(package / relative, data, 0o500 if relative.parts[0] == "bin" else 0o400)
+    metadata = runtime.stage(package)
+    for path in (package / "bin").iterdir():
+        if path.is_file():
+            data = path.read_text()
+            if data.startswith("#!/bin/bash"):
+                data = data.replace("/usr/bin/python3 -I", shlex.quote(str(package / "runtime/bin/python3")))
+            for name in ("tmux", "gh"):
+                data = data.replace("/opt/homebrew/bin/" + name, metadata["tools"][name])
+            path.chmod(0o700)
+            path.write_text(data)
+            path.chmod(0o500)
+    runtime_config = package / "config/codex-forge-runtime.json"
+    config = json.loads(runtime_config.read_text())
+    config["codex"]["binary"] = worker_binaries["codex"]
+    runtime_config.chmod(0o600)
+    runtime_config.write_text(encoded(config))
+    runtime_config.chmod(0o400)
+    # Explicit paths in all prompt/skill/command copies. No global discovery rename.
+    replacements = {"~/bin/": str(package / "bin") + "/",
+                    "$HOME/bin/": str(package / "bin") + "/",
+                    "~/.claude/skills/": str(package / "skills") + "/",
+                    "~/.codex/skills/": str(package / "codex-skills") + "/",
+                    "~/.config/forge/prompts/": str(package / "prompts") + "/",
+                    "~/.config/forge/digests/": str(package / "digests") + "/"}
+    for path in package.rglob("*"):
+        if path.is_file() and path.suffix in (".md", ".txt"):
+            data = path.read_text()
+            for old, new in replacements.items():
+                data = data.replace(old, new)
+            path.chmod(0o600)
+            path.write_text(data)
+            path.chmod(0o400)
+    home = base / "home"
+    (home / ".codex").mkdir(parents=True, mode=0o700)
+    (home / ".claude").mkdir(mode=0o700)
+    # These are policy-only inputs. Never copy auth.json, credentials or global hooks.
+    codex_config = 'cli_auth_credentials_store = "keyring"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\n'
+    write(home / ".codex/config.toml", codex_config)
+    write(home / ".claude/settings.json", '{}\n')
+    entry = package / "discovery" / ("forge-candidate-" + provider + "-" + identity[:12] + ".md")
+    canonical = package / "skills/forge-orchestrator/SKILL.md"
+    adapter = package / ("skills/forge-orchestrator/references/" + provider + ".md")
+    write(entry, "# Forge Candidate " + identity + "\n\nRead with native file tools, in full, before acting:\n"
+          + str(canonical) + "\n" + str(adapter) + "\n\n"
+          + "Reload these exact paths after compaction, resume, reinvocation and restart.\n"
+          + "Do not load a global or project-local same-named orchestrator.\n"
+          + "Control entry: " + str(package / "bin/forge") + "\n")
+    prompt = "Read and follow the explicit protected Forge entry at " + str(entry)
+    if provider == "codex":
+        argv = [str(binary), "-C", str(ctx.root), "--strict-config", "--sandbox", "workspace-write",
+                "--ask-for-approval", "on-request", "-m", model, prompt]
+    else:
+        argv = [str(binary), "--setting-sources", "", "--settings", str(home / ".claude/settings.json"),
+                "--strict-mcp-config", "--mcp-config", "{}", "--model", model, prompt]
+    env = runtime.environment(package, home)
+    env["FORGE_ORCHESTRATOR_PROVIDER"] = provider
+    # Ignore inherited shell functions/startup files before the first command,
+    # then close every helper override rather than trusting pane environment.
+    retained = ("TMUX", "TMUX_PANE", "TMUX_SESSION", "FORGE_ROLE", "FORGE_ROOT", "FORGE_INITIATIVE",
+                "FORGE_ORCHESTRATOR_LAUNCH_ID", "FORGE_ORCHESTRATOR_REQUEST_VERSION")
+    # env -i also removes raw BASH_FUNC_* names, which compgen/unset misses.
+    # Keep payloads beside their public entries so sibling lookup stays pinned.
+    bootstrap = ('#!/bin/bash -p\nexec /usr/bin/env -i '
+                 + ' '.join(shlex.quote(key + '=' + value) for key, value in sorted(env.items()))
+                 + ' ' + ' '.join('"' + key + '=${' + key + '-}"' for key in retained))
+    for path in list((package / "bin").iterdir()):
+        data = path.read_text()
+        if data.startswith("#!/bin/bash\n"):
+            body = path.with_name('.' + path.name + '-body')
+            write(body, data)
+            path.chmod(0o700)
+            path.write_text(bootstrap + ' /bin/bash -p ' + shlex.quote(str(body)) + ' "$@"\n')
+            path.chmod(0o500)
+        elif data.startswith("#!/usr/bin/env python3\n"):
+            parsed = ast.parse(data)
+            insertion = max((n.end_lineno for n in parsed.body
+                             if isinstance(n, ast.ImportFrom) and n.module == "__future__"), default=1)
+            lines = data.splitlines(keepends=True)
+            lines[0] = "#!" + metadata["python"] + " -ISB\n"
+            fixed = ('if __name__ == "__main__":\n'
+                     '    import os as _forge_os\n'
+                     '    _forge_keep = {k:v for k,v in _forge_os.environ.items() if k in ' + repr(retained) + '}\n'
+                     '    _forge_os.environ.clear()\n'
+                     '    _forge_os.environ.update(_forge_keep)\n'
+                     '    _forge_os.environ.update(' + repr(env) + ')\n')
+            lines.insert(insertion, fixed)
+            path.chmod(0o700)
+            path.write_text(''.join(lines))
+            path.chmod(0o500)
+    dependencies = runtime.native_dependencies([*runtime.dependency_files(package), binary, *worker_binaries.values()])
+    host.require(not dependencies["unresolved"], "RUNTIME_DEPENDENCY_UNRESOLVED", encoded(dependencies["unresolved"]))
+    aliases = dict(dependencies["aliases"])
+    for path in (metadata["stdlib"], *metadata["tools"].values(), str(binary)):
+        aliases.update(alias_chain(path))
+    inventory = {Path(p) for p in dependencies["files"]}
+    inventory.update(p for p in package.rglob("*") if p.is_file())
+    inventory.update((home / ".codex/config.toml", home / ".claude/settings.json"))
+    receipt = {"schema": "forge-orchestrator-package/1", "root": ctx.identity, "definition": definition,
+               "entry": str(entry), "provider_argv": argv, "environment": env,
+               "worker_binaries": worker_binaries,
+               "runtime_inventory_sha256": host.records.digest([str(p) for p in runtime.dependency_files(package)]),
+               "files": [host.file_identity(p) for p in sorted(inventory)], "aliases": aliases,
+               "topology_sha256": definition["topology_sha256"],
+               "os_cached_libraries": dependencies["os_cached_libraries"],
+               "os_build": runtime.os_identity(),
+               "qualification": "required", "supported_providers": []}
+    host.require(definition["runtime_inputs_sha256"] == host.records.digest(runtime.inputs()),
+                 "RUNTIME_INPUTS_CHANGED", "runtime changed during staging; retry with stable inputs")
+    write(package / "package.json", encoded(receipt))
+    verify(package)
+    return {"package": str(package), "entry": str(entry), "admission": "requires-native-qualification"}
+
+
+@contextmanager
+def owned_canaries(package, targets, run):
+    canaries = []
+    try:
+        for directory in sorted({Path(p).parent for p in targets if package in Path(p).parents}):
+            canary = directory / (".qualification-" + run)
+            write(canary, "owned write-denial canary\n", 0o600)
+            canaries.append(canary)
+            fd = os.open(canary, os.O_WRONLY)
+            os.close(fd)
+        yield canaries
+    finally:
+        for canary in canaries:
+            canary.unlink(missing_ok=True)
+
+
+def policy_probes(package, receipt, report_dir, worker, topology, targets, run):
+    with owned_canaries(package, targets, run) as canaries:
+        return _policy_probes(package, receipt, report_dir, worker, topology,
+                              targets + [str(p) for p in canaries], run)
+
+
+def _policy_probes(package, receipt, report_dir, worker, topology, targets, run):
+    targets_file = report_dir / "targets.json"
+    write(targets_file, encoded(targets))
+    script = report_dir / "write_open_probe.py"
+    write(script, 'import json,os,pathlib,sys\n'
+          'targets=json.loads(pathlib.Path(sys.argv[1]).read_text())\n'
+          'opened=[]\n'
+          'for p in targets:\n'
+          ' try:\n'
+          '  fd=os.open(p,os.O_WRONLY); os.close(fd); opened.append(p)\n'
+          ' except PermissionError: pass\n'
+          'control=pathlib.Path(sys.argv[2])\n'
+          'with control.open("x") as f: f.write("workspace control")\n'
+          'control.unlink()\n'
+          'print(json.dumps({"opened":opened,"tested":len(targets),"workspace_control":True}))\n'
+          'sys.exit(bool(opened))\n')
+    metadata = json.loads((package / "runtime/runtime.json").read_text())
+    env = dict(receipt["environment"])
+    observations = []
+    try:
+        help_text = subprocess.check_output([str(worker), "sandbox", "--help"], text=True, env=env, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "fail", [{"status": "fail", "error": str(exc)}]
+    if "--permission-profile" not in help_text:
+        return "unsupported", observations
+    for item in topology:
+        argv = [str(worker), "sandbox", "--permission-profile", ":workspace", "-C", item["root"],
+                metadata["python"], "-I", "-S", "-B", str(script), str(targets_file),
+                str(Path(item["root"]) / (".forge-capability-" + run))]
+        try:
+            cp = subprocess.run(argv, env=env, cwd=item["root"], text=True, capture_output=True, timeout=60)
+            result = json.loads(cp.stdout)
+            passed = cp.returncode == 0 and result == {"opened": [], "tested": len(targets), "workspace_control": True}
+            observations.append({"root": item["root"], "status": "pass" if passed else "fail", "result": result,
+                                 "stderr": cp.stderr, "argv": argv})
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            observations.append({"root": item["root"], "status": "fail", "error": str(exc)})
+    status = "pass" if observations and all(o["status"] == "pass" for o in observations) else "fail"
+    return status, observations
+
+
+def qualify(package, worker_binary=None):
+    """Measure native prerequisites, retaining failures without minting admission."""
+    package = Path(package).absolute()
+    receipt = verify(package)
+    ctx = host.Context(receipt["root"]["physical_root"])
+    worker = Path(worker_binary or shutil.which("codex") or "").resolve(strict=True)
+    worker_identity = host.file_identity(worker)
+    run = uuid.uuid4().hex
+    report_dir = ctx.store.path / "reports" / ("capability-" + run)
+    report_dir.mkdir(parents=True, mode=0o700)
+    checks = {"package_integrity": "pass", "native_policy": "not-run",
+              "native_loading": "not-run", "native_children": "not-run",
+              "native_reload": "not-run", "management_entry": "not-run",
+              "hook_transport": "not-run", "runtime_closure": "not-run"}
+    topology = host.topology(ctx)
+    # An exact baseline pointer rule is not proof against future nested pointer
+    # creation/rename. Keep those layouts unavailable, per P1's measured limit.
+    nested = any(Path(a["root"]) in Path(b["root"]).parents for a in topology for b in topology if a != b)
+    checks["topology"] = "unsupported" if nested else "pass"
+    targets = [i["path"] for i in receipt["files"]] + [str(package / "package.json")]
+    targets += [str(Path(item["root"]) / ".git") for item in topology if item["pointer_sha256"]]
+    # Read-only file modes alone would make write-open tests vacuous. Place
+    # owner-writable, invocation-owned canaries in the actual protected package
+    # directories, then remove only those exact canaries before final integrity.
+    env = dict(receipt["environment"])
+    checks["native_policy"], observations = policy_probes(package, receipt, report_dir, worker, topology, targets, run)
+    provider = receipt["definition"]["provider"]
+    binary = receipt["definition"]["executable"]["path"]
+    auth_args = [binary, "login", "status"] if provider == "codex" else [binary, "auth", "status"]
+    cp = subprocess.run(auth_args, env=env, cwd=ctx.root, text=True, capture_output=True, timeout=30)
+    authenticated = cp.returncode == 0
+    if provider == "claude":
+        try:
+            authenticated = authenticated and json.loads(cp.stdout).get("loggedIn") is True
+        except ValueError:
+            authenticated = False
+    checks["authentication"] = "available" if authenticated else "unavailable"
+    # Native sandbox utility evidence is explicitly narrower than a model-led
+    # workflow. Never sign a P2 qualification from these prerequisite checks.
+    report = {"schema": "forge-orchestrator-capability/1", "root": ctx.identity,
+              "package": host.file_identity(package / "package.json"), "worker": worker_identity,
+              "provider": receipt["definition"]["executable"], "checks": checks,
+              "topology_sha256": receipt["topology_sha256"], "observations": observations,
+              "authentication": {"exit_code": cp.returncode, "diagnostic": cp.stderr.strip()},
+              "supported_providers": [], "admission": "unsupported",
+              "limits": ["Native write-open utility evidence is not model policy evidence.",
+                         "Authenticated native load/children/reload and runtime/management/hook closure remain required.",
+                         "No credentials copied, no global discovery changed, no profile registered."]}
+    verify(package)
+    write(report_dir / "report.json", encoded(report))
+    return {"report": str(report_dir / "report.json"), "checks": checks, "admission": "unsupported"}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="action", required=True)
+    staging = sub.add_parser("stage")
+    staging.add_argument("--root", required=True)
+    staging.add_argument("--provider", required=True, choices=("claude", "codex"))
+    staging.add_argument("--binary")
+    staging.add_argument("--model", required=True)
+    check = sub.add_parser("verify")
+    check.add_argument("--package", required=True)
+    qualification = sub.add_parser("qualify")
+    qualification.add_argument("--package", required=True)
+    qualification.add_argument("--worker-binary")
+    args = parser.parse_args()
+    if args.action == "stage":
+        result = stage(host.Context(args.root), args.provider, args.binary, args.model)
+    elif args.action == "qualify":
+        result = qualify(args.package, args.worker_binary)
+    else:
+        receipt = verify(args.package)
+        result = {"integrity": "pass", "entry": receipt["entry"], "admission": "requires-native-qualification"}
+    print(encoded(result), end="")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (host.Refusal, host.broker.Refusal, OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(encoded({"error": getattr(exc, "code", "PACKAGE_REFUSED"), "detail": str(exc)}), file=sys.stderr)
+        sys.exit(2)

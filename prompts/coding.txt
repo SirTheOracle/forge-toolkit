@@ -12,7 +12,7 @@ You are executing the 'coding' stage of a forge pipeline.
 
 Slug: {slug}
 
-Follow the forge-coder skill at ~/.claude/skills/forge-coder/SKILL.md
+Follow the forge-coder skill at {worker_skill}
 Project config: .claude/forge-project.yml
 Implementation doc: .dev/proposals/{slug}/implementation.md
 

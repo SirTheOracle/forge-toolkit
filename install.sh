@@ -36,16 +36,19 @@ SKILL_NAMES=(
 # "<repo-relative-src>:<dst-under-$HOME/.claude>"
 OPERATOR_FILES=(
     "commands/forge.md:commands/forge.md"
+    "commands/forge-orchestrator.md:commands/forge-orchestrator.md"
+    "commands/forge-status.md:commands/forge-status.md"
     "agents/forge-orchestrator.md:agents/forge-orchestrator.md"
 )
 
 # Single bin manifest (was duplicated across install/uninstall/drift).
 BIN_SCRIPTS=(forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review
              forge-stall-install-regex forge-watch forge forge-cc-hook forge-broker
-             forge-git-request forge-sync-main forge-web forge-orchestrator-host)
+             forge-git-request forge-sync-main forge-web forge-orchestrator-host forge-orchestrator-package)
 # Legacy bin symlinks resolve libraries in this source tree. P3's copied
 # candidate package must copy this same declared inventory, not glob imports.
-LIB_FILES=(lib/forge_orchestrator.py)
+LIB_FILES=(lib/forge_orchestrator.py lib/forge_assets.py lib/forge_install.py
+           lib/forge_runtime.py lib/forge_python_entry.py lib/forge_sha256sum.py)
 MANAGED_POLICY_FILES=(codex-forge.config.toml codex-forge-runtime.json idle-prompts.yml)
 
 # Stage prompt templates. bin/forge-bridge renders $FORGE_PROMPTS_DIR/<stage>.txt for
@@ -87,6 +90,23 @@ SYNTHETIC_PROMPTS=(_preamble _operator_constraints)
 # synthetic _preamble, the way every other prompt already does.
 UNVENDORABLE_PROMPTS=(env-fix qa-live-retry)
 
+CODEX_SKILL_NAMES=(forge-orchestrator forge-coder fix-coder adversarial-proposal
+    adversarial-lite adversarial-implementation adversarial-qa adversarial-verify
+    docs-refresh proposal-reviewer)
+DIGEST_NAMES=(proposal proposal-lite review incorporate implementation impl-review
+    coding coding-fix qa qa-retry qa-fix verify fix-reproduce fix-investigate
+    fix-investigate-solo fix-plan fix-plan-solo fix-plan-review fix-plan-revise
+    fix-code fix-qa fix-qa-retry fix-scout)
+FORGE_DIGESTS_DIR="$FORGE_CONFIG_DIR/digests"
+owned() {
+    python3 "$SCRIPT_DIR/lib/forge_install.py" "$1" "$2" "$3" "$FORGE_CONFIG_DIR/install-ownership.json"
+}
+
+if [ "${1:-}" = "--stage-candidate" ]; then
+    shift
+    exec python3 "$SCRIPT_DIR/bin/forge-orchestrator-package" stage "$@"
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -105,6 +125,18 @@ err()   { printf "${RED}%s${NC}\n" "$1"; }
 if [ "${1:-}" = "--check-drift" ]; then
     info "Checking repo ↔ installed drift (read-only)..."
     DRIFT=0
+    python3 "$SCRIPT_DIR/lib/forge_assets.py" check || DRIFT=1
+
+    for name in "${DIGEST_NAMES[@]}"; do
+        if ! cmp -s "$SCRIPT_DIR/digests/$name.txt" "$FORGE_DIGESTS_DIR/$name.txt"; then
+            err "  digests/$name.txt — missing or DIFFERS"; DRIFT=1
+        fi
+    done
+    for dst in "$FORGE_DIGESTS_DIR"/*.txt; do
+        [ -e "$dst" ] || continue
+        name="$(basename "$dst" .txt)"
+        case " ${DIGEST_NAMES[*]} " in *" $name "*) ;; *) err "  undeclared digest: $name"; DRIFT=1 ;; esac
+    done
 
     for library in "${LIB_FILES[@]}"; do
         if [ ! -f "$SCRIPT_DIR/$library" ] || [ -L "$SCRIPT_DIR/$library" ]; then
@@ -144,7 +176,7 @@ if [ "${1:-}" = "--check-drift" ]; then
         if [ ! -d "$skill_dir" ]; then err "  skills/$skill_name — DECLARED in SKILL_NAMES but no source directory in the repo"; DRIFT=1
         elif [ ! -d "$dst" ]; then err "  skills/$skill_name — not installed (claude)"; DRIFT=1
         elif diff -rq --exclude=.DS_Store "$skill_dir" "$dst" >/dev/null 2>&1; then ok "  skills/$skill_name — identical (claude)"
-        else err "  skills/$skill_name — DIFFERS from installed (claude):"; diff -rq --exclude=.DS_Store "$skill_dir" "$dst" 2>&1 | sed 's/^/      /'; DRIFT=1; fi
+        else err "  skills/$skill_name — DIFFERS from installed (claude):"; diff -rq --exclude=.DS_Store "$skill_dir" "$dst" 2>&1 | sed 's/^/      /' || true; DRIFT=1; fi
     done
     # REVERSE: a skills/ directory absent from SKILL_NAMES still INSTALLS (that loop is a
     # glob) but never UNINSTALLS, because both uninstall loops walk SKILL_NAMES — a silent
@@ -157,12 +189,12 @@ if [ "${1:-}" = "--check-drift" ]; then
             *) err "  skills/$skill_name — present in the repo but NOT declared in SKILL_NAMES (it would install and never uninstall)"; DRIFT=1 ;;
         esac
     done
-    for skill_dir in "$SCRIPT_DIR"/codex-skills/*/; do
-        [ -d "$skill_dir" ] || continue
-        skill_name="$(basename "$skill_dir")"; dst="$CODEX_SKILLS_DIR/$skill_name"
-        if [ ! -d "$dst" ]; then err "  codex-skills/$skill_name — not installed (codex)"; DRIFT=1
+    for skill_name in "${CODEX_SKILL_NAMES[@]}"; do
+        skill_dir="$SCRIPT_DIR/codex-skills/$skill_name"; dst="$CODEX_SKILLS_DIR/$skill_name"
+        if [ ! -d "$skill_dir" ]; then err "  codex-skills/$skill_name — DECLARED but absent from source"; DRIFT=1
+        elif [ ! -d "$dst" ]; then err "  codex-skills/$skill_name — not installed (codex)"; DRIFT=1
         elif diff -rq --exclude=.DS_Store "$skill_dir" "$dst" >/dev/null 2>&1; then ok "  codex-skills/$skill_name — identical (codex)"
-        else err "  codex-skills/$skill_name — DIFFERS from installed (codex):"; diff -rq --exclude=.DS_Store "$skill_dir" "$dst" 2>&1 | sed 's/^/      /'; DRIFT=1; fi
+        else err "  codex-skills/$skill_name — DIFFERS from installed (codex):"; diff -rq --exclude=.DS_Store "$skill_dir" "$dst" 2>&1 | sed 's/^/      /' || true; DRIFT=1; fi
     done
 
     for pair in "${OPERATOR_FILES[@]}"; do
@@ -226,7 +258,9 @@ if [ "${1:-}" = "--check-drift" ]; then
             [ -f "$dst" ] || continue
             prompt_name="$(basename "$dst" .txt)"
             case " ${PROMPT_NAMES[*]} " in *" $prompt_name "*) continue ;; esac
-            case " ${SYNTHETIC_PROMPTS[*]} " in *" $prompt_name "*) continue ;; esac
+            case " ${SYNTHETIC_PROMPTS[*]} " in
+                *" $prompt_name "*) err "  prompts/$prompt_name.txt — shadows a synthetic include"; DRIFT=1; continue ;;
+            esac
             # Silently, not as a warning: reporting these two on every run forever is the
             # exact noise the exclusion exists to remove. The reason lives at the
             # UNVENDORABLE_PROMPTS declaration, where a reader who wonders why they are
@@ -238,88 +272,49 @@ if [ "${1:-}" = "--check-drift" ]; then
 
     echo ""
     if [ "$DRIFT" -eq 0 ]; then ok "No drift — repo and installed state converged."; exit 0
-    else err "Drift found (see above). Re-run ./install.sh to converge, or reconcile by hand."; exit 1; fi
+    else err "Drift found (see above). Existing assets are preserved; reconcile explicitly or stage a distinct candidate."; exit 1; fi
 fi
 
 # ── Uninstall ──────────────────────────────────────────────
 
 if [ "${1:-}" = "--uninstall" ]; then
+    # A legacy native session can reread these paths after compaction. Refuse
+    # real-home uninstall while native clients are live; isolated HOME fixtures
+    # own no running user clients and remain independently uninstallable.
+    python3 - "$HOME" <<'PY'
+import os, pathlib, pwd, subprocess, sys
+if pathlib.Path(sys.argv[1]).resolve() == pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir).resolve():
+    result = subprocess.run(['/usr/bin/pgrep', '-x', 'claude|codex'], capture_output=True)
+    if result.returncode == 0:
+        raise SystemExit('UNINSTALL_REFUSED: native Claude/Codex clients are live; leave legacy discovery intact until they exit.')
+    if result.returncode != 1:
+        raise SystemExit('UNINSTALL_REFUSED: could not establish that native clients are stopped.')
+PY
     info "Uninstalling forge toolkit..."
 
-    # Unload the forge-watch launchd agent before removing its symlink, else it
-    # keeps firing every 30s against a now-dangling path.
-    for agent in com.forge.watch com.forge.gc; do
-        AGENT_PLIST="$HOME/Library/LaunchAgents/$agent.plist"
-        if [ -f "$AGENT_PLIST" ]; then
-            launchctl unload "$AGENT_PLIST" 2>/dev/null || true
-            rm -f "$AGENT_PLIST"
-            ok "  Unloaded and removed $agent launchd agent"
-        fi
-    done
-
-    # Remove bin symlinks
+    # No ambient launchd or candidate discovery assets are owned by this installer.
     for script in "${BIN_SCRIPTS[@]}"; do
-        if [ -L "$BIN_DIR/$script" ]; then
-            rm "$BIN_DIR/$script"
-            ok "  Removed ~/bin/$script"
-        fi
+        owned remove "$SCRIPT_DIR/bin/$script" "$BIN_DIR/$script"
     done
-
-    # Remove Claude skill directories
     for skill in "${SKILL_NAMES[@]}"; do
-        if [ -d "$CLAUDE_SKILLS_DIR/$skill" ]; then
-            rm -rf "$CLAUDE_SKILLS_DIR/$skill"
-            ok "  Removed ~/.claude/skills/$skill"
-        fi
+        owned remove "$SCRIPT_DIR/skills/$skill" "$CLAUDE_SKILLS_DIR/$skill"
     done
-
-
-    # Remove only toolkit-owned policy copies. Preserve an operator-modified
-    # runtime classifier instead of treating the config directory as disposable.
-    if [ -f "$FORGE_CONFIG_DIR/idle-prompts.yml" ] \
-       && [ -f "$MANAGED_POLICY_DIR/idle-prompts.yml" ] \
-       && cmp -s "$FORGE_CONFIG_DIR/idle-prompts.yml" "$MANAGED_POLICY_DIR/idle-prompts.yml"; then
-        rm -f "$FORGE_CONFIG_DIR/idle-prompts.yml"
-        ok "  Removed managed runtime idle-prompts.yml"
-    fi
-    for managed in "${MANAGED_POLICY_FILES[@]}"; do
-        [ -f "$MANAGED_POLICY_DIR/$managed" ] || continue
-        rm -f "$MANAGED_POLICY_DIR/$managed"
-        ok "  Removed managed/codex-v1/$managed"
+    for skill in "${CODEX_SKILL_NAMES[@]}"; do
+        owned remove "$SCRIPT_DIR/codex-skills/$skill" "$CODEX_SKILLS_DIR/$skill"
     done
-    rmdir "$MANAGED_POLICY_DIR" 2>/dev/null || true
-    rmdir "$FORGE_CONFIG_DIR/managed" 2>/dev/null || true
-
-    # Remove only prompts still byte-identical to their repo source. An operator-modified
-    # prompt is preserved (same rule as the runtime classifier above), and the two
-    # quarantined files are not ours to delete — they are absent from PROMPT_NAMES, so
-    # this loop cannot see them. Installing without uninstalling is the one-way door this
-    # file's own SKILL_NAMES comments call a defect; don't reopen it here.
-    for prompt_name in "${PROMPT_NAMES[@]}"; do
-        src="$SCRIPT_DIR/prompts/$prompt_name.txt"
-        dst="$FORGE_PROMPTS_DIR/$prompt_name.txt"
-        if [ -f "$dst" ] && [ -f "$src" ] && cmp -s "$src" "$dst"; then
-            rm -f "$dst"
-            ok "  Removed prompts/$prompt_name.txt"
-        fi
-    done
-    rmdir "$FORGE_PROMPTS_DIR" 2>/dev/null || true
-
-    # Remove operator-file symlinks (never a regular file — those are unmanaged)
     for pair in "${OPERATOR_FILES[@]}"; do
-        dst="$HOME/.claude/${pair##*:}"
-        if [ -L "$dst" ]; then
-            rm "$dst"
-            ok "  Removed $dst"
-        fi
+        owned remove "$SCRIPT_DIR/${pair%%:*}" "$HOME/.claude/${pair##*:}"
     done
-
-    # Remove Codex skill directories
-    for skill in "${SKILL_NAMES[@]}"; do
-        if [ -d "$CODEX_SKILLS_DIR/$skill" ]; then
-            rm -rf "$CODEX_SKILLS_DIR/$skill"
-            ok "  Removed ~/.codex/skills/$skill"
-        fi
+    for managed in "${MANAGED_POLICY_FILES[@]}"; do
+        owned remove "$SCRIPT_DIR/config/$managed" "$MANAGED_POLICY_DIR/$managed"
+    done
+    owned remove "$SCRIPT_DIR/config/idle-prompts.yml" "$FORGE_CONFIG_DIR/idle-prompts.yml"
+    owned remove "$SCRIPT_DIR/config/orchestrator-assets.json" "$FORGE_CONFIG_DIR/orchestrator-assets.json"
+    for name in "${PROMPT_NAMES[@]}"; do
+        owned remove "$SCRIPT_DIR/prompts/$name.txt" "$FORGE_PROMPTS_DIR/$name.txt"
+    done
+    for name in "${DIGEST_NAMES[@]}"; do
+        owned remove "$SCRIPT_DIR/digests/$name.txt" "$FORGE_DIGESTS_DIR/$name.txt"
     done
 
     warn ""
@@ -343,204 +338,34 @@ for library in "${LIB_FILES[@]}"; do
 done
 echo ""
 
-# ── Step 1: Bin scripts ───────────────────────────────────
-
-info "Step 1: Symlinking bin scripts to ~/bin/"
-
-mkdir -p "$BIN_DIR"
-
+# Validate the whole declared closure before any installation mutation.
+python3 "$SCRIPT_DIR/lib/forge_assets.py" check
 for script in "${BIN_SCRIPTS[@]}"; do
-    src="$SCRIPT_DIR/bin/$script"
-    dst="$BIN_DIR/$script"
-
-    if [ -L "$dst" ]; then
-        existing="$(readlink "$dst")"
-        if [ "$existing" = "$src" ]; then
-            ok "  $script — already linked"
-            continue
-        else
-            warn "  $script — updating symlink (was: $existing)"
-            rm "$dst"
-        fi
-    elif [ -f "$dst" ]; then
-        warn "  $script — ~/bin/$script exists as a regular file, skipping"
-        warn "    Remove it manually if you want forge-toolkit to manage it"
-        continue
-    fi
-
-    ln -s "$src" "$dst"
-    chmod +x "$src"
-    ok "  $script — linked"
+    owned link "$SCRIPT_DIR/bin/$script" "$BIN_DIR/$script"
 done
-
-# Verify ~/bin is in PATH
-if ! echo "$PATH" | tr ':' '\n' | grep -q "^$BIN_DIR$"; then
-    warn ""
-    warn "  ~/bin is not in your PATH. Add this to your shell profile:"
-    warn "    export PATH=\"\$HOME/bin:\$PATH\""
-fi
-
-echo ""
-
-# ── Step 2: Claude Code Skills ───────────────────────────
-
-info "Step 2: Copying Claude Code skills to ~/.claude/skills/"
-
-mkdir -p "$CLAUDE_SKILLS_DIR"
-
-for skill_dir in "$SCRIPT_DIR"/skills/*/; do
-    skill_name="$(basename "$skill_dir")"
-    dst="$CLAUDE_SKILLS_DIR/$skill_name"
-
-    if [ -d "$dst" ]; then
-        rm -rf "$dst"
-        cp -R "$skill_dir" "$dst"
-        ok "  $skill_name — updated"
-    else
-        cp -R "$skill_dir" "$dst"
-        ok "  $skill_name — installed"
-    fi
+for skill in "${SKILL_NAMES[@]}"; do
+    [ "$skill" = proposal-reviewer ] && continue
+    owned copy "$SCRIPT_DIR/skills/$skill" "$CLAUDE_SKILLS_DIR/$skill"
 done
-
-echo ""
-
-# ── Step 3: Codex Skills ─────────────────────────────────
-
-info "Step 3: Copying Codex skills to ~/.codex/skills/"
-
 if [ -d "$HOME/.codex" ]; then
-    mkdir -p "$CODEX_SKILLS_DIR"
-
-    for skill_dir in "$SCRIPT_DIR"/codex-skills/*/; do
-        [ -d "$skill_dir" ] || continue
-        skill_name="$(basename "$skill_dir")"
-        dst="$CODEX_SKILLS_DIR/$skill_name"
-
-        if [ -d "$dst" ]; then
-            rm -rf "$dst"
-            cp -R "$skill_dir" "$dst"
-            ok "  $skill_name — updated"
-        else
-            cp -R "$skill_dir" "$dst"
-            ok "  $skill_name — installed"
-        fi
+    for skill in "${CODEX_SKILL_NAMES[@]}"; do
+        owned copy "$SCRIPT_DIR/codex-skills/$skill" "$CODEX_SKILLS_DIR/$skill"
     done
-else
-    warn "  ~/.codex/ not found — skipping Codex skills"
-    warn "  Install Codex CLI first, then re-run ./install.sh"
 fi
-
-echo ""
-
-# ── Step 3.5: Operator files (command + agent definition) ─
-# ~/.claude/commands/forge.md and ~/.claude/agents/forge-orchestrator.md were
-# long-standing UNTRACKED operator state; the toolkit now owns them. Symlink
-# with the same regular-file guard the bins use.
-
-info "Step 3.5: Symlinking operator files into ~/.claude/"
-
 for pair in "${OPERATOR_FILES[@]}"; do
-    src="$SCRIPT_DIR/${pair%%:*}"
-    dst="$HOME/.claude/${pair##*:}"
-    mkdir -p "$(dirname "$dst")"
-
-    if [ -L "$dst" ]; then
-        existing="$(readlink "$dst")"
-        if [ "$existing" = "$src" ]; then
-            ok "  ${pair##*:} — already linked"
-            continue
-        else
-            warn "  ${pair##*:} — updating symlink (was: $existing)"
-            rm "$dst"
-        fi
-    elif [ -f "$dst" ]; then
-        if cmp -s "$src" "$dst"; then
-            rm "$dst"   # byte-identical regular file → safe to converge to a symlink
-        else
-            warn "  ${pair##*:} — exists as a DIFFERENT regular file, skipping"
-            warn "    Diff/merge it into $src, then re-run"
-            continue
-        fi
-    fi
-
-    ln -s "$src" "$dst"
-    ok "  ${pair##*:} — linked"
+    owned link "$SCRIPT_DIR/${pair%%:*}" "$HOME/.claude/${pair##*:}"
 done
-
-echo ""
-
-# ── Step 3.75: Managed Codex policy and classifier sources ────────────────
-# These files contain policy only, never credentials. The versioned managed
-# directory is refreshed atomically. The runtime classifier follows upgrades
-# only while it still matches the previously managed copy; local operator
-# changes are preserved and surfaced by --check-drift.
-
-info "Step 3.75: Installing managed Codex policy sources"
-
-runtime_classifier="$FORGE_CONFIG_DIR/idle-prompts.yml"
-old_classifier="$MANAGED_POLICY_DIR/idle-prompts.yml"
-refresh_runtime_classifier=0
-if [ ! -e "$runtime_classifier" ]; then
-    refresh_runtime_classifier=1
-elif [ -f "$old_classifier" ] && cmp -s "$runtime_classifier" "$old_classifier"; then
-    refresh_runtime_classifier=1
-fi
-
-mkdir -p "$MANAGED_POLICY_DIR"
-chmod 700 "$FORGE_CONFIG_DIR/managed" "$MANAGED_POLICY_DIR" 2>/dev/null || true
 for managed in "${MANAGED_POLICY_FILES[@]}"; do
-    src="$SCRIPT_DIR/config/$managed"
-    tmp="$(mktemp "$MANAGED_POLICY_DIR/.${managed}.XXXXXX")"
-    cp "$src" "$tmp"
-    chmod 600 "$tmp"
-    mv "$tmp" "$MANAGED_POLICY_DIR/$managed"
-    ok "  managed/codex-v1/$managed — installed"
+    owned copy "$SCRIPT_DIR/config/$managed" "$MANAGED_POLICY_DIR/$managed"
 done
-if [ "$refresh_runtime_classifier" -eq 1 ]; then
-    tmp="$(mktemp "$FORGE_CONFIG_DIR/.idle-prompts.yml.XXXXXX")"
-    cp "$MANAGED_POLICY_DIR/idle-prompts.yml" "$tmp"
-    chmod 600 "$tmp"
-    mv "$tmp" "$runtime_classifier"
-    ok "  idle-prompts.yml — runtime classifier installed"
-else
-    warn "  idle-prompts.yml — operator-modified runtime preserved (check drift before rollout)"
-fi
-
-echo ""
-
-# ── Step 3.8: Stage prompt templates ──────────────────────
-# bin/forge-bridge renders $FORGE_PROMPTS_DIR/<stage>.txt on every dispatch. Convergence
-# follows the runtime-classifier rule, not the managed-policy one: a prompt the operator
-# has edited is PRESERVED, never silently overwritten, and --check-drift reports the
-# divergence so the reconciliation is a decision rather than a surprise.
-
-info "Step 3.8: Installing stage prompt templates"
-
-mkdir -p "$FORGE_PROMPTS_DIR"
-for prompt_name in "${PROMPT_NAMES[@]}"; do
-    src="$SCRIPT_DIR/prompts/$prompt_name.txt"
-    dst="$FORGE_PROMPTS_DIR/$prompt_name.txt"
-
-    if [ ! -f "$src" ]; then
-        warn "  prompts/$prompt_name.txt — DECLARED in PROMPT_NAMES but missing from the repo, skipping"
-        continue
-    fi
-    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
-        ok "  prompts/$prompt_name.txt — identical"
-        continue
-    fi
-    if [ -e "$dst" ]; then
-        warn "  prompts/$prompt_name.txt — operator-modified, preserving (reconcile it into $src, then re-run)"
-        continue
-    fi
-    tmp="$(mktemp "$FORGE_PROMPTS_DIR/.$prompt_name.txt.XXXXXX")"
-    cp "$src" "$tmp"
-    chmod 644 "$tmp"
-    mv "$tmp" "$dst"
-    ok "  prompts/$prompt_name.txt — installed"
+owned copy "$SCRIPT_DIR/config/idle-prompts.yml" "$FORGE_CONFIG_DIR/idle-prompts.yml"
+owned copy "$SCRIPT_DIR/config/orchestrator-assets.json" "$FORGE_CONFIG_DIR/orchestrator-assets.json"
+for name in "${PROMPT_NAMES[@]}"; do
+    owned copy "$SCRIPT_DIR/prompts/$name.txt" "$FORGE_PROMPTS_DIR/$name.txt"
 done
-
-echo ""
+for name in "${DIGEST_NAMES[@]}"; do
+    owned copy "$SCRIPT_DIR/digests/$name.txt" "$FORGE_DIGESTS_DIR/$name.txt"
+done
 
 # Worker context-hygiene reset-capability seed (worker-context-hygiene). Copy the
 # fail-closed seed to the runtime path only if the operator has none; never clobber.

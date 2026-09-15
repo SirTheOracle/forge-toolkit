@@ -12,7 +12,9 @@ You are executing the 'fix-qa-retry' stage of a forge fix-pipeline.
 
 Slug: {slug}
 
-Follow the adversarial-fix-qa skill at ~/.claude/skills/adversarial-fix-qa/SKILL.md — RETRY MODE.
+Follow the adversarial-fix-qa skill at {worker_skill} — RETRY MODE.
+
+Use --input-dir .dev/proposals/{slug} --output-dir .dev/qa/{slug}.
 
 This stage RE-VERIFIES the fix after a qa-fix loop landed additional commits to address one or more findings from the first fix-qa run. The prior fix-qa report is at `.dev/qa/{slug}/fix-issues.md` and the qa-fix work is documented at `.dev/qa/{slug}/qa-fix-report.md`. New commits since the original fix-qa are visible via `git log --oneline` against origin/main.
 
@@ -36,12 +38,12 @@ Also check the live code state:
 - git log --oneline origin/main..HEAD
 
 Outputs (overwrites the prior fix-qa artifacts):
-- .dev/qa/{slug}/fix-confirmer-report.md
-- .dev/qa/{slug}/regression-hunter-report.md
-- .dev/qa/{slug}/fix-qa-synthesis.md
-- .dev/qa/{slug}/fix-qa-review-for-A.md
-- .dev/qa/{slug}/fix-qa-review-for-B.md
-- .dev/qa/{slug}/fix-qa-reconciliation-notes.md
+- .dev/qa/{slug}/qa-A.md
+- .dev/qa/{slug}/qa-B.md
+- .dev/qa/{slug}/qa-C.md
+- .dev/qa/{slug}/review-for-A.md
+- .dev/qa/{slug}/review-for-B.md
+- .dev/qa/{slug}/reconciliation-notes.md
 - .dev/qa/{slug}/fix-issues.md (canonical issue list, refreshed)
 - .dev/qa/{slug}/fix-manifest.yaml (refreshed)
 

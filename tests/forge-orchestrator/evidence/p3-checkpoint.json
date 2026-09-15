@@ -1,0 +1,55 @@
+{
+  "schema": "forge-p3-checkpoint-evidence/1",
+  "status": "incomplete",
+  "admission": "unsupported",
+  "supported_providers": [],
+  "report": {
+    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-5a5f4700ca5c4c5b864dae9785f1dda9/report.json",
+    "sha256": "66a5b7a5e69cdb7d874ad671cb956e03a44821d093847f0d091bed627b4fc305"
+  },
+  "package": {
+    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/2b0340461a675106ae6c41f1242d297f081a5b0b6bbefdd79f14c7734d93c44b/package/package.json",
+    "sha256": "ad00f9275b9b2ed94b7a6c43e13aaa5083d41012ba6ad8cf0af237c1f042300d"
+  },
+  "worker": {
+    "path": "/opt/homebrew/Caskroom/codex/0.153.4/bin/codex",
+    "sha256": "b973d440acac501fd2594a43e7ca9ce41e0a65b9dfb28d0d7a7837c99e1261e3"
+  },
+  "checks": {
+    "authentication": "unavailable",
+    "hook_transport": "not-run",
+    "management_entry": "not-run",
+    "native_children": "not-run",
+    "native_loading": "not-run",
+    "native_policy": "pass",
+    "native_reload": "not-run",
+    "package_integrity": "pass",
+    "runtime_closure": "not-run",
+    "topology": "pass"
+  },
+  "observations": [
+    {
+      "root": ".dev/forge-p3/native-linked",
+      "status": "pass",
+      "result": {
+        "opened": [],
+        "tested": 2721,
+        "workspace_control": true
+      }
+    },
+    {
+      "root": ".dev/forge-p3/native-root",
+      "status": "pass",
+      "result": {
+        "opened": [],
+        "tested": 2721,
+        "workspace_control": true
+      }
+    }
+  ],
+  "limits": [
+    "Native sandbox utility evidence is not authenticated model policy evidence.",
+    "Native loading, children, reload, management, hook and complete runtime qualification remain required.",
+    "The current qualifier does not produce a P2 candidate/conformance pair."
+  ]
+}

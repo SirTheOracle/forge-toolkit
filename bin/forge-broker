@@ -62,7 +62,7 @@ def process_executable(pid: int) -> Path:
 
 
 def runtime_identity() -> dict:
-    """Observed startup inputs; full protected dependency qualification is P3."""
+    """Observed startup inputs, including a copied candidate's full inventory."""
     interpreter = process_executable(os.getpid())
     paths = {Path(__file__).resolve(), Path(sys.executable).resolve(), interpreter}
     for relative in ("bin/forge-orchestrator-host", "lib/forge_orchestrator.py"):
@@ -73,13 +73,23 @@ def runtime_identity() -> dict:
         filename = getattr(module, "__file__", None)
         if filename and Path(filename).is_file():
             paths.add(Path(filename).resolve())
+    package = Path(__file__).resolve().parent.parent / "package.json"
+    if package.exists():
+        receipt = load_json(package)
+        if receipt.get("schema") != "forge-orchestrator-package/1":
+            raise Refusal("BROKER_RUNTIME_INVALID", "invalid copied package receipt")
+        paths.add(package)
+        paths.update(Path(item["path"]) for item in receipt["files"])
     files = [{"path": str(path), "sha256": sha(path.read_bytes())}
              for path in sorted(paths)]
     payload = {"schema": "forge-broker-runtime/1", "protocol": CONTROL_PROTOCOL,
                "entry": str(Path(__file__).resolve()),
                "interpreter": str(interpreter), "files": files,
                "process": {"pid": os.getpid(), "started": process_stamp(os.getpid())}}
-    return dict(payload, sha256=sha(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()))
+    identity = dict(payload, sha256=sha(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()))
+    if package.exists():
+        verify_runtime_files(identity)
+    return identity
 
 
 def verify_runtime_files(identity: dict) -> None:
@@ -116,6 +126,25 @@ def verify_runtime_files(identity: dict) -> None:
             if isinstance(exc, Refusal):
                 raise
             raise Refusal("BROKER_RUNTIME_CHANGED", str(path)) from exc
+    package = Path(identity["entry"]).parent.parent / "package.json"
+    if str(package) in paths:
+        control = package.parent / "bin/forge-orchestrator-package"
+        if str(control) not in paths:
+            raise Refusal("BROKER_RUNTIME_INVALID", "package verifier missing from startup inventory")
+        # Execute only after every startup hash has passed, including the verifier.
+        spec = importlib.util.spec_from_loader("forge_broker_package", loader=None, origin=str(control))
+        module = importlib.util.module_from_spec(spec)
+        module.__file__ = str(control)
+        try:
+            receipt = json.loads(package.read_bytes())
+            expected = {item["path"]: item["sha256"] for item in receipt["files"]}
+            observed = {item["path"]: item["sha256"] for item in identity["files"]}
+            if any(observed.get(path) != digest for path, digest in expected.items()):
+                raise ValueError("package dependency changed or missing from startup inventory")
+            exec(compile(control.read_bytes(), str(control), "exec"), module.__dict__)
+            receipt = module.verify(package.parent)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+            raise Refusal("BROKER_RUNTIME_CHANGED", str(exc)) from exc
 
 
 def runtime_proof(token: str, nonce: bytes, identity: dict) -> str:

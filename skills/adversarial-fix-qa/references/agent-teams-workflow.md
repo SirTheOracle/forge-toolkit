@@ -306,7 +306,7 @@ SendMessage(
     Critique from A: {a_critique_body}
     Critique from B: {b_critique_body}
     Your prior qa-C.md: {output_dir}/qa-C.md
-    fix-review.md (if present): {output_dir}/fix-review.md
+    fix-review.md (if present): {input_dir}/fix-review.md
 
     # Required outputs (all three)
     {output_dir}/fix-issues.md

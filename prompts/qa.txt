@@ -10,7 +10,7 @@ You are executing the 'qa' stage of a forge pipeline.
 
 Slug: {slug}
 
-Follow the adversarial-qa skill at ~/.codex/skills/adversarial-qa/SKILL.md
+Follow the adversarial-qa skill at {worker_skill}
 
 Inputs:
 - .dev/proposals/{slug}/implementation.md (the changes under test)

@@ -12,7 +12,7 @@ You are executing the 'fix-code' stage of a forge fix-pipeline.
 
 Slug: {slug}
 
-Follow the fix-coder skill at ~/.claude/skills/fix-coder/SKILL.md
+Follow the fix-coder skill at {worker_skill}
 
 This is the MECHANICAL stage. You apply a vetted fix plan to the codebase exactly as written. You do NOT redesign, you do NOT re-plan, you do NOT extend scope.
 

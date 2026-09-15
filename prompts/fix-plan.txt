@@ -12,7 +12,7 @@ You are executing the 'fix-plan' stage of a forge fix-pipeline.
 
 Slug: {slug}
 
-Follow the adversarial-fix-plan skill at ~/.claude/skills/adversarial-fix-plan/SKILL.md
+Follow the adversarial-fix-plan skill at {worker_skill}
 
 The skill spawns 3 persistent teammates (Planner A surgical, Planner B robust, Synthesizer C) across 4 rounds:
   Round 1 — A proposes a SURGICAL fix (minimum change to stop the diagnosed cause); B proposes a ROBUST fix (cause fix + defenses against recurrence + adjacent fragility). A and B work independently with zero knowledge of each other.

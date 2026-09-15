@@ -1,12 +1,21 @@
 <<<INCLUDE _preamble>>>
 
-<<<INCLUDE _ask_escalation>>>
+<<<INCLUDE _operator_constraints>>>
+
+<<<INCLUDE _constraint_check>>>
+
+Include this rendered constraint ledger and frame challenge in BOTH isolated
+Round 1 proposer inputs. Before proposing, read constraints.yml beside the
+problem statement. A restatement that narrows, widens or reframes a verbatim
+operator ruling is a finding. A principle unsupported by its verbatim or a
+binds field merely repeating asked_about is a finding. Return REJECT: <clause>
+on the problem statement itself when appropriate; its author is under review.
 
 You are executing the 'proposal' stage of a forge pipeline.
 
 Slug: {slug}
 
-Follow the adversarial-proposal skill at ~/.claude/skills/adversarial-proposal/SKILL.md
+Follow the adversarial-proposal skill at {worker_skill}
 
 The skill spawns 3 persistent teammates (Proposer A, Proposer B, Synthesizer C) across 4 rounds:
   Round 1 — A and B investigate the problem independently with zero knowledge of each other
@@ -38,9 +47,8 @@ BLOCKING_ITEMS: N
 NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
 
 When complete:
-  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \
-    --message "FORGE_DONE: proposal — see .dev/proposals/{slug}/final-plan.md"
+  Return the final artifact path to the host. The host closes its existing
+  local pending entry with forge-bridge log-response --to claude --stage proposal.
 
 If blocked (genuine ambiguity not resolved by problem-statement.md):
-  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet \
-    --message "{specific question}"
+  Return the specific blocking question to the host; do not forge a worker callback.

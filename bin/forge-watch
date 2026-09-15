@@ -52,7 +52,7 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 # Resolve the real path of this script so the plist points at the installed
 # location (works whether ~/bin/forge-watch is a symlink or a copy).
-SELF="$( cd "$(dirname "$0")" >/dev/null 2>&1 && pwd )/$(basename "$0")"
+SELF="${FORGE_WATCH_BIN:-$( cd "$(dirname "$0")" >/dev/null 2>&1 && pwd )/$(basename "$0")}"
 
 mkdir -p "$CACHE_DIR" "$CONFIG_DIR" 2>/dev/null || true
 

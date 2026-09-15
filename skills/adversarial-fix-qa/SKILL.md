@@ -75,7 +75,12 @@ Takes effect on new Claude Code sessions. If Teams is not available, fall back t
 
 Required:
 
-- `--output-dir` — path to the fix directory. fix-coder-report.md, fix-diffs.md, fix-plan.md, diagnosis.md, repro.md (if present) all live here. fix-issues.md and fix-manifest.yaml will be written here.
+- `--input-dir` — upstream fix directory, normally `.dev/proposals/{slug}`.
+  Read fix-coder-report.md, fix-diffs.md, fix-plan.md, diagnosis.md and optional
+  repro.md here. For legacy standalone invocations only, default to output-dir.
+- `--output-dir` — QA results directory, normally `.dev/qa/{slug}`. Write
+  fix-issues.md, fix-manifest.yaml and all QA teammate/reconciliation artifacts
+  here. Never relocate or overwrite upstream inputs to make them visible.
 - `--env prod | dev` — affects QA strategy. Dev allows live execution; prod is test-against-local-fix only.
 
 Optional:
@@ -126,7 +131,7 @@ You (the lead) orchestrate everything. The exact tool-call sequence is in `refer
 
 **0A. Empty-args short-circuit.** If `--output-dir` is missing, `--env` is missing, or `fix-coder-report.md` does not exist, stop:
 
-> "This skill requires --output-dir, --env (one of `prod` | `dev`), and an existing fix-coder-report.md in that directory. Provide --output-dir, --env, and ensure fix-coder has run."
+> "This skill requires --output-dir, --env (one of `prod` | `dev`), and fix-coder-report.md in --input-dir (defaults to output-dir for legacy standalone calls). Ensure fix-coder has run."
 
 Write the early-stop pair (fix-issues.md + fix-manifest.yaml — see "Early-stop artifact pair" below).
 
@@ -175,7 +180,7 @@ stop_reason: "{the reason from above}"
 
 The orchestrator may parse the manifest unconditionally; both artifacts are required even on Step 0 stops.
 
-**0C. Read inputs from `{output_dir}`:**
+**0C. Read upstream inputs from `{input_dir}`; write QA outputs to `{output_dir}`:**
 
 - `fix-coder-report.md` — required (status + commit + validation claims)
 - `fix-diffs.md` — required (the concrete changes for B's dependent analysis)
@@ -388,7 +393,7 @@ ISOLATION RULE — strict.
 Allowed reads:
 - Files listed under "Source files" in this prompt
 - diagnosis.md, problem-statement.md, repro.md, fix-plan.md, fix-coder-report.md,
-  fix-diffs.md in the current output directory
+  fix-diffs.md in the upstream input directory
 - Files listed under "Original pipeline context" (if provided) — READ-ONLY
 
 Forbidden reads, in the current output directory:
@@ -612,7 +617,7 @@ Arguments: $ARGUMENTS
 ## Output Directory
 
 ```
-{output_dir}/
+{input_dir}/
 ├── problem-statement.md         ← Input
 ├── repro.md                     ← Input (if present)
 ├── diagnosis.md                 ← Input
@@ -620,6 +625,8 @@ Arguments: $ARGUMENTS
 ├── fix-review.md                ← Input (if present)
 ├── fix-diffs.md                 ← Input
 ├── fix-coder-report.md          ← Input
+
+{output_dir}/
 ├── qa-A.md                      ← Round 1: Fix Confirmation
 ├── qa-B.md                      ← Round 1: Regression Hunting
 ├── qa-C.md                      ← Round 2: Synthesis

@@ -22,7 +22,7 @@ against the existing code on the current branch. The prior `coding` stage's
 report is at `.dev/proposals/{slug}/coder-report.md` if you need to see what
 was already committed.
 
-Follow the forge-coder skill at ~/.claude/skills/forge-coder/SKILL.md for the
+Follow the forge-coder skill at {worker_skill} for the
 fix-application discipline (commit groups, validation gates, Definition of
 Done). The forge-coder phases adapt as follows:
   - "Implementation doc" → read issues.md + final-plan.md + coder-report.md

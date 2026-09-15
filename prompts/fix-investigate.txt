@@ -12,7 +12,7 @@ You are executing the 'fix-investigate' stage of a forge fix-pipeline.
 
 Slug: {slug}
 
-Follow the adversarial-investigate skill at ~/.claude/skills/adversarial-investigate/SKILL.md
+Follow the adversarial-investigate skill at {worker_skill}
 
 The skill spawns 3 persistent teammates (Investigator A forward-tracer, Investigator B backward-tracer, Synthesizer C) across 4 rounds:
   Round 1 — A traces FORWARD from the bug trigger to the failure point; B traces BACKWARD from the failure point to the trigger. A and B work independently with zero knowledge of each other. Both have access to the same evidence (repro.md + problem-statement.md + codebase).

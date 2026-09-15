@@ -131,7 +131,7 @@ def prepare_management(ctx):
         if relative == "bin/forge":
             interpreter = str(Path(sys.executable).resolve())
             require(" " not in interpreter and "\n" not in interpreter, "INTERPRETER_UNSUPPORTED", interpreter)
-            data = ("#!" + interpreter + " -I\n").encode() + data.split(b"\n", 1)[1]
+            data = ("#!" + interpreter + " -ISB\n").encode() + data.split(b"\n", 1)[1]
         directory = records.directory(target.parent, create=True)
         try:
             fd = os.open(target.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500, dir_fd=directory)
@@ -223,6 +223,10 @@ def validate_candidate(ctx, candidate, *, qualification=True):
         records.validate_evidence(provider["evidence"])
     require(candidate["project_config_sha256"] is None or records.sha256(candidate["project_config_sha256"]),
             "INVALID_PROFILE", "project config hash required")
+    package = candidate_package(candidate)
+    if package:
+        for item in package["files"]:
+            require(inventory.get(Path(item["path"])) == item["sha256"], "DEPENDENCY_MISSING", item["path"])
     if qualification:
         report_item = candidate["conformance"]
         verify_file(report_item)
@@ -244,7 +248,23 @@ def validate_candidate(ctx, candidate, *, qualification=True):
     return candidate
 
 
+def candidate_package(candidate):
+    item = candidate.get("inputs", {}).get("package") if candidate else None
+    if not item or Path(item["path"]).name != "package.json":
+        return None
+    verify_file(item)
+    package = Path(item["path"]).parent
+    control = module("forge_package", package / "bin/forge-orchestrator-package")
+    return control.verify(package)
+
+
 def clean_env(ctx, candidate=None):
+    package = candidate_package(candidate)
+    if package:
+        env = dict(package["environment"])
+        if os.environ.get("TMUX"):
+            env["TMUX"] = os.environ["TMUX"]
+        return env
     env = {key: os.environ[key] for key in ("HOME", "USER", "LOGNAME", "TERM") if key in os.environ}
     env.update(PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL="C", LANG="C")
     if candidate:
@@ -253,6 +273,16 @@ def clean_env(ctx, candidate=None):
         env["TMUX"] = os.environ["TMUX"]
     env["FORGE_WATCH_TRIGGER"] = "0"
     return env
+
+
+def host_argv(candidate, *args):
+    package = candidate_package(candidate)
+    if package:
+        root = Path(candidate["inputs"]["package"]["path"]).parent
+        metadata = read_json(root / "runtime/runtime.json")
+        return [metadata["python"], "-I", "-S", "-B", str(root / "runtime/python_entry.py"),
+                candidate["tools"]["host"], *args]
+    return ["/usr/bin/python3", "-I", candidate["tools"]["host"], *args]
 
 
 def project_request(ctx, candidate):
@@ -865,7 +895,8 @@ def launch(ctx, args):
         for key in ("FORGE_ORCHESTRATOR_LAUNCH_ID", "FORGE_ORCHESTRATOR_PROVIDER", "FORGE_ORCHESTRATOR_REQUEST_VERSION"):
             if key in os.environ:
                 env[key] = os.environ[key]
-        os.execve("/usr/bin/python3", ["/usr/bin/python3", "-I", candidate["tools"]["host"], *sys.argv[1:]], env)
+        argv = host_argv(candidate, *sys.argv[1:])
+        os.execve(argv[0], argv, env)
     rt = Runtime(ctx, candidate)
     current = ctx.store.current()
     if args.command != "populate" and current and current["record"]["state"] == "ready" and rt.at_root():
@@ -907,8 +938,8 @@ def launch(ctx, args):
             rt.idle(seat, shell)
             env = dict(rt.env, TMUX_SESSION=args.session, FORGE_ORCHESTRATOR_PROVIDER=args.provider,
                        FORGE_ORCHESTRATOR_REQUEST_VERSION="1", FORGE_ORCHESTRATOR_LAUNCH_ID=launch_id)
-            result = subprocess.run(["/usr/bin/python3", "-I", candidate["tools"]["host"], "hook", "--root", str(ctx.root),
-                                     "--launch-id", launch_id], cwd=ctx.root, env=env,
+            result = subprocess.run(host_argv(candidate, "hook", "--root", str(ctx.root),
+                                     "--launch-id", launch_id), cwd=ctx.root, env=env,
                                     text=True, capture_output=True, timeout=120)
             require(result.returncode == 0, "POPULATE_FAILED", "approved hook failed; host session left alive: " + result.stderr[-2048:])
             return live_binding(ctx, rt, ctx.store.current(), args.provider)
