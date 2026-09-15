@@ -15,6 +15,8 @@ for suite in \
   tests/forge-infra-lock/run.sh \
   tests/forge-recover/run.sh \
   tests/forge-sync-main/run.sh \
+  tests/forge-web/run.sh \
+  tests/forge-web/docs.sh \
   tests/adversarial-skills/run.sh; do
   echo "== $suite =="; bash "$ROOT/$suite"
 done

@@ -1212,3 +1212,15 @@ guarantee — it is not one:
   feature provides is "a protocol-following worker cannot forge this" — not
   "unforgeable". `evidence_sha256` in the terminal journal makes a post-decision
   mutation of the decision artifact detectable, which is the boundary this rests on.
+
+## The web control center (`forge-web`)
+
+A local browser view of every live session, with messaging, answering, park/resolve, ack,
+spawn, pause and stop. It renders `.dev/` and invokes the same commands you would type. It is
+a layer: no database, no scheduler, no second source of truth. Full detail in `web/README.md`.
+
+```bash
+python3 -m pip install -e 'web/backend[test]'
+npm --prefix web/frontend ci
+npm --prefix web/frontend run build
+forge-web                     # 127.0.0.1:8765; --port N to change, --check to diagnose
