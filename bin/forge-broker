@@ -28,6 +28,7 @@ SCHEMA = "forge-broker-request/1"
 DELIVERY_SCHEMA = "forge-delivery/1"
 RESULT_SCHEMA = "forge-broker-result/1"
 STOP = False
+TMUX_SOCKET = ""
 
 
 class Refusal(RuntimeError):
@@ -487,8 +488,26 @@ def control_call(protected: Path, request: dict) -> dict:
     return value
 
 
+def tmux_socket_from_context(context: str) -> str:
+    if not context:
+        return ""
+    parts = context.rsplit(",", 2)
+    if (len(parts) != 3 or not Path(parts[0]).is_absolute() or "\x00" in context
+            or not parts[1].isdigit() or not parts[2].isdigit()):
+        raise Refusal("TMUX_CONTEXT_INVALID", "expected an absolute socket path, server PID and session index")
+    socket_path = Path(parts[0]).resolve()
+    default = Path(f"/tmp/tmux-{os.getuid()}/default").resolve()
+    # Empty preserves the historical default-server binding for legacy records.
+    return "" if socket_path == default else str(socket_path)
+
+
+def tmux_argv(*args: str) -> list[str]:
+    # Bound at process startup, never selected by a worker's control request.
+    return ["/opt/homebrew/bin/tmux", *(["-S", TMUX_SOCKET] if TMUX_SOCKET else []), *args]
+
+
 def tmux_field(target: str, fmt: str) -> str:
-    cp = subprocess.run(["/opt/homebrew/bin/tmux", "display-message", "-p", "-t", target, fmt],
+    cp = subprocess.run(tmux_argv("display-message", "-p", "-t", target, fmt),
                         text=True, capture_output=True, env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin"})
     if cp.returncode:
         raise Refusal("TMUX_TARGET_INVALID", target)
@@ -507,8 +526,7 @@ def tmux_session_created(session: str) -> str | None:
         live = dict(item.split("=", 1) for item in fixture.split(",") if "=" in item)
         return live.get(session)
     try:
-        cp = subprocess.run(["/opt/homebrew/bin/tmux", "display-message", "-p",
-                             "-t", session, "#{session_created}"],
+        cp = subprocess.run(tmux_argv("display-message", "-p", "-t", session, "#{session_created}"),
                             text=True, capture_output=True,
                             env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin"})
     except OSError:
@@ -1370,6 +1388,7 @@ def serve(args: argparse.Namespace) -> int:
     atomic_json(protected / "pid.json", {"schema": "forge-broker-pid/1", "pid": os.getpid(),
                 "pid_started": started, "git_dir": str(git_dir), "git_common_dir": str(common),
                 "session": args.session, "session_incarnation": args.incarnation,
+                "tmux_socket": TMUX_SOCKET,
                 "physical_code_root": str(root), "root_identity": root_id,
                 "control_host": control_host, "control_port": control_port,
                 "lifecycle_queue": 1, "callback_incarnation_probe": 1,
@@ -1498,6 +1517,7 @@ def await_lock_release(protected: Path, timeout: float) -> bool:
 
 
 def main() -> int:
+    global TMUX_SOCKET
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("serve"); s.add_argument("--root", required=True); s.add_argument("--session", required=True); s.add_argument("--incarnation", required=True); s.add_argument("--mode", required=True)
@@ -1508,6 +1528,7 @@ def main() -> int:
     s = sub.add_parser("paths"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true")
     s = sub.add_parser("once"); s.add_argument("--root", required=True); s.add_argument("--request", required=True)
     args = p.parse_args()
+    TMUX_SOCKET = tmux_socket_from_context(os.environ.get("TMUX", ""))
     root, git_dir, common, root_id = resolve_root(args.root)
     protected, _, _, _ = state_paths(root, git_dir, common, root_id)
     if args.cmd == "serve":
@@ -1523,6 +1544,8 @@ def main() -> int:
                                 "mode": args.mode, "physical_code_root": str(root),
                                 "root_identity": root_id}
                     mismatches = [key for key, value in expected.items() if info.get(key) != value]
+                    if info.get("tmux_socket", "") != TMUX_SOCKET:
+                        mismatches.append("tmux_socket")
                     if mismatches == ["session_incarnation"] and not tmux_incarnation_alive(
                             str(info.get("session", "")), str(info.get("session_incarnation", ""))):
                         # The only difference is the incarnation, and tmux confirms the

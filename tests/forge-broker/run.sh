@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; B="$ROOT/bin/forge-broker"; W="$(mktemp -d)"
 trap 'rm -rf "$W"' EXIT
+python3 "$ROOT/tests/forge-broker/test_tmux_context.py"
 R="$W/repo"; git init -q "$R"; git -C "$R" config user.name test; git -C "$R" config user.email test@local
 echo one > "$R/a.txt"; git -C "$R" add a.txt; git -C "$R" commit -qm base
 G="$(git -C "$R" rev-parse --absolute-git-dir)"; RID="$(python3 - "$R" "$G" <<'PY'
@@ -148,6 +149,10 @@ printf '%064d\n' 1 > "$P/control.token"
 r6_out="$(FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$R" --session reap-test --incarnation 600 --mode contain 2>&1 || true)"
 printf '%s\n' "$r6_out" | grep -q CONTROL_SERVER_UNAUTHENTICATED
 printf '%s\n' "$tok" > "$P/control.token"
+test "$pid3" = "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["pid"])' "$P/pid.json")"
+# Same root/session/incarnation on another tmux server cannot reuse or reap it.
+socket_out="$(TMUX="$W/other-socket,123,0" FORGE_BROKER_TEST_ENABLE=1 "$B" start --root "$R" --session reap-test --incarnation 300 --mode contain 2>&1 || true)"
+printf '%s\n' "$socket_out" | grep -q '"detail": "tmux_socket"'
 test "$pid3" = "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["pid"])' "$P/pid.json")"
 FORGE_BROKER_TEST_ENABLE=1 "$B" status --root "$R" --json | grep -q '"live": true'
 FORGE_BROKER_TEST_ENABLE=1 "$B" stop --root "$R" >/dev/null
