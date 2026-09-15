@@ -140,24 +140,74 @@ The synthetic digest lacked a CONFIDENCE field; this is not integrated Forge
 digest-render/retry acceptance. Explicit Codex child closure was unavailable on
 the tested API; completion notifications were observed instead.
 
+### Protected runtime and native host continuation
+
+The import defect above is resolved for the new **fixture runtime**, not for
+arbitrary installed helpers. `prepare --runtime` copies pure-Python PyYAML into
+the protected package and pins Python to `-I -S -B`. A whitelist environment
+excludes project Python imports, shell startup variables, ambient Forge overrides
+and user Git configuration. The entry supports the copied helpers' `-c`, stdin
+and protected-script forms; external scripts and unsupported modes refuse.
+This is experimental packaging, not a production admission or installer API.
+
+New evidence is indexed by `tests/forge-orchestrator/evidence/2026-09-14-runtime.json`.
+Paths below are relative to `.dev/forge-p1/`:
+
+| Measurement | Result | Evidence |
+| --- | --- | --- |
+| Runtime isolation | Protected PyYAML loads despite hostile project/Python startup paths | `runtime-20260914-01/isolated-import.json` |
+| Copied package | 121 actual files deny write-open from five roots, positive controls succeed | `runtime-20260914-03/package-access-e496ab9333af817f/report.json` |
+| Runtime and actual Git pointers | Primary/linked pass; nested-parent and source-root cells expose nested `.git` pointer write-open | `runtime-20260914-03/runtime-audit-8e4c04612d41a2d1/report.json` |
+| Native contained worker | 2,088 package/runtime/pointer files denied from primary and linked roots; actual command traces and positive controls | `runtime-20260914-03/native-worker-fab24055416bc6b2/report.json`, `native-worker-23c06b965202ac20/report.json` in the same packet |
+| Native nested-parent worker | FAIL: nested linked worktree `.git` pointer opens for write; bytes remain unchanged | `runtime-20260914-02/native-runtime-reviewed.json` |
+| Codex reviewed host | Actual sandbox denial, one-time native approvals and protected bridge `identity_state=MATCH` | `runtime-20260914-03/host-8d2b8bec/host-identity-approved.json` |
+| Real worker registration | Live Codex worker argv/PID attestation, authenticated registration, normal cancellation and broker stop | `runtime-20260914-03/host-8d2b8bec/registration.json` |
+| Shared infra lock | Acquire, cross-root contender timeout with live holder, status and normal release | `runtime-20260914-02/host-14bf2203/report.json` |
+| Native children | A/B follow-up, C synthesis, disk-only child, independently recorded effective policies and 2,088 denied child write-opens | `runtime-20260914-03/host-8d2b8bec/codex-interactive-reviewed.json` |
+
+The runtime audit covers resolved Python/stdlib/tools and native dependencies.
+Sixteen platform-cached library names are explicitly trusted as OS components;
+they are not copied or claimed to have been individually mutated. This does not
+certify every possible helper path or dependency-alias replacement. Actual nested
+pointer write-open is a topology failure, not proof of a performed destructive
+write. Primary and linked support must be evaluated separately from nested roots.
+
+The native host and all four children report workspace-write, network disabled,
+on-request approval in their native rollout metadata. A child also successfully
+read an explicitly staged **dummy** token outside its workspace. No real token was
+read: this demonstrates shared readability, not secret isolation. Child message
+payloads remain opaque; native `fork_turns:none`, follow-up and completion are
+observed, but plaintext disjoint-input attestation remains incomplete.
+
+Identity testing required literal, freshly observed tmux binding because the
+first native tool execution did not retain the expected ambient binding. Two
+one-time approvals succeeded; one malformed command with an extra trailing period
+was rejected before execution. No persistent allow rule was selected. Review was
+performed by the P1 test controller, so this is not a human usability study.
+Registration and lock results above are operator-driven native-fixture supporting
+evidence, not a claim that the Codex host completed those integrated gates.
+
+The real dedicated-server test found a broker defect: its minimal subprocess
+environment discarded the inherited tmux socket. `bin/forge-broker` now binds
+custom sockets from validated startup context, persists that binding and refuses
+cross-socket daemon reuse. Requests cannot choose a socket. Default/legacy
+bindings remain compatible; the lifecycle action list is unchanged.
+
 ### Remaining gates
 
-**Do not approve host effects from the current copied helper closure.**
-`forge-bridge` invokes `python3 -c` and stdin programs that import `yaml`.
-`find_spec("yaml")` selected the inert project-local canary without importing it.
-Protecting the helper script alone leaves project import substitution possible.
-P1 still needs a protected interpreter/import environment and audited transitive
-helper/config/hook paths, followed by real worker-denial checks on that closure.
-No production helper was changed to mask this result.
+Native interactive protected loading and Codex reload after compaction/resume
+now have traced evidence. Separate reports cover fresh restart and local duplicate
+discovery; these do not certify changed global discovery. Claude's corresponding
+interactive checks use normal client auth and scoped Read approvals, not a copied
+credential or system-prompt replacement. Hooks were disabled to isolate loading
+and permission tests and therefore cannot count as hook/attention acceptance.
 
-The following remain unqualified, rather than silently skipped: interactive
-entry, duplicate/global discovery, explicit reloading across compaction/restart,
-child policy and token inheritance, actual Git-pointer/profile-management
-authority, native identity/tmux, authenticated broker registration, shared locks,
-dispatch/wait, digest retry, asks, callback recovery, host approval usability and
-provider-aware hook attention. These are the 16 cases in `native-cases.json`;
-partial supporting measurements above do not turn those full cases into PASS.
-In particular, no host-control case passed: the closure gate precedes them.
+P1 remains INCOMPLETE: full provider/topology loading reconciliation, remaining
+child inheritance checks, profile-management authority, native-host registration
+and lock integration, legal dispatch/wait, rendered digest/missing-template retry,
+ask/answer, callback recovery and genuine provider-aware hooks are still required.
+The current fixtures establish useful capabilities; they neither enable provider
+selection nor close P1/P2-P6. Preserve this distinction in status and PR text.
 
 Earlier `sandbox_apply: Operation not permitted` reports are historical only.
 The preserved copy is beside the proposal's `p1-handoff.md`. Trials 01/02 have
@@ -165,7 +215,9 @@ failed positive controls and are retained as invalid protection evidence; the
 corrected trials 03/04 passed. Do not attribute that difference solely to layout:
 the standalone profile invocation was corrected too.
 
-Validation: 27 hermetic harness tests pass. Native sandbox/package-access exits
+Validation: 37 hermetic harness tests and the full broker suite (including five
+socket-binding unit tests) pass. Existing Codex policy smoke passes with its live
+gates skipped. Native sandbox/package-access exits
 are deliberately 2 (primitives complete, P1 incomplete). The full aggregate and
 integrated native workflow suites were not run. Existing production tmux sessions,
 brokers, locks, rollout defaults, installed skills and worker containment settings

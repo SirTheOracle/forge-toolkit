@@ -1,13 +1,14 @@
 # P1 native orchestrator experiments
 
 This is the P1 experiment harness, not provider selection or a parity release.
-Its `prepare`, `run` and `package-access` commands never install skills, change production
+Its `prepare`, `run`, `package-access` and `runtime-audit` commands never install skills, change production
 configuration, start a provider, attach to an existing tmux server, or call a
 production broker. The automatic
 portion invokes the real Codex sandbox **without a model**. Interactive host and
-child-agent acceptance are separate, attended cases and remain NOT_RUN until
-their actual traces have been reviewed. A sandbox primitive pass is not a native
+child-agent acceptance are separate, attended cases whose status comes from
+reviewed native traces, not this automatic report. A sandbox primitive pass is not a native
 worker pass, a protected-helper qualification, or a P1 completion verdict.
+`native-worker` is a separate, explicit opt-in that starts a real Codex model run.
 
 ## Restart with scoped approvals
 
@@ -55,7 +56,7 @@ after restart before attempting the native work.
 Local validation on Codex 0.153.4: `doctor --json` with these overrides reports
 `config.load: ok`, `approval policy: OnRequest`, and restricted filesystem and
 network sandboxes. Doctor's aggregate exit was 1; this is validation of those
-named configuration fields, not an all-health or native P1 pass. The 22 hermetic
+named configuration fields, not an all-health or native P1 pass. The 37 hermetic
 harness tests and existing Codex worker policy smoke also pass.
 
 The launcher uses the documented [CLI configuration overrides](https://learn.chatgpt.com/docs/config-file/config-advanced)
@@ -142,20 +143,41 @@ This is an initial inventory, **not** a claim of complete runtime dependency clo
 
 ## Latest measured results
 
-The full-access continuation passed 145 topology checks and actual write-open
-denial for 76 copied files from each of five roots. A separate native Codex
-`exec` run using Forge's containment flags denied all 76 opens while allowing
-the workspace positive control. Both providers explicitly read the protected
-entry through traced native tools and used real native children and follow-up.
-These are noninteractive surfaces; exact interactive/discovery, child policy,
-host approvals and integrated host-control acceptance remain incomplete.
+The runtime continuation retains the 145 canary checks and expands the copied
+package to 121 files. Native Codex execution denies all 2,088 inventoried
+package/runtime/pointer write-opens from primary and linked roots, with successful
+workspace controls. The primary-with-nested root FAILS: its nested worktree's
+actual `.git` pointer can be opened for write. No pointer bytes were changed.
+Topologies are qualified separately; nested layouts are not silently admitted.
 
-The closure review found a concrete blocker: bare `python3 -c`/stdin imports can
-resolve `yaml` from the worker-writable current directory. An inert `yaml.py`
-fixture was selected by `find_spec` without importing or executing it. Do not
-approve copied Forge host helpers until the interpreter, import paths and other
-runtime dependencies are isolated and their protection measured. See
-`skills/forge-orchestrator/references/technical.md` for results and evidence paths.
+The bare-Python project-import defect is addressed in the fixture runtime by
+`-I -S -B`, protected pure-Python PyYAML, pinned tool wrappers and a whitelist
+environment. This is not a production runtime installer. The audit inventories
+stdlib/native dependencies and explicitly lists platform-cached libraries; it
+does not certify all possible Forge execution paths or alias replacement.
+
+```bash
+bash tests/forge-orchestrator/native-probe.sh prepare --in-worktree --runtime \
+  --directory .dev/forge-p1/runtime-trial-01
+bash tests/forge-orchestrator/native-probe.sh runtime-audit \
+  --directory .dev/forge-p1/runtime-trial-01
+# Use the actual report path printed above, not a guessed audit ID.
+bash tests/forge-orchestrator/native-probe.sh native-worker \
+  --directory .dev/forge-p1/runtime-trial-01 \
+  --audit .dev/forge-p1/runtime-trial-01/runtime-audit-ACTUAL_ID/report.json \
+  --topology primary
+```
+
+Both audit commands retain each invocation separately. Native execution requires
+the exact successful tool command, unchanged inputs and a real positive control;
+the model's answer alone is never evidence. Exit 2 still means P1 INCOMPLETE.
+
+`host_probe.py` provides invocation-owned tmux fixtures for attended work. It
+never selects the default server. Do not send its shell `command()` into a pane
+running a native client. Native host identity/approval, child policy and loading
+transitions now have supporting evidence; the integrated dispatch, digest retry,
+ask/recovery and hook gates remain incomplete. See the technical reference and
+`evidence/2026-09-14-runtime.json` for exact coverage and limitations.
 
 ## Attended native acceptance
 
