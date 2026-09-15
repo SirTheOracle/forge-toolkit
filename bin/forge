@@ -40,6 +40,7 @@
 #   forge parked [--root PATH] [--session S] [--json]   list parked items (exit 10 if any)
 #   forge parked --resolve <slug> <stage> [--note "…"]  clear a parked item (proxies bridge)
 #   forge codex-broker status|stop [--root PATH]          inspect/drain the host broker
+#   forge orchestrator-status --root PATH               read-only protected binding (not admission)
 #
 # Dispatch REUSES `forge-bridge send claude` (the proven 3-step cmd_send split);
 # it never reimplements tmux send-keys. Every write lands under the target root's
@@ -3524,6 +3525,7 @@ case "${1:-help}" in
     codex-doctor) shift; cmd_codex_doctor "$@" ;;
     codex-launch) shift; cmd_codex_launch "$@" ;;
     codex-broker) shift; cmd_codex_broker "$@" ;;
+    orchestrator-status) shift; exec "$(_toolkit_root)/bin/forge-broker" orchestrator-status "$@" ;;
     rehome-audit) shift; cmd_rehome_audit "$@" ;;
     dispatch)  shift; cmd_dispatch "$@" ;;
     reply)     shift; cmd_reply "$@" ;;

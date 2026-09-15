@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='forge-web-launcher-') as work:
     checkout, home, tools = (base / n for n in ('checkout', 'home', 'tools'))
     checkout.mkdir(); home.mkdir(); tools.mkdir()
     # Copy installer inputs: install/uninstall/drift never use the real checkout or home.
-    for name in ('bin', 'skills', 'codex-skills', 'commands', 'agents', 'config', 'prompts'):
+    for name in ('bin', 'lib', 'skills', 'codex-skills', 'commands', 'agents', 'config', 'prompts'):
         src = root / name
         if src.is_dir(): shutil.copytree(src, checkout / name, symlinks=False)
     shutil.copy2(root / 'install.sh', checkout / 'install.sh')

@@ -43,6 +43,9 @@ OPERATOR_FILES=(
 BIN_SCRIPTS=(forge-bridge forge-start forge-dispatch-review forge-dispatch-pr-review
              forge-stall-install-regex forge-watch forge forge-cc-hook forge-broker
              forge-git-request forge-sync-main forge-web)
+# Legacy bin symlinks resolve libraries in this source tree. P3's copied
+# candidate package must copy this same declared inventory, not glob imports.
+LIB_FILES=(lib/forge_orchestrator.py)
 MANAGED_POLICY_FILES=(codex-forge.config.toml codex-forge-runtime.json idle-prompts.yml)
 
 # Stage prompt templates. bin/forge-bridge renders $FORGE_PROMPTS_DIR/<stage>.txt for
@@ -102,6 +105,19 @@ err()   { printf "${RED}%s${NC}\n" "$1"; }
 if [ "${1:-}" = "--check-drift" ]; then
     info "Checking repo ↔ installed drift (read-only)..."
     DRIFT=0
+
+    for library in "${LIB_FILES[@]}"; do
+        if [ ! -f "$SCRIPT_DIR/$library" ] || [ -L "$SCRIPT_DIR/$library" ]; then
+            err "  $library - declared library missing or symlinked"; DRIFT=1
+        fi
+    done
+    for library in "$SCRIPT_DIR"/lib/*.py; do
+        [ -e "$library" ] || continue
+        case " ${LIB_FILES[*]} " in
+            *" lib/$(basename "$library") "*) ;;
+            *) err "  lib/$(basename "$library") - present but undeclared"; DRIFT=1 ;;
+        esac
+    done
 
     for script in "${BIN_SCRIPTS[@]}"; do
         src="$SCRIPT_DIR/bin/$script"; dst="$BIN_DIR/$script"
@@ -319,6 +335,12 @@ fi
 
 echo ""
 info "Installing forge toolkit..."
+for library in "${LIB_FILES[@]}"; do
+    if [ ! -f "$SCRIPT_DIR/$library" ] || [ -L "$SCRIPT_DIR/$library" ]; then
+        err "Required library missing or symlinked: $library"
+        exit 1
+    fi
+done
 echo ""
 
 # ── Step 1: Bin scripts ───────────────────────────────────

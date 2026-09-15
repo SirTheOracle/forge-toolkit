@@ -11554,6 +11554,19 @@ cmd_identity() {
     esac
 }
 
+cmd_orchestrator_status() {
+    [ "$#" = 0 ] || { echo "orchestrator-status takes no arguments" >&2; return 2; }
+    # Use the shared resolver without require_identity's audit write.
+    _forge_identity
+    case "${ID_state:-}" in
+        MATCH) ;;
+        *) _print_identity_block >&2; return 3 ;;
+    esac
+    # Resolve the live bridge root first. The record cannot redirect this read,
+    # and a stored ready state is not sufficient for admission.
+    "$(_forge_sibling_bin)" orchestrator-status --root "$ID_target_root"
+}
+
 # ---- Global cross-session flags (session-pin hardening P1.6) ----
 # PROCESS-LOCAL, NEVER exported → authorization cannot be inherited by a nested bridge
 # call, and an in-pane orchestrator cannot acquire the bypass from its session env.
@@ -11739,6 +11752,7 @@ case "${1:-help}" in
     stall-check-status)  shift; require_identity "stall-check-status" host-degrade || true; cmd_stall_check_status "$@" ;;
     alias-self-test)     shift; cmd_alias_self_test "$@" ;;
     identity)            cmd_identity ;;
+    orchestrator-status) shift; cmd_orchestrator_status "$@" ;;
     health)              cmd_health ;;
     constraint-check)    shift; cmd_constraint_check "$@" ;;
     constraints)         shift; cmd_constraints "$@" ;;
@@ -11787,6 +11801,7 @@ case "${1:-help}" in
         echo "                                dispatch-time safety precondition; refuses on an open pending, non-idle health,"
         echo "                                a terminal state, in observe mode, and on the orchestrator (pane 0)"
         echo "  identity                      Print host/target identity descriptor; exit 0 (MATCH/CROSS) or 3 (MISMATCH/AMBIGUOUS/UNAVAILABLE)"
+        echo "  orchestrator-status           Read protected binding at the live bridge root; does not admit work"
         echo "  stall-check-status [--project-root <p>]"
         echo "                                List panes with pending dispatch and stale stall-check coverage"
         echo "  alias-self-test [--strict]    Verify pane alias maps stay in lockstep"
