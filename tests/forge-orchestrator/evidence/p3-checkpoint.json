@@ -4,12 +4,12 @@
   "admission": "unsupported",
   "supported_providers": [],
   "report": {
-    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-ebd359d6c865428088df5142c2f56d1e/report.json",
-    "sha256": "f84306270ebc5394dea99fc82db0b6e3233ef9661c39604ca72e1ddba8534cdf"
+    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-d96f1baea9544ab7b9b4151521e113f2/report.json",
+    "sha256": "687a33b952aa6db112c263eb0337e532fb335e15eff21bfaff55eebda0bd2c6c"
   },
   "package": {
-    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/747d40a1db2c20dd40909d83662d789527305fc889551939fe59ff65d53772c6/package/package.json",
-    "sha256": "616bef888c617046ffab27837164550fc2698f637398a0e6044f9061fefc2ec6"
+    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/76c7961f4509ce40871d48120d89be47edab4403a4723a1879a323da317572a3/package/package.json",
+    "sha256": "48a409d88f8d00d6a0c91043cf94d7f5b5790f1555033609a2507015440c85d6"
   },
   "worker": {
     "path": "/opt/homebrew/Caskroom/codex/0.153.4/bin/codex",
@@ -75,7 +75,7 @@
     "Native write-open utility evidence is not model policy evidence.",
     "Authenticated native load/children/reload and runtime/management/hook closure remain required.",
     "No credentials copied, no global discovery changed, no profile registered.",
-    "Codex child and candidate/conformance producer schema tests are not native qualification.",
-    "Claude child, duplicate/concurrent legacy, model-led policy, management/hook and complete runtime runners remain unfinished."
+    "Codex child/policy, duplicate and candidate/conformance producer tests are not native qualification.",
+    "Claude child/policy, concurrent legacy, management/hook and complete runtime runners remain unfinished."
   ]
 }

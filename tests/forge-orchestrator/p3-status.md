@@ -76,15 +76,28 @@ orchestrate; the remaining work is production qualification, not feasibility.
   a profile. Synthetic schema tests explicitly do not establish native proof.
 - Utility write-denial results are now named `worker_containment`, separate from
   `native_policy`. A successful sandbox utility cannot certify model-led policy.
+- The Codex model-led policy runner requires one exact native command execution,
+  a successful exit, a fresh nonce, workspace-positive controls and the digest of
+  every expected denied mutation. Actual uncontained execution fails its test.
+  It runs separately for primary and linked roots; utility evidence is not reused.
+- Native duplicate-skill probes now cover fresh, changed and removed decoys for
+  both provider adapters. They require fresh candidate reads and reject decoy
+  reads or marker contamination. Existing assets and registered profiles refuse
+  the disposable overlay. Descriptor-relative creation/cleanup resists parent
+  symlink swaps and preserves concurrently changed files.
+- Claude's empty MCP argument now uses `{"mcpServers":{}}`. The installed native
+  CLI rejected the previous `{}` before starting a model turn. A regression test
+  covers the required shape.
 
 ## Deliberately Not Admission
 
 The prerequisite report schema is `forge-orchestrator-capability/1`, not P2's
 `forge-orchestrator-qualification/1`. Current native reports advertise an empty provider set.
 It cannot by itself register a qualified profile. The authenticated load/reload
-and Codex child harnesses have not run successfully yet. Claude child,
-duplicate/concurrent legacy, model-led policy, management/hook and complete runtime
-qualification runners remain unfinished. The new producer is gated on all these
+and Codex child, model-policy and duplicate harnesses have not run successfully
+against an authenticated candidate yet. Claude child/policy, concurrent legacy,
+management/hook and complete runtime qualification runners remain unfinished.
+The new producer is gated on all these
 checks, so it does not currently publish a qualified candidate.
 Do not relabel not-run checks as pass or use synthetic tests as admission evidence.
 
@@ -107,6 +120,13 @@ after login. The helper stages/verifies current copied bytes and stays in this
 worktree. Native first startup can materialize bundled skills; that correctly
 invalidates an earlier discovery snapshot and requires restaging. No permission
 restart or global installation is needed.
+
+A separate read-only legacy Claude streaming experiment successfully read the
+installed global `commands/forge.md` through the native Read tool. The same
+process's second turn received a provider API refusal (`reasoning_extraction`),
+so it did not establish reread or concurrent coexistence. Raw exploratory output
+is in `.dev/forge-p3/legacy-stream-a89a9bf8a27c45099c7bfdcf96f33115/`.
+This is not protected admission evidence and no workaround was attempted.
 
 ## Remaining P3 Acceptance
 
@@ -135,10 +155,10 @@ mutation attempts apiece. All were denied and workspace positive controls passed
 Codex's effective native configuration also passes. Authentication remains
 unavailable; the report still says `admission: unsupported`.
 
-Latest focused package tests: 20 passed. The source-stable broader run recorded
-under `.dev/forge-p2/requests-1789573151822267000/` ran 176 orchestrator tests
-(174 passed, two opt-in native skips), including ten native trace interpretation
-tests. All 71 start checks, 31 spawn checks and hermetic worker policy passed.
+Latest source-stable broader run recorded under
+`.dev/forge-p2/requests-1789580218441111000/` ran 185 orchestrator tests
+(183 passed, two opt-in native skips), including 23 package tests and 16 native
+trace/fixture tests. All 71 start checks, 31 spawn checks and hermetic worker policy passed.
 The runner's dedicated tmux server is stopped. The device login again expired
 without authorization; no login or model process remains running.
 

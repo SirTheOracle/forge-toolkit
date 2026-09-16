@@ -290,7 +290,7 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
                 *project_policy, "-m", model, prompt]
     else:
         argv = [str(binary), "--safe-mode", "--permission-mode", "default", "--setting-sources", "", "--settings", str(home / ".claude/settings.json"),
-                "--strict-mcp-config", "--mcp-config", "{}", "--model", model, prompt]
+                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--model", model, prompt]
     env = runtime.environment(package, home)
     env.update(auth_env)
     env["FORGE_ORCHESTRATOR_PROVIDER"] = provider
@@ -376,19 +376,21 @@ def owned_canaries(package, targets, run):
                 canary.with_name(canary.name + "-" + operation).unlink(missing_ok=True)
 
 
-def policy_probes(package, receipt, report_dir, worker, topology, targets, run):
+def policy_probes(package, receipt, report_dir, worker, topology, targets, run, *, native_runner=None):
     with owned_canaries(package, targets, run) as canaries:
         return _policy_probes(package, receipt, report_dir, worker, topology,
-                              targets + [str(p) for p in canaries], run, canaries)
+                              targets + [str(p) for p in canaries], run, canaries, native_runner=native_runner)
 
 
-def _policy_probes(package, receipt, report_dir, worker, topology, targets, run, canaries=()):
+def _policy_probes(package, receipt, report_dir, worker, topology, targets, run, canaries=(), *, native_runner=None):
     targets_file = report_dir / "targets.json"
     write(targets_file, encoded(targets))
+    canaries_file = report_dir / "canaries.json"
+    write(canaries_file, encoded([str(p) for p in canaries]))
     script = report_dir / "write_open_probe.py"
-    write(script, 'import json,os,pathlib,sys\n'
+    write(script, 'import hashlib,json,os,pathlib,sys\n'
           'targets=json.loads(pathlib.Path(sys.argv[1]).read_text())\n'
-          'canaries=json.loads(sys.argv[3])\n'
+          'canaries=json.loads(pathlib.Path(sys.argv[3]).read_text())\n'
           'opened=[]\n'
           'for p in targets:\n'
           ' try:\n'
@@ -424,36 +426,53 @@ def _policy_probes(package, receipt, report_dir, worker, topology, targets, run,
           'finally:\n'
           ' for p in control.iterdir(): p.unlink()\n'
           ' control.rmdir()\n'
-          'print(json.dumps({"opened":opened,"tested":len(targets),"workspace_control":True,"operations":operations}))\n'
+          'result={"opened":opened,"tested":len(targets),"workspace_control":True,"operations":operations}\n'
+          'if len(sys.argv)>4:\n'
+          ' result.pop("operations")\n'
+          ' result.update(nonce=sys.argv[4],operations_count=len(operations),\n'
+          '  operations_sha256=hashlib.sha256(json.dumps(operations,sort_keys=True).encode()).hexdigest())\n'
+          'print(json.dumps(result))\n'
           'sys.exit(bool(opened) or any(not row["denied"] for row in operations))\n')
     metadata = json.loads((package / "runtime/runtime.json").read_text())
     env = dict(receipt["environment"])
     observations = []
-    try:
-        help_text = subprocess.check_output([str(worker), "sandbox", "--help"], text=True, env=env, timeout=15)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return "fail", [{"status": "fail", "error": str(exc)}]
-    if "--permission-profile" not in help_text:
-        return "unsupported", observations
-    for item in topology:
+    if native_runner is None:
+        try:
+            help_text = subprocess.check_output([str(worker), "sandbox", "--help"], text=True, env=env, timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "fail", [{"status": "fail", "error": str(exc)}]
+        if "--permission-profile" not in help_text:
+            return "unsupported", observations
+    for index, item in enumerate(topology):
         control = Path(item["root"]) / (".forge-capability-" + run)
         control.mkdir(mode=0o700)
-        argv = [str(worker), "sandbox", "--permission-profile", ":workspace", "-C", item["root"],
-                metadata["python"], "-I", "-S", "-B", str(script), str(targets_file),
-                str(control), encoded([str(p) for p in canaries])]
+        argv = [metadata["python"], "-I", "-S", "-B", str(script), str(targets_file), str(control), str(canaries_file)]
+        if native_runner is None:
+            argv = [str(worker), "sandbox", "--permission-profile", ":workspace", "-C", item["root"], *argv]
+        else:
+            argv.append(run)
         try:
-            cp = subprocess.run(argv, env=env, cwd=item["root"], text=True, capture_output=True, timeout=60)
+            cp = (subprocess.run(argv, env=env, cwd=item["root"], text=True, capture_output=True, timeout=60)
+                  if native_runner is None else native_runner(receipt, argv, item["root"],
+                                                             report_dir / ("native-policy-" + str(index) + ".jsonl")))
             result = json.loads(cp.stdout)
             operations = result.get("operations", [])
             expected = {(str(path), op) for path in canaries
                         for op in ("create", "overwrite", "rename", "unlink", "symlink-redirection")}
+            if native_runner is None:
+                mutations_passed = ({(row["path"], row["operation"]) for row in operations} == expected
+                                    and len(operations) == len(expected) and all(row["denied"] is True for row in operations))
+            else:
+                expected_rows = [{"path": str(path), "operation": op, "denied": True} for path in canaries
+                                 for op in ("create", "overwrite", "rename", "unlink", "symlink-redirection")]
+                expected_digest = hashlib.sha256(json.dumps(expected_rows, sort_keys=True).encode()).hexdigest()
+                mutations_passed = (result.get("nonce") == run and result.get("operations_count") == len(expected)
+                                    and result.get("operations_sha256") == expected_digest)
             passed = (cp.returncode == 0 and result.get("opened") == [] and result.get("tested") == len(targets)
-                      and result.get("workspace_control") is True
-                      and {(row["path"], row["operation"]) for row in operations} == expected
-                      and len(operations) == len(expected) and all(row["denied"] is True for row in operations))
+                      and result.get("workspace_control") is True and mutations_passed)
             observations.append({"root": item["root"], "status": "pass" if passed else "fail", "result": result,
                                  "stderr": cp.stderr, "argv": argv})
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
             observations.append({"root": item["root"], "status": "fail", "error": str(exc)})
         finally:
             if control.exists():
@@ -587,17 +606,27 @@ def qualify(package, worker_binary=None, *, native=False):
         except ValueError:
             authenticated = False
     checks["authentication"] = "available" if authenticated else "unavailable"
-    loading, configuration, children = None, None, None
+    loading, configuration, children, policy, duplicates = None, None, None, None, None
     if native:
         probes = module("forge_native", package / "lib/forge_native.py")
         configuration = probes.configuration(receipt, report_dir)
         checks["native_configuration"] = configuration["status"]
         if authenticated:
+            if provider == "codex":
+                native_dir = report_dir / "native-policy"
+                native_dir.mkdir(mode=0o700)
+                checks["native_policy"], policy = policy_probes(
+                    package, receipt, native_dir, worker, topology, targets, run + "-native",
+                    native_runner=probes.policy_command)
+            else:
+                checks["native_policy"] = "unsupported"
             loading = probes.loading(package, receipt, report_dir)
             checks["native_loading"] = loading["status"]
             checks["native_reload"] = loading["status"]
             children = probes.children(package, receipt, report_dir)
             checks["native_children"] = children["status"]
+            duplicates = probes.duplicates(package, receipt, report_dir)
+            checks["native_duplicates"] = duplicates["status"]
     # Utility containment and child primitives alone never mint admission.
     complete = checks.get("authentication") == "available" and all(checks.get(name) == "pass" for name in ADMISSION_CHECKS)
     report = {"schema": "forge-orchestrator-capability/1", "root": ctx.identity,
@@ -609,6 +638,8 @@ def qualify(package, worker_binary=None, *, native=False):
               "native_loading": loading,
               "native_configuration": configuration,
               "native_children": children,
+              "native_policy": policy,
+              "native_duplicates": duplicates,
               "supported_providers": [provider] if complete else [],
               "admission": "measured-not-published" if complete else "unsupported",
               "limits": ["Native write-open utility evidence is not model policy evidence.",

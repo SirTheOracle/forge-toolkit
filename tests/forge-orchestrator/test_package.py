@@ -2,6 +2,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -83,6 +84,12 @@ class Package(unittest.TestCase):
         self.assertNotIn("danger-full-access", argv)
         self.assertIn("allow_login_shell=false", argv)
         self.assertIn("skip_host_skill_discovery", argv)
+
+    def test_claude_empty_mcp_configuration_has_required_server_map(self):
+        staged = package.stage(self.ctx, "claude", "/bin/echo", "fixture-no-native-qualification")
+        argv = package.verify(staged["package"])["provider_argv"]
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(json.loads(argv[argv.index("--mcp-config") + 1]), {"mcpServers": {}})
 
     def test_new_native_input_directories_and_aliases_refuse(self):
         receipt = package.verify(self.path)
@@ -300,6 +307,47 @@ class Package(unittest.TestCase):
                 raise KeyboardInterrupt()
         self.assertTrue(all(not p.exists() for p in paths))
         package.verify(self.path)
+
+    def test_model_policy_summary_requires_nonce_and_exact_operation_digest(self):
+        receipt = package.verify(self.path)
+        canary = self.root / "synthetic-canary"
+        expected = [{"path": str(canary), "operation": operation, "denied": True}
+                    for operation in ("create", "overwrite", "rename", "unlink", "symlink-redirection")]
+        digest = hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()
+        good = {"nonce": "fixture", "opened": [], "tested": 1, "workspace_control": True,
+                "operations_count": 5, "operations_sha256": digest}
+        for patch_value in ({}, {"nonce": "stale"}, {"operations_sha256": "0" * 64},
+                            {"operations_count": 4}, {"workspace_control": False}, {"opened": [str(canary)]}):
+            directory = self.ctx.store.path / "reports" / ("policy-fixture-" + uuid.uuid4().hex)
+            directory.mkdir(parents=True)
+            def runner(actual_receipt, argv, cwd, transcript):
+                self.assertEqual(actual_receipt, receipt)
+                self.assertEqual(argv[1:4], ["-I", "-S", "-B"])
+                self.assertNotIn("sandbox", argv)
+                self.assertEqual(argv[-1], "fixture")
+                return subprocess.CompletedProcess(argv, 0, json.dumps(dict(good, **patch_value)), "")
+            with self.subTest(patch=patch_value):
+                status, rows = package._policy_probes(self.path, receipt, directory, Path("/unused/worker"),
+                    [{"root": str(self.root)}], [str(canary)], "fixture", [canary], native_runner=runner)
+                self.assertEqual(status, "fail" if patch_value else "pass")
+                self.assertEqual(len(rows), 1)
+
+    def test_model_policy_script_rejects_uncontained_execution(self):
+        receipt = package.verify(self.path)
+        directory = self.ctx.store.path / "reports" / ("uncontained-fixture-" + uuid.uuid4().hex)
+        directory.mkdir(parents=True)
+        canary = self.root / "uncontained-owned-canary"
+        canary.write_text("owned fixture")
+        def runner(actual_receipt, argv, cwd, transcript):
+            return subprocess.run(argv, cwd=cwd, env=receipt["environment"], capture_output=True, text=True, timeout=10)
+        try:
+            status, rows = package._policy_probes(self.path, receipt, directory, Path("/unused/worker"),
+                [{"root": str(self.root)}], [str(canary)], "uncontained", [canary], native_runner=runner)
+            self.assertEqual(status, "fail")
+            self.assertEqual(rows[0]["result"]["opened"], [str(canary)])
+            self.assertTrue(rows[0]["result"]["workspace_control"])
+        finally:
+            canary.unlink(missing_ok=True)
 
     def test_watch_registration_uses_executable_scrubbed_entry(self):
         receipt = package.verify(self.path)
