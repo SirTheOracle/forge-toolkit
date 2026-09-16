@@ -61,6 +61,38 @@ class Package(unittest.TestCase):
                                  env=env, capture_output=True, text=True)
         self.assertNotEqual(escaped.returncode, 0)
 
+    def test_git_executable_and_native_helper_directory_are_inventoried(self):
+        receipt = package.verify(self.path)
+        metadata = json.loads((self.path / "runtime/runtime.json").read_text())
+        files = {item["path"] for item in receipt["files"]}
+        self.assertIn(str(Path(metadata["tools"]["git"]).resolve()), files)
+        helper_dir, helpers = package.runtime.git_helpers(metadata["tools"]["git"])
+        self.assertEqual(str(helper_dir), metadata["git_exec_path"])
+        self.assertTrue(helpers)
+        self.assertTrue(all(str(path.resolve()) in files for path in helpers))
+        if package.sys.platform == "darwin":
+            self.assertNotEqual(metadata["tools"]["git"], "/usr/bin/git")
+            for name in ("forge", "forge-broker", "forge-orchestrator-host"):
+                text = (self.path / "bin" / (".forge-body" if name == "forge" else name)).read_text()
+                self.assertNotRegex(text, r'''["']/usr/bin/git["']''')
+                self.assertIn(metadata["tools"]["git"], text)
+        audit = package.runtime.audit(self.path, receipt)
+        self.assertEqual(audit["status"], "unsupported")
+        self.assertTrue(audit["blockers"])
+
+    def test_git_helper_addition_changes_runtime_inventory(self):
+        root = self.root / "git-runtime-fixture"
+        (root / "runtime").mkdir(parents=True)
+        helpers = root / "git-core"
+        helpers.mkdir()
+        stdlib = root / "stdlib"
+        stdlib.mkdir()
+        (root / "runtime/runtime.json").write_text(json.dumps({"python": "/bin/sh", "tools": {},
+            "stdlib": str(stdlib), "git_exec_path": str(helpers)}))
+        before = package.runtime.dependency_files(root)
+        (helpers / "git-remote-new").write_text("not a qualified helper")
+        self.assertNotEqual(before, package.runtime.dependency_files(root))
+
     def test_stable_auth_namespace_and_policy_only_inputs(self):
         receipt = package.verify(self.path)
         env = receipt["environment"]

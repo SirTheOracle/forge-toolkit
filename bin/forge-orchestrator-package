@@ -236,6 +236,7 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
             data = path.read_text()
             if data.startswith("#!/bin/bash"):
                 data = data.replace("/usr/bin/python3 -I", shlex.quote(str(package / "runtime/bin/python3")))
+            data = data.replace("/usr/bin/git", metadata["tools"]["git"])
             for name in ("tmux", "gh"):
                 data = data.replace("/opt/homebrew/bin/" + name, metadata["tools"][name])
             path.chmod(0o700)
@@ -569,7 +570,7 @@ def publish_candidate(package, report_path):
     return {"candidate": str(destination), "conformance": str(path), "admission": "qualified-not-registered"}
 
 
-def qualify(package, worker_binary=None, *, native=False):
+def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
     """Measure native prerequisites, retaining failures without minting admission."""
     package = Path(package).absolute()
     receipt = verify(package)
@@ -583,6 +584,8 @@ def qualify(package, worker_binary=None, *, native=False):
     report_dir.mkdir(parents=True, mode=0o700)
     checks = dict.fromkeys(ADMISSION_CHECKS, "not-run")
     checks["package_integrity"] = "pass"
+    runtime_audit = runtime.audit(package, receipt)
+    checks["runtime_closure"] = runtime_audit["status"]
     topology = host.topology(ctx)
     # An exact baseline pointer rule is not proof against future nested pointer
     # creation/rename. Keep those layouts unavailable, per P1's measured limit.
@@ -606,7 +609,7 @@ def qualify(package, worker_binary=None, *, native=False):
         except ValueError:
             authenticated = False
     checks["authentication"] = "available" if authenticated else "unavailable"
-    loading, configuration, children, policy, duplicates = None, None, None, None, None
+    loading, configuration, children, policy, duplicates, legacy = None, None, None, None, None, None
     if native:
         probes = module("forge_native", package / "lib/forge_native.py")
         configuration = probes.configuration(receipt, report_dir)
@@ -627,6 +630,8 @@ def qualify(package, worker_binary=None, *, native=False):
             checks["native_children"] = children["status"]
             duplicates = probes.duplicates(package, receipt, report_dir)
             checks["native_duplicates"] = duplicates["status"]
+            legacy = probes.legacy_coexistence(package, receipt, report_dir, legacy_model)
+            checks["legacy_coexistence"] = legacy["status"]
     # Utility containment and child primitives alone never mint admission.
     complete = checks.get("authentication") == "available" and all(checks.get(name) == "pass" for name in ADMISSION_CHECKS)
     report = {"schema": "forge-orchestrator-capability/1", "root": ctx.identity,
@@ -640,6 +645,8 @@ def qualify(package, worker_binary=None, *, native=False):
               "native_children": children,
               "native_policy": policy,
               "native_duplicates": duplicates,
+              "legacy_coexistence": legacy,
+              "runtime_audit": runtime_audit,
               "supported_providers": [provider] if complete else [],
               "admission": "measured-not-published" if complete else "unsupported",
               "limits": ["Native write-open utility evidence is not model policy evidence.",
@@ -676,6 +683,7 @@ def main():
     qualification.add_argument("--package", required=True)
     qualification.add_argument("--worker-binary")
     qualification.add_argument("--native", action="store_true", help="run authenticated model-led loading probes")
+    qualification.add_argument("--legacy-model", help="explicit Claude model for concurrent legacy read-only verification")
     login = sub.add_parser("auth", help="authenticate only the candidate's isolated native namespace")
     login.add_argument("--package", required=True)
     login.add_argument("--status", action="store_true")
@@ -683,7 +691,7 @@ def main():
     if args.action == "stage":
         result = stage(host.Context(args.root), args.provider, args.binary, args.model)
     elif args.action == "qualify":
-        result = qualify(args.package, args.worker_binary, native=args.native)
+        result = qualify(args.package, args.worker_binary, native=args.native, legacy_model=args.legacy_model)
     elif args.action == "auth":
         return authenticate(args.package, status=args.status)
     else:

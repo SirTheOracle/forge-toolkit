@@ -24,8 +24,24 @@ def selected_tools():
         selected = shutil.which(name, path=None if name in {"tmux", "gh", "rg"} else SYSTEM_PATH)
         if not selected:
             raise ValueError("missing candidate runtime command: " + name)
+        if name == "git" and sys.platform == "darwin":
+            # /usr/bin/git is an Apple developer-tool dispatcher, not the Git
+            # executable. Bind the selected toolchain without ambient overrides.
+            selected = subprocess.check_output(["/usr/bin/xcrun", "--find", "git"],
+                env={"PATH": SYSTEM_PATH}, text=True, timeout=15).strip()
+            if not Path(selected).is_absolute() or not Path(selected).is_file():
+                raise ValueError("cannot resolve the native Git executable")
         result[name] = selected
     return result
+
+
+def git_helpers(binary):
+    directory = subprocess.check_output([str(binary), "--exec-path"], env={"PATH": SYSTEM_PATH},
+                                        text=True, timeout=15).strip()
+    path = Path(directory)
+    if not path.is_absolute() or not path.is_dir():
+        raise ValueError("Git helper directory is unavailable")
+    return path, sorted(p.absolute() for p in path.rglob("*") if p.is_file() or p.is_symlink())
 
 
 def provider_dependencies(binaries):
@@ -48,6 +64,7 @@ def python_files(stdlib):
 def inputs():
     """Bind staging identity to runtime inputs, not just the interpreter path."""
     tools = selected_tools()
+    git_exec_path, helpers = git_helpers(tools["git"])
     yaml = Path(importlib.metadata.distribution("PyYAML").locate_file("yaml"))
     if yaml.is_symlink():
         raise ValueError("symlinked PyYAML source")
@@ -55,10 +72,11 @@ def inputs():
     if any(path.is_symlink() for path in yaml.rglob("*")):
         raise ValueError("symlinked PyYAML input")
     dependencies = native_dependencies([sys.executable, *tools.values(),
-                                        *python_files(sysconfig.get_path("stdlib")), *vendor])
+                                        *python_files(sysconfig.get_path("stdlib")), *vendor, *helpers])
     if dependencies["unresolved"]:
         raise ValueError("unresolved runtime inputs: " + repr(dependencies["unresolved"]))
-    return {"tools": tools, "aliases": dependencies["aliases"],
+    return {"tools": tools, "git_exec_path": str(git_exec_path), "git_helpers": list(map(str, helpers)),
+            "aliases": dependencies["aliases"],
             "files": [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                       for path in dependencies["files"]],
             "os_cached_libraries": dependencies["os_cached_libraries"]}
@@ -117,8 +135,10 @@ def stage(package, *, yaml_source=None):
         stub = runtime / "bin" / name
         stub.write_text("#!/bin/sh\nexec " + shlex.quote(resolved) + ' "$@"\n')
         stub.chmod(0o755)
+    git_exec_path, _ = git_helpers(tools["git"])
     metadata = {"schema": "forge-orchestrator-runtime/1", "python": interpreter,
                 "stdlib": sysconfig.get_path("stdlib"), "tools": tools,
+                "git_exec_path": str(git_exec_path),
                 "python_flags": ["-I", "-S", "-B"],
                 "shims": {"shasum": "isolated Python; only -a 256 and at most one input"},
                 "source_yaml": str(yaml_source), "qualified": False,
@@ -169,7 +189,28 @@ def dependency_files(package):
     # Bytecode can execute even with -B; include it, excluding user site-packages.
     # Preserve logical names too: a new alias to an existing file changes imports.
     files.update(path.absolute() for path in python_files(stdlib))
+    if "git_exec_path" in metadata:
+        files.update(p.absolute() for p in Path(metadata["git_exec_path"]).rglob("*") if p.is_file() or p.is_symlink())
     return sorted(files)
+
+
+def audit(package, receipt):
+    """Expose static closure gaps; never turn an inventory into native proof."""
+    metadata = json.loads((Path(package) / "runtime/runtime.json").read_text())
+    executables = {Path(p) for p in metadata["tools"].values()}
+    executables.update(Path(p) for p in receipt["worker_binaries"].values())
+    if "git_exec_path" in metadata:
+        executables.update(p for p in Path(metadata["git_exec_path"]).rglob("*") if p.is_file())
+    scripts = []
+    for path in sorted(executables):
+        with path.open("rb") as stream:
+            if stream.read(2) == b"#!":
+                scripts.append(str(path))
+    return {"status": "unsupported", "git_executable": metadata["tools"]["git"],
+            "git_exec_path": metadata.get("git_exec_path"), "script_dependencies": scripts,
+            "blockers": ["Native subprocess closure has not been measured for this package.",
+                         "Repository Git config/include, hooks, filters and remote helpers still require execution-policy qualification."]
+                        + (["Script interpreter/import/include dependencies are not fully qualified."] if scripts else [])}
 
 
 def native_dependencies(files):

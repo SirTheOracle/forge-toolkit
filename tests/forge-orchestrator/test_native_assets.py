@@ -3,10 +3,11 @@ import importlib.util
 import copy
 import json
 import shlex
+import sys
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 TREE = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("native_assets", TREE / "lib/forge_native.py")
@@ -51,6 +52,173 @@ class NativeAssets(unittest.TestCase):
         self.assertTrue(native.claude_reads([call, result], [self.path])[str(self.path)])
         result["message"]["content"][0]["is_error"] = True
         self.assertFalse(native.claude_reads([call, result], [self.path])[str(self.path)])
+
+    def claude_read(self, path):
+        return [{"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Read", "id": "read-1", "input": {"file_path": str(path)}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "read-1", "content": path.read_text()}]}}]
+
+    def test_claude_stream_requires_success_and_stable_native_session(self):
+        stream = native.ClaudeStream([], {}, "/", self.path)
+        stream.handshake()
+        stream.send = Mock()
+        final = {"type": "result", "subtype": "success", "is_error": False, "session_id": "native-session"}
+        stream.until = Mock(return_value=[final])
+        self.assertEqual(stream.turn("Read test"), [final])
+        self.assertEqual(stream.session, "native-session")
+        self.assertEqual(stream.send.call_args.args[0]["message"]["content"], "Read test")
+        for changed in (dict(final, is_error=True), dict(final, subtype="error_during_execution"),
+                        dict(final, session_id=None), dict(final, session_id="different")):
+            stream.until.return_value = [changed]
+            with self.assertRaises((RuntimeError, ValueError)):
+                stream.turn("Read test")
+
+    def test_stream_real_transport_reuses_process_and_cleans_up(self):
+        # An explicit protocol double, not native authentication/qualification.
+        code = ('import sys,json\nfor line in sys.stdin:\n'
+                ' value=json.loads(line)\n'
+                ' print(json.dumps({"type":"result","subtype":"success","is_error":False,'
+                '"session_id":"fixture-session"}),flush=True)\n')
+        stream = native.ClaudeStream([sys.executable, "-I", "-S", "-B", "-c", code], {},
+                                    str(self.path.parent), self.path.parent / "stream.jsonl", timeout=3)
+        with stream as client:
+            first = client.process.pid
+            client.turn("one")
+            client.turn("two")
+            self.assertEqual(client.process.pid, first)
+            self.assertIsNone(client.process.poll())
+        self.assertIsNotNone(stream.process.poll())
+        self.assertTrue(stream.log.closed)
+        self.assertTrue(stream.stderr.closed)
+        self.assertEqual(len(stream.transcript.read_text().splitlines()), 2)
+
+    def test_transport_launch_failure_closes_opened_logs(self):
+        stream = native.ClaudeStream(["/nonexistent/forge-probe"], {}, "/", self.path.parent / "failure.jsonl")
+        with self.assertRaises(FileNotFoundError):
+            with stream:
+                self.fail("missing executable must not start")
+        self.assertTrue(stream.log.closed)
+        self.assertTrue(stream.stderr.closed)
+
+    def test_transport_exclusive_log_failure_closes_stderr(self):
+        stream = native.Rpc([], {}, "/", self.path)
+        with self.assertRaises(FileExistsError):
+            with stream:
+                self.fail("existing log must not be replaced")
+        self.assertTrue(stream.stderr.closed)
+        self.assertIn("# Protocol", self.path.read_text())
+
+    def test_claude_stream_launch_has_only_read_and_no_approval_bypass(self):
+        receipt = {"provider_argv": ["/pinned/claude", "--safe-mode", "--permission-mode", "default", "prompt"]}
+        argv = native.claude_stream_argv(receipt, session="native-id", persist=False)
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read")
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "Read")
+        self.assertEqual(argv[argv.index("--permission-prompts") + 1], "none")
+        self.assertIn("--no-session-persistence", argv)
+        self.assertIn("native-id", argv)
+        self.assertNotIn("prompt", argv)
+        self.assertFalse(any("bypass" in value or "dangerous" in value for value in argv))
+
+    def test_legacy_snapshot_detects_bytes_and_same_byte_alias_swap(self):
+        alias = self.path.parent / "legacy.md"
+        alias.symlink_to(self.path)
+        before = native.legacy_snapshot([alias])
+        alternate = self.path.parent / "same.md"
+        alternate.write_bytes(self.path.read_bytes())
+        alias.unlink()
+        alias.symlink_to(alternate)
+        after = native.legacy_snapshot([alias])
+        self.assertEqual(before[0]["sha256"], after[0]["sha256"])
+        self.assertNotEqual(before, after)
+        alternate.write_text("changed bytes")
+        self.assertNotEqual(after, native.legacy_snapshot([alias]))
+
+    def test_concurrent_rounds_require_fresh_reads_and_two_live_processes(self):
+        legacy_file = self.path.parent / "legacy.md"
+        legacy_file.write_text("Legacy only.\n")
+        legacy, candidate = Mock(), Mock()
+        legacy.process.pid, candidate.process.pid = 100, 200
+        legacy.process.poll.return_value = candidate.process.poll.return_value = None
+        legacy.turn.return_value = self.claude_read(legacy_file)
+        read = Mock(return_value=self.claude_read(self.path))
+        cases = native.coexistence_rounds(legacy, candidate, read, [legacy_file], [self.path], "claude")
+        self.assertEqual([c["case"] for c in cases], ["candidate-fresh", "legacy-reread", "candidate-reinvoke", "legacy-final"])
+        self.assertTrue(all(c["status"] == "pass" and c["concurrent"] for c in cases))
+        self.assertEqual(legacy.turn.call_count, 2)
+        self.assertEqual(read.call_count, 2)
+        legacy.process.poll.return_value = 0
+        with self.assertRaisesRegex(RuntimeError, "both original"):
+            native.coexistence_rounds(legacy, candidate, read, [legacy_file], [self.path], "claude")
+        legacy.process.poll.return_value = None
+        read.return_value = []
+        cases = native.coexistence_rounds(legacy, candidate, read, [legacy_file], [self.path], "claude")
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]["status"], "fail")
+
+    def test_coexistence_rejects_cross_read_and_parent_claim(self):
+        other = self.path.parent / "other.md"
+        other.write_text("Other protocol")
+        reads = self.claude_read(self.path)
+        self.assertEqual(native.read_separation(reads, [self.path], [other], "claude")["status"], "pass")
+        crossed = copy.deepcopy(self.claude_read(other))
+        for event in crossed:
+            for item in event["message"]["content"]:
+                item["id" if item["type"] == "tool_use" else "tool_use_id"] = "other-read"
+        self.assertEqual(native.read_separation(reads + crossed, [self.path], [other], "claude")["status"], "fail")
+        claim = [{"type": "assistant", "message": {"content": [{"type": "text", "text": self.path.read_text()}]}}]
+        self.assertEqual(native.read_separation(claim, [self.path], [other], "claude")["status"], "fail")
+
+    def claude_graph(self):
+        expected = {"A": {"own": "A_UNIQUE", "other": "UNKNOWN", "value": 11},
+                    "B": {"own": "B_UNIQUE", "other": "UNKNOWN", "value": 17}, "C": {"total": 28}}
+        events = []
+        for label, generation in (("A", 0), ("B", 0), ("A", 1), ("B", 1), ("C", 0)):
+            task, tool = label.lower(), label + str(generation)
+            events.extend([
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Agent" if generation == 0 else "SendMessage", "id": tool,
+                     "input": {"to": task, "prompt": "bounded fixture"}}]}},
+                {"type": "system", "subtype": "task_started", "task_id": task, "tool_use_id": tool,
+                 "spawn_depth": 1, "prompt": "bounded fixture"},
+                {"type": "assistant", "parent_tool_use_id": tool, "message": {"content": [
+                    {"type": "text", "text": json.dumps(expected[label])}]}},
+                {"type": "system", "subtype": "task_notification", "task_id": task, "tool_use_id": tool,
+                 "status": "completed"},
+            ])
+        return events, expected
+
+    def test_claude_children_require_child_results_and_native_generations(self):
+        events, expected = self.claude_graph()
+        result = native.claude_child_graph(events, expected, followups=True)
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["children"], {"A": "a", "B": "b", "C": "c"})
+        self.assertFalse(result["plaintext_isolation_attested"])
+        self.assertEqual(native.claude_child_graph([], expected, followups=True)["status"], "fail")
+        cases = []
+        for index, key, value in ((2, "parent_tool_use_id", None), (3, "status", "running"),
+                                  (9, "task_id", "unknown"), (9, "prompt", "B_UNIQUE"),
+                                  (9, "tool_use_id", "A0"), (13, "spawn_depth", 2)):
+            changed = copy.deepcopy(events)
+            changed[index][key] = value
+            cases.append(changed)
+        cases.extend([events[:-1], events + [events[-1]], events[:8] + events[16:] + events[8:16]])
+        no_followup = copy.deepcopy(events)
+        no_followup[8]["message"]["content"][0]["name"] = "Agent"
+        cases.append(no_followup)
+        for changed in cases:
+            with self.subTest(events=changed):
+                self.assertEqual(native.claude_child_graph(changed, expected, followups=True)["status"], "fail")
+
+    def test_claude_digest_read_evidence_cannot_come_from_parent_or_other_child(self):
+        events = self.claude_read(self.path)
+        self.assertFalse(native.claude_reads(events, [self.path], parent_tool_use_id="child")[str(self.path)])
+        for event in events:
+            event["parent_tool_use_id"] = "child"
+        self.assertFalse(native.claude_reads(events, [self.path])[str(self.path)])
+        self.assertTrue(native.claude_reads(events, [self.path], parent_tool_use_id="child")[str(self.path)])
+        self.assertFalse(native.claude_reads(events, [self.path], parent_tool_use_id="other")[str(self.path)])
+        self.assertEqual(native.claude_blocks({"message": {"content": "a replayed user prompt"}}), [])
 
     def test_codex_rpc_preserves_policy_but_cwd_is_not_a_config_key(self):
         receipt = {"provider_argv": ["/bin/codex", "-C", "/a/.worktree", "--strict-config",

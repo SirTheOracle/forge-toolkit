@@ -1,9 +1,11 @@
 """Native, authenticated loading probes. Model assertions are not test evidence."""
 
 import json
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+import hashlib
 import os
 from pathlib import Path
+import pwd
 import selectors
 import shlex
 import signal
@@ -21,37 +23,57 @@ class Rpc:
         self.sequence, self.buffer, self.pending = 0, b"", []
 
     def __enter__(self):
-        self.stderr = self.transcript.with_suffix(".stderr").open("x")
-        self.log = self.transcript.open("x")
-        self.process = subprocess.Popen(self.argv, env=self.env, cwd=self.cwd,
-                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
-                                        start_new_session=True)
-        self.selector = selectors.DefaultSelector()
-        self.selector.register(self.process.stdout, selectors.EVENT_READ)
+        self.stderr = self.log = self.process = self.selector = None
         try:
-            self.call("initialize", {"clientInfo": {"name": "forge-native-qualification", "version": "1"},
-                                     "capabilities": {"experimentalApi": True}})
-            self.send({"method": "initialized", "params": {}})
+            self.stderr = self.transcript.with_suffix(".stderr").open("x")
+            self.log = self.transcript.open("x")
+            self.process = subprocess.Popen(self.argv, env=self.env, cwd=self.cwd,
+                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
+                                            start_new_session=True)
+            self.selector = selectors.DefaultSelector()
+            self.selector.register(self.process.stdout, selectors.EVENT_READ)
+            self.handshake()
             return self
         except BaseException:
             self.__exit__(None, None, None)
             raise
 
+    def handshake(self):
+        self.call("initialize", {"clientInfo": {"name": "forge-native-qualification", "version": "1"},
+                                 "capabilities": {"experimentalApi": True}})
+        self.send({"method": "initialized", "params": {}})
+
     def __exit__(self, *exc):
-        self.process.stdin.close()
         try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(self.process.pid, signal.SIGTERM)
-            try:
+            if self.process:
+                try:
+                    self.process.stdin.close()
+                except BrokenPipeError:
+                    pass
+                # Also terminate background descendants if their leader already
+                # exited. Only the process group created by this client is owned.
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.killpg(self.process.pid, sig)
+                    except ProcessLookupError:
+                        break
+                    try:
+                        self.process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        continue
                 self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait(timeout=5)
-        self.selector.close()
-        self.process.stdout.close()
-        self.log.close()
-        self.stderr.close()
+        finally:
+            if self.selector:
+                self.selector.close()
+            if self.process:
+                self.process.stdout.close()
+            for stream in (self.log, self.stderr):
+                if stream:
+                    stream.close()
 
     def send(self, value):
         self.process.stdin.write((json.dumps(value) + "\n").encode())
@@ -114,6 +136,42 @@ class Rpc:
         if final["status"] != "completed":
             raise RuntimeError("native turn failed: " + json.dumps(final))
         return events
+
+
+class ClaudeStream(Rpc):
+    """Claude's native stream protocol, without a fabricated RPC handshake."""
+
+    def handshake(self):
+        self.session = None
+
+    def turn(self, prompt):
+        self.pending = []
+        self.send({"type": "user", "message": {"role": "user", "content": prompt},
+                   "parent_tool_use_id": None})
+        events = self.until(lambda event: event.get("type") == "result" and not event.get("parent_tool_use_id"))
+        finals = [event for event in events if event.get("type") == "result" and not event.get("parent_tool_use_id")]
+        final = finals[-1]
+        if final.get("is_error") is not False or final.get("subtype") != "success":
+            raise RuntimeError("Claude native turn did not succeed: " + str(final.get("subtype")))
+        session = final.get("session_id")
+        if not isinstance(session, str) or not session or (self.session and session != self.session):
+            raise ValueError("Claude stream session identity absent or changed")
+        self.session = session
+        return events
+
+
+def claude_stream_argv(receipt, *, session=None, persist=True, children=False):
+    toolset = "Read,Agent,SendMessage" if children else "Read"
+    argv = receipt["provider_argv"][:-1] + ["--print", "--verbose", "--input-format", "stream-json",
+                                            "--output-format", "stream-json", "--tools", toolset,
+                                            "--allowedTools", toolset, "--permission-prompts", "none"]
+    if children:
+        argv.append("--forward-subagent-text")
+    if session:
+        argv += ["--resume", session]
+    if not persist:
+        argv.append("--no-session-persistence")
+    return argv
 
 
 def codex_argv(receipt):
@@ -288,7 +346,7 @@ def duplicate_result(events, paths, decoys, marker, provider):
     else:
         loaded = any(item.get("type") == "tool_use" and item.get("name") == "Read"
                      and item.get("input", {}).get("file_path") in set(map(str, decoys))
-                     for event in events for item in event.get("message", {}).get("content", []))
+                     for event in events for item in claude_blocks(event))
     contaminated = bool(marker and marker in json.dumps(events))
     return {"reads": reads, "decoy_read": loaded, "marker_observed": contaminated,
             "status": "pass" if all(reads.values()) and not loaded and not contaminated else "fail"}
@@ -320,16 +378,22 @@ def duplicates(package, receipt, directory):
                 events = thread_events(client.turn(thread, load_prompt(paths)), thread)
                 cases.append(dict(duplicate_result(events, paths, decoys, None, provider), case="duplicate-removed"))
         else:
-            session = None
-            for case in ("duplicate-fresh", "duplicate-changed"):
-                marker = "DECOY_" + uuid.uuid4().hex
-                with duplicate_assets(decoys, marker) as body:
-                    events, session = claude_read_turn(receipt, load_prompt(paths), directory, case, session)
-                    result = duplicate_result(events, paths, decoys, marker, provider)
-                    result.update(case=case, decoy_body=body, decoy_paths=list(map(str, decoys)))
-                    cases.append(result)
-            events, session = claude_read_turn(receipt, load_prompt(paths), directory, "duplicate-removed", session)
-            cases.append(dict(duplicate_result(events, paths, decoys, None, provider), case="duplicate-removed"))
+            with ExitStack() as stack:
+                client = None
+                for case in ("duplicate-fresh", "duplicate-changed"):
+                    marker = "DECOY_" + uuid.uuid4().hex
+                    with duplicate_assets(decoys, marker) as body:
+                        if client is None:
+                            client = stack.enter_context(ClaudeStream(claude_stream_argv(receipt), receipt["environment"],
+                                receipt["root"]["physical_root"], directory / "claude-duplicates.jsonl"))
+                        events = client.turn(load_prompt(paths))
+                        result = duplicate_result(events, paths, decoys, marker, provider)
+                        result.update(case=case, decoy_body=body, decoy_paths=list(map(str, decoys)),
+                                      session=client.session, pid=client.process.pid)
+                        cases.append(result)
+                events = client.turn(load_prompt(paths))
+                cases.append(dict(duplicate_result(events, paths, decoys, None, provider), case="duplicate-removed",
+                                  session=client.session, pid=client.process.pid))
         return {"status": "pass" if cases and all(case["status"] == "pass" for case in cases) else "fail", "cases": cases}
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
         return {"status": "fail", "error": str(exc), "cases": cases}
@@ -505,10 +569,9 @@ def codex_children(package, receipt, directory):
 
 
 def children(package, receipt, directory):
-    if receipt["definition"]["provider"] != "codex":
-        return {"status": "unsupported", "reason": "Claude child transcript qualification not yet implemented"}
     try:
-        cases = codex_children(package, receipt, directory)
+        runner = codex_children if receipt["definition"]["provider"] == "codex" else claude_children
+        cases = runner(package, receipt, directory)
         return {"status": "pass" if all(case["status"] == "pass" for case in cases) else "fail", "cases": cases,
                 "scope": "native child primitives; not full proposal or QA pipeline acceptance"}
     except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError, TimeoutError) as exc:
@@ -543,52 +606,265 @@ def codex_loads(package, receipt, directory):
     return results
 
 
-def claude_reads(events, paths):
+def claude_blocks(event):
+    contents = event.get("message", {}).get("content", [])
+    return [item for item in contents if isinstance(item, dict)] if isinstance(contents, list) else []
+
+
+def claude_reads(events, paths, *, parent_tool_use_id=None):
     calls, contents = {}, {}
     for event in events:
-        for item in event.get("message", {}).get("content", []):
+        if event.get("parent_tool_use_id") != parent_tool_use_id:
+            continue
+        for item in claude_blocks(event):
             if item.get("type") == "tool_use" and item.get("name") == "Read":
                 calls[item["id"]] = item.get("input", {}).get("file_path")
             if item.get("type") == "tool_result" and not item.get("is_error"):
                 contents[item["tool_use_id"]] = item.get("content", "")
     result = {}
     for path in paths:
-        output = "\n".join(value if isinstance(value, str) else "\n".join(part.get("text", "") for part in value)
+        output = "\n".join(value if isinstance(value, str) else "\n".join(part.get("text", "") for part in value if isinstance(part, dict))
                            for key, value in contents.items() if calls.get(key) == str(path))
         expected = [line.strip() for line in path.read_text().splitlines() if line.strip()]
         result[str(path)] = bool(expected) and all(line in output for line in expected)
     return result
 
 
-def claude_read_turn(receipt, prompt, directory, case, session=None):
-    argv = receipt["provider_argv"][:-1] + ["--print", "--verbose", "--output-format", "stream-json",
-                                               "--allowedTools", "Read"]
-    if session:
-        argv += ["--resume", session]
-    argv += ["--", prompt]
-    with (directory / ("claude-" + case + ".jsonl")).open("x") as out:
-        with (directory / ("claude-" + case + ".stderr")).open("x") as err:
-            cp = subprocess.run(argv, env=receipt["environment"], cwd=receipt["root"]["physical_root"],
-                                stdout=out, stderr=err, timeout=300)
-    events = [json.loads(line) for line in (directory / ("claude-" + case + ".jsonl")).read_text().splitlines()]
-    finals = [event for event in events if event.get("type") == "result"]
-    if cp.returncode or not finals or finals[-1].get("is_error"):
-        raise RuntimeError("Claude native read did not complete: " + case)
-    return events, finals[-1]["session_id"]
+def claude_child_graph(events, expected, *, followups=False):
+    """Match native task generations to child-owned output and completion."""
+    calls, tasks, spawned = {}, {}, []
+    invalid = False
+    for index, event in enumerate(events):
+        if not event.get("parent_tool_use_id"):
+            for item in claude_blocks(event):
+                if item.get("type") == "tool_use" and item.get("name") in ("Agent", "Task", "SendMessage"):
+                    if not item.get("id") or item["id"] in calls:
+                        invalid = True
+                    calls[item.get("id")] = (index, item)
+        if event.get("type") != "system" or event.get("subtype") != "task_started":
+            continue
+        task, tool = event.get("task_id"), event.get("tool_use_id")
+        call_index, call = calls.get(tool, (-1, {}))
+        if not task or not tool or call_index < 0 or event.get("spawn_depth") != 1:
+            invalid = True
+            continue
+        generations = tasks.setdefault(task, [])
+        if call.get("name") in ("Agent", "Task"):
+            if generations or call.get("input", {}).get("resume"):
+                invalid = True
+            spawned.append(task)
+        elif call.get("name") == "SendMessage":
+            target = call.get("input", {}).get("to") or call.get("input", {}).get("recipient")
+            if not generations or target != task:
+                invalid = True
+        else:
+            invalid = True
+        messages = [(i, "".join(part.get("text", "") for part in claude_blocks(e) if part.get("type") == "text"))
+                    for i, e in enumerate(events) if e.get("type") == "assistant" and e.get("parent_tool_use_id") == tool]
+        messages = [(i, text) for i, text in messages if text.strip()]
+        completions = [(i, e) for i, e in enumerate(events) if e.get("type") == "system"
+                       and e.get("subtype") == "task_notification" and e.get("task_id") == task
+                       and e.get("tool_use_id") == tool]
+        complete_at = completions[0][0] if len(completions) == 1 else -1
+        if (len(completions) != 1 or completions[0][1].get("status") != "completed" or not messages
+                or not call_index < index < messages[-1][0] < complete_at
+                or any(g["tool_use_id"] == tool for rows in tasks.values() for g in rows)):
+            invalid = True
+        if generations and not generations[-1]["completed_at"] < call_index:
+            invalid = True
+        generations.append({"tool_use_id": tool, "call_at": call_index, "started_at": index,
+                            "completed_at": complete_at, "answer": json_message(messages[-1][1]) if messages else None,
+                            "prompt": event.get("prompt", "")})
+    matched = {}
+    for label, value in expected.items():
+        matches = [task for task, rows in tasks.items() if rows[-1]["answer"] == value]
+        if len(matches) == 1:
+            matched[label] = matches[0]
+    passed = (not invalid and len(spawned) == len(set(spawned)) == len(expected) == len(matched)
+              and len(set(matched.values())) == len(expected)
+              and len(calls) == sum(len(rows) for rows in tasks.values()))
+    if followups:
+        c_rows = tasks.get(matched.get("C"), [])
+        passed = passed and len(c_rows) == 1
+        for label, other in (("A", "B"), ("B", "A")):
+            rows = tasks.get(matched.get(label), [])
+            passed = bool(passed and len(rows) == 2 and all(row["answer"] == expected[label] for row in rows)
+                          and rows[-1]["completed_at"] < c_rows[0]["call_at"]
+                          and all(expected[other]["own"] not in row["prompt"] for row in rows))
+    else:
+        passed = passed and all(len(rows) == 1 for rows in tasks.values())
+    return {"status": "pass" if passed else "fail", "children": matched, "tasks": tasks,
+            "loading_evidence": "behavioral", "plaintext_isolation_attested": False}
+
+
+def claude_children(package, receipt, directory):
+    results = []
+    for case in ("proposal", "digest", "local-qa"):
+        prompt, expected, artifact = child_packet(package, receipt, directory, case)
+        with ClaudeStream(claude_stream_argv(receipt, children=True), receipt["environment"],
+                          receipt["root"]["physical_root"], directory / ("claude-children-" + case + ".jsonl"),
+                          timeout=600) as client:
+            events = client.turn(prompt)
+            result = claude_child_graph(events, expected, followups=case != "digest")
+            adapter = protocol_paths(package, receipt)[-1]
+            result["adapter_read"] = claude_reads(events, [adapter])[str(adapter)]
+            if not result["adapter_read"]:
+                result["status"] = "fail"
+            if artifact:
+                protected = [artifact, directory / "digest-prompt.txt"]
+                parent_read = any(item.get("type") == "tool_use" and item.get("name") == "Read"
+                                  and item.get("input", {}).get("file_path") in set(map(str, protected))
+                                  for event in events if not event.get("parent_tool_use_id") for item in claude_blocks(event))
+                task = result["children"].get("digest")
+                rows = result["tasks"].get(task, [])
+                child_read = bool(len(rows) == 1 and all(claude_reads(
+                    events, protected, parent_tool_use_id=rows[0]["tool_use_id"]).values()))
+                result.update(parent_artifact_read=parent_read, child_artifact_read=child_read)
+                if parent_read or not child_read:
+                    result["status"] = "fail"
+            results.append(dict(result, case=case, session=client.session))
+    return results
 
 
 def claude_loads(package, receipt, directory):
-    paths, results, session = protocol_paths(package, receipt), [], None
-    for case in ("fresh", "reinvoke", "compact-transition", "compact", "resume", "restart"):
-        events, session = claude_read_turn(receipt, "/compact" if case == "compact-transition" else load_prompt(paths),
-                                          directory, case, None if case == "restart" else session)
-        if case == "compact-transition":
+    paths, results = protocol_paths(package, receipt), []
+    env, cwd = receipt["environment"], receipt["root"]["physical_root"]
+    with ClaudeStream(claude_stream_argv(receipt), env, cwd, directory / "claude-live.jsonl") as client:
+        for case in ("fresh", "reinvoke", "compact-transition", "compact"):
+            events = client.turn("/compact" if case == "compact-transition" else load_prompt(paths))
+            if case != "compact-transition":
+                reads = claude_reads(events, paths)
+                results.append({"case": case, "reads": reads, "session": client.session,
+                                "pid": client.process.pid, "status": "pass" if all(reads.values()) else "fail"})
+                continue
             observed = any(event.get("type") == "system" and event.get("subtype") == "compact_boundary" for event in events)
             results.append({"case": case, "status": "pass" if observed else "fail"})
-            continue
-        reads = claude_reads(events, paths)
-        results.append({"case": case, "reads": reads, "status": "pass" if all(reads.values()) else "fail"})
+            if not observed:
+                return results
+        session = client.session
+    for case in ("resume", "restart"):
+        argv = claude_stream_argv(receipt, session=session if case == "resume" else None)
+        with ClaudeStream(argv, env, cwd, directory / ("claude-" + case + ".jsonl")) as client:
+            events = client.turn(load_prompt(paths))
+            reads = claude_reads(events, paths)
+            identity = client.session == session if case == "resume" else client.session != session
+            results.append({"case": case, "reads": reads, "session": client.session, "pid": client.process.pid,
+                            "status": "pass" if identity and all(reads.values()) else "fail"})
     return results
+
+
+def legacy_snapshot(paths):
+    """Read only named public discovery assets, including their alias targets."""
+    result = []
+    for path in paths:
+        aliases = {str(part): os.readlink(part) for part in (*reversed(path.parents), path) if part.is_symlink()}
+        physical = path.resolve(strict=True)
+        before = physical.stat()
+        body = physical.read_bytes()
+        after = physical.stat()
+        identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        if identity(before) != identity(after) or path.resolve(strict=True) != physical:
+            raise ValueError("legacy asset changed during snapshot: " + str(path))
+        if aliases != {str(part): os.readlink(part) for part in (*reversed(path.parents), path) if part.is_symlink()}:
+            raise ValueError("legacy discovery alias changed during snapshot: " + str(path))
+        result.append({"path": str(path), "resolved": str(physical), "aliases": aliases,
+                       "sha256": hashlib.sha256(body).hexdigest()})
+    return result
+
+
+def read_separation(events, own, other, provider):
+    reads = (codex_reads if provider == "codex" else claude_reads)(events, own)
+    if provider == "codex":
+        crossed = any(str(path) in item.get("command", "") for path in other for item in completed_items(events)
+                      if item.get("type") == "commandExecution")
+    else:
+        crossed = any(item.get("type") == "tool_use" and item.get("name") == "Read"
+                      and item.get("input", {}).get("file_path") in set(map(str, other))
+                      for event in events for item in claude_blocks(event))
+    return {"reads": reads, "cross_read": crossed, "status": "pass" if all(reads.values()) and not crossed else "fail"}
+
+
+@contextmanager
+def candidate_reader(receipt, transcript):
+    env, cwd = receipt["environment"], receipt["root"]["physical_root"]
+    if receipt["definition"]["provider"] == "codex":
+        with Rpc(codex_argv(receipt), env, cwd, transcript) as client:
+            params = {"cwd": cwd, "model": receipt["definition"]["model"], "approvalPolicy": "on-request",
+                      "approvalsReviewer": "user", "sandbox": "workspace-write"}
+            thread = client.call("thread/start", params)["thread"]["id"]
+            yield client, lambda prompt: thread_events(client.turn(thread, prompt), thread)
+    else:
+        with ClaudeStream(claude_stream_argv(receipt), env, cwd, transcript) as client:
+            yield client, client.turn
+
+
+def coexistence_rounds(legacy, candidate, candidate_turn, legacy_paths, candidate_paths, provider):
+    cases = []
+    for name, client, read, own, other, native in (
+        ("candidate-fresh", candidate, candidate_turn, candidate_paths, legacy_paths, provider),
+        ("legacy-reread", legacy, legacy.turn, legacy_paths, candidate_paths, "claude"),
+        ("candidate-reinvoke", candidate, candidate_turn, candidate_paths, legacy_paths, provider),
+        ("legacy-final", legacy, legacy.turn, legacy_paths, candidate_paths, "claude"),
+    ):
+        alive_before = legacy.process.poll() is None and candidate.process.poll() is None
+        if not alive_before:
+            raise RuntimeError("coexistence requires both original native processes to remain alive")
+        events = read(load_prompt(own))
+        result = read_separation(events, own, other, native)
+        alive = legacy.process.poll() is None and candidate.process.poll() is None
+        result.update(case=name, legacy_pid=legacy.process.pid, candidate_pid=candidate.process.pid,
+                      concurrent=alive_before and alive)
+        if not alive or legacy.process.pid == candidate.process.pid:
+            result["status"] = "fail"
+        cases.append(result)
+        if result["status"] != "pass":
+            break
+    return cases
+
+
+def legacy_coexistence(package, receipt, directory, model):
+    if not model:
+        return {"status": "unsupported", "reason": "explicit --legacy-model required for the legacy Claude probe"}
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    paths = [home / ".claude/skills/forge-orchestrator/SKILL.md", home / ".claude/commands/forge.md",
+             home / ".claude/agents/forge-orchestrator.md"]
+    result = {"status": "fail", "model": model, "binary": receipt["worker_binaries"]["claude"], "cases": []}
+    before = None
+    try:
+        before = legacy_snapshot(paths)
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "SHELL": "/bin/zsh",
+               "USER": pwd.getpwuid(os.getuid()).pw_name, "LOGNAME": pwd.getpwuid(os.getuid()).pw_name,
+               "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+        legacy_receipt = {"provider_argv": [receipt["worker_binaries"]["claude"], "--safe-mode", "--setting-sources", "",
+                          "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                          "--permission-mode", "default", "--model", model, "unused"]}
+        argv = claude_stream_argv(legacy_receipt, persist=False)
+        # Only the legacy read-only client sees the user's normal keyring/HOME.
+        # Candidate authentication/configuration is never replaced or copied.
+        with ClaudeStream(argv, env, receipt["root"]["physical_root"], directory / "legacy-live.jsonl") as legacy:
+            events = legacy.turn(load_prompt(paths))
+            fresh = read_separation(events, paths, protocol_paths(package, receipt), "claude")
+            result["cases"].append(dict(fresh, case="legacy-fresh", legacy_pid=legacy.process.pid))
+            if fresh["status"] != "pass":
+                raise ValueError("legacy fresh read did not load its complete assets")
+            with candidate_reader(receipt, directory / "candidate-coexistence.jsonl") as (candidate, read):
+                result["cases"].extend(coexistence_rounds(legacy, candidate, read, paths,
+                                                        protocol_paths(package, receipt), receipt["definition"]["provider"]))
+        result["status"] = "pass" if len(result["cases"]) == 5 and all(c["status"] == "pass" for c in result["cases"]) else "fail"
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
+        result["error"] = str(exc)
+    finally:
+        if before is not None:
+            try:
+                after = legacy_snapshot(paths)
+                result.update(before=before, after=after, legacy_unchanged=before == after)
+                if before != after:
+                    result["status"] = "fail"
+            except (OSError, ValueError) as exc:
+                result.update(status="fail", legacy_unchanged=False, integrity_error=str(exc))
+    with (directory / "legacy-coexistence.json").open("x") as stream:
+        json.dump(result, stream, indent=2, sort_keys=True)
+    return result
 
 
 def loading(package, receipt, directory):

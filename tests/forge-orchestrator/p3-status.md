@@ -88,15 +88,32 @@ orchestrate; the remaining work is production qualification, not feasibility.
 - Claude's empty MCP argument now uses `{"mcpServers":{}}`. The installed native
   CLI rejected the previous `{}` before starting a model turn. A regression test
   covers the required shape.
+- Claude loading and duplicate probes now use a persistent native stream. Fresh
+  entry, reinvocation, compaction and decoy changes share one process/session;
+  resume and restart use separate processes and check session identities.
+  Transport cleanup also covers failed launches and background descendants.
+- Claude child verification matches native task starts, forwarded child-owned
+  results, SendMessage generations and completion notifications. It rejects
+  missing/early joins, changed task identities, cross-contaminated prompts and
+  parent-produced digest reads. This runner is not yet authenticated evidence.
+- Concurrent legacy/candidate verification now has a runner. Both original
+  native processes must stay alive through interleaved fresh reads; wrong-entry
+  reads fail. Global legacy file hashes and symlink targets must remain unchanged.
+  Only that read-only legacy client uses normal HOME; candidate isolation is
+  unchanged. `--legacy-model` explicitly selects its model.
+- Copied helpers now pin the actual macOS Git executable instead of Apple's
+  dispatcher. Its helper directory, logical aliases and resolved file bytes
+  participate in staging and drift detection. A static audit records remaining
+  script/configuration/execution gaps as unsupported, never as native proof.
 
 ## Deliberately Not Admission
 
 The prerequisite report schema is `forge-orchestrator-capability/1`, not P2's
 `forge-orchestrator-qualification/1`. Current native reports advertise an empty provider set.
 It cannot by itself register a qualified profile. The authenticated load/reload
-and Codex child, model-policy and duplicate harnesses have not run successfully
-against an authenticated candidate yet. Claude child/policy, concurrent legacy,
-management/hook and complete runtime qualification runners remain unfinished.
+and child, model-policy, duplicate and concurrent legacy harnesses have not run
+successfully against an authenticated candidate yet. Claude effective configuration
+and model-policy, management/hook and complete runtime qualification remain unfinished.
 The new producer is gated on all these
 checks, so it does not currently publish a qualified candidate.
 Do not relabel not-run checks as pass or use synthetic tests as admission evidence.
@@ -132,14 +149,15 @@ This is not protected admission evidence and no workaround was attempted.
 
 1. Complete the pending native logins and verify credential persistence through
    restaging without widening worker/child authority or changing existing sessions.
-2. Implement and run authenticated fresh/duplicate/reinvoke/compact/resume/
-   restart loading and native proposal/digest/local-QA child qualification on
+2. Run authenticated fresh/duplicate/reinvoke/compact/resume/restart loading and
+   native proposal/digest/local-QA child qualification on
    these exact copied bytes, including legacy/candidate concurrent rereads.
 3. Finish full runtime/alias/implicit-input closure auditing, including native
    helper subprocesses, Python startup/cache inputs, provider auxiliary binaries,
    HOME input additions and direct/indirect control-entry approval behavior.
 4. Exercise the protected P2 candidate/conformance producer only after real native
    management, hook transport, worker policy and topology evidence passes.
+   Finish Claude effective-configuration/model-policy and management/hook runners.
    Prove broker startup/status/handshake/reuse against the full packaged closure.
 5. Re-run all P3 acceptance negatives (including stale daemon, source/alias
    replacement and newly introduced native discovery inputs) plus existing
@@ -150,17 +168,20 @@ Package staging and fixture tests are not replacements for these requirements.
 ## Evidence
 
 `evidence/p3-checkpoint.json` records the latest package-bound native prerequisite
-result. Both primary and linked probes tested 2,822 write-open targets and 525
+result. Both primary and linked probes tested 2,873 write-open targets and 525
 mutation attempts apiece. All were denied and workspace positive controls passed.
 Codex's effective native configuration also passes. Authentication remains
-unavailable; the report still says `admission: unsupported`.
+unavailable; the report still says `admission: unsupported`. The runtime audit
+identifies 14 Git scripts with unqualified interpreter/include dependencies, plus
+the remaining repository-config and native subprocess-closure requirements.
 
 Latest source-stable broader run recorded under
-`.dev/forge-p2/requests-1789580218441111000/` ran 185 orchestrator tests
-(183 passed, two opt-in native skips), including 23 package tests and 16 native
+`.dev/forge-p2/requests-1789595569370194000/` ran 197 orchestrator tests
+(195 passed, two opt-in native skips), including 25 package tests and 26 native
 trace/fixture tests. All 71 start checks, 31 spawn checks and hermetic worker policy passed.
-The runner's dedicated tmux server is stopped. The device login again expired
-without authorization; no login or model process remains running.
+The runner's dedicated tmux server is stopped. Both candidate authentication
+statuses were rechecked and remain logged out. No new login was started and no
+login or model process remains running. Local `main` is already merged.
 
 Prior checkpoint regression evidence: P0 contract suite: 60 passed. Watcher: 429 passed.
 Full bridge rerun: 558 passed, zero failed or not-run, recorded in
