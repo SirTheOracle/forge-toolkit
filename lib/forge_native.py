@@ -7,6 +7,7 @@ import selectors
 import signal
 import subprocess
 import time
+import uuid
 
 
 class Rpc:
@@ -181,6 +182,173 @@ def codex_reads(events, paths):
         expected = [line.strip() for line in path.read_text().splitlines() if line.strip()]
         result[str(path)] = bool(expected) and all(line in outputs for line in expected)
     return result
+
+
+def completed_items(events):
+    return [event.get("params", {}).get("item", {}) for event in events if event.get("method") == "item/completed"]
+
+
+def thread_events(events, thread):
+    return [event for event in events if event.get("params", {}).get("threadId") == thread]
+
+
+def child_turn_items(thread):
+    """One terminal answer per completed child turn, plus native tool evidence."""
+    turns = thread.get("turns", [])
+    if not turns or any(turn.get("status") != "completed" for turn in turns):
+        raise ValueError("child transcript contains absent or unfinished turns")
+    items = []
+    for turn in turns:
+        messages = [item for item in turn.get("items", []) if item.get("type") == "agentMessage"
+                    and item.get("phase") != "commentary"]
+        items.extend(item for item in turn.get("items", []) if item.get("type") != "agentMessage")
+        if messages:
+            items.append(messages[-1])
+    return items
+
+
+def json_message(text):
+    if not isinstance(text, str):
+        return None
+    lines = text.strip().splitlines()
+    if len(lines) > 2 and lines[0] in ("```", "```json") and lines[-1] == "```":
+        text = "\n".join(lines[1:-1])
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def child_graph(events, child_items, expected, *, followups=False):
+    """Require distinct native children, native joins and child-owned results."""
+    calls = [item for item in completed_items(events)
+             if item.get("type") == "collabAgentToolCall" and item.get("status") == "completed"]
+    spawned = [thread for item in calls if item.get("tool") == "spawnAgent" for thread in item.get("receiverThreadIds", [])]
+    # A completed wait call may only have timed out. Require a completed child
+    # state in that wait, and require follow-up joins to occur after the send.
+    def joined_at(thread, after):
+        return [index for index, item in enumerate(calls) if index > after and item.get("tool") == "wait"
+                and thread in item.get("receiverThreadIds", [])
+                and item.get("agentsStates", {}).get(thread, {}).get("status") == "completed"]
+    spawned_at = {thread: index for index, item in enumerate(calls) if item.get("tool") == "spawnAgent"
+                  for thread in item.get("receiverThreadIds", [])}
+    joined = {thread for thread in spawned if joined_at(thread, spawned_at[thread])}
+    followed = {thread for item in calls if item.get("tool") in ("followupTask", "sendInput", "sendMessage")
+                for thread in item.get("receiverThreadIds", [])}
+    matches = {}
+    for label, value in expected.items():
+        candidates = []
+        for thread in spawned:
+            messages = [item.get("text") for item in child_items.get(thread, []) if item.get("type") == "agentMessage"]
+            # The parent cannot satisfy this with an assertion in its own turn.
+            if messages and json_message(messages[-1]) == value:
+                candidates.append(thread)
+        if len(candidates) == 1:
+            matches[label] = candidates[0]
+    passed = (len(spawned) == len(expected) == len(set(spawned)) == len(matches)
+              and len(set(matches.values())) == len(expected) and set(spawned) <= joined)
+    if followups:
+        passed = passed and {matches.get("A"), matches.get("B")} <= followed
+        c_spawn = next((index for index, item in enumerate(calls) if item.get("tool") == "spawnAgent"
+                        and matches.get("C") in item.get("receiverThreadIds", [])), -1)
+        for label in ("A", "B"):
+            thread = matches.get(label)
+            sends = [index for index, item in enumerate(calls)
+                     if item.get("tool") in ("followupTask", "sendInput", "sendMessage")
+                     and thread in item.get("receiverThreadIds", [])]
+            spawned_at = next((index for index, item in enumerate(calls) if item.get("tool") == "spawnAgent"
+                               and thread in item.get("receiverThreadIds", [])), -1)
+            messages = [item for item in child_items.get(thread, []) if item.get("type") == "agentMessage"]
+            passed = bool(passed and len(messages) >= 2 and sends
+                          and any(spawned_at < index < sends[0] for index in joined_at(thread, spawned_at))
+                          and any(index < c_spawn for index in joined_at(thread, sends[-1])))
+    return {"status": "pass" if passed else "fail", "children": matches,
+            "spawned": spawned, "joined": sorted(joined), "followed": sorted(followed),
+            "loading_evidence": "behavioral", "plaintext_isolation_attested": False}
+
+
+def child_packet(package, receipt, directory, case):
+    nonce = uuid.uuid4().hex
+    adapter = package / ("skills/forge-orchestrator/references/" + receipt["definition"]["provider"] + ".md")
+    prefix = ("This is a bounded native child qualification, not a pipeline run. Read the host adapter at "
+              + str(adapter) + ". Use its actual native child, follow-up and join tools. "
+              "Do not substitute shell providers, sequential parent work, or inherited parent history. "
+              "Do not request privileges or read credentials. Wait for every child to finish. ")
+    if case == "digest":
+        artifact = directory / "digest-artifact.md"
+        value = {"result": nonce, "confidence": "HIGH", "blockers": []}
+        prompt = directory / "digest-prompt.txt"
+        with artifact.open("x") as stream:
+            stream.write(json.dumps(value) + "\n")
+        with prompt.open("x") as stream:
+            stream.write("Read " + str(artifact) + ". Return its JSON object exactly, with no prose.\n")
+        artifact.chmod(0o400)
+        prompt.chmod(0o400)
+        message = prefix + ("Spawn exactly one fresh digest child, with no parent-history fork. "
+                            "Its entire message is the following JSON string: " + json.dumps("Follow " + str(prompt)) + ". "
+                            "Do not read that prompt or any artifact yourself; let the child read them. Join its completion.")
+        return message, {"digest": value}, artifact
+    a, b = "A_" + nonce, "B_" + nonce
+    values = {"A": {"own": a, "other": "UNKNOWN", "value": 11},
+              "B": {"own": b, "other": "UNKNOWN", "value": 17}, "C": {"total": 28}}
+    role = "independent proposal reviewers" if case == "proposal" else "independent local-QA reviewers"
+    message = (prefix + "Create exactly three fresh children total. First create A and B as " + role
+               + ", separately and without parent history. A receives only marker " + a
+               + " and value 11; B receives only marker " + b + " and value 17. "
+               "Ask each for JSON with own (its own marker), other (UNKNOWN unless it has actually received "
+               "the other marker), and value (its assigned integer). Do not reveal the other child's marker. "
+               "Join A and B, then send each a separate native follow-up asking it to repeat the same JSON "
+               "with other remaining UNKNOWN if it does not know the other marker. Join both follow-ups. Finally spawn fresh C, without "
+               "parent history, receiving only the numbers 11 and 17 and the task of adding them, returning "
+               "JSON {\"total\":28}. Join C. All child results must be JSON only.")
+    return message, values, None
+
+
+def codex_children(package, receipt, directory):
+    results = []
+    params = {"cwd": receipt["root"]["physical_root"], "model": receipt["definition"]["model"],
+              "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandbox": "workspace-write"}
+    with Rpc(codex_argv(receipt), receipt["environment"], receipt["root"]["physical_root"],
+             directory / "codex-children.jsonl", timeout=600) as client:
+        for case in ("proposal", "digest", "local-qa"):
+            prompt, expected, artifact = child_packet(package, receipt, directory, case)
+            thread = client.call("thread/start", params)["thread"]["id"]
+            events = thread_events(client.turn(thread, prompt), thread)
+            ids = {target for item in completed_items(events) if item.get("type") == "collabAgentToolCall"
+                   and item.get("tool") == "spawnAgent" for target in item.get("receiverThreadIds", [])}
+            transcripts = {}
+            for child in ids:
+                response = client.call("thread/read", {"threadId": child, "includeTurns": True})
+                transcripts[child] = child_turn_items(response["thread"])
+            result = child_graph(events, transcripts, expected, followups=case != "digest")
+            adapter = protocol_paths(package, receipt)[-1]
+            result["adapter_read"] = codex_reads(events, [adapter])[str(adapter)]
+            if not result["adapter_read"]:
+                result["status"] = "fail"
+            if artifact:
+                parent_read = any(any(str(path) in item.get("command", "") for path in
+                                      (artifact, directory / "digest-prompt.txt")) for item in completed_items(events)
+                                  if item.get("type") == "commandExecution")
+                child_events = [{"method": "item/completed", "params": {"item": item}}
+                                for items in transcripts.values() for item in items]
+                child_read = codex_reads(child_events, [artifact])[str(artifact)]
+                result.update(parent_artifact_read=parent_read, child_artifact_read=child_read)
+                if parent_read or not child_read:
+                    result["status"] = "fail"
+            result["case"] = case
+            results.append(result)
+    return results
+
+
+def children(package, receipt, directory):
+    if receipt["definition"]["provider"] != "codex":
+        return {"status": "unsupported", "reason": "Claude child transcript qualification not yet implemented"}
+    try:
+        cases = codex_children(package, receipt, directory)
+        return {"status": "pass" if all(case["status"] == "pass" for case in cases) else "fail", "cases": cases,
+                "scope": "native child primitives; not full proposal or QA pipeline acceptance"}
+    except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError, TimeoutError) as exc:
+        return {"status": "fail", "error": str(exc)}
 
 
 def codex_loads(package, receipt, directory):

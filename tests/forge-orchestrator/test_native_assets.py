@@ -1,5 +1,6 @@
 """Unit coverage for trace interpretation, never native qualification evidence."""
 import importlib.util
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -63,6 +64,78 @@ class NativeAssets(unittest.TestCase):
         receipt["provider_argv"].insert(-1, "--unknown-policy")
         with self.assertRaises(ValueError):
             native.codex_argv(receipt)
+
+    def graph(self):
+        expected = {"A": {"own": "A", "other": "UNKNOWN", "value": 11},
+                    "B": {"own": "B", "other": "UNKNOWN", "value": 17}, "C": {"total": 28}}
+        def call(tool, *threads):
+            return self.event(type="collabAgentToolCall", tool=tool, status="completed",
+                              receiverThreadIds=list(threads),
+                              agentsStates={thread: {"status": "completed"} for thread in threads})
+        events = [call("spawnAgent", "a"), call("spawnAgent", "b"), call("wait", "a", "b"),
+                  call("followupTask", "a"), call("sendInput", "b"), call("wait", "a", "b"),
+                  call("spawnAgent", "c"), call("wait", "c")]
+        transcripts = {label.lower(): [{"type": "agentMessage", "text": json.dumps(value)}]
+                       * (1 if label == "C" else 2) for label, value in expected.items()}
+        return events, transcripts, expected
+
+    def test_children_require_native_graph_and_child_owned_final_results(self):
+        events, transcripts, expected = self.graph()
+        result = native.child_graph(events, transcripts, expected, followups=True)
+        self.assertEqual(result["status"], "pass")
+        self.assertFalse(result["plaintext_isolation_attested"])
+        parent_claim = [self.event(type="agentMessage", text=json.dumps(expected))]
+        self.assertEqual(native.child_graph(parent_claim, transcripts, expected)["status"], "fail")
+        transcripts["a"].append({"type": "agentMessage", "text": '{"own":"wrong"}'})
+        self.assertEqual(native.child_graph(events, transcripts, expected, followups=True)["status"], "fail")
+
+    def test_children_reject_missing_followup_timed_out_wait_and_early_synthesis(self):
+        events, transcripts, expected = self.graph()
+        cases = []
+        cases.append(events[:3] + events[4:])
+        timed_out = copy.deepcopy(events)
+        timed_out[5]["params"]["item"]["agentsStates"]["a"]["status"] = "running"
+        cases.append(timed_out)
+        cases.append(events[:5] + [events[6], events[5], events[7]])
+        cases.append([events[2], *events[:2], *events[3:]])
+        cases.append(events[:5] + events[6:])
+        for invalid in cases:
+            with self.subTest(events=invalid):
+                self.assertEqual(native.child_graph(invalid, transcripts, expected, followups=True)["status"], "fail")
+
+    def test_children_reject_duplicate_children_and_cross_contamination(self):
+        events, transcripts, expected = self.graph()
+        duplicate = copy.deepcopy(events)
+        duplicate[1]["params"]["item"]["receiverThreadIds"] = ["a"]
+        self.assertEqual(native.child_graph(duplicate, transcripts, expected, followups=True)["status"], "fail")
+        transcripts["a"][-1] = {"type": "agentMessage", "text": json.dumps(dict(expected["A"], other="B"))}
+        self.assertEqual(native.child_graph(events, transcripts, expected, followups=True)["status"], "fail")
+
+    def test_native_events_are_scoped_to_the_parent_thread(self):
+        parent, child = self.event(type="agentMessage", text="parent"), self.event(type="agentMessage", text="child")
+        parent["params"]["threadId"], child["params"]["threadId"] = "p", "c"
+        self.assertEqual(native.thread_events([child, parent, self.event(type="agentMessage")], "p"), [parent])
+
+    def test_only_completed_child_turns_count_as_followup_answers(self):
+        commentary = {"type": "agentMessage", "phase": "commentary", "text": "working"}
+        final = {"type": "agentMessage", "phase": "final_answer", "text": "{}"}
+        thread = {"turns": [{"status": "completed", "items": [commentary, final, final]}]}
+        self.assertEqual(native.child_turn_items(thread), [final])
+        thread["turns"][0]["status"] = "inProgress"
+        with self.assertRaises(ValueError):
+            native.child_turn_items(thread)
+        with self.assertRaises(ValueError):
+            native.child_turn_items({"turns": []})
+
+    def test_digest_parent_gets_only_path_not_artifact_contents(self):
+        directory = Path(self.temp.name)
+        prompt, expected, artifact = native.child_packet(directory, {"definition": {"provider": "codex"}},
+                                                       directory, "digest")
+        self.assertNotIn(str(artifact), prompt)
+        self.assertNotIn(expected["digest"]["result"], prompt)
+        self.assertIn(json.dumps("Follow " + str(directory / "digest-prompt.txt")), prompt)
+        self.assertIn(str(artifact), (directory / "digest-prompt.txt").read_text())
+        self.assertEqual(json.loads(artifact.read_text()), expected["digest"])
 
 
 if __name__ == "__main__":

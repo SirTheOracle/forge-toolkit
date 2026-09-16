@@ -4,12 +4,12 @@
   "admission": "unsupported",
   "supported_providers": [],
   "report": {
-    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-dccca9a964f84d90aee1242f2bb379b3/report.json",
-    "sha256": "51699f54502cb5fe48cf7f55965de3e31bccd7e19167e5fe5534126ba1ec12f2"
+    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-ebd359d6c865428088df5142c2f56d1e/report.json",
+    "sha256": "f84306270ebc5394dea99fc82db0b6e3233ef9661c39604ca72e1ddba8534cdf"
   },
   "package": {
-    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/c0f11b3d031a2a836c5ebe944774c0afa1701de6a5ae68e1b2cf72461b630af3/package/package.json",
-    "sha256": "4eaf2901b7b38bb7cd74fae6b44b49a3efad50c44f36fcfbb04ce5987e46d4ea"
+    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/747d40a1db2c20dd40909d83662d789527305fc889551939fe59ff65d53772c6/package/package.json",
+    "sha256": "616bef888c617046ffab27837164550fc2698f637398a0e6044f9061fefc2ec6"
   },
   "worker": {
     "path": "/opt/homebrew/Caskroom/codex/0.153.4/bin/codex",
@@ -18,15 +18,18 @@
   "checks": {
     "authentication": "unavailable",
     "hook_transport": "not-run",
+    "legacy_coexistence": "not-run",
     "management_entry": "not-run",
     "native_children": "not-run",
     "native_configuration": "pass",
+    "native_duplicates": "not-run",
     "native_loading": "not-run",
-    "native_policy": "pass",
+    "native_policy": "not-run",
     "native_reload": "not-run",
     "package_integrity": "pass",
     "runtime_closure": "not-run",
-    "topology": "pass"
+    "topology": "pass",
+    "worker_containment": "pass"
   },
   "native_configuration": {
     "features": {
@@ -72,6 +75,7 @@
     "Native write-open utility evidence is not model policy evidence.",
     "Authenticated native load/children/reload and runtime/management/hook closure remain required.",
     "No credentials copied, no global discovery changed, no profile registered.",
-    "Native child, duplicate/concurrent legacy, management/hook and complete runtime runners and the P2 candidate/conformance producer remain unfinished."
+    "Codex child and candidate/conformance producer schema tests are not native qualification.",
+    "Claude child, duplicate/concurrent legacy, model-led policy, management/hook and complete runtime runners remain unfinished."
   ]
 }

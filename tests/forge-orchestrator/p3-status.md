@@ -65,16 +65,28 @@ orchestrate; the remaining work is production qualification, not feasibility.
   boundary. Unit tests cover evidence interpretation, not successful native model
   execution. The copied qualifier selects its pinned worker rather than PATH,
   refuses a different worker, and retains reports when final integrity drifts.
+- Codex child qualification now checks native spawn/follow-up/join ordering,
+  completed child-owned answers, separate A/B results, fresh C synthesis and
+  child-side disk reads for a path-only digest. Parent summaries, timed-out joins,
+  stale answers and premature synthesis fail. These are primitive probes, not
+  P5/P6 full pipeline acceptance; authenticated execution is still unverified.
+- A P2 candidate/conformance producer requires every admission check and protected
+  raw-evidence hashes. The host rechecks capability evidence on later admission,
+  so changed transcripts invalidate the qualification. Publication never registers
+  a profile. Synthetic schema tests explicitly do not establish native proof.
+- Utility write-denial results are now named `worker_containment`, separate from
+  `native_policy`. A successful sandbox utility cannot certify model-led policy.
 
 ## Deliberately Not Admission
 
 The prerequisite report schema is `forge-orchestrator-capability/1`, not P2's
-`forge-orchestrator-qualification/1`. It always advertises an empty provider set.
-It cannot be used to register a qualified profile. The authenticated load/reload
-harness has not run successfully yet. Native child, duplicate/concurrent legacy,
-management/hook and complete runtime qualification runners, and the production
-P2 candidate/conformance producer, remain unfinished.
-Do not relabel these not-run checks as pass or wire this report into admission.
+`forge-orchestrator-qualification/1`. Current native reports advertise an empty provider set.
+It cannot by itself register a qualified profile. The authenticated load/reload
+and Codex child harnesses have not run successfully yet. Claude child,
+duplicate/concurrent legacy, model-led policy, management/hook and complete runtime
+qualification runners remain unfinished. The new producer is gated on all these
+checks, so it does not currently publish a qualified candidate.
+Do not relabel not-run checks as pass or use synthetic tests as admission evidence.
 
 The isolated Codex configuration uses OS keyring credentials only, never copied
 auth.json or inherited API keys. The protected keychain locator now works, but
@@ -106,7 +118,7 @@ restart or global installation is needed.
 3. Finish full runtime/alias/implicit-input closure auditing, including native
    helper subprocesses, Python startup/cache inputs, provider auxiliary binaries,
    HOME input additions and direct/indirect control-entry approval behavior.
-4. Produce the protected P2 candidate/conformance pair only after real native
+4. Exercise the protected P2 candidate/conformance producer only after real native
    management, hook transport, worker policy and topology evidence passes.
    Prove broker startup/status/handshake/reuse against the full packaged closure.
 5. Re-run all P3 acceptance negatives (including stale daemon, source/alias
@@ -123,12 +135,12 @@ mutation attempts apiece. All were denied and workspace positive controls passed
 Codex's effective native configuration also passes. Authentication remains
 unavailable; the report still says `admission: unsupported`.
 
-Latest focused package tests: 16 passed; native trace interpretation: 4 passed;
-assets/installer: 9 passed. The broader run before the final pinned-worker and
-native-config additions passed 165 orchestrator tests (two opt-in native skips),
-71 start checks, 31 spawn checks and hermetic worker policy, recorded under
-`.dev/forge-p2/requests-1789514100502202000/`. The final additions were then
-covered by the focused package tests and the real copied native qualifier.
+Latest focused package tests: 20 passed. The source-stable broader run recorded
+under `.dev/forge-p2/requests-1789573151822267000/` ran 176 orchestrator tests
+(174 passed, two opt-in native skips), including ten native trace interpretation
+tests. All 71 start checks, 31 spawn checks and hermetic worker policy passed.
+The runner's dedicated tmux server is stopped. The device login again expired
+without authorization; no login or model process remains running.
 
 Prior checkpoint regression evidence: P0 contract suite: 60 passed. Watcher: 429 passed.
 Full bridge rerun: 558 passed, zero failed or not-run, recorded in

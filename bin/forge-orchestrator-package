@@ -32,6 +32,10 @@ host = module("host", TREE / "bin/forge-orchestrator-host")
 assets = module("assets", TREE / "lib/forge_assets.py")
 runtime = module("runtime", TREE / "lib/forge_runtime.py")
 
+ADMISSION_CHECKS = ("package_integrity", "worker_containment", "native_policy", "native_configuration",
+                    "native_loading", "native_children", "native_reload", "native_duplicates",
+                    "legacy_coexistence", "management_entry", "hook_transport", "runtime_closure", "topology")
+
 
 def write(path, data, mode=0o400):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -458,6 +462,94 @@ def _policy_probes(package, receipt, report_dir, worker, topology, targets, run,
     return status, observations
 
 
+def candidate_manifest(package, receipt, evidence):
+    """Construct the P2 contract without registering or asserting qualification."""
+    package = Path(package)
+    metadata = host.read_json(package / "runtime/runtime.json")
+    provider = receipt["definition"]["provider"]
+    ctx = host.Context(receipt["root"]["physical_root"])
+    project = ctx.root / ".claude/forge-project.yml"
+    files = {item["path"]: item for item in receipt["files"]}
+    files[str(package / "package.json")] = host.file_identity(package / "package.json")
+    return {
+        "schema": "forge-orchestrator-candidate/1", "root": ctx.identity,
+        "on_spawn": {"kind": "builtin", "argv": [str(package / "bin/forge-start"), "--populate-existing"],
+                     "supported_providers": [provider], "transport_version": 1},
+        "files": [files[path] for path in sorted(files)],
+        "inputs": {name: host.file_identity(package / relative) for name, relative in {
+            "package": "package.json", "core": "skills/forge-orchestrator/SKILL.md",
+            "adapter": "skills/forge-orchestrator/references/" + provider + ".md",
+            "helpers": "runtime/runtime.json"}.items()},
+        "tools": {"tmux": metadata["tools"]["tmux"], "shell": metadata["tools"]["bash"],
+                  "forge": str(package / "bin/forge"), "forge_start": str(package / "bin/forge-start"),
+                  "bridge": str(package / "bin/forge-bridge"), "broker": str(package / "bin/forge-broker"),
+                  "host": str(package / "bin/forge-orchestrator-host"),
+                  "claude_worker": receipt["worker_binaries"]["claude"]},
+        "providers": {provider: {"argv": receipt["provider_argv"],
+                                 "executable": receipt["definition"]["executable"],
+                                 "version": receipt["definition"]["version"], "evidence": evidence}},
+        "conformance": {},
+        "project_config_sha256": host.file_identity(project)["sha256"] if project.exists() else None,
+    }
+
+
+def validate_capability(package, receipt, report_path):
+    """Recheck raw measurement inputs at publication and every later admission."""
+    package, report_path = Path(package), Path(report_path)
+    ctx = host.Context(receipt["root"]["physical_root"])
+    host.require(ctx.store.path / "reports" in report_path.parents, "QUALIFICATION_UNPROTECTED", str(report_path))
+    report = host.read_json(report_path)
+    host.require(report.get("schema") == "forge-orchestrator-capability/1" and report.get("root") == ctx.identity
+                 and report.get("package") == host.file_identity(package / "package.json")
+                 and report.get("topology_sha256") == host.records.digest(host.topology(ctx)),
+                 "QUALIFICATION_MISMATCH", "capability report does not bind these package/root/topology inputs")
+    checks = report.get("checks", {})
+    missing = [name for name in ADMISSION_CHECKS if checks.get(name) != "pass"]
+    host.require(checks.get("authentication") == "available" and not missing,
+                 "ORCHESTRATOR_NOT_QUALIFIED", ", ".join(missing) or "authentication")
+    # Recheck all raw evidence and the measured management inputs at publication.
+    artifacts = report.get("artifacts", [])
+    host.require(artifacts and all(report_path.parent in Path(item["path"]).parents for item in artifacts),
+                 "QUALIFICATION_MISMATCH", "protected measurement artifacts required")
+    for item in artifacts:
+        host.verify_file(item)
+    management = host.management_inputs(ctx)
+    host.require(report.get("management_sha256") == host.records.digest(management),
+                 "QUALIFICATION_MISMATCH", "management inputs changed after measurement")
+    host.require(report.get("qualifier") == host.file_identity(package / "bin/forge-orchestrator-package")
+                 and report.get("provider") == receipt["definition"]["executable"]
+                 and report.get("worker") == host.file_identity(receipt["worker_binaries"]["codex"]),
+                 "QUALIFICATION_MISMATCH", "qualifier/provider/worker inputs differ")
+    return report
+
+
+def publish_candidate(package, report_path):
+    """Called only after measurement; an incomplete check cannot mint admission."""
+    package, report_path = Path(package), Path(report_path)
+    receipt = verify(package)
+    report = validate_capability(package, receipt, report_path)
+    ctx = host.Context(receipt["root"]["physical_root"])
+    management = host.management_inputs(ctx)
+    evidence = {"reports": [host.file_identity(report_path)["sha256"]], "loading": "behavioral",
+                "native_policy": "pass", "workflows": ["native-orchestration-primitives"]}
+    candidate = candidate_manifest(package, receipt, evidence)
+    host.validate_candidate(ctx, candidate, qualification=False)
+    conformance = {"schema": "forge-orchestrator-qualification/1", "root": ctx.identity,
+                   "candidate_sha256": host.records.digest(host.candidate_body(candidate)), "checks": report["checks"],
+                   "management_entry_sha256": host.file_identity(ctx.management_entry)["sha256"],
+                   "management_sha256": host.records.digest(management),
+                   "topology_sha256": receipt["topology_sha256"],
+                   "supported_providers": sorted(candidate["providers"]),
+                   "capability": host.file_identity(report_path)}
+    path = report_path.parent / "conformance.json"
+    write(path, encoded(conformance))
+    candidate["conformance"] = host.file_identity(path)
+    host.validate_candidate(ctx, candidate)
+    destination = report_path.parent / "candidate.json"
+    write(destination, encoded(candidate))
+    return {"candidate": str(destination), "conformance": str(path), "admission": "qualified-not-registered"}
+
+
 def qualify(package, worker_binary=None, *, native=False):
     """Measure native prerequisites, retaining failures without minting admission."""
     package = Path(package).absolute()
@@ -470,10 +562,8 @@ def qualify(package, worker_binary=None, *, native=False):
     run = uuid.uuid4().hex
     report_dir = ctx.store.path / "reports" / ("capability-" + run)
     report_dir.mkdir(parents=True, mode=0o700)
-    checks = {"package_integrity": "pass", "native_policy": "not-run",
-              "native_loading": "not-run", "native_children": "not-run",
-              "native_reload": "not-run", "management_entry": "not-run",
-              "hook_transport": "not-run", "runtime_closure": "not-run"}
+    checks = dict.fromkeys(ADMISSION_CHECKS, "not-run")
+    checks["package_integrity"] = "pass"
     topology = host.topology(ctx)
     # An exact baseline pointer rule is not proof against future nested pointer
     # creation/rename. Keep those layouts unavailable, per P1's measured limit.
@@ -485,7 +575,7 @@ def qualify(package, worker_binary=None, *, native=False):
     # owner-writable, invocation-owned canaries in the actual protected package
     # directories, then remove only those exact canaries before final integrity.
     env = dict(receipt["environment"])
-    checks["native_policy"], observations = policy_probes(package, receipt, report_dir, worker, topology, targets, run)
+    checks["worker_containment"], observations = policy_probes(package, receipt, report_dir, worker, topology, targets, run)
     provider = receipt["definition"]["provider"]
     binary = receipt["definition"]["executable"]["path"]
     auth_args = [binary, "login", "status"] if provider == "codex" else [binary, "auth", "status"]
@@ -497,7 +587,7 @@ def qualify(package, worker_binary=None, *, native=False):
         except ValueError:
             authenticated = False
     checks["authentication"] = "available" if authenticated else "unavailable"
-    loading, configuration = None, None
+    loading, configuration, children = None, None, None
     if native:
         probes = module("forge_native", package / "lib/forge_native.py")
         configuration = probes.configuration(receipt, report_dir)
@@ -506,8 +596,10 @@ def qualify(package, worker_binary=None, *, native=False):
             loading = probes.loading(package, receipt, report_dir)
             checks["native_loading"] = loading["status"]
             checks["native_reload"] = loading["status"]
-    # Native sandbox utility evidence is explicitly narrower than a model-led
-    # workflow. Never sign a P2 qualification from these prerequisite checks.
+            children = probes.children(package, receipt, report_dir)
+            checks["native_children"] = children["status"]
+    # Utility containment and child primitives alone never mint admission.
+    complete = checks.get("authentication") == "available" and all(checks.get(name) == "pass" for name in ADMISSION_CHECKS)
     report = {"schema": "forge-orchestrator-capability/1", "root": ctx.identity,
               "qualifier": host.file_identity(Path(__file__).absolute()),
               "package": host.file_identity(package / "package.json"), "worker": worker_identity,
@@ -516,17 +608,27 @@ def qualify(package, worker_binary=None, *, native=False):
               "authentication": {"exit_code": cp.returncode, "diagnostic": cp.stderr.strip()},
               "native_loading": loading,
               "native_configuration": configuration,
-              "supported_providers": [], "admission": "unsupported",
+              "native_children": children,
+              "supported_providers": [provider] if complete else [],
+              "admission": "measured-not-published" if complete else "unsupported",
               "limits": ["Native write-open utility evidence is not model policy evidence.",
                          "Authenticated native load/children/reload and runtime/management/hook closure remain required.",
                          "No credentials copied, no global discovery changed, no profile registered."]}
+    if ctx.management.exists():
+        report["management_sha256"] = host.records.digest(host.management_inputs(ctx))
     try:
         verify(package)
     except (host.Refusal, host.broker.Refusal, OSError, ValueError) as exc:
         checks["package_integrity"] = "fail"
         report["integrity_error"] = str(exc)
-    write(report_dir / "report.json", encoded(report))
-    return {"report": str(report_dir / "report.json"), "checks": checks, "admission": "unsupported"}
+        report.update(supported_providers=[], admission="unsupported")
+    report["artifacts"] = [host.file_identity(path) for path in sorted(report_dir.rglob("*")) if path.is_file()]
+    report_path = report_dir / "report.json"
+    write(report_path, encoded(report))
+    result = {"report": str(report_path), "checks": checks, "admission": "unsupported"}
+    if checks.get("authentication") == "available" and all(checks.get(name) == "pass" for name in ADMISSION_CHECKS):
+        result.update(publish_candidate(package, report_path))
+    return result
 
 
 def main():

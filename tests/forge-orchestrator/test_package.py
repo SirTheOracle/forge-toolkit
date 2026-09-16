@@ -127,6 +127,93 @@ class Package(unittest.TestCase):
         with self.assertRaisesRegex(package.host.Refusal, "packaged worker executable"):
             package.qualify(self.path, "/bin/echo")
 
+    def capability_fixture(self):
+        directory = self.ctx.store.path / "reports" / ("fixture-only-" + uuid.uuid4().hex)
+        directory.mkdir(parents=True)
+        artifact = directory / "not-native-evidence.txt"
+        artifact.write_text("Synthetic schema test only. Never native qualification evidence.\n")
+        report = {"schema": "forge-orchestrator-capability/1", "root": self.ctx.identity,
+                  "package": package.host.file_identity(self.path / "package.json"),
+                  "topology_sha256": package.host.records.digest(package.host.topology(self.ctx)),
+                  "checks": dict.fromkeys(package.ADMISSION_CHECKS, "pass"),
+                  "artifacts": [package.host.file_identity(artifact)]}
+        report["checks"]["authentication"] = "available"
+        return directory / "report.json", report
+
+    def test_candidate_producer_matches_p2_schema_without_admission(self):
+        evidence = {"reports": ["0" * 64], "loading": "behavioral", "native_policy": "pass",
+                    "workflows": ["fixture-only-not-native-proof"]}
+        candidate = package.candidate_manifest(self.path, package.verify(self.path), evidence)
+        package.host.validate_candidate(self.ctx, candidate, qualification=False)
+        self.assertEqual(candidate["on_spawn"]["supported_providers"], ["codex"])
+        self.assertEqual(candidate["conformance"], {})
+        self.assertIsNone(self.ctx.store.profile())
+
+    def test_candidate_publication_refuses_each_missing_or_failed_gate(self):
+        path, report = self.capability_fixture()
+        receipt = package.verify(self.path)
+        for gate in (*package.ADMISSION_CHECKS, "authentication"):
+            original = report["checks"].pop(gate)
+            for value in (None, "not-run", "fail", "unsupported"):
+                with self.subTest(gate=gate, value=value):
+                    if value is not None:
+                        report["checks"][gate] = value
+                    path.write_text(package.encoded(report))
+                    with self.assertRaises(package.host.Refusal) as refused:
+                        package.validate_capability(self.path, receipt, path)
+                    self.assertEqual(refused.exception.code, "ORCHESTRATOR_NOT_QUALIFIED")
+                    self.assertFalse((path.parent / "candidate.json").exists())
+                    self.assertFalse((path.parent / "conformance.json").exists())
+            report["checks"][gate] = original
+
+    def test_candidate_publication_refuses_changed_or_unprotected_evidence(self):
+        path, report = self.capability_fixture()
+        report["topology_sha256"] = "0" * 64
+        path.write_text(package.encoded(report))
+        with self.assertRaisesRegex(package.host.Refusal, "package/root/topology"):
+            package.publish_candidate(self.path, path)
+        path, report = self.capability_fixture()
+        artifact = Path(report["artifacts"][0]["path"])
+        path.write_text(package.encoded(report))
+        artifact.write_text("changed evidence")
+        with self.assertRaises(package.host.Refusal) as refused:
+            package.publish_candidate(self.path, path)
+        self.assertEqual(refused.exception.code, "INPUT_CHANGED")
+        report["artifacts"] = [package.host.file_identity(self.path / "package.json")]
+        path.write_text(package.encoded(report))
+        with self.assertRaisesRegex(package.host.Refusal, "protected measurement artifacts"):
+            package.publish_candidate(self.path, path)
+        report["artifacts"] = []
+        path.write_text(package.encoded(report))
+        with self.assertRaisesRegex(package.host.Refusal, "protected measurement artifacts"):
+            package.publish_candidate(self.path, path)
+        with self.assertRaises(package.host.Refusal) as refused:
+            package.publish_candidate(self.path, self.root / "report.json")
+        self.assertEqual(refused.exception.code, "QUALIFICATION_UNPROTECTED")
+        self.assertIsNone(self.ctx.store.profile())
+
+    def test_synthetic_publication_does_not_register_and_later_evidence_drift_refuses(self):
+        # Only a schema/consumer integration fixture. No native qualification is
+        # inferred from these synthetic statuses or the /bin/echo provider.
+        if not self.ctx.management.exists():
+            package.host.prepare_management(self.ctx)
+        path, report = self.capability_fixture()
+        receipt = package.verify(self.path)
+        report.update(management_sha256=package.host.records.digest(package.host.management_inputs(self.ctx)),
+                      qualifier=package.host.file_identity(self.path / "bin/forge-orchestrator-package"),
+                      provider=receipt["definition"]["executable"],
+                      worker=package.host.file_identity(receipt["worker_binaries"]["codex"]))
+        path.write_text(package.encoded(report))
+        published = package.publish_candidate(self.path, path)
+        candidate = package.host.read_json(published["candidate"])
+        package.host.validate_candidate(self.ctx, candidate)
+        self.assertEqual(published["admission"], "qualified-not-registered")
+        self.assertIsNone(self.ctx.store.profile())
+        Path(report["artifacts"][0]["path"]).write_text("Changed synthetic evidence")
+        with self.assertRaises(package.host.Refusal) as refused:
+            package.host.validate_candidate(self.ctx, candidate)
+        self.assertEqual(refused.exception.code, "INPUT_CHANGED")
+
     def test_missing_changed_extra_and_symlink_rejected(self):
         path = self.path / "digests/coding.txt"
         old = path.read_bytes()

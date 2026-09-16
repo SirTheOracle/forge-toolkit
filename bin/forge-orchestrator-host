@@ -245,6 +245,18 @@ def validate_candidate(ctx, candidate, *, qualification=True):
         require(report.get("topology_sha256") == records.digest(topology(ctx)),
                 "TOPOLOGY_CHANGED", "Git pointer topology requires requalification")
         require(report.get("supported_providers") == sorted(providers), "QUALIFICATION_MISMATCH", "provider coverage differs")
+        if package:
+            capability = report.get("capability")
+            verify_file(capability)
+            package_root = Path(candidate["inputs"]["package"]["path"]).parent
+            control = module("forge_package", package_root / "bin/forge-orchestrator-package")
+            try:
+                measured = control.validate_capability(package_root, package, Path(capability["path"]))
+            except control.host.Refusal as exc:
+                raise Refusal(exc.code, exc.detail) from exc
+            require(measured["checks"] == report["checks"]
+                    and all(provider["evidence"]["reports"] == [capability["sha256"]] for provider in providers.values()),
+                    "QUALIFICATION_MISMATCH", "capability evidence differs from conformance")
     return candidate
 
 
