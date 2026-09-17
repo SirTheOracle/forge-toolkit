@@ -236,7 +236,11 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
             data = path.read_text()
             if data.startswith("#!/bin/bash"):
                 data = data.replace("/usr/bin/python3 -I", shlex.quote(str(package / "runtime/bin/python3")))
-            data = data.replace("/usr/bin/git", metadata["tools"]["git"])
+            if path.name in {"forge", "forge-broker", "forge-orchestrator-host"}:
+                # These calls are Python literals (including forge's heredoc).
+                # Requote the entire literal so root names cannot inject code.
+                git_entry = repr(str(package / "runtime/bin/git"))
+                data = data.replace('"/usr/bin/git"', git_entry).replace("'/usr/bin/git'", git_entry)
             for name in ("tmux", "gh"):
                 data = data.replace("/opt/homebrew/bin/" + name, metadata["tools"][name])
             path.chmod(0o700)

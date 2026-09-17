@@ -105,6 +105,15 @@ orchestrate; the remaining work is production qualification, not feasibility.
   dispatcher. Its helper directory, logical aliases and resolved file bytes
   participate in staging and drift detection. A static audit records remaining
   script/configuration/execution gaps as unsupported, never as native proof.
+- Copied Git calls now go through a protected Python guard before repository
+  operations. It parses bounded regular config bytes with Git's own parser and
+  includes disabled, checks common/worktree config, rejects unknown/executable
+  settings, and clears injected Git environment. Default hooks and submodule
+  recursion are disabled. Incomplete nested metadata cannot hide ancestor config.
+  This candidate-only path restricts network transports to HTTP(S), merges to
+  fast-forward-only, and commands to the existing helper vocabulary; legacy Git
+  behavior is unchanged. This is a constrained implementation, not native closure
+  qualification. Quoted root paths are escaped when generating copied calls.
 
 ## Deliberately Not Admission
 
@@ -168,7 +177,7 @@ Package staging and fixture tests are not replacements for these requirements.
 ## Evidence
 
 `evidence/p3-checkpoint.json` records the latest package-bound native prerequisite
-result. Both primary and linked probes tested 2,873 write-open targets and 525
+result. Both primary and linked probes tested 2,875 write-open targets and 525
 mutation attempts apiece. All were denied and workspace positive controls passed.
 Codex's effective native configuration also passes. Authentication remains
 unavailable; the report still says `admission: unsupported`. The runtime audit
@@ -176,12 +185,13 @@ identifies 14 Git scripts with unqualified interpreter/include dependencies, plu
 the remaining repository-config and native subprocess-closure requirements.
 
 Latest source-stable broader run recorded under
-`.dev/forge-p2/requests-1789595569370194000/` ran 197 orchestrator tests
-(195 passed, two opt-in native skips), including 25 package tests and 26 native
-trace/fixture tests. All 71 start checks, 31 spawn checks and hermetic worker policy passed.
-The runner's dedicated tmux server is stopped. Both candidate authentication
-statuses were rechecked and remain logged out. No new login was started and no
-login or model process remains running. Local `main` is already merged.
+`.dev/forge-p2/requests-1789659406683507000/` ran 209 orchestrator tests
+(207 passed, two opt-in native skips), including 27 package tests, 10 Git guard
+tests and 26 native trace/fixture tests. All 71 start checks, 31 spawn checks and
+hermetic worker policy passed. The runner's dedicated tmux server is stopped.
+Full filesystem access works. Codex authentication was rechecked and remains
+unavailable; the new device login expired after 15 minutes without authorization.
+No login or model process remains running. Local `main` is already merged.
 
 Prior checkpoint regression evidence: P0 contract suite: 60 passed. Watcher: 429 passed.
 Full bridge rerun: 558 passed, zero failed or not-run, recorded in

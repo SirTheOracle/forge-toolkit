@@ -109,6 +109,7 @@ def stage(package, *, yaml_source=None):
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src, dst)
     shutil.copyfile(Path(__file__).parent / "forge_python_entry.py", runtime / "python_entry.py")
+    shutil.copyfile(Path(__file__).parent / "forge_git_entry.py", runtime / "git_entry.py")
     interpreter = str(Path(sys.executable).resolve(strict=True))
     launch = [interpreter, "-I", "-S", "-B", str(runtime / "python_entry.py")]
     wrapper = runtime / "bin/python3"
@@ -133,7 +134,8 @@ def stage(package, *, yaml_source=None):
             resolved = str(copied)
         tools[name] = resolved
         stub = runtime / "bin" / name
-        stub.write_text("#!/bin/sh\nexec " + shlex.quote(resolved) + ' "$@"\n')
+        command = shlex.join([*launch, str(runtime / "git_entry.py")]) if name == "git" else shlex.quote(resolved)
+        stub.write_text("#!/bin/sh\nexec " + command + ' "$@"\n')
         stub.chmod(0o755)
     git_exec_path, _ = git_helpers(tools["git"])
     metadata = {"schema": "forge-orchestrator-runtime/1", "python": interpreter,
@@ -208,8 +210,9 @@ def audit(package, receipt):
                 scripts.append(str(path))
     return {"status": "unsupported", "git_executable": metadata["tools"]["git"],
             "git_exec_path": metadata.get("git_exec_path"), "script_dependencies": scripts,
+            "git_config_guard": str(Path(package) / "runtime/git_entry.py"),
             "blockers": ["Native subprocess closure has not been measured for this package.",
-                         "Repository Git config/include, hooks, filters and remote helpers still require execution-policy qualification."]
+                         "The copied Git guard constrains repository config and helper selection; end-to-end native qualification remains required."]
                         + (["Script interpreter/import/include dependencies are not fully qualified."] if scripts else [])}
 
 

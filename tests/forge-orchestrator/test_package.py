@@ -75,7 +75,7 @@ class Package(unittest.TestCase):
             for name in ("forge", "forge-broker", "forge-orchestrator-host"):
                 text = (self.path / "bin" / (".forge-body" if name == "forge" else name)).read_text()
                 self.assertNotRegex(text, r'''["']/usr/bin/git["']''')
-                self.assertIn(metadata["tools"]["git"], text)
+                self.assertIn(str(self.path / "runtime/bin/git"), text)
         audit = package.runtime.audit(self.path, receipt)
         self.assertEqual(audit["status"], "unsupported")
         self.assertTrue(audit["blockers"])
@@ -92,6 +92,30 @@ class Package(unittest.TestCase):
         before = package.runtime.dependency_files(root)
         (helpers / "git-remote-new").write_text("not a qualified helper")
         self.assertNotEqual(before, package.runtime.dependency_files(root))
+
+    def test_copied_git_and_broker_refuse_repository_includes(self):
+        config = self.root / ".git/config"
+        before = config.read_bytes()
+        try:
+            config.write_bytes(before + b'\n[include]\npath = /nonexistent/qualification-include\n')
+            for argv in ([str(self.path / "runtime/bin/git"), "-C", str(self.root), "status", "--porcelain"],
+                         [str(self.path / "bin/forge-broker"), "status", "--root", str(self.root)]):
+                cp = subprocess.run(argv, cwd=self.root, text=True, capture_output=True, timeout=15)
+                self.assertNotEqual(cp.returncode, 0)
+                self.assertIn("GIT_CONFIG_EXECUTION_REFUSED", cp.stderr)
+        finally:
+            config.write_bytes(before)
+        package.verify(self.path)
+
+    def test_quoted_root_cannot_inject_into_copied_git_calls(self):
+        root = self.root / "quote'and\"space root"
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        staged = package.stage(package.host.Context(str(root)), "codex", "/bin/echo", "fixture-no-native-qualification")
+        copied = Path(staged["package"])
+        cp = subprocess.run([str(copied / "bin/forge-orchestrator-package"), "verify", "--package", str(copied)],
+                            cwd=root, text=True, capture_output=True, timeout=30)
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        self.assertEqual(json.loads(cp.stdout)["integrity"], "pass")
 
     def test_stable_auth_namespace_and_policy_only_inputs(self):
         receipt = package.verify(self.path)

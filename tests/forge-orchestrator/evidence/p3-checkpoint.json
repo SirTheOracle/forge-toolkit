@@ -4,12 +4,12 @@
   "admission": "unsupported",
   "supported_providers": [],
   "report": {
-    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-1fa877183626406b949592ea20709bde/report.json",
-    "sha256": "d212aea3628ba6741e41f62dbf4330915faabc8dacf80ce96639bad7011e6a7c"
+    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-0dd59d2dc23047c6872f940906ee49c5/report.json",
+    "sha256": "6064692766f9f5b156bfbdef7a79f961762542fc9c82993add7e4685df07f222"
   },
   "package": {
-    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/5fd36bb0ddd57ddb736c2c96eaaf30af5f62503b2c3c1daaf596c8bba5ff5eee/package/package.json",
-    "sha256": "74c589c84886edd6396004926775e5b269775fe467ba9296d16182d18449d7c9"
+    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/d113719b9e40117816542bc1495ec6c15d1d57fbd4e4883270e473636996cdba/package/package.json",
+    "sha256": "3036eecbb35502b69fc625b71901b5cfafcdec040b39c489a63bdf13682eac2c"
   },
   "worker": {
     "path": "/opt/homebrew/Caskroom/codex/0.153.4/bin/codex",
@@ -53,7 +53,7 @@
       "status": "pass",
       "result": {
         "opened": [],
-        "tested": 2873,
+        "tested": 2875,
         "workspace_control": true,
         "mutation_attempts": 525,
         "mutations_denied": 525
@@ -64,7 +64,7 @@
       "status": "pass",
       "result": {
         "opened": [],
-        "tested": 2873,
+        "tested": 2875,
         "workspace_control": true,
         "mutation_attempts": 525,
         "mutations_denied": 525
@@ -77,6 +77,6 @@
     "No credentials copied, no global discovery changed, no profile registered.",
     "Child, policy, duplicate, concurrent legacy and candidate/conformance producer tests are not native qualification.",
     "Claude effective configuration/model-policy, management/hook and complete runtime qualification remain unfinished.",
-    "Git native executable and helpers are inventoried; script/config/include execution dependencies remain unsupported."
+    "Copied Git guards repository config and helper selection; end-to-end native execution qualification remains unsupported."
   ]
 }

@@ -113,6 +113,7 @@
     "digests/review.txt",
     "digests/verify.txt",
     "lib/forge_assets.py",
+    "lib/forge_git_entry.py",
     "lib/forge_install.py",
     "lib/forge_orchestrator.py",
     "lib/forge_python_entry.py",
