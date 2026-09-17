@@ -80,6 +80,9 @@ def verify(package):
     host.require(host.records.digest(host.topology(ctx)) == receipt["topology_sha256"],
                  "TOPOLOGY_CHANGED", "re-stage and qualify this topology")
     host.require(receipt["os_build"] == runtime.os_identity(), "OS_RUNTIME_CHANGED", "requalify OS runtime")
+    metadata = host.read_json(package / "runtime/runtime.json")
+    host.require(metadata.get("implicit_inputs") == runtime.implicit_inputs(),
+                 "NATIVE_STARTUP_CHANGED", "Python archive, shell startup or managed policy inputs changed")
     for item in receipt["files"]:
         host.verify_file(item)
     declared = {i["path"] for i in receipt["files"] if package in Path(i["path"]).parents}
@@ -517,6 +520,127 @@ def candidate_manifest(package, receipt, evidence):
     }
 
 
+def hook_transport(package, receipt, directory):
+    """Measure the builtin's real argument/env parser, without launching panes."""
+    provider = receipt["definition"]["provider"]
+    session, launch_id = "p3-transport-" + uuid.uuid4().hex, uuid.uuid4().hex
+    env = dict(receipt["environment"], FORGE_ORCHESTRATOR_REQUEST_VERSION="1",
+               FORGE_ORCHESTRATOR_LAUNCH_ID=launch_id, FORGE_ORCHESTRATOR_PROVIDER=provider)
+    argv = [str(package / "bin/forge-start"), "--inspect-request", "--populate-existing", session]
+    observations = []
+    for label, args, changes in (
+            ("valid", argv, {}),
+            ("version", argv, {"FORGE_ORCHESTRATOR_REQUEST_VERSION": "2"}),
+            ("locator", argv, {"FORGE_ORCHESTRATOR_LAUNCH_ID": ""}),
+            ("contradiction", argv + ["--orchestrator", "claude" if provider == "codex" else "codex"], {}),
+            ("missing-session", argv[:-1], {})):
+        try:
+            cp = subprocess.run(args, cwd=receipt["root"]["physical_root"], env=dict(env, **changes),
+                                text=True, capture_output=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            observations.append({"case": label, "pass": False, "error": str(exc)})
+            continue
+        if label == "valid":
+            try:
+                passed = cp.returncode == 0 and json.loads(cp.stdout) == {
+                    "provider": provider, "session": session, "launch_id": launch_id, "transport_version": "1"}
+            except ValueError:
+                passed = False
+        else:
+            passed = cp.returncode != 0 and not cp.stdout.strip()
+        observations.append({"case": label, "pass": passed, "exit_code": cp.returncode,
+                             "stdout": cp.stdout, "stderr": cp.stderr})
+    result = {"status": "pass" if all(row["pass"] for row in observations) else "fail",
+              "scope": "builtin request transport only; no custom hooks or P4 attention hooks",
+              "observations": observations}
+    write(directory / "hook-transport.json", encoded(result))
+    return result
+
+
+def management_probe(package, receipt, directory, topology, worker, native_runner=None, denial_runner=None):
+    ctx = host.Context(receipt["root"]["physical_root"])
+    observations = []
+    try:
+        manifest = host.management_inputs(ctx)
+        host.require(manifest.get("package") is not None, "MANAGEMENT_CLOSURE_REQUIRED",
+                     "prepare management from a protected candidate, not the mutable source checkout")
+        before = ctx.store.profile()
+        command = [str(ctx.management_entry), "orchestrator-profile", "probe", "--root", str(ctx.root)]
+        positive = subprocess.run(command, cwd=ctx.root, env=receipt["environment"],
+                                  text=True, capture_output=True, timeout=20)
+        host.require(positive.returncode == 0 and json.loads(positive.stdout) == {
+            "management_write": True, "profile_changed": False}, "MANAGEMENT_PROBE_FAILED", positive.stderr)
+        metadata = host.read_json(package / "runtime/runtime.json")
+        commands = [command, [str(package / "bin/forge"), *command[1:]],
+                    [metadata["python"], "-I", "-S", "-B", *command],
+                    [metadata["tools"]["bash"], "--noprofile", "--norc", "-c", shlex.join(command)]]
+        nonce = uuid.uuid4().hex
+        script = directory / "management-probe.py"
+        write(script, 'import json,pathlib,subprocess,sys\n'
+              + 'commands=' + repr(commands) + '\n'
+              + 'rows=[]\n'
+              + 'for argv in commands:\n'
+              + ' cp=subprocess.run(argv,text=True,capture_output=True,timeout=20)\n'
+              + ' denied=cp.returncode!=0 and any(s in cp.stderr for s in '
+                '("Permission denied","Operation not permitted","OPERATOR_ENTRY_REQUIRED"))\n'
+              + ' rows.append({"denied":denied,"exit_code":cp.returncode,"stderr":cp.stderr})\n'
+              + 'p=pathlib.Path(sys.argv[1]); p.write_text("positive"); p.unlink()\n'
+              + 'print(json.dumps({"nonce":' + repr(nonce) + ',"workspace_control":True,"results":rows}))\n'
+              + 'sys.exit(not all(r["denied"] for r in rows))\n')
+        for index, item in enumerate(topology):
+            control = Path(item["root"]) / (".forge-management-" + nonce)
+            argv = [metadata["python"], "-I", "-S", "-B", str(script), str(control)]
+            runners = [("worker", None)] + ([("native", native_runner)] if native_runner else [])
+            for label, runner in runners:
+                try:
+                    cp = (subprocess.run([str(worker), "sandbox", "--permission-profile", ":workspace",
+                                          "-C", item["root"], *argv], env=receipt["environment"], cwd=item["root"],
+                                         text=True, capture_output=True, timeout=100) if runner is None else
+                          runner(receipt, argv, item["root"], directory / ("management-native-" + str(index) + ".jsonl")))
+                    value = json.loads(cp.stdout)
+                    passed = (cp.returncode == 0 and value.get("nonce") == nonce
+                              and value.get("workspace_control") is True and len(value.get("results", [])) == len(commands)
+                              and all(row.get("denied") is True for row in value["results"]))
+                    observations.append({"root": item["root"], "kind": label, "pass": passed, "result": value})
+                finally:
+                    control.unlink(missing_ok=True)
+            if denial_runner:
+                for command_index, command in enumerate(commands):
+                    denied = denial_runner(receipt, command, item["root"],
+                        directory / ("management-manual-" + str(index) + "-" + str(command_index) + ".jsonl"))
+                    observations.append({"root": item["root"], "kind": "native-manual", "pass": denied["status"] == "pass",
+                                         "result": denied})
+        host.require(ctx.store.profile() == before and host.management_inputs(ctx) == manifest,
+                     "MANAGEMENT_PROBE_CHANGED_STATE", "profile or management inputs changed")
+        result = {"status": ("pass" if native_runner or denial_runner else "not-run") if all(row["pass"] for row in observations) else "fail",
+                  "operator_positive": True, "observations": observations}
+    except (host.Refusal, host.broker.Refusal, OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
+        result = {"status": "fail", "error": str(exc), "observations": observations}
+    write(directory / "management-probe.json", encoded(result))
+    return result
+
+
+def manual_policy(package, receipt, directory, topology, runner):
+    """Claude's P1 contract is manual approval, not unapproved Bash containment."""
+    metadata = host.read_json(package / "runtime/runtime.json")
+    canary = directory / "manual-policy-canary.txt"
+    value = uuid.uuid4().hex
+    write(canary, value, 0o600)
+    argv = [metadata["python"], "-I", "-S", "-B", "-c",
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('unexpected execution')", str(canary)]
+    observations = []
+    for index, item in enumerate(topology):
+        try:
+            result = runner(receipt, argv, item["root"], directory / ("manual-policy-" + str(index) + ".jsonl"))
+            passed = result["status"] == "pass" and host.file_bytes(canary) == value.encode()
+            observations.append({"root": item["root"], "pass": passed, "result": result})
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
+            observations.append({"root": item["root"], "pass": False, "error": str(exc)})
+    return {"status": "pass" if observations and all(row["pass"] for row in observations) else "fail",
+            "scope": "default/manual native command refusal; approved Claude host/children are not worker-contained",
+            "observations": observations}
+
+
 def validate_capability(package, receipt, report_path):
     """Recheck raw measurement inputs at publication and every later admission."""
     package, report_path = Path(package), Path(report_path)
@@ -588,7 +712,7 @@ def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
     report_dir.mkdir(parents=True, mode=0o700)
     checks = dict.fromkeys(ADMISSION_CHECKS, "not-run")
     checks["package_integrity"] = "pass"
-    runtime_audit = runtime.audit(package, receipt)
+    runtime_audit = runtime.measure(package, receipt, report_dir)
     checks["runtime_closure"] = runtime_audit["status"]
     topology = host.topology(ctx)
     # An exact baseline pointer rule is not proof against future nested pointer
@@ -596,7 +720,14 @@ def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
     nested = any(Path(a["root"]) in Path(b["root"]).parents for a in topology for b in topology if a != b)
     checks["topology"] = "unsupported" if nested else "pass"
     targets = [i["path"] for i in receipt["files"]] + [str(package / "package.json")]
+    if ctx.management.exists():
+        management = host.management_inputs(ctx)
+        targets += [item["path"] for item in management["files"]] + [str(ctx.management / "entry.json")]
+        if management.get("package"):
+            targets += [management["package"]["path"]]
+            targets += [item["path"] for item in host.read_json(management["package"]["path"])["files"]]
     targets += [str(Path(item["root"]) / ".git") for item in topology if item["pointer_sha256"]]
+    targets = sorted(set(targets))
     # Read-only file modes alone would make write-open tests vacuous. Place
     # owner-writable, invocation-owned canaries in the actual protected package
     # directories, then remove only those exact canaries before final integrity.
@@ -613,11 +744,14 @@ def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
         except ValueError:
             authenticated = False
     checks["authentication"] = "available" if authenticated else "unavailable"
+    transport = hook_transport(package, receipt, report_dir)
+    checks["hook_transport"] = transport["status"]
     loading, configuration, children, policy, duplicates, legacy = None, None, None, None, None, None
     if native:
         probes = module("forge_native", package / "lib/forge_native.py")
-        configuration = probes.configuration(receipt, report_dir)
-        checks["native_configuration"] = configuration["status"]
+        if authenticated or provider == "codex":
+            configuration = probes.configuration(receipt, report_dir)
+            checks["native_configuration"] = configuration["status"]
         if authenticated:
             if provider == "codex":
                 native_dir = report_dir / "native-policy"
@@ -626,7 +760,8 @@ def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
                     package, receipt, native_dir, worker, topology, targets, run + "-native",
                     native_runner=probes.policy_command)
             else:
-                checks["native_policy"] = "unsupported"
+                policy = manual_policy(package, receipt, report_dir, topology, probes.policy_denial)
+                checks["native_policy"] = policy["status"]
             loading = probes.loading(package, receipt, report_dir)
             checks["native_loading"] = loading["status"]
             checks["native_reload"] = loading["status"]
@@ -636,6 +771,10 @@ def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
             checks["native_duplicates"] = duplicates["status"]
             legacy = probes.legacy_coexistence(package, receipt, report_dir, legacy_model)
             checks["legacy_coexistence"] = legacy["status"]
+    management = management_probe(package, receipt, report_dir, topology, worker,
+                                  native_runner=probes.policy_command if native and authenticated and provider == "codex" else None,
+                                  denial_runner=probes.policy_denial if native and authenticated and provider == "claude" else None)
+    checks["management_entry"] = management["status"]
     # Utility containment and child primitives alone never mint admission.
     complete = checks.get("authentication") == "available" and all(checks.get(name) == "pass" for name in ADMISSION_CHECKS)
     report = {"schema": "forge-orchestrator-capability/1", "root": ctx.identity,
@@ -650,6 +789,8 @@ def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
               "native_policy": policy,
               "native_duplicates": duplicates,
               "legacy_coexistence": legacy,
+              "management_entry": management,
+              "hook_transport": transport,
               "runtime_audit": runtime_audit,
               "supported_providers": [provider] if complete else [],
               "admission": "measured-not-published" if complete else "unsupported",

@@ -31,6 +31,13 @@ class ManagementSandboxTests(unittest.TestCase):
         positive = run([sys.executable, "-I", "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('allowed')", str(ordinary)])
         self.assertEqual(positive.returncode, 0, positive.stderr)
         self.assertEqual(ordinary.read_text(), "allowed")
+        for entry in (ctx.management_entry, ROOT / "bin/forge"):
+            result = run([str(entry), "orchestrator-profile", "probe", "--root", str(root)])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(ctx.store.profile(), before)
+            self.assertTrue("Operation not permitted" in result.stderr or "Permission denied" in result.stderr
+                            or "OPERATOR_ENTRY_REQUIRED" in result.stderr, result.stderr)
+            self.assertEqual(list(ctx.management.glob(".probe-*")), [])
         for entry, action in ((ctx.management_entry, "disable"), (ROOT / "bin/forge", "disable"),
                               (ctx.management_entry, "register"), (ROOT / "bin/forge", "register")):
             argv = [str(entry), "orchestrator-profile", action, "--root", str(root), "--expect-revision", "1"]

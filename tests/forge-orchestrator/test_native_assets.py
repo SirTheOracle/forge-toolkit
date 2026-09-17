@@ -25,6 +25,59 @@ class NativeAssets(unittest.TestCase):
     def event(self, **item):
         return {"method": "item/completed", "params": {"item": item}}
 
+    def test_claude_manual_policy_requires_exact_native_permission_denial(self):
+        argv = ["/protected/python", "-I", "/protected/probe.py"]
+        call = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "id": "command-1",
+                "input": {"command": shlex.join(argv)}}]}}
+        result = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "command-1", "is_error": True, "content": "denied"}]}}
+        final = {"type": "result", "subtype": "success", "is_error": False,
+                 "permission_denials": [{"tool_name": "Bash", "tool_use_id": "command-1", "tool_input": {"command": shlex.join(argv)}}]}
+        self.assertEqual(native.claude_denial_result([call, result, final], argv)["status"], "pass")
+        for mutate in ("wrong-id", "success", "bypass", "extra-command", "claim-only", "ordinary-error", "failed-turn", "bad-denials", "wrong-denial-id"):
+            events = copy.deepcopy([call, result, final])
+            if mutate == "wrong-id":
+                events[1]["message"]["content"][0]["tool_use_id"] = "other"
+            elif mutate == "success":
+                events[1]["message"]["content"][0]["is_error"] = False
+            elif mutate == "bypass":
+                events[0]["message"]["content"][0]["input"]["dangerouslyDisableSandbox"] = True
+            elif mutate == "extra-command":
+                events.append(copy.deepcopy(call))
+            elif mutate == "ordinary-error":
+                events[2]["permission_denials"] = []
+            elif mutate == "failed-turn":
+                events[2]["is_error"] = True
+            elif mutate == "bad-denials":
+                events[2]["permission_denials"] = "Bash denied"
+            elif mutate == "wrong-denial-id":
+                events[2]["permission_denials"][0]["tool_use_id"] = "other"
+            else:
+                events = [{"type": "assistant", "message": {"content": [{"type": "text", "text": '{"measured":true}'}]}}]
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                native.claude_denial_result(events, argv)
+
+    def test_claude_configuration_requires_native_init_and_closed_policy(self):
+        settings = self.path.parent / "settings.json"
+        policy = {}
+        settings.write_text(json.dumps(policy))
+        receipt = {"provider_argv": ["/native/claude", "--safe-mode", "--permission-mode", "default",
+                   "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                   "--settings", str(settings), "prompt"], "environment": {},
+                   "root": {"git_common_dir": "/protected/git", "git_dir": "/protected/git", "physical_root": "/fixture"}}
+        with patch.object(native, "ClaudeStream") as stream:
+            client = stream.return_value.__enter__.return_value
+            event = {"type": "system", "subtype": "init", "permissionMode": "manual", "model": "fixture-model", "mcp_servers": [], "plugins": []}
+            client.turn.return_value = [event]
+            self.assertEqual(native.claude_configuration(receipt, self.path.parent)["status"], "pass")
+            for events in ([], [event, event], [dict(event, permissionMode="bypassPermissions")],
+                           [dict(event, mcp_servers=[{"name": "unexpected"}])]):
+                client.turn.return_value = events
+                self.assertEqual(native.claude_configuration(receipt, self.path.parent)["status"], "fail")
+            policy["permissions"] = {"defaultMode": "bypassPermissions"}
+            settings.write_text(json.dumps(policy))
+            client.turn.return_value = [event]
+            self.assertEqual(native.claude_configuration(receipt, self.path.parent)["status"], "fail")
+
     def test_codex_requires_complete_successful_tool_output(self):
         def read(output, **extra):
             return self.event(type="commandExecution", command="cat " + str(self.path),

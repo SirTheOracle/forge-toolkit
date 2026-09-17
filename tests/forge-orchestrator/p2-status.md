@@ -55,7 +55,7 @@ Profiles cannot transfer automatically to newly created worktrees. Qualified
 forge-start therefore uses --here; worktree creation/registration is an explicit
 preceding operation. Legacy default provisioning is unchanged.
 
-    bin/forge-orchestrator-host prepare-management --root /absolute/worktree
+    /absolute/protected/candidate/package/bin/forge-orchestrator-host prepare-management --root /absolute/worktree
     forge orchestrator-profile inspect --root /absolute/worktree --from candidate.json
 
 Preparation prints management_entry. Invoke that exact copied entry, through its
@@ -76,6 +76,11 @@ The executable validator is validate_candidate in bin/forge-orchestrator-host.
 Inspect validates without running the hook. P3 produces real qualification
 reports; there is deliberately no production force-qualification command.
 Bootstrap refuses an existing management entry instead of overwriting its bytes.
+P3 requires preparation from the staged candidate shown above so management pins
+its original package's complete runtime closure. The source-checkout preparation
+used by P2 fixtures is not sufficient for production P3 qualification. The
+non-admitting `orchestrator-profile probe --root ROOT` checks this entry's write
+boundary without publishing or changing a profile.
 
 ## Verification Scope
 

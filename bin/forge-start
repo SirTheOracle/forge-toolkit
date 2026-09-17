@@ -43,6 +43,7 @@ FORGE_START_ATTACH="${FORGE_START_ATTACH:-auto}"
 
 DIR="$(pwd)"
 POPULATE=0
+INSPECT_REQUEST=0
 ALLOW_DIRTY=""
 FORGE_LAYOUT_VERSION="${FORGE_LAYOUT_VERSION:-2}"
 SESSION=""
@@ -53,6 +54,7 @@ _AUTO_NAMED=0
 # Parse every argument before even a read-only tmux call. A trailing provider
 # request must not be discarded after a positional session name.
 while [ $# -gt 0 ]; do case "$1" in
+    --inspect-request) INSPECT_REQUEST=1; shift ;;
     --here) FORGE_START_WORKTREE=0; shift ;;
     --allow-dirty-base) ALLOW_DIRTY=1; shift ;;
     --no-attach) FORGE_START_ATTACH=0; shift ;;
@@ -90,6 +92,15 @@ case "$ORCHESTRATOR" in
     claude|codex) ;;
     *) echo "forge-start: --orchestrator must be claude|codex" >&2; exit 2 ;;
 esac
+
+if [ "$INSPECT_REQUEST" = 1 ]; then
+    [ "$POPULATE" = 1 ] && [ "${FORGE_ORCHESTRATOR_REQUEST_VERSION:-}" = 1 ] \
+        && [ -n "${FORGE_ORCHESTRATOR_LAUNCH_ID:-}" ] \
+        || { echo "forge-start: complete populate request required for inspection" >&2; exit 2; }
+    /usr/bin/python3 -I -c 'import json,sys; print(json.dumps(dict(zip(("provider","session","launch_id","transport_version"),sys.argv[1:]))))' \
+        "$ORCHESTRATOR" "$SESSION" "$FORGE_ORCHESTRATOR_LAUNCH_ID" "$FORGE_ORCHESTRATOR_REQUEST_VERSION"
+    exit $?
+fi
 
 # The qualified launcher is a separate path. Its profile and protected handoff
 # are mandatory; missing evidence never falls through into legacy population.

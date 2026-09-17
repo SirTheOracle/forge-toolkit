@@ -10,9 +10,12 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import tempfile
 
 
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+GIT_HELPERS = ("git-remote-http", "git-remote-https", "git-upload-pack", "git-fetch-pack",
+               "git-index-pack", "git-unpack-objects", "git-pack-objects", "git-rev-list")
 TOOLS = ("bash", "sh", "zsh", "env", "git", "tmux", "gh", "rg", "awk", "basename", "cat", "cp", "date", "dirname", "grep",
          "head", "hostname", "mkdir", "mktemp", "mv", "pgrep", "ps", "readlink", "rm",
          "sed", "sleep", "sort", "tail", "tee", "tr", "wc", "cut", "find", "ls", "chmod", "cmp", "diff", "kill", "touch", "uname", "xargs")
@@ -61,10 +64,38 @@ def python_files(stdlib):
             and path.is_file() and path.suffix in {".py", ".pyc", ".so", ".dylib", ".zip"}]
 
 
+def implicit_inputs():
+    """Include absence: adding an earlier Python zip or global startup file drifts."""
+    stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
+    etc = Path("/private/etc" if sys.platform == "darwin" else "/etc")
+    paths = [stdlib.parent / ("python" + str(sys.version_info.major) + str(sys.version_info.minor) + ".zip"),
+             etc / "zshenv", etc / "zsh/zshenv", etc / "codex"]
+    paths.append(Path("/Library/Application Support/ClaudeCode") if sys.platform == "darwin" else etc / "claude-code")
+    result = []
+    for start in paths:
+        pending = [start]
+        while pending:
+            path = pending.pop()
+            if path.is_symlink():
+                raise ValueError("aliased native startup input: " + str(path))
+            if path.is_dir():
+                result.append({"path": str(path), "kind": "directory"})
+                pending.extend(sorted(path.iterdir(), reverse=True))
+            elif path.is_file():
+                result.append({"path": str(path), "kind": "file",
+                               "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+            elif path.exists():
+                raise ValueError("nonregular native startup input: " + str(path))
+            else:
+                result.append({"path": str(path), "kind": "absent"})
+    return sorted(result, key=lambda item: item["path"])
+
+
 def inputs():
     """Bind staging identity to runtime inputs, not just the interpreter path."""
     tools = selected_tools()
-    git_exec_path, helpers = git_helpers(tools["git"])
+    git_exec_path, _ = git_helpers(tools["git"])
+    helpers = [git_exec_path / name for name in GIT_HELPERS]
     yaml = Path(importlib.metadata.distribution("PyYAML").locate_file("yaml"))
     if yaml.is_symlink():
         raise ValueError("symlinked PyYAML source")
@@ -76,6 +107,7 @@ def inputs():
     if dependencies["unresolved"]:
         raise ValueError("unresolved runtime inputs: " + repr(dependencies["unresolved"]))
     return {"tools": tools, "git_exec_path": str(git_exec_path), "git_helpers": list(map(str, helpers)),
+            "implicit_inputs": implicit_inputs(),
             "aliases": dependencies["aliases"],
             "files": [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                       for path in dependencies["files"]],
@@ -137,10 +169,23 @@ def stage(package, *, yaml_source=None):
         command = shlex.join([*launch, str(runtime / "git_entry.py")]) if name == "git" else shlex.quote(resolved)
         stub.write_text("#!/bin/sh\nexec " + command + ' "$@"\n')
         stub.chmod(0o755)
-    git_exec_path, _ = git_helpers(tools["git"])
+    original_git_exec_path, _ = git_helpers(tools["git"])
+    git_exec_path = runtime / "git-core"
+    git_exec_path.mkdir()
+    # The guard permits builtins and HTTP(S) fetch only. Do not expose unrelated
+    # Perl/shell helpers, even if the upstream Git installation ships them.
+    for name in GIT_HELPERS:
+        source = original_git_exec_path / name
+        with source.open("rb") as stream:
+            if stream.read(2) == b"#!":
+                raise ValueError("scripted Git helper is not supported: " + name)
+        target = git_exec_path / name
+        shutil.copyfile(source, target)
+        target.chmod(0o500)
     metadata = {"schema": "forge-orchestrator-runtime/1", "python": interpreter,
                 "stdlib": sysconfig.get_path("stdlib"), "tools": tools,
                 "git_exec_path": str(git_exec_path),
+                "implicit_inputs": implicit_inputs(),
                 "python_flags": ["-I", "-S", "-B"],
                 "shims": {"shasum": "isolated Python; only -a 256 and at most one input"},
                 "source_yaml": str(yaml_source), "qualified": False,
@@ -197,7 +242,7 @@ def dependency_files(package):
 
 
 def audit(package, receipt):
-    """Expose static closure gaps; never turn an inventory into native proof."""
+    """Check the reachable executable set; measurement is a separate step."""
     metadata = json.loads((Path(package) / "runtime/runtime.json").read_text())
     executables = {Path(p) for p in metadata["tools"].values()}
     executables.update(Path(p) for p in receipt["worker_binaries"].values())
@@ -208,12 +253,84 @@ def audit(package, receipt):
         with path.open("rb") as stream:
             if stream.read(2) == b"#!":
                 scripts.append(str(path))
-    return {"status": "unsupported", "git_executable": metadata["tools"]["git"],
+    blockers = []
+    implicit = metadata.get("implicit_inputs")
+    if implicit != implicit_inputs():
+        blockers.append("Implicit startup inputs changed.")
+    if any(item["kind"] != "absent" for item in implicit or []):
+        blockers.append("Custom global startup/archive/policy inputs require a separate closure audit.")
+    if scripts:
+        blockers.append("Script interpreter/import/include dependencies are not qualified.")
+    helper_dir = Path(metadata.get("git_exec_path", "/nonexistent"))
+    if helper_dir != Path(package) / "runtime/git-core" or {p.name for p in helper_dir.iterdir()} != set(GIT_HELPERS):
+        blockers.append("Git helper directory is not the closed copied helper set.")
+    if metadata.get("python_flags") != ["-I", "-S", "-B"]:
+        blockers.append("Python startup is not isolated.")
+    return {"status": "unsupported" if blockers else "not-run", "static_status": "fail" if blockers else "pass",
+            "git_executable": metadata["tools"]["git"],
             "git_exec_path": metadata.get("git_exec_path"), "script_dependencies": scripts,
             "git_config_guard": str(Path(package) / "runtime/git_entry.py"),
-            "blockers": ["Native subprocess closure has not been measured for this package.",
-                         "The copied Git guard constrains repository config and helper selection; end-to-end native qualification remains required."]
-                        + (["Script interpreter/import/include dependencies are not fully qualified."] if scripts else [])}
+            "blockers": blockers}
+
+
+def measure(package, receipt, directory):
+    """Run actual copied control entries under hostile startup/override inputs."""
+    package = Path(package)
+    result = audit(package, receipt)
+    observations = []
+    if result["static_status"] != "pass":
+        return result
+    try:
+        root = receipt["root"]["physical_root"]
+        with tempfile.TemporaryDirectory(prefix=".forge-runtime-", dir=root) as temporary:
+            attack = Path(temporary)
+            sentinel = attack / "executed"
+            payload = "#!/bin/sh\nprintf injected > " + shlex.quote(str(sentinel)) + "\n"
+            evil = attack / "override"
+            evil.write_text(payload)
+            evil.chmod(0o700)
+            for name in (".bashrc", ".bash_profile", ".zshenv", ".profile"):
+                (attack / name).write_text(payload)
+            (attack / "sitecustomize.py").write_text("open(" + repr(str(sentinel)) + ",'w').write('python')\n")
+            (attack / ".gitconfig").write_text("[include]\npath = /nonexistent/runtime-probe\n")
+            env = dict(receipt["environment"], HOME=str(attack), PATH=str(attack), BASH_ENV=str(evil),
+                       ENV=str(evil), ZDOTDIR=str(attack), PYTHONPATH=str(attack),
+                       GIT_CONFIG_GLOBAL=str(attack / ".gitconfig"),
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.fsmonitor", GIT_CONFIG_VALUE_0=str(evil),
+                       FORGE_BROKER_BIN=str(evil), FORGE_BRIDGE_BIN=str(evil), FORGE_FORGE_BIN=str(evil))
+            cases = [
+                ("isolated-python", [str(package / "runtime/bin/python3"), "-c",
+                  "import json,sys,yaml; print(json.dumps({'isolated':sys.flags.isolated,'no_site':sys.flags.no_site,"
+                  "'no_bytecode':sys.flags.dont_write_bytecode,'yaml':yaml.__file__}))"]),
+                ("guarded-git", [str(package / "runtime/bin/git"), "-C", root, "status", "--porcelain"]),
+                ("copied-router", [str(package / "bin/forge"), "orchestrator-profile", "inspect", "--root", root]),
+                ("copied-host", [str(package / "bin/forge-orchestrator-host"), "orchestrator-profile", "inspect", "--root", root]),
+                ("copied-broker", [str(package / "bin/forge-broker"), "status", "--root", root, "--json"])]
+            for label, argv in cases:
+                cp = subprocess.run(argv, cwd=root, env=env, text=True, capture_output=True, timeout=30)
+                passed = cp.returncode == 0 and not sentinel.exists()
+                output = cp.stdout
+                if label == "copied-broker":
+                    value = json.loads(cp.stdout)
+                    passed = (not sentinel.exists() and
+                              ((cp.returncode == 0 and value.get("live") is True)
+                               or (cp.returncode == 3 and value.get("live") is False)))
+                    output = json.dumps({key: value.get(key) for key in ("state", "live", "runtime_state")})
+                if label == "isolated-python" and passed:
+                    value = json.loads(cp.stdout)
+                    passed = value == {"isolated": 1, "no_site": 1, "no_bytecode": 1,
+                                       "yaml": str(package / "runtime/vendor/yaml/__init__.py")}
+                observations.append({"case": label, "pass": passed, "exit_code": cp.returncode,
+                                     "stdout": output, "stdout_sha256": hashlib.sha256(cp.stdout.encode()).hexdigest(),
+                                     "stderr": cp.stderr})
+        result.update(status="pass" if all(row["pass"] for row in observations) else "fail",
+                      observations=observations,
+                      scope="Copied control startup and overrides; provider execution is separately required by native checks.")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        result.update(status="fail", error=str(exc), observations=observations)
+    with (Path(directory) / "runtime-probe.json").open("x") as stream:
+        json.dump(result, stream, indent=2, sort_keys=True)
+    return result
 
 
 def native_dependencies(files):

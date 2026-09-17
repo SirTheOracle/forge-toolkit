@@ -67,9 +67,10 @@ class Package(unittest.TestCase):
         files = {item["path"] for item in receipt["files"]}
         self.assertIn(str(Path(metadata["tools"]["git"]).resolve()), files)
         helper_dir, helpers = package.runtime.git_helpers(metadata["tools"]["git"])
-        self.assertEqual(str(helper_dir), metadata["git_exec_path"])
+        self.assertEqual(str(self.path / "runtime/git-core"), metadata["git_exec_path"])
+        self.assertEqual({p.name for p in Path(metadata["git_exec_path"]).iterdir()}, set(package.runtime.GIT_HELPERS))
         self.assertTrue(helpers)
-        self.assertTrue(all(str(path.resolve()) in files for path in helpers))
+        self.assertTrue(all(str(path) in files for path in Path(metadata["git_exec_path"]).iterdir()))
         if package.sys.platform == "darwin":
             self.assertNotEqual(metadata["tools"]["git"], "/usr/bin/git")
             for name in ("forge", "forge-broker", "forge-orchestrator-host"):
@@ -77,8 +78,81 @@ class Package(unittest.TestCase):
                 self.assertNotRegex(text, r'''["']/usr/bin/git["']''')
                 self.assertIn(str(self.path / "runtime/bin/git"), text)
         audit = package.runtime.audit(self.path, receipt)
-        self.assertEqual(audit["status"], "unsupported")
-        self.assertTrue(audit["blockers"])
+        if audit["script_dependencies"]:
+            # The aggregate runner supplies a scripted tmux socket shim. That
+            # test-only runtime must not become a qualified production runtime.
+            self.assertEqual(audit["status"], "unsupported")
+            self.assertTrue(audit["blockers"])
+        else:
+            self.assertEqual(audit["status"], "not-run")
+            self.assertEqual(audit["static_status"], "pass")
+            self.assertEqual(audit["blockers"], [])
+
+    def test_runtime_measurement_executes_copied_entries_under_hostile_overrides(self):
+        directory = self.ctx.store.path / "reports" / ("runtime-" + uuid.uuid4().hex)
+        directory.mkdir(parents=True)
+        measured = package.runtime.measure(self.path, package.verify(self.path), directory)
+        if measured["script_dependencies"]:
+            self.assertEqual(measured["status"], "unsupported")
+        else:
+            self.assertEqual(measured["status"], "pass", measured)
+            self.assertEqual(len(measured["observations"]), 5)
+            self.assertTrue((directory / "runtime-probe.json").exists())
+        package.verify(self.path)
+
+    def test_implicit_startup_addition_invalidates_existing_candidate(self):
+        existing = package.runtime.implicit_inputs()
+        with patch.object(package.runtime, "implicit_inputs", return_value=existing + [{"path": "/fixture/new-startup", "kind": "file"}]):
+            with self.assertRaisesRegex(package.host.Refusal, "startup"):
+                package.verify(self.path)
+
+    def test_real_builtin_request_transport_without_profile_or_launch(self):
+        directory = self.ctx.store.path / "reports" / ("transport-" + uuid.uuid4().hex)
+        directory.mkdir(parents=True)
+        before = self.ctx.store.profile(), self.ctx.store.current()
+        measured = package.hook_transport(self.path, package.verify(self.path), directory)
+        self.assertEqual(measured["status"], "pass", measured)
+        self.assertEqual((self.ctx.store.profile(), self.ctx.store.current()), before)
+
+    def test_management_binds_its_original_package_and_measures_real_worker_denial(self):
+        root = self.root / "management-bound"
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        ctx = package.host.Context(str(root))
+        staged = package.stage(ctx, "codex", "/bin/echo", "fixture-no-native-qualification")
+        copied = Path(staged["package"])
+        cp = subprocess.run([str(copied / "bin/forge-orchestrator-host"), "prepare-management", "--root", str(root)],
+                            text=True, capture_output=True, timeout=30)
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        self.assertEqual(package.host.management_inputs(ctx)["package"], package.host.file_identity(copied / "package.json"))
+        directory = ctx.store.path / "reports/test-management"
+        directory.mkdir(parents=True)
+        receipt = package.verify(copied)
+        measured = package.management_probe(copied, receipt, directory, package.host.topology(ctx), receipt["worker_binaries"]["codex"])
+        self.assertEqual(measured["status"], "not-run", measured)
+        self.assertTrue(measured["operator_positive"])
+        self.assertTrue(all(row["pass"] for row in measured["observations"]))
+        self.assertIsNone(ctx.store.profile())
+        target = copied / "lib/forge_runtime.py"
+        before = target.read_bytes()
+        try:
+            target.chmod(0o600)
+            target.write_bytes(before + b"\nraise RuntimeError('must not execute changed management dependency')\n")
+            with self.assertRaises(package.host.Refusal):
+                package.host.management_inputs(ctx)
+        finally:
+            target.write_bytes(before)
+            target.chmod(0o400)
+
+    def test_manual_policy_claim_cannot_hide_an_executed_protected_write(self):
+        for mutate in (False, True):
+            directory = self.ctx.store.path / "reports" / ("manual-" + uuid.uuid4().hex)
+            directory.mkdir(parents=True)
+            def runner(receipt, argv, cwd, transcript):
+                if mutate:
+                    Path(argv[-1]).write_text("unexpected execution")
+                return {"status": "pass"}
+            result = package.manual_policy(self.path, package.verify(self.path), directory, [{"root": str(self.root)}], runner)
+            self.assertEqual(result["status"], "fail" if mutate else "pass")
 
     def test_git_helper_addition_changes_runtime_inventory(self):
         root = self.root / "git-runtime-fixture"
@@ -146,6 +220,9 @@ class Package(unittest.TestCase):
         argv = package.verify(staged["package"])["provider_argv"]
         self.assertIn("--strict-mcp-config", argv)
         self.assertEqual(json.loads(argv[argv.index("--mcp-config") + 1]), {"mcpServers": {}})
+        settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
+        self.assertEqual(settings, {})
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
 
     def test_new_native_input_directories_and_aliases_refuse(self):
         receipt = package.verify(self.path)

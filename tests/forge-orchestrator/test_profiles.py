@@ -27,6 +27,21 @@ class ProfileTests(unittest.TestCase):
         route = f.run("route", "--root", str(f.root), "--provider", "codex")
         self.assertIn("PROFILE_DISABLED", route.stderr)
 
+    def test_management_probe_never_publishes_or_changes_profile(self):
+        f = self.fixture
+        for registered in (False, True):
+            if registered:
+                f.register()
+            before = f.ctx.store.profile()
+            result = f.run("orchestrator-profile", "probe", "--root", str(f.root), entry=f.ctx.management_entry)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {"management_write": True, "profile_changed": False})
+            self.assertEqual(f.ctx.store.profile(), before)
+            self.assertEqual(list(f.ctx.management.glob(".probe-*")), [])
+            denied = f.run("orchestrator-profile", "probe", "--root", str(f.root), entry=ROOT / "bin/forge")
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertIn("OPERATOR_ENTRY_REQUIRED", denied.stderr)
+
     def test_generic_forge_and_source_helper_cannot_register_even_with_role_stamp(self):
         f = self.fixture
         args = ("orchestrator-profile", "register", "--root", str(f.root), "--from", str(f.candidate_path), "--expect-revision", "0")

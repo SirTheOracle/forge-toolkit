@@ -1,82 +1,218 @@
 {
-  "schema": "forge-p3-checkpoint-evidence/1",
+  "schema": "forge-p3-checkpoint-evidence/2",
   "status": "incomplete",
   "admission": "unsupported",
   "supported_providers": [],
-  "report": {
-    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-0dd59d2dc23047c6872f940906ee49c5/report.json",
-    "sha256": "6064692766f9f5b156bfbdef7a79f961762542fc9c82993add7e4685df07f222"
-  },
-  "package": {
-    "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/d113719b9e40117816542bc1495ec6c15d1d57fbd4e4883270e473636996cdba/package/package.json",
-    "sha256": "3036eecbb35502b69fc625b71901b5cfafcdec040b39c489a63bdf13682eac2c"
-  },
-  "worker": {
-    "path": "/opt/homebrew/Caskroom/codex/0.153.4/bin/codex",
-    "sha256": "b973d440acac501fd2594a43e7ca9ce41e0a65b9dfb28d0d7a7837c99e1261e3"
-  },
-  "checks": {
-    "authentication": "unavailable",
-    "hook_transport": "not-run",
-    "legacy_coexistence": "not-run",
-    "management_entry": "not-run",
-    "native_children": "not-run",
-    "native_configuration": "pass",
-    "native_duplicates": "not-run",
-    "native_loading": "not-run",
-    "native_policy": "not-run",
-    "native_reload": "not-run",
-    "package_integrity": "pass",
-    "runtime_closure": "unsupported",
-    "topology": "pass",
-    "worker_containment": "pass"
-  },
-  "native_configuration": {
-    "features": {
-      "hooks": false,
-      "plugins": false,
-      "shell_snapshot": false,
-      "skip_host_skill_discovery": true
-    },
-    "policy": {
-      "allow_login_shell": false,
-      "approval_policy": "on-request",
-      "model": "gpt-6-astra",
-      "sandbox_mode": "workspace-write"
-    },
-    "project_untrusted": true,
-    "status": "pass"
-  },
-  "observations": [
-    {
-      "root": ".dev/forge-p3/native-linked",
-      "status": "pass",
-      "result": {
-        "opened": [],
-        "tested": 2875,
-        "workspace_control": true,
-        "mutation_attempts": 525,
-        "mutations_denied": 525
+  "provider_reports": {
+    "codex": {
+      "package": {
+        "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/3daf5205e9777f80934e494dde345bb160e46ac0726f995f2a22a7d0177ac5f0/package/package.json",
+        "sha256": "5ffade74def8da7c50b939ee8021e2a1c29814575b8ae11802ce91c2778de30a"
+      },
+      "worker": {
+        "path": "/opt/homebrew/Caskroom/codex/0.153.4/bin/codex",
+        "sha256": "b973d440acac501fd2594a43e7ca9ce41e0a65b9dfb28d0d7a7837c99e1261e3"
+      },
+      "checks": {
+        "authentication": "unavailable",
+        "hook_transport": "pass",
+        "legacy_coexistence": "not-run",
+        "management_entry": "not-run",
+        "native_children": "not-run",
+        "native_configuration": "pass",
+        "native_duplicates": "not-run",
+        "native_loading": "not-run",
+        "native_policy": "not-run",
+        "native_reload": "not-run",
+        "package_integrity": "pass",
+        "runtime_closure": "pass",
+        "topology": "pass",
+        "worker_containment": "pass"
+      },
+      "native_configuration": {
+        "features": {
+          "hooks": false,
+          "plugins": false,
+          "shell_snapshot": false,
+          "skip_host_skill_discovery": true
+        },
+        "policy": {
+          "allow_login_shell": false,
+          "approval_policy": "on-request",
+          "model": "gpt-6-astra",
+          "sandbox_mode": "workspace-write"
+        },
+        "project_untrusted": true,
+        "status": "pass"
+      },
+      "runtime_audit": {
+        "status": "pass",
+        "static_status": "pass",
+        "blockers": []
+      },
+      "management_entry": {
+        "status": "not-run",
+        "operator_positive": true,
+        "observations": [
+          {
+            "root": ".dev/forge-p3/native-linked",
+            "kind": "worker",
+            "pass": true,
+            "workspace_control": true,
+            "attempts": 4,
+            "denied": 4
+          },
+          {
+            "root": ".dev/forge-p3/native-root",
+            "kind": "worker",
+            "pass": true,
+            "workspace_control": true,
+            "attempts": 4,
+            "denied": 4
+          }
+        ]
+      },
+      "observations": [
+        {
+          "root": ".dev/forge-p3/native-linked",
+          "status": "pass",
+          "tested": 3225,
+          "workspace_control": true,
+          "mutation_attempts": 930,
+          "mutations_denied": 930
+        },
+        {
+          "root": ".dev/forge-p3/native-root",
+          "status": "pass",
+          "tested": 3225,
+          "workspace_control": true,
+          "mutation_attempts": 930,
+          "mutations_denied": 930
+        }
+      ],
+      "report": {
+        "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-c963cbc9a7fd484ea7c37456f0c6f123/report.json",
+        "sha256": "8329d9db02e298bc841d288976cadf6e07be736d22478e1682c983d4a4dc6372"
       }
     },
-    {
-      "root": ".dev/forge-p3/native-root",
-      "status": "pass",
-      "result": {
-        "opened": [],
-        "tested": 2875,
-        "workspace_control": true,
-        "mutation_attempts": 525,
-        "mutations_denied": 525
+    "claude": {
+      "package": {
+        "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/candidates/fbe6ffd71de22b04d1843d87dbb791553df541bdb229776d515e507d7e476543/package/package.json",
+        "sha256": "f2f2d6c08427ca17558a3caabebc5855b5409d87f0aefb1fcce1b3e327068ae6"
+      },
+      "worker": {
+        "path": "/opt/homebrew/Caskroom/codex/0.153.4/bin/codex",
+        "sha256": "b973d440acac501fd2594a43e7ca9ce41e0a65b9dfb28d0d7a7837c99e1261e3"
+      },
+      "checks": {
+        "authentication": "unavailable",
+        "hook_transport": "pass",
+        "legacy_coexistence": "not-run",
+        "management_entry": "not-run",
+        "native_children": "not-run",
+        "native_configuration": "not-run",
+        "native_duplicates": "not-run",
+        "native_loading": "not-run",
+        "native_policy": "not-run",
+        "native_reload": "not-run",
+        "package_integrity": "pass",
+        "runtime_closure": "pass",
+        "topology": "pass",
+        "worker_containment": "pass"
+      },
+      "native_configuration": null,
+      "runtime_audit": {
+        "status": "pass",
+        "static_status": "pass",
+        "blockers": []
+      },
+      "management_entry": {
+        "status": "not-run",
+        "operator_positive": true,
+        "observations": [
+          {
+            "root": ".dev/forge-p3/native-linked",
+            "kind": "worker",
+            "pass": true,
+            "workspace_control": true,
+            "attempts": 4,
+            "denied": 4
+          },
+          {
+            "root": ".dev/forge-p3/native-root",
+            "kind": "worker",
+            "pass": true,
+            "workspace_control": true,
+            "attempts": 4,
+            "denied": 4
+          }
+        ]
+      },
+      "observations": [
+        {
+          "root": ".dev/forge-p3/native-linked",
+          "status": "pass",
+          "tested": 3225,
+          "workspace_control": true,
+          "mutation_attempts": 930,
+          "mutations_denied": 930
+        },
+        {
+          "root": ".dev/forge-p3/native-root",
+          "status": "pass",
+          "tested": 3225,
+          "workspace_control": true,
+          "mutation_attempts": 930,
+          "mutations_denied": 930
+        }
+      ],
+      "report": {
+        "path": ".dev/forge-p3/native-root/.git/forge/broker-v1/roots/aa2a2c8ab257338453fa65d687a50aaea566267622dab57802ae02510fe9eb02/orchestrator/reports/capability-27386bec394f488e8df34e7335524c75/report.json",
+        "sha256": "2aa7f540271a811b55ca9f85c122e1d690aef3ea3774cfcb8727398067b65c29"
       }
     }
-  ],
+  },
   "limits": [
-    "Native write-open utility evidence is not model policy evidence.",
-    "Authenticated native load/children/reload and runtime/management/hook closure remain required.",
-    "No credentials copied, no global discovery changed, no profile registered.",
-    "Child, policy, duplicate, concurrent legacy and candidate/conformance producer tests are not native qualification.",
-    "Claude effective configuration/model-policy, management/hook and complete runtime qualification remain unfinished.",
-    "Copied Git guards repository config and helper selection; end-to-end native execution qualification remains unsupported."
-  ]
+    "All missing qualifier paths are implemented; authenticated native acceptance has not passed.",
+    "Both isolated authentication namespaces are unavailable; the device authorization expired.",
+    "Management operator/worker probes pass; native host-side management measurement remains not-run.",
+    "Claude retains P1 default/manual approvals. Approved Claude hosts and children are not worker-contained.",
+    "Builtin request transport is not P4 attention-hook qualification or P4b integrated preview.",
+    "No credentials copied, global discovery changed, production profile registered, or live session migrated."
+  ],
+  "regressions": {
+    "report": {
+      "path": ".dev/forge-p3/validation-1789686859134375000/report.json",
+      "sha256": "ac61c589b6c3c132c245e98b0b5dde5c4bbb174c3fa64b32fd9895c6412e569f"
+    },
+    "bridge": {
+      "path": ".dev/forge-p3/validation-1789686859134375000/forge-bridge.log",
+      "sha256": "56a3f61bb7efc1aeeda357ff730b4f67b8da38b2cd4fb7a6b9dcf0897cd00de2",
+      "passed": 558,
+      "failed": 0,
+      "not_run": 0,
+      "embedded_web_bridge_tests": 32
+    },
+    "orchestrator": {
+      "path": ".dev/forge-p3/validation-1789686859134375000/forge-orchestrator.log",
+      "sha256": "1f6f8864950bd2c13edd1d1092a1390b96077763948b81ba8ee78e217ff66a6f",
+      "ran": 217,
+      "passed": 215,
+      "skipped": 2
+    },
+    "web": {
+      "path": ".dev/forge-p3/validation-1789686859134375000/forge-web.log",
+      "sha256": "045ed0b8bef67fef0dd00db9cd111be6e5ef5011cbba2210d87a53dc23ab2eae",
+      "exit_code": 0
+    },
+    "explicit_native_management": {
+      "path": ".dev/forge-p3/validation-1789686859134375000/native-management.log",
+      "sha256": "e65317593e878de123102de3024e78563f2a67395302bfeb5774304167592b6a",
+      "passed": 2,
+      "scope": "actual sandbox utility, not authenticated model acceptance"
+    },
+    "earlier_start_spawn_policy_report": ".dev/forge-p2/requests-1789686415046213000/report.json",
+    "owned_tmux_server_stopped": true,
+    "warning": "Bridge emits the same pre-existing missing docs/forge-technical-reference.md grep warning as the previous passing run."
+  }
 }

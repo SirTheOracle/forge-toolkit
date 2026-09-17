@@ -102,6 +102,21 @@ def management_inputs(ctx):
             "MANAGEMENT_INPUT_CHANGED", "management inventory differs")
     for item in files:
         verify_file(item)
+    if manifest.get("package"):
+        item = manifest["package"]
+        verify_file(item)
+        package_root = Path(item["path"]).parent
+        require(ctx.store.path / "candidates" in package_root.parents,
+                "MANAGEMENT_INPUT_CHANGED", "management package is not protected under this root")
+        receipt = read_json(item["path"])
+        require(receipt.get("schema") == "forge-orchestrator-package/1" and receipt.get("root") == ctx.identity,
+                "MANAGEMENT_INPUT_CHANGED", "management package belongs to another root")
+        for dependency in receipt["files"]:
+            verify_file(dependency)
+        verifier = package_root / "bin/forge-orchestrator-package"
+        require(str(verifier) in {entry["path"] for entry in receipt["files"]},
+                "MANAGEMENT_INPUT_CHANGED", "management package verifier missing")
+        module("management_package", verifier).verify(package_root)
     return manifest
 
 
@@ -148,8 +163,11 @@ def prepare_management(ctx):
         files.append(file_identity(target))
     fd = records.directory(ctx.management)
     try:
-        records.write_at(fd, "entry.json", {"schema": "forge-orchestrator-management/1", "root": ctx.identity,
-                         "interpreter": file_identity(Path(sys.executable).resolve()), "files": files}, exclusive=True)
+        manifest = {"schema": "forge-orchestrator-management/1", "root": ctx.identity,
+                    "interpreter": file_identity(Path(sys.executable).resolve()), "files": files}
+        if (TREE / "package.json").exists():
+            manifest["package"] = file_identity(TREE / "package.json")
+        records.write_at(fd, "entry.json", manifest, exclusive=True)
     finally:
         os.close(fd)
     return {"management_entry": str(ctx.management_entry), "admission": "requires-native-qualification"}
@@ -337,6 +355,18 @@ def profile_command(ctx, args):
                     "management_entry": str(ctx.management_entry), "admission": "unverified"}
         return {"profile": ctx.store.profile(), "management_entry": str(ctx.management_entry)}
     management_admission(ctx)
+    if args.profile_action == "probe":
+        # Exercise the management entry and protected write boundary without
+        # creating a profile, approving a candidate, or changing a revision.
+        directory = records.directory(ctx.management)
+        name = ".probe-" + uuid.uuid4().hex
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            os.close(fd)
+            os.unlink(name, dir_fd=directory)
+        finally:
+            os.close(directory)
+        return {"management_write": True, "profile_changed": False}
     if args.profile_action == "register":
         require(args.source is not None, "INVALID_PROFILE", "register requires --from")
         candidate = validate_candidate(ctx, read_json(args.source))
@@ -1015,14 +1045,14 @@ def main():
         attach.add_argument("--attach", action="store_true")
     profile = commands.add_parser("orchestrator-profile")
     actions = profile.add_subparsers(dest="profile_action", required=True)
-    for action in ("inspect", "register", "disable"):
+    for action in ("inspect", "register", "disable", "probe"):
         command = actions.add_parser(action)
         command.add_argument("--root", required=True)
         if action in {"inspect", "register"}:
             command.add_argument("--from", dest="source", required=action == "register")
         else:
             command.set_defaults(source=None)
-        if action != "inspect":
+        if action in {"register", "disable"}:
             command.add_argument("--expect-revision", type=int, required=True)
     args = parser.parse_args()
     ctx = Context(args.root)
