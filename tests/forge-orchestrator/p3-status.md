@@ -1,10 +1,18 @@
 # P3 Status
 
-P3 is **not complete**. The previously missing qualifier paths are implemented;
-authenticated acceptance is still unverified. No production provider profile is
-enabled, and no P4 readiness claim is made.
+P3 implementation is **complete under the revised local-only acceptance scope**
+approved by the user on 2026-09-21. P4 implementation can begin. Authenticated
+live-model validation is explicitly deferred, not passed; this is not a claim
+that the complete provider-selection feature is production-ready.
 
-## Scope Fixed to the Original Plan
+## Accepted Scope
+
+The user approved closing P3 with the implemented feature changes and focused
+local regressions, without additional model runs, API billing, new services, or
+separate account sign-ins. This supersedes the original plan's requirement to
+finish authenticated qualification before beginning P4. Historical capability
+reports retain their actual not-run/unsupported results. Production admission
+checks have not been bypassed, and no production provider profile is enabled.
 
 P3 owns reproducible protected assets, explicit native loading, primitive child
 adapters, installer/digest correctness, protected runtime inputs, and local
@@ -59,7 +67,21 @@ protection and model-led host policy remain distinct checks.
   publishes anything. No force-qualification flag or synthetic admission path
   was added.
 
-## Current Evidence
+## Local Closeout Verification
+
+On 2026-09-21, all 93 focused local tests passed with no failures or skips:
+assets/installer/digest recovery (9), copied package/runtime (32), native trace
+parsers and adapter fixtures (28), Git protections (10), and broker runtime (14).
+Hard Rule 24's skill/agent copies also compare identically. Commands and log
+hashes are recorded in `evidence/p3-checkpoint.json` under `local_closeout`.
+No additional model calls, account sign-ins, or external services were used for
+this closeout. Test-owned broker/tmux processes were cleaned up.
+
+Implementation remains at c837d4b; this closeout changes documentation/evidence
+only. Local main was merged (already up to date). Unrelated user files remain
+untouched. No further runtime changes were needed for the revised P3 scope.
+
+## Earlier Evidence
 
 The protected reports indexed in `evidence/p3-checkpoint.json` cover both
 candidate providers and both primary/separate-linked worktrees. Package
@@ -69,10 +91,11 @@ worker denial forms pass for both topologies.
 Each provider/topology denied all 3,225 write-open attempts and 930 canary
 mutations, with successful workspace controls.
 
-The overall management check intentionally remains not-run until the native host
-side is also measured. Codex effective configuration passes. Both isolated native
-authentication namespaces report unavailable. The Codex device authorization
-attempt expired; no credentials were copied and no login process remains.
+In those historical reports, the overall management check remains not-run because
+the native host side was not measured. Codex effective configuration passes.
+Both isolated native authentication namespaces were unavailable. Subsequent
+sign-in attempts were canceled on 2026-09-21; no credentials were copied and no
+login process remains. Authentication is no longer a P3 implementation blocker.
 
 Standalone package tests: 32 passed. Native trace/parser tests: 28 passed.
 Explicit native management sandbox tests: both primary and linked passed.
@@ -87,28 +110,20 @@ then run explicitly: both passed. The owned tmux server is stopped. Both retaine
 candidate packages still verify after the full run. Log hashes are in the index.
 The bridge emitted its pre-existing missing generated technical-reference warning.
 
-## Remaining Acceptance
+## Deferred Live Validation
 
-1. Authenticate each isolated provider namespace through its native login.
-2. Run every authenticated primitive against the exact copied candidates:
-   loading, reinvocation/compaction/resume/restart, children, duplicates,
-   model-led policy/management, and concurrent legacy reads.
-3. Fix any failures those real executions expose, retain the raw evidence, and
-   publish candidate/conformance files only after all mandatory checks pass.
-4. Mark P3 complete and begin P4 only after that evidence exists.
+Candidate loading, reinvocation/compaction/resume/restart, real child execution,
+duplicate discovery, model-led policy/management, Claude native initialization,
+and concurrent legacy reads have not passed authenticated candidate acceptance.
+Local parser/fixture tests do not establish those live behaviors. Do not run
+native qualification or initiate sign-ins without a new user request.
 
-These are unexecuted acceptance tests, not a claim that sign-in alone guarantees
-success. Filesystem permissions already work; no restart is needed. The existing
-worktree-local continuation helper keeps authentication and qualification here:
+P4 owns provider-aware observation/attention; P4b owns the integrated preview;
+P5/P6 own full workflows and rollout. These remain subsequent implementation
+phases, not reasons to reopen P3 or expand its test infrastructure. The existing
+production admission path still requires live evidence, so this closeout alone
+does not enable Codex orchestration in a production session. Any change to that
+admission policy must be explicit, not fabricated evidence or a silent bypass.
 
-```sh
-python3 -B .dev/forge-p3/continue-native.py auth codex
-python3 -B .dev/forge-p3/continue-native.py auth claude
-python3 -B .dev/forge-p3/continue-native.py qualify codex
-python3 -B .dev/forge-p3/continue-native.py qualify claude
-```
-
-Run qualification sequentially because canary measurements briefly add owned files
-inside protected package directories. Existing management copies are never
-silently overwritten. No global installation, profile registration, live-session
-migration, or provider switch has been performed.
+No global installation, profile registration, live-session migration, or provider
+switch has been performed. All work remains in the current Forge worktree.

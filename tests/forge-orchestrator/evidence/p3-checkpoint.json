@@ -1,8 +1,62 @@
 {
   "schema": "forge-p3-checkpoint-evidence/2",
-  "status": "incomplete",
+  "status": "implementation-complete",
+  "acceptance_scope": "user-approved-local-only-2026-09-21",
+  "live_model_validation": "deferred-not-passed",
+  "p4_implementation_ready": true,
+  "production_ready": false,
   "admission": "unsupported",
   "supported_providers": [],
+  "local_closeout": {
+    "date": "2026-09-21",
+    "implementation_commit": "c837d4b",
+    "command_template": "python3 -B -m unittest discover -s tests/forge-orchestrator -p {module} -v",
+    "passed": 93,
+    "failed": 0,
+    "skipped": 0,
+    "additional_model_calls": 0,
+    "production_code_changed": false,
+    "test_processes_stopped": true,
+    "local_main_merged": true,
+    "hard_rule_24_lockstep": "pass",
+    "suites": [
+      {
+        "module": "test_assets.py",
+        "passed": 9,
+        "exit_code": 0,
+        "log": ".dev/forge-p3/local-closeout-20260921-assets.log",
+        "sha256": "5ffb5ab40fd8cefa6b3cf62930b8d9832af333c19e35ea97ea883c5b6a0b93b9"
+      },
+      {
+        "module": "test_package.py",
+        "passed": 32,
+        "exit_code": 0,
+        "log": ".dev/forge-p3/local-closeout-20260921-package.log",
+        "sha256": "ab278562c0f7b46dd2ef782f5f122c5e9fe60d420c9add3adf8afbd9d48e3895"
+      },
+      {
+        "module": "test_native_assets.py",
+        "passed": 28,
+        "exit_code": 0,
+        "log": ".dev/forge-p3/local-closeout-20260921-native-assets.log",
+        "sha256": "612ba3e566f696d709eb3edfcb70b2c9a031921573816ee92075d56593025f7a"
+      },
+      {
+        "module": "test_git_runtime.py",
+        "passed": 10,
+        "exit_code": 0,
+        "log": ".dev/forge-p3/local-closeout-20260921-git-runtime.log",
+        "sha256": "8af8040e1613750b0cafde6bbb9a9e186dc2c360fdeb0412cf8b77666e30dde1"
+      },
+      {
+        "module": "test_broker_runtime.py",
+        "passed": 14,
+        "exit_code": 0,
+        "log": ".dev/forge-p3/local-closeout-20260921-broker-runtime.log",
+        "sha256": "bbfccc1a4d3e6dfaaa7c36784bffc20519f2c0b129fcee37fde60c813ec1f036"
+      }
+    ]
+  },
   "provider_reports": {
     "codex": {
       "package": {
@@ -173,8 +227,8 @@
     }
   },
   "limits": [
-    "All missing qualifier paths are implemented; authenticated native acceptance has not passed.",
-    "Both isolated authentication namespaces are unavailable; the device authorization expired.",
+    "P3 implementation is closed under the user-approved local-only scope; authenticated native acceptance is deferred, not passed.",
+    "Historical reports retain their actual authentication and not-run results; further sign-in attempts were canceled on 2026-09-21.",
     "Management operator/worker probes pass; native host-side management measurement remains not-run.",
     "Claude retains P1 default/manual approvals. Approved Claude hosts and children are not worker-contained.",
     "Builtin request transport is not P4 attention-hook qualification or P4b integrated preview.",
