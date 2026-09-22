@@ -74,13 +74,15 @@ def runtime_identity() -> dict:
         if filename and Path(filename).is_file():
             paths.add(Path(filename).resolve())
     package = Path(__file__).resolve().parent.parent / "package.json"
+    projections = {}
     if package.exists():
         receipt = load_json(package)
         if receipt.get("schema") != "forge-orchestrator-package/1":
             raise Refusal("BROKER_RUNTIME_INVALID", "invalid copied package receipt")
         paths.add(package)
         paths.update(Path(item["path"]) for item in receipt["files"])
-    files = [{"path": str(path), "sha256": sha(path.read_bytes())}
+        projections = {item["path"]: item for item in receipt["files"] if item.get("kind")}
+    files = [projections.get(str(path)) or {"path": str(path), "sha256": sha(path.read_bytes())}
              for path in sorted(paths)]
     payload = {"schema": "forge-broker-runtime/1", "protocol": CONTROL_PROTOCOL,
                "entry": str(Path(__file__).resolve()),
@@ -108,11 +110,18 @@ def verify_runtime_files(identity: dict) -> None:
         raise Refusal("BROKER_RUNTIME_INVALID", "startup process identity required")
     paths = set()
     for item in identity["files"]:
-        if (not isinstance(item, dict) or set(item) != {"path", "sha256"}
+        if (not isinstance(item, dict) or set(item) not in ({"path", "sha256"}, {"path", "sha256", "kind"})
                 or not isinstance(item["path"], str) or not Path(item["path"]).is_absolute()
                 or not isinstance(item["sha256"], str) or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])
                 or item["path"] in paths):
             raise Refusal("BROKER_RUNTIME_INVALID", "invalid startup file")
+        if "kind" in item:
+            path = Path(item["path"])
+            if (item["kind"] != "codex-hook-trust" or path.parts[-2:] != ("codex", "config.toml")
+                    or path.parent.parent.parent.name != "authentication-p4"
+                    or not re.fullmatch(r"[a-f0-9]{64}", path.parent.parent.name)
+                    or item["path"] in (identity["entry"], identity["interpreter"])):
+                raise Refusal("BROKER_RUNTIME_INVALID", "invalid hook trust projection")
         paths.add(item["path"])
     if (not isinstance(identity["entry"], str) or not isinstance(identity["interpreter"], str)
             or identity["entry"] not in paths or identity["interpreter"] not in paths):
@@ -120,7 +129,8 @@ def verify_runtime_files(identity: dict) -> None:
     for item in identity["files"]:
         path = Path(item["path"])
         try:
-            if path.resolve(strict=True) != path or not path.is_file() or sha(path.read_bytes()) != item["sha256"]:
+            if (path.resolve(strict=True) != path or not path.is_file()
+                    or ("kind" not in item and sha(path.read_bytes()) != item["sha256"])):
                 raise Refusal("BROKER_RUNTIME_CHANGED", str(path))
         except (OSError, RuntimeError) as exc:
             if isinstance(exc, Refusal):
@@ -131,20 +141,24 @@ def verify_runtime_files(identity: dict) -> None:
         control = package.parent / "bin/forge-orchestrator-package"
         if str(control) not in paths:
             raise Refusal("BROKER_RUNTIME_INVALID", "package verifier missing from startup inventory")
-        # Execute only after every startup hash has passed, including the verifier.
+        # Verify all executable bytes before loading the parser. Only native
+        # hook-trust data is deferred to the pinned package's schema validation.
         spec = importlib.util.spec_from_loader("forge_broker_package", loader=None, origin=str(control))
         module = importlib.util.module_from_spec(spec)
         module.__file__ = str(control)
         try:
             receipt = json.loads(package.read_bytes())
-            expected = {item["path"]: item["sha256"] for item in receipt["files"]}
-            observed = {item["path"]: item["sha256"] for item in identity["files"]}
-            if any(observed.get(path) != digest for path, digest in expected.items()):
+            expected = {item["path"]: item for item in receipt["files"]}
+            observed = {item["path"]: item for item in identity["files"]}
+            if (any(observed.get(path) != item for path, item in expected.items())
+                    or any("kind" in item and expected.get(path) != item for path, item in observed.items())):
                 raise ValueError("package dependency changed or missing from startup inventory")
             exec(compile(control.read_bytes(), str(control), "exec"), module.__dict__)
             receipt = module.verify(package.parent)
         except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
             raise Refusal("BROKER_RUNTIME_CHANGED", str(exc)) from exc
+    elif any("kind" in item for item in identity["files"]):
+        raise Refusal("BROKER_RUNTIME_INVALID", "hook trust projection requires its pinned package verifier")
 
 
 def runtime_proof(token: str, nonce: bytes, identity: dict) -> str:

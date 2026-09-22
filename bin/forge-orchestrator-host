@@ -69,14 +69,51 @@ def read_json(path):
         os.close(fd)
 
 
-def file_identity(path):
-    return {"path": str(path), "sha256": hashlib.sha256(file_bytes(path)).hexdigest()}
+def file_identity(path, kind=None):
+    data = file_bytes(path)
+    if kind == "codex-hook-trust":
+        location = Path(path)
+        require(location.parts[-2:] == ("codex", "config.toml")
+                and location.parent.parent.parent.name == "authentication-p4"
+                and records.sha256(location.parent.parent.name),
+                "INVALID_INPUT", "hook trust projection is restricted to its native config")
+        try:
+            import tomllib
+        except ImportError:
+            # Apple's isolated Python 3.9 ships the same parser with pip.
+            from pip._vendor import tomli as tomllib
+        config = tomllib.loads(data.decode("utf-8"))
+        require(set(config) <= {"cli_auth_credentials_store", "hooks"}
+                and config.get("cli_auth_credentials_store") == "keyring",
+                "AUTH_CONFIG_CHANGED", str(path))
+        hooks = config.get("hooks", {})
+        require(isinstance(hooks, dict) and set(hooks) <= {"state"}, "AUTH_CONFIG_CHANGED", str(path))
+        state = hooks.get("state", {})
+        require(isinstance(state, dict), "AUTH_CONFIG_CHANGED", str(path))
+        for key, value in state.items():
+            require(isinstance(key, str) and isinstance(value, dict)
+                    and set(value) <= {"enabled", "trusted_hash"}
+                    and ("enabled" not in value or type(value["enabled"]) is bool)
+                    and ("trusted_hash" not in value or (isinstance(value["trusted_hash"], str)
+                         and re.fullmatch(r"sha256:[0-9a-f]{64}", value["trusted_hash"]))),
+                    "AUTH_CONFIG_CHANGED", str(path))
+        # Native per-hook approval is mutable state, never a source of hook code.
+        data = b'cli_auth_credentials_store = "keyring"\n'
+    else:
+        require(kind is None, "INVALID_INPUT", "unknown dependency kind")
+    result = {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
+    if kind:
+        result["kind"] = kind
+    return result
 
 
 def verify_file(item):
     require(isinstance(item, dict) and isinstance(item.get("path"), str) and records.sha256(item.get("sha256")),
             "INVALID_INPUT", "absolute path and SHA-256 required")
-    require(file_identity(item["path"]) == {"path": item["path"], "sha256": item["sha256"]},
+    expected = {"path": item["path"], "sha256": item["sha256"]}
+    if item.get("kind") is not None:
+        expected["kind"] = item["kind"]
+    require(file_identity(item["path"], item.get("kind")) == expected,
             "INPUT_CHANGED", item["path"])
 
 

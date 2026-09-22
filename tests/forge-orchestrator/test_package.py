@@ -6,6 +6,8 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -194,7 +196,8 @@ class Package(unittest.TestCase):
     def test_stable_auth_namespace_and_policy_only_inputs(self):
         receipt = package.verify(self.path)
         env = receipt["environment"]
-        self.assertEqual(Path(env["CODEX_HOME"]), self.ctx.store.path / "authentication/codex")
+        self.assertEqual(Path(env["CODEX_HOME"]), self.ctx.store.path / "authentication-p4" /
+                         package.host.file_identity(receipt["worker_binaries"]["codex"])["sha256"] / "codex")
         self.assertNotEqual(Path(env["HOME"]), Path.home())
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("OPENAI_API_KEY", env)
@@ -214,6 +217,9 @@ class Package(unittest.TestCase):
         self.assertNotIn("danger-full-access", argv)
         self.assertIn("allow_login_shell=false", argv)
         self.assertIn("skip_host_skill_discovery", argv)
+        hook_arg = next(arg for arg in argv if arg.startswith("hooks="))
+        self.assertEqual(tomllib.loads(hook_arg), json.loads(Path(receipt["attention_hooks"]).read_text()))
+        self.assertNotIn("--dangerously-bypass-hook-trust", argv)
 
     def test_claude_empty_mcp_configuration_has_required_server_map(self):
         staged = package.stage(self.ctx, "claude", "/bin/echo", "fixture-no-native-qualification")
@@ -221,8 +227,148 @@ class Package(unittest.TestCase):
         self.assertIn("--strict-mcp-config", argv)
         self.assertEqual(json.loads(argv[argv.index("--mcp-config") + 1]), {"mcpServers": {}})
         settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
-        self.assertEqual(settings, {})
+        receipt = package.verify(staged["package"])
+        self.assertEqual(settings, json.loads(Path(receipt["attention_hooks"]).read_text()))
+        self.assertNotIn("--safe-mode", argv)
+        self.assertIn("--disable-slash-commands", argv)
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
+
+    def test_attention_configs_are_copied_pinned_and_provider_specific(self):
+        for provider in ("codex", "claude"):
+            staged = package.stage(self.ctx, provider, "/bin/echo", "fixture-no-native-qualification")
+            receipt = package.verify(staged["package"])
+            attention = Path(receipt["attention_hooks"])
+            hooks = json.loads(attention.read_text())["hooks"]
+            self.assertTrue({"UserPromptSubmit", "Stop", "PermissionRequest", "PostToolUse"} <= set(hooks))
+            self.assertNotIn("SubagentStop", hooks)
+            for event, entries in hooks.items():
+                for entry in entries:
+                    for hook in entry["hooks"]:
+                        argv = shlex.split(hook["command"])
+                        self.assertEqual(argv, [str(Path(staged["package"]) / "bin/forge-cc-hook")]
+                                         + (["--codex"] if provider == "codex" else []) + [event.lower()])
+                        self.assertEqual(hook["type"], "command")
+                        self.assertEqual(hook["timeout"], 10)
+            before = attention.read_bytes()
+            try:
+                attention.chmod(0o600)
+                attention.write_text('{"hooks":{}}')
+                with self.assertRaises(package.host.Refusal):
+                    package.verify(staged["package"])
+            finally:
+                attention.write_bytes(before)
+                attention.chmod(0o400)
+
+    def test_native_hook_trust_is_the_only_mutable_auth_configuration(self):
+        receipt = package.verify(self.path)
+        config = Path(receipt["environment"]["CODEX_HOME"]) / "config.toml"
+        item = next(item for item in receipt["files"] if item["path"] == str(config))
+        self.assertEqual(item["kind"], "codex-hook-trust")
+        before = config.read_bytes()
+        try:
+            config.chmod(0o600)
+            config.write_text(before.decode() + '\n[hooks.state."fixture"]\nenabled = false\ntrusted_hash = "sha256:' + 'a' * 64 + '"\n')
+            package.host.verify_file(item)
+            if Path("/usr/bin/python3").exists():
+                code = ("import importlib.machinery,json,sys; "
+                        "host=importlib.machinery.SourceFileLoader('host',sys.argv[1]).load_module(); "
+                        "host.verify_file(json.loads(sys.argv[2]))")
+                cp = subprocess.run(["/usr/bin/python3", "-I", "-c", code, str(TREE / "bin/forge-orchestrator-host"), json.dumps(item)],
+                                    text=True, capture_output=True, timeout=10)
+                self.assertEqual(cp.returncode, 0, cp.stderr)
+            package.verify(self.path)
+            self.assertEqual(package.stage(self.ctx, "codex", "/bin/echo", "fixture-no-native-qualification"), self.result)
+            for suffix in ('sandbox_mode = "danger-full-access"\n',
+                           '[hooks]\nUserPromptSubmit = []\n',
+                           '[hooks.state.fixture]\ncommand = "/bin/true"\n',
+                           '[hooks.state.fixture]\nenabled = "true"\n',
+                           '[hooks.state.fixture]\ntrusted_hash = "anything"\n'):
+                config.write_text(before.decode() + suffix)
+                with self.assertRaises(package.host.Refusal):
+                    package.verify(self.path)
+        finally:
+            config.write_bytes(before)
+            config.chmod(0o400)
+
+    @unittest.skipUnless(shutil.which("codex") and shutil.which("sandbox-exec"), "requires local offline Codex config reader")
+    def test_codex_native_hook_discovery_and_trust_without_a_model(self):
+        native = package.module("native_hooks", TREE / "lib/forge_native.py")
+        receipt = package.verify(self.path)
+        config = Path(receipt["environment"]["CODEX_HOME"]) / "config.toml"
+        before = config.read_bytes()
+        argv = native.codex_argv(receipt)
+        argv[0] = shutil.which("codex")
+        argv = [shutil.which("sandbox-exec"), "-p", "(version 1)(allow default)(deny network*)", *argv]
+        try:
+            with tempfile.TemporaryDirectory(dir=self.root) as tmp:
+                with native.Rpc(argv, receipt["environment"], str(self.root), Path(tmp) / "hooks.jsonl", timeout=15) as client:
+                    result = client.call("hooks/list", {"cwds": [str(self.root)]})["data"][0]
+                    self.assertEqual(result["errors"], [])
+                    self.assertEqual(len(result["hooks"]), 4)
+                    for row in result["hooks"]:
+                        self.assertEqual(row["trustStatus"], "untrusted")
+                        self.assertFalse(row["isManaged"])
+                        self.assertIn(str(self.path / "bin/forge-cc-hook"), row["command"])
+                    row = result["hooks"][0]
+                    # Only this disposable fixture is approved, using the native
+                    # config writer behind /hooks. No thread or turn is started.
+                    client.call("config/value/write", {"keyPath": "hooks.state." + json.dumps(row["key"]) + ".trusted_hash",
+                                "value": row["currentHash"], "mergeStrategy": "replace"})
+                    rows = client.call("hooks/list", {"cwds": [str(self.root)]})["data"][0]["hooks"]
+                    self.assertEqual(next(r for r in rows if r["key"] == row["key"])["trustStatus"], "trusted")
+                    self.assertEqual(package.discovery_inputs(receipt["environment"]), receipt["discovery"])
+                    package.verify(self.path)
+                changed = [arg.replace("forge-cc-hook", "forge-cc-hook-changed") if arg.startswith("hooks=") else arg for arg in argv]
+                with native.Rpc(changed, receipt["environment"], str(self.root), Path(tmp) / "changed.jsonl", timeout=15) as client:
+                    rows = client.call("hooks/list", {"cwds": [str(self.root)]})["data"][0]["hooks"]
+                    self.assertTrue(all(r["trustStatus"] in ("untrusted", "modified") for r in rows))
+                    self.assertEqual(next(r for r in rows if r["key"] == row["key"])["trustStatus"], "modified")
+        finally:
+            config.chmod(0o600)
+            config.write_bytes(before)
+            config.chmod(0o400)
+
+    @unittest.skipUnless(shutil.which("tmux"), "requires local tmux")
+    def test_copied_attention_commands_emit_for_both_providers(self):
+        tmux = shutil.which("tmux")
+        socket = "forge-p4-hooks-" + uuid.uuid4().hex
+        def mux(*args):
+            return subprocess.run([tmux, "-L", socket, "-f", "/dev/null", *args],
+                                  capture_output=True, text=True, check=True)
+        mux("new-session", "-d", "-s", "p4-attention", "-c", str(self.root), "/bin/cat")
+        try:
+            mux("split-window", "-d", "-t", "p4-attention:0", "-c", str(self.root), "/bin/cat")
+            socket_path = mux("display-message", "-p", "-t", "p4-attention:0.0", "#{socket_path}").stdout.strip()
+            panes = [mux("display-message", "-p", "-t", f"p4-attention:0.{i}", "#{pane_id}").stdout.strip() for i in (0, 1)]
+            attention = self.root / ".dev/attention"
+            attention.mkdir(parents=True, exist_ok=True)
+            for provider in ("codex", "claude"):
+                staged = package.stage(self.ctx, provider, "/bin/echo", "fixture-no-native-qualification")
+                receipt = package.verify(staged["package"])
+                hooks = json.loads(Path(receipt["attention_hooks"]).read_text())["hooks"]
+                env = dict(receipt["environment"], TMUX=socket_path + ",0,0", TMUX_PANE=panes[0], FORGE_ROLE="orchestrator")
+                def emit(event, payload, pane=None):
+                    command = hooks[event][0]["hooks"][0]["command"]
+                    cp = subprocess.run(shlex.split(command), input=json.dumps(payload), cwd=self.root,
+                                        env=dict(env, TMUX_PANE=pane or panes[0]), text=True, capture_output=True, timeout=15)
+                    self.assertEqual((cp.returncode, cp.stdout), (0, ""), cp.stderr)
+                emit("UserPromptSubmit", {"prompt": "local fixture", "session_id": "native", "turn_id": "turn"})
+                emit("PermissionRequest", {"tool_name": "Bash", "tool_input": {"command": "pwd"}})
+                self.assertEqual(len(list(attention.glob("perm.p4-attention.*"))), 1)
+                emit("PostToolUse", {"tool_name": "Bash", "tool_input": {"command": "pwd"}})
+                self.assertFalse(list(attention.glob("perm.p4-attention.*")))
+                emit("Stop", {"last_assistant_message": "host fixture", "session_id": "native", "turn_id": "turn"})
+                stop = attention / "stop.p4-attention.json"
+                record = json.loads(stop.read_text())
+                self.assertEqual(record["role"], "orchestrator")
+                self.assertEqual(record["snippet"], "host fixture")
+                self.assertEqual(record["provider"], "unknown")  # No native model is admitted in this fixture.
+                before = stop.read_bytes()
+                emit("Stop", {"last_assistant_message": "worker fixture", "turn_id": "worker"}, panes[1])
+                self.assertEqual(stop.read_bytes(), before)
+                self.assertTrue(list(attention.glob("wstop.*")))
+        finally:
+            mux("kill-server")
 
     def test_new_native_input_directories_and_aliases_refuse(self):
         receipt = package.verify(self.path)
@@ -528,6 +674,8 @@ class Package(unittest.TestCase):
                                   capture_output=True, text=True, timeout=30)
         changed = self.path / "digests/coding.txt"
         old = changed.read_bytes()
+        trust = Path(env["CODEX_HOME"]) / "config.toml"
+        old_trust = trust.read_bytes()
         started = False
         try:
             cp = mux("new-session", "-d", "-s", "candidate", "-c", str(self.root), "/bin/sleep 120")
@@ -551,6 +699,17 @@ class Package(unittest.TestCase):
             cp = broker("start", "--session", "candidate", "--incarnation", incarnation, "--mode", "contain")
             self.assertEqual(cp.returncode, 0, cp.stderr)
             self.assertEqual(json.loads(cp.stdout)["pid"], info["pid"])
+            trust.chmod(0o600)
+            trust.write_text(old_trust.decode() + '\n[hooks.state.fixture]\ntrusted_hash = "sha256:' + 'a' * 64 + '"\n')
+            cp = broker("control", "--expect-runtime-sha256", identity["sha256"], request={"action": "inspect-runtime"})
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            cp = broker("start", "--session", "candidate", "--incarnation", incarnation, "--mode", "contain")
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            self.assertEqual(json.loads(cp.stdout)["pid"], info["pid"])
+            trust.write_text(old_trust.decode() + 'sandbox_mode = "danger-full-access"\n')
+            cp = broker("control", "--expect-runtime-sha256", identity["sha256"], request={"action": "inspect-runtime"})
+            self.assertNotEqual(cp.returncode, 0)
+            trust.write_bytes(old_trust)
             changed.chmod(0o600)
             changed.write_text("changed after startup")
             cp = broker("status", "--json")
@@ -560,6 +719,9 @@ class Package(unittest.TestCase):
             self.assertNotEqual(cp.returncode, 0)
             self.assertIn("BROKER_RUNTIME_CHANGED", cp.stderr)
         finally:
+            trust.chmod(0o600)
+            trust.write_bytes(old_trust)
+            trust.chmod(0o400)
             changed.chmod(0o600)
             changed.write_bytes(old)
             changed.chmod(0o400)

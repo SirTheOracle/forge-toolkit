@@ -73,6 +73,22 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(broker.Refusal):
             broker.verify_runtime_files(self.identity)
 
+    def test_hook_trust_projection_cannot_exempt_executable_bytes(self):
+        identity = copy.deepcopy(self.identity)
+        identity["files"][0]["kind"] = "codex-hook-trust"
+        with self.assertRaises(broker.Refusal):
+            broker.verify_runtime_files(sign(identity))
+
+    def test_hook_trust_projection_requires_copied_package_verifier(self):
+        config = self.path.parent / "authentication-p4" / ("a" * 64) / "codex/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('cli_auth_credentials_store = "keyring"\n')
+        identity = copy.deepcopy(self.identity)
+        identity["files"].append({"path": str(config), "sha256": broker.sha(config.read_bytes()), "kind": "codex-hook-trust"})
+        with self.assertRaises(broker.Refusal) as raised:
+            broker.verify_runtime_files(sign(identity))
+        self.assertEqual(raised.exception.code, "BROKER_RUNTIME_INVALID")
+
     def test_proof_binds_manifest_nonce_and_secret(self):
         proof = broker.runtime_proof("secret", b"nonce", self.identity)
         for token, nonce, value in (("other", b"nonce", self.identity),

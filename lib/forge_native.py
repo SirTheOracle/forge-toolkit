@@ -212,7 +212,8 @@ def configuration(receipt, directory):
             config = client.call("config/read", {"cwd": receipt["root"]["physical_root"], "includeLayers": False})["config"]
         expected = {"model": receipt["definition"]["model"], "sandbox_mode": "workspace-write",
                     "approval_policy": "on-request", "allow_login_shell": False}
-        features = {"hooks": False, "plugins": False, "shell_snapshot": False, "skip_host_skill_discovery": True}
+        features = {"hooks": bool(receipt.get("attention_hooks")), "plugins": False,
+                    "shell_snapshot": False, "skip_host_skill_discovery": True}
         actual = {key: config.get(key) for key in expected}
         actual_features = {key: config.get("features", {}).get(key) for key in features}
         untrusted = config.get("projects", {}).get(receipt["root"]["physical_root"], {}).get("trust_level") == "untrusted"
@@ -232,12 +233,18 @@ def claude_configuration(receipt, directory):
     try:
         argv = receipt["provider_argv"]
         expected = {"--permission-mode": "default", "--setting-sources": "", "--mcp-config": '{"mcpServers":{}}'}
-        if ("--safe-mode" not in argv or "--strict-mcp-config" not in argv
+        attention = receipt.get("attention_hooks")
+        if (("--disable-slash-commands" if attention else "--safe-mode") not in argv
+                or (attention and "--safe-mode" in argv) or "--strict-mcp-config" not in argv
                 or any(argv.count(key) != 1 or argv[argv.index(key) + 1] != value for key, value in expected.items())):
             raise ValueError("Claude candidate startup policy differs")
         settings = Path(argv[argv.index("--settings") + 1])
-        if json.loads(settings.read_text()) != {}:
+        expected_settings = json.loads(Path(attention).read_text()) if attention else {}
+        if json.loads(settings.read_text()) != expected_settings:
             raise ValueError("Claude explicit settings differ from the measured manual profile")
+        if attention and any(receipt["environment"].get(key) != "1" for key in (
+                "CLAUDE_CODE_DISABLE_CLAUDE_MDS", "CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS")):
+            raise ValueError("Claude implicit instructions are not disabled")
         with ClaudeStream(claude_stream_argv(receipt, persist=False), receipt["environment"],
                           receipt["root"]["physical_root"], directory / "claude-configuration.jsonl") as client:
             events = client.turn("Do not use tools. Reply CONFIGURATION_ONLY.")

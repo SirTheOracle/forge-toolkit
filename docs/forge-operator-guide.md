@@ -869,6 +869,31 @@ Fix:
    marker as a routing instruction.
 <!-- docs-refresh:end section=recovery -->
 
+## Protected orchestrator attention
+
+New protected candidates include provider-specific attention hooks from the
+copied package. Codex exposes them through native session configuration; review
+and approve the intended commands with `/hooks` when using the candidate. They
+start untrusted, and changing a command requires a fresh native approval. Hook
+approval does not approve model tool calls or enable a production profile.
+
+The private Codex configuration permits only hook enable/disable and hash-trust
+records to change without invalidating its package. Other configuration changes
+still refuse. Staging initializes bundled native files offline before recording
+their identity, uses a distinct binary-scoped authentication namespace, and never
+copies credentials or alters older candidates.
+
+Claude candidates load only the explicit copied attention settings, with normal
+manual permissions, no user/project/local settings, disabled implicit instruction
+and memory discovery, and strict empty MCP configuration. Safe mode is not used
+because it would suppress the intended hooks too.
+
+Provider-aware health, usage and attention remain observational. Unknown binding
+identity is displayed as unknown; pane 0 is handoff-only and never worker-reset.
+P4 local implementation is complete. Model-led attribution and the integrated
+P4b preview are not claimed by the local fixtures; production admission checks
+are unchanged.
+
 ## Codex containment and rollout
 
 The default is `contain`. New panes use the exact-version-gated interactive

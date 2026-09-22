@@ -53,6 +53,16 @@ def encoded(data):
     return json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n"
 
 
+def toml_value(value):
+    """Encode the JSON-shaped hook template as a CLI TOML inline table."""
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(key) + "=" + toml_value(item) for key, item in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(toml_value(item) for item in value) + "]"
+    host.require(isinstance(value, (str, bool, int)), "HOOK_CONFIG_INVALID", "unsupported hook template value")
+    return json.dumps(value, ensure_ascii=False)
+
+
 def source_files():
     declared = json.loads((TREE / "config/orchestrator-files.json").read_text())
     actual = set()
@@ -112,9 +122,10 @@ def alias_chain(path):
     return result
 
 
-def authentication_seed(ctx):
+def authentication_seed(ctx, codex):
     """Stable keyring namespace; never read, copy or fall back to auth.json."""
-    auth = ctx.store.path / "authentication"
+    # Do not change the discovery namespace of any previously staged candidate.
+    auth = ctx.store.path / "authentication-p4" / host.file_identity(codex)["sha256"]
     seeds = {"codex/config.toml": 'cli_auth_credentials_store = "keyring"\n',
              "claude/settings.json": '{}\n'}
     for relative, contents in seeds.items():
@@ -124,12 +135,34 @@ def authentication_seed(ctx):
             write(path, contents)
         except FileExistsError:
             pass
-        host.require(host.file_bytes(path) == contents.encode(), "AUTH_CONFIG_CHANGED", str(path))
-    return {"CODEX_HOME": str(auth / "codex"), "CLAUDE_CONFIG_DIR": str(auth / "claude")}, [auth / name for name in seeds]
+        if relative == "codex/config.toml":
+            host.file_identity(path, "codex-hook-trust")
+        else:
+            host.require(host.file_bytes(path) == contents.encode(), "AUTH_CONFIG_CHANGED", str(path))
+    env = {"CODEX_HOME": str(auth / "codex"), "CLAUDE_CONFIG_DIR": str(auth / "claude")}
+    marker = auth / "native-discovery.json"
+    if not marker.exists():
+        # Native startup materializes bundled skills even with discovery disabled.
+        # Seed them before freezing inventory, offline and without a model turn.
+        home = auth / "bootstrap-home"
+        os.close(host.records.directory(home, create=True))
+        argv = [str(codex), "app-server", "--disable", "hooks", "--disable", "plugins",
+                "--enable", "skip_host_skill_discovery"]
+        if sys.platform == "darwin":
+            argv = ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)(deny network*)", *argv]
+        else:
+            argv = [str(codex), "sandbox", "--permission-profile", ":workspace", "-C", str(auth), *argv]
+        cp = subprocess.run(argv, input="", text=True, capture_output=True, timeout=30, cwd=auth,
+                            env=dict(env, HOME=str(home), PATH="/usr/bin:/bin", LANG="C", LC_ALL="C"))
+        host.require(cp.returncode == 0, "NATIVE_DISCOVERY_INIT_FAILED", cp.stderr[-2000:])
+        write(marker, encoded({"inputs": discovery_inputs(env)}))
+    host.require(host.read_json(marker) == {"inputs": discovery_inputs(env)}, "NATIVE_DISCOVERY_CHANGED",
+                 "private native inputs differ from their initialized inventory")
+    return env, [*(auth / name for name in seeds), marker]
 
 
-def authentication(ctx, home):
-    env, inputs = authentication_seed(ctx)
+def authentication(ctx, home, codex):
+    env, inputs = authentication_seed(ctx, codex)
     aliases = {}
     if sys.platform == "darwin":
         keychains = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library/Keychains"
@@ -171,7 +204,9 @@ def discovery_inputs(env):
                     result.append({"path": str(path), "directory": True})
                     pending.extend(sorted(path.iterdir(), reverse=True))
                 elif path.exists():
-                    result.append(host.file_identity(path))
+                    kind = ("codex-hook-trust" if key == "CODEX_HOME" and name == "config.toml"
+                            and root.parent.parent.name == "authentication-p4" else None)
+                    result.append(host.file_identity(path, kind))
     return sorted(result, key=lambda item: item["path"])
 
 
@@ -195,7 +230,7 @@ def stage(ctx, provider, binary, model):
     version = subprocess.check_output([str(binary), "--version"], text=True, timeout=15).strip()
     worker_binaries = {name: str(Path(shutil.which(name) or "").resolve(strict=True)) for name in ("claude", "codex")}
     native_inputs = runtime.provider_dependencies(worker_binaries)
-    auth_env, _ = authentication_seed(ctx)
+    auth_env, _ = authentication_seed(ctx, worker_binaries["codex"])
     definition = {"root": ctx.identity, "sources": files, "provider": provider, "executable": executable,
                   "version": version, "model": model, "topology_sha256": host.records.digest(host.topology(ctx)),
                   "python": host.file_identity(Path(sys.executable).resolve()),
@@ -276,8 +311,18 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
     # These are policy-only inputs. Never copy auth.json, credentials or global hooks.
     codex_config = 'cli_auth_credentials_store = "keyring"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\n'
     write(home / ".codex/config.toml", codex_config)
-    write(home / ".claude/settings.json", '{}\n')
-    auth_env, auth_inputs, auth_aliases = authentication(ctx, home)
+    hook_block = json.loads((package / "config" / (provider + "-cc-hooks.json")).read_text())
+    for entries in hook_block.values():
+        for entry_config in entries:
+            for hook in entry_config["hooks"]:
+                command = shlex.split(hook["command"])
+                host.require(command[0] == "$HOME/bin/forge-cc-hook" and hook["type"] == "command",
+                             "HOOK_CONFIG_INVALID", "only the copied attention adapter is supported")
+                hook["command"] = shlex.join([str(package / "bin/forge-cc-hook"), *command[1:]])
+    attention = package / "config/native-attention.json"
+    write(attention, encoded({"hooks": hook_block}))
+    write(home / ".claude/settings.json", encoded({"hooks": hook_block} if provider == "claude" else {}))
+    auth_env, auth_inputs, auth_aliases = authentication(ctx, home, worker_binaries["codex"])
     entry = package / "discovery" / ("forge-candidate-" + provider + "-" + identity[:12] + ".md")
     canonical = package / "skills/forge-orchestrator/SKILL.md"
     adapter = package / ("skills/forge-orchestrator/references/" + provider + ".md")
@@ -293,14 +338,18 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
         argv = [str(binary), "-C", str(ctx.root), "--strict-config", "--sandbox", "workspace-write",
                 "--ask-for-approval", "on-request", "-c", "allow_login_shell=false",
                 "-c", "shell_environment_policy.experimental_use_profile=false",
-                "--disable", "plugins", "--disable", "hooks", "--disable", "shell_snapshot",
+                "--disable", "plugins", "--enable", "hooks", "--disable", "shell_snapshot",
+                "-c", "hooks=" + toml_value(hook_block),
                 "--enable", "skip_host_skill_discovery",
                 *project_policy, "-m", model, prompt]
     else:
-        argv = [str(binary), "--safe-mode", "--permission-mode", "default", "--setting-sources", "", "--settings", str(home / ".claude/settings.json"),
+        argv = [str(binary), "--disable-slash-commands", "--permission-mode", "default", "--setting-sources", "", "--settings", str(home / ".claude/settings.json"),
                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--model", model, prompt]
     env = runtime.environment(package, home)
     env.update(auth_env)
+    if provider == "claude":
+        env.update(CLAUDE_CODE_DISABLE_CLAUDE_MDS="1", CLAUDE_CODE_DISABLE_AUTO_MEMORY="1",
+                   CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS="1")
     env["FORGE_ORCHESTRATOR_PROVIDER"] = provider
     # Ignore inherited shell functions/startup files before the first command,
     # then close every helper override rather than trusting pane environment.
@@ -354,7 +403,9 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
                "discovery": discovery,
                "worker_binaries": worker_binaries,
                "runtime_inventory_sha256": host.records.digest([str(p) for p in runtime.dependency_files(package)]),
-               "files": [host.file_identity(p) for p in sorted(inventory)], "aliases": aliases,
+               "files": [host.file_identity(p, "codex-hook-trust" if p == Path(auth_env["CODEX_HOME"]) / "config.toml"
+                                            else None) for p in sorted(inventory)], "aliases": aliases,
+               "attention_hooks": str(attention),
                "topology_sha256": definition["topology_sha256"],
                "os_cached_libraries": dependencies["os_cached_libraries"],
                "os_build": runtime.os_identity(),

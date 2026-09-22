@@ -89,6 +89,29 @@ class NativeAssets(unittest.TestCase):
         events.append(read("Last contract.", exitCode=0))
         self.assertTrue(native.codex_reads(events, [self.path])[str(self.path)])
 
+    def test_claude_attention_policy_uses_explicit_settings_not_safe_mode(self):
+        settings = self.path.parent / "settings.json"
+        attention = self.path.parent / "attention.json"
+        policy = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/protected/forge-cc-hook stop"}]}]}}
+        for path in (settings, attention):
+            path.write_text(json.dumps(policy))
+        receipt = {"provider_argv": ["/native/claude", "--disable-slash-commands", "--permission-mode", "default",
+                   "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                   "--settings", str(settings), "prompt"], "attention_hooks": str(attention),
+                   "environment": {key: "1" for key in ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+                                                         "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS")},
+                   "root": {"git_common_dir": "/protected/git", "git_dir": "/protected/git", "physical_root": "/fixture"}}
+        with patch.object(native, "ClaudeStream") as stream:
+            client = stream.return_value.__enter__.return_value
+            client.turn.return_value = [{"type": "system", "subtype": "init", "permissionMode": "default",
+                                         "model": "fixture-model", "mcp_servers": [], "plugins": []}]
+            self.assertEqual(native.claude_configuration(receipt, self.path.parent)["status"], "pass")
+            receipt["provider_argv"].insert(1, "--safe-mode")
+            self.assertEqual(native.claude_configuration(receipt, self.path.parent)["status"], "fail")
+            receipt["provider_argv"].remove("--safe-mode")
+            receipt["environment"].pop("CLAUDE_CODE_DISABLE_CLAUDE_MDS")
+            self.assertEqual(native.claude_configuration(receipt, self.path.parent)["status"], "fail")
+
     def test_codex_model_claim_and_checksum_are_not_loads(self):
         events = [self.event(type="agentMessage", text=self.path.read_text()),
                   self.event(type="commandExecution", command="shasum " + str(self.path),
