@@ -52,6 +52,16 @@ class LaunchTests(unittest.TestCase):
         self.assertIn("LAUNCH_IDENTITY_MISMATCH", self.start().stderr)
         self.assertEqual(self.f.ctx.store.current(), current)
 
+    def test_readonly_observation_validates_provider_and_event_pane(self):
+        self.assertEqual(self.start().returncode, 0)
+        current = self.f.ctx.store.current()
+        pane = current["record"]["seat"]["pane_id"]
+        for requested, expected in ((pane, "codex"), ("%99999", "unknown")):
+            result = self.f.run("observe", "--root", str(self.f.root), "--session", "fixture", "--pane-id", requested)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["provider"], expected)
+            self.assertEqual(self.f.ctx.store.current(), current)
+
     def test_spawn_transfers_one_use_handoff_through_builtin_populate(self):
         result = self.start(action="spawn")
         self.assertEqual(result.returncode, 0, result.stderr)

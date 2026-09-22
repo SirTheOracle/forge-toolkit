@@ -4398,6 +4398,8 @@ echo "── ACM §1: pane-1 observation ──"
 AP="$WORK/acmPane1"; mkdir -p "$AP/.dev"
 _resolve_project_root(){ printf '%s' "$AP"; }
 _session_or_sentinel(){ printf 'acmP'; }
+# Local footer fixture; P4 descriptor validation has separate host-binding tests.
+_orchestrator_provider(){ printf 'claude'; }
 FORGE_PANE1_FIXTURE="$AFIX/claude-81.txt" _observe_pane1 "$AP" p1slug >/dev/null
 python3 - "$AP/$(_usage_file)" <<'PY' && ok "T-ACM-PANE1 record lands under top-level orchestrator:, never under workers:" || bad "T-ACM-PANE1 placement wrong"
 import sys,yaml

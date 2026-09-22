@@ -1178,7 +1178,7 @@ _context_alert_headroom() {   # <worker_canonical>
     printf '%s' "$shared"
 }
 
-# Effective orchestrator-pane alert headroom (S11/S13.3). No family dimension — the orchestrator (pane 0) is always Claude.
+# Effective orchestrator-pane alert headroom, shared by both host providers.
 # Deliberately NOT named *_MIN_HEADROOM: it is not gate vocabulary and never authorizes an
 # action against the orchestrator (pane 0).
 _orchestrator_alert_headroom() {
@@ -2823,6 +2823,8 @@ rec = {"family": os.environ.get("FORGE_U_FAMILY", ""),
        "stage": n(os.environ.get("FORGE_U_STAGE", "null")),
        "measured_at": os.environ.get("FORGE_U_AT", ""),
        "observed_by": os.environ.get("FORGE_U_OBSBY", "callback")}
+if slot == "orchestrator":
+    rec["provider"] = rec["family"] if rec["family"] in ("claude", "codex") else "unknown"
 _g = os.environ.get("FORGE_U_GEN", "")
 if _g:
     rec["generation"] = _g
@@ -2871,8 +2873,12 @@ try:
             prior = data.get("orchestrator") if slot == "orchestrator" else workers.get(wk)
             if not isinstance(prior, dict):
                 prior = None
-            crossed = 1 if (_low(rec) and not _low(prior)) else 0
-            if not (mode == "sample" and rec.get("confidence") != "high" and prior is not None):
+            same_host = (slot != "orchestrator" or (prior is not None
+                         and prior.get("family") == rec["family"]
+                         and prior.get("session") == rec.get("session")
+                         and prior.get("incarnation") == rec.get("incarnation")))
+            crossed = 1 if (_low(rec) and not (same_host and _low(prior))) else 0
+            if not (mode == "sample" and rec.get("confidence") != "high" and prior is not None and same_host):
                 if slot == "orchestrator":
                     data["orchestrator"] = rec
                 else:
@@ -2937,6 +2943,7 @@ _observe_pane1() {   # <project_root> [slug]
     local pr="$1" slug="${2:-orchestrator}"
     [ -n "$pr" ] || { printf 'unknown none\n'; return 0; }
     local sess="${ID_target_session:-}"
+    local provider; provider="$(_orchestrator_provider "$pr" "$sess")"
     local cap="" fixture=""
     if [ -n "${FORGE_PANE1_FIXTURE:-}" ] && [ -f "${FORGE_PANE1_FIXTURE}" ]; then
         cap="$FORGE_PANE1_FIXTURE"; fixture=1
@@ -2950,12 +2957,12 @@ _observe_pane1() {   # <project_root> [slug]
         tmux capture-pane -p -t "$sess:$WINDOW.$ORCH_IDX" -S -12 > "$cap" 2>/dev/null || true
     fi
     local _pct _tok _hr _cf _rs _raw
-    IFS=$'\t' read -r _pct _tok _hr _cf _rs _raw <<< "$(_usage_parse_capture "$cap" claude)"
+    IFS=$'\t' read -r _pct _tok _hr _cf _rs _raw <<< "$(_usage_parse_capture "$cap" "$provider")"
     [ -z "$fixture" ] && rm -f "$cap" 2>/dev/null
     local _oal; _oal="$(_orchestrator_alert_headroom 2>/dev/null)" || _oal=-1
     case "$_oal" in ''|*[!0-9]*) _oal=-1 ;; esac
     local _ctl
-    _ctl="$(FORGE_U_FAMILY=claude FORGE_U_STAGE=orchestrator FORGE_U_AT="$(timestamp)" \
+    _ctl="$(FORGE_U_FAMILY="$provider" FORGE_U_STAGE=orchestrator FORGE_U_AT="$(timestamp)" \
             FORGE_U_OBSBY=pane1 FORGE_U_SESSION="${sess:-}" FORGE_U_INCARNATION="${ID_target_incarnation:-}" \
             _usage_upsert "$pr/$(_usage_file)" orchestrator sample "$_oal" \
               "$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$_pct" "$_tok" "$_hr" "$_cf" "$_rs" "$_raw")")"
@@ -2964,7 +2971,7 @@ _observe_pane1() {   # <project_root> [slug]
     if [ "${_r_cross:-0}" = 1 ]; then
         # S13.3: one event per crossing. The BOARD row is state-derived from the ledger, so
         # this event is telemetry only — it is never what makes the row appear or disappear.
-        _emit_event ORCHESTRATOR_LOW_CONTEXT "$slug" "worker=claude-orchestrator headroom=${_r_hr:-unknown} threshold=$_oal confidence=${_r_conf:-none} session=${sess:-} incarnation=${ID_target_incarnation:-}"
+        _emit_event ORCHESTRATOR_LOW_CONTEXT "$slug" "worker=orchestrator provider=$provider headroom=${_r_hr:-unknown} threshold=$_oal confidence=${_r_conf:-none} session=${sess:-} incarnation=${ID_target_incarnation:-}"
     fi
     printf '%s %s\n' "${_r_hr:-unknown}" "${_r_conf:-none}"
     return 0
@@ -5490,7 +5497,8 @@ if usage_file and os.path.exists(usage_file):
             ctx_rows.append(
                 f"  {'pane-0 (orch)':<15} headroom={str(_o.get('headroom')):<8} "
                 f"confidence={str(_o.get('confidence')):<5} age={_u_hage(_a):<5} "
-                f"by={str(_o.get('observed_by') or '?'):<9}{_tag}  OBSERVE-ONLY")
+                f"by={str(_o.get('observed_by') or '?'):<9}{_tag} "
+                f"provider={_o.get('provider') or 'unknown'}  OBSERVE-ONLY")
 L.append("## Worker context")
 L.append("")
 L.extend(ctx_rows or ["  (no usage recorded yet)"])
@@ -10722,6 +10730,16 @@ cmd_stall_check() {
     canonical=$(canonical_pane_name "$target")
     idx=$(pane_index "$target")
 
+    local classifier="$canonical" host_provider=""
+    if [ "$idx" = "$ORCH_IDX" ]; then
+        host_provider="$(_orchestrator_provider "$project_root" "$SESSION")"
+        case "$host_provider" in
+            claude) classifier=claude-opus ;;
+            codex) classifier=codex-a ;;
+            *) echo "UNKNOWN pane=$canonical provider=unknown reason=host_binding_unavailable"; return 0 ;;
+        esac
+    fi
+
     # Pane existence check → DEAD signal.
     if ! tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_index}' 2>/dev/null | grep -qx "$idx"; then
         cmd_signal "stall-check" "DEAD pane=$canonical session=$SESSION" >/dev/null
@@ -10740,6 +10758,22 @@ cmd_stall_check() {
     if [ ! -s "$raw_file" ]; then
         rm -f "$raw_file"
         echo "UNKNOWN capture_failed pane=$canonical"
+        return 0
+    fi
+
+    # The operator seat has no worker callback boundary. Report its UI state,
+    # never a worker completion/recovery action inferred from pending logs.
+    if [ -n "$host_provider" ]; then
+        local host_state
+        host_state="$(FORGE_HEALTH_FIXTURE="$raw_file" _worker_health "$SESSION" "$idx" "$classifier")"
+        rm -f "$raw_file"
+        case "$host_state" in
+            busy) host_state=ACTIVE ;;
+            idle) host_state=IDLE ;;
+            prompting) host_state=PROMPTING ;;
+            *) host_state=UNKNOWN ;;
+        esac
+        echo "$host_state pane=$canonical provider=$host_provider"
         return 0
     fi
 
@@ -11460,7 +11494,7 @@ cmd_health() {
     # Expected (canonical_name, idx, kind) tuples.
     # kind is 'claude' or 'codex' — matched against idle-prompts.yml regex tables.
     local specs=(
-        "claude:0:claude-opus"
+        "claude:0:$(_orchestrator_provider "$ID_target_root" "$SESSION")"
         "claude-opus:1:claude-opus"
         "claude-sonnet:2:claude-sonnet"
         "codex-a:3:codex-a"
@@ -11478,6 +11512,15 @@ cmd_health() {
         idx="${rest%%:*}"
         kind="${rest##*:}"
 
+        if [ "$idx" = "$ORCH_IDX" ]; then
+            case "$kind" in
+                claude) kind=claude-opus ;;
+                codex) kind=codex-a ;;
+                *) echo "UNKNOWN pane=$name idx=$idx provider=unknown reason=host_binding_unavailable"
+                   unknown=$((unknown+1)); continue ;;
+            esac
+        fi
+
         if ! echo " $existing_idxs " | grep -q " $idx "; then
             echo "DEAD pane=$name idx=$idx"
             dead=$((dead+1))
@@ -11489,6 +11532,19 @@ cmd_health() {
         if [ ! -s "$raw_file" ]; then
             echo "UNKNOWN pane=$name idx=$idx reason=capture_failed"
             unknown=$((unknown+1))
+            continue
+        fi
+
+        if [ "$idx" = "$ORCH_IDX" ]; then
+            local host_state
+            host_state="$(FORGE_HEALTH_FIXTURE="$raw_file" _worker_health "$SESSION" "$idx" "$kind")"
+            case "$host_state" in
+                idle|busy|prompting)
+                    echo "OK pane=$name idx=$idx kind=${kind%%-*} provider=${kind%%-*} state=$host_state"
+                    ok=$((ok+1)) ;;
+                *) echo "UNKNOWN pane=$name idx=$idx provider=${kind%%-*} reason=no_marker_match"
+                   unknown=$((unknown+1)) ;;
+            esac
             continue
         fi
 
@@ -11643,6 +11699,21 @@ _orchestrator_admission() {
     local sibling="$(_forge_sibling_bin)"
     /usr/bin/python3 -I "$(dirname "$sibling")/forge-orchestrator-host" guard \
         --root "$ID_target_root" --session "$ID_target_session" >/dev/null
+}
+
+_orchestrator_provider() {   # <resolved root> <resolved session>
+    local sibling observation
+    sibling="$(_forge_sibling_bin)"
+    observation="$(/usr/bin/python3 -I "$(dirname "$sibling")/forge-orchestrator-host" observe \
+        --root "$1" --session "$2" 2>/dev/null)" || observation='{}'
+    printf '%s' "$observation" | python3 -c '
+import json,sys
+try:
+    value=json.load(sys.stdin)
+    provider=value.get("provider") if value.get("observation") == "verified" else None
+except (ValueError, AttributeError):
+    provider=None
+print(provider if provider in ("claude", "codex") else "unknown")'
 }
 
 # ---- Global cross-session flags (session-pin hardening P1.6) ----

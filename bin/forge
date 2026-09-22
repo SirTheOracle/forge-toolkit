@@ -694,8 +694,8 @@ PY
     # Write event + (pointer) payload atomically; python emits the inject one-liner.
     local outf; outf="$(mktemp "${TMPDIR:-/tmp}/forge-dispatch.XXXXXX")"
     FORGE_CC_INSTR="$instr" FORGE_CC_ANSWERS="$answers" python3 - "$root" "$session" "$sender" \
-        "$force_pointer" "$INLINE_MAX" "$outf" <<'PY' || { rm -f "$outf"; _dispatch_fail "failed to stage dispatch event"; }
-import os, sys, json, re, hashlib, secrets, datetime
+        "$force_pointer" "$INLINE_MAX" "$outf" "$(_toolkit_root)/bin/forge-orchestrator-host" <<'PY' || { rm -f "$outf"; _dispatch_fail "failed to stage dispatch event"; }
+import os, sys, json, re, hashlib, secrets, datetime, subprocess
 root, session, sender = sys.argv[1], sys.argv[2], sys.argv[3]
 force_pointer = sys.argv[4] == "true"; inline_max = int(sys.argv[5]); outf = sys.argv[6]
 instr = os.environ.get("FORGE_CC_INSTR", "")
@@ -721,6 +721,20 @@ rec = {"schema": "cc-dispatch/1", "event": "dispatch", "dispatch_id": did,
        "instruction_sha256": sha, "dispatched_at": ts, "sender": sender,
        "state": "queued-input",
        "answers_ask_id": (os.environ.get("FORGE_CC_ANSWERS") or None)}
+rec.update(role="orchestrator", provider="unknown")
+try:
+    observed = subprocess.run([sys.executable, "-I", sys.argv[7], "observe", "--root", root,
+                               "--session", session], capture_output=True, text=True, timeout=5)
+    binding = json.loads(observed.stdout) if observed.returncode == 0 else {}
+    if not isinstance(binding, dict):
+        binding = {}
+    if binding.get("observation") == "verified" and binding.get("provider") in ("claude", "codex"):
+        rec["provider"] = binding["provider"]
+        for key in ("launch_id", "incarnation"):
+            if binding.get(key):
+                rec[key] = binding[key]
+except (OSError, ValueError, subprocess.SubprocessError):
+    pass
 if pointer:
     pdir = os.path.join(adir, "payloads"); os.makedirs(pdir, exist_ok=True)
     rel = os.path.join(".dev", "attention", "payloads", did + ".txt")
@@ -823,7 +837,7 @@ cmd_ask() {
     # the ask event atomically — all in one python. Reports id/mode/session/root/
     # snippet back via <outf>.
     local outf; outf="$(mktemp "${TMPDIR:-/tmp}/forge-ask.XXXXXX")"
-    FORGE_ASK_Q="$question" python3 - "$want_stage" "$slug" "$stage" "$worker" "$root_override" "$outf" <<'PY' \
+    FORGE_ASK_Q="$question" python3 - "$want_stage" "$slug" "$stage" "$worker" "$root_override" "$outf" "$(_toolkit_root)/bin/forge-orchestrator-host" <<'PY' \
         || { rm -f "$outf"; die "ask: failed to write the ask event"; }
 import os, sys, json, re, hashlib, secrets, datetime, subprocess
 want_stage = sys.argv[1] == "1"
@@ -935,8 +949,9 @@ ask_id = "ask-" + now.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
 # Verified by `forge-bridge alias-self-test --strict`.
 ORCH_PANE_INDEX = '0'
 _multi = (window_panes or "").isdigit() and int(window_panes) > 1
-role = os.environ.get("FORGE_ROLE") or (
-    "orchestrator" if (pane_index == ORCH_PANE_INDEX and _multi) else "worker")
+role = ("orchestrator" if pane_index == ORCH_PANE_INDEX
+        and (_multi or os.environ.get("FORGE_ROLE") == "orchestrator")
+        and os.environ.get("FORGE_ROLE") != "worker" else "worker")
 rec = {"schema": "cc-attention/1", "event": "ask", "variant": "ask",
        "session": session or None, "root": root,
        "pane_index": pane_index or None, "role": role, "tmux_pane": tmux_pane,
@@ -948,6 +963,20 @@ rec = {"schema": "cc-attention/1", "event": "ask", "variant": "ask",
        "question_text_bytes": question_text_bytes,
        "question_sha256": hashlib.sha256(q.encode("utf-8", "replace")).hexdigest(),
        "slug": slug or None, "stage": stage or None, "worker": worker or None}
+if role == "orchestrator":
+    rec["provider"] = "unknown"
+    try:
+        argv = [sys.executable, "-I", sys.argv[7], "observe", "--root", root, "--session", session]
+        if tmux_pane:
+            argv += ["--pane-id", tmux_pane]
+        observed = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        binding = json.loads(observed.stdout) if observed.returncode == 0 else {}
+        if not isinstance(binding, dict):
+            binding = {}
+        if binding.get("observation") == "verified" and binding.get("provider") in ("claude", "codex"):
+            rec["provider"] = binding["provider"]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
 adir = os.path.join(root, ".dev", "attention")
 try:
     os.makedirs(adir, exist_ok=True)

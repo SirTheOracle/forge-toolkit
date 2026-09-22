@@ -623,7 +623,29 @@ def legacy_ensure(ctx, session, provider):
             "ORCHESTRATOR_BINDING_UNAVAILABLE", "legacy native Claude process not corroborated")
     require(rt.seat(panes[0], "claude")[0] == before and same_process(observed) and rt.at_root() == rows,
             "ORCHESTRATOR_BINDING_UNAVAILABLE", "legacy identity changed while observing")
-    return {"admission": "legacy-observed", "role": "orchestrator", "provider": "claude", "session": session}
+    return {"admission": "legacy-observed", "role": "orchestrator", "provider": "claude", "session": session,
+            "pane_id": before["pane_id"], "incarnation": before["incarnation"]}
+
+
+def observe_host(ctx, session, pane_id=None):
+    """Read-only attribution, never infer a provider from a seat alias or env."""
+    unknown = {"role": "orchestrator", "provider": "unknown", "session": session,
+               "observation": "unknown"}
+    try:
+        require(bool(session), "INVALID_SESSION", "resolved session required")
+        current = ctx.store.current()
+        if current is None:
+            result = legacy_ensure(ctx, session, None)
+        else:
+            result = admission_guard(ctx, session)
+            require(ctx.store.current() == current, "REVISION_CONFLICT", "binding changed during observation")
+            result.update(pane_id=current["record"]["seat"]["pane_id"],
+                          incarnation=current["record"]["seat"]["incarnation"])
+        require(not pane_id or result["pane_id"] == pane_id,
+                "LAUNCH_IDENTITY_MISMATCH", "event came from a different pane")
+        return dict(result, observation="verified")
+    except (Refusal, records.Refusal, broker.Refusal, OSError, ValueError, subprocess.SubprocessError) as exc:
+        return dict(unknown, reason=getattr(exc, "code", "OBSERVATION_UNAVAILABLE"))
 
 
 def ancestry(record, candidate):
@@ -1033,11 +1055,13 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare-management")
     prepare.add_argument("--root", required=True)
-    for name in ("start", "spawn", "populate", "admit", "route", "guard", "recover", "legacy-ensure", "hook"):
+    for name in ("start", "spawn", "populate", "admit", "route", "guard", "recover", "legacy-ensure", "hook", "observe"):
         command = commands.add_parser(name)
         command.add_argument("--root", required=True)
         command.add_argument("--provider", choices=("claude", "codex"))
         command.add_argument("--session")
+        if name == "observe":
+            command.add_argument("--pane-id")
         command.add_argument("--launch-id")
         command.add_argument("--dry-run", action="store_true")
         attach = command.add_mutually_exclusive_group()
@@ -1075,6 +1099,8 @@ def main():
     elif args.command == "guard":
         require(bool(args.session), "INVALID_SESSION", "resolved session required")
         result = admission_guard(ctx, args.session)
+    elif args.command == "observe":
+        result = observe_host(ctx, args.session, args.pane_id)
     elif args.command == "recover":
         result = recover_launch(ctx, args)
     elif args.command == "legacy-ensure":
