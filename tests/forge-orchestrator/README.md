@@ -1,4 +1,26 @@
-# P1 native orchestrator experiments
+# Orchestrator acceptance and experiments
+
+## P6 local acceptance
+
+```bash
+python3 tests/forge-orchestrator/acceptance.py --output .dev/p6-acceptance-RUN
+```
+
+Use a new directory for each run. This executes the finite local orchestrator,
+bridge, broker, skill, fix-runner, launcher, recovery and lock suites. It uses
+disposable local process/tmux fixtures, never model calls, sign-in, installation
+or a production profile change. Native-management opt-ins and attach are forced
+off. Keep source stable until it finishes; drift, a failed/missing suite or an
+interrupted run makes the aggregate fail. Individual opt-in skips remain in the
+logs and native workflow cases are explicitly `not-run` in the report.
+
+`report.json` records exact source/tool identities, commands, exits and log
+digests. Its schema is intentionally different from native conformance and
+cannot be registered. Related local regression suites are mapped to the finite
+affected issue paths, but do not close or requalify those original defects.
+The committed scope and results are in [p6-status.md](p6-status.md).
+
+## Historical P1 native experiments
 
 This is the P1 experiment harness, not provider selection or a parity release.
 Its `prepare`, `run`, `package-access` and `runtime-audit` commands never install skills, change production

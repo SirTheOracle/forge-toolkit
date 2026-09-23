@@ -933,6 +933,83 @@ These local implementation checks do not qualify native full-workflow parity
 or enable a production provider profile. See `tests/forge-orchestrator/p5-status.md`
 for the acceptance scope and retained qualification limits.
 
+## Orchestrator rollout and rollback
+
+Claude remains the default for new sessions. `--orchestrator codex` is an
+explicit request, not permission to replace a running host. Registration and
+launch are scoped to the physical worktree, not the branch name. Existing
+sessions keep their retained profile, package and delivery ownership.
+
+Read the current protected admission decision without starting any model:
+
+```bash
+forge orchestrator-rollout --root "$PWD" --provider codex
+forge orchestrator-rollout --root "$PWD" --provider codex --check
+```
+
+Inspection normally exits zero even when ineligible; `--check` exits 3 for
+ineligibility. Both return structured JSON with the refusal reason, profile
+revision/hash, any launch binding, and verified provider/package/protocol/helper
+inputs when eligible. A profile without a live binding is only eligible for a
+launch attempt. A live binding must still match its original profile and
+provider. After all old resources are independently proven terminal, the report
+returns `boundary=new-session`, including when a newer profile is selected; it
+does not rewrite the retained old record. Unconsumed callbacks, pending work,
+live processes or locks still refuse. The launcher rechecks everything at the
+actual effect boundary.
+Neither command registers, repairs, disables, migrates or switches anything.
+
+`scope=registered-prerequisites-only` is deliberate. Current native conformance
+describes orchestration primitives, not complete build/fix execution or all
+local-QA fallbacks. `full_workflow_parity=not-established` is not upgraded by
+local tests, synthetic fixtures, a stored ready record or hook approval.
+
+For a separately qualified and operator-registered root, a new explicit start is:
+
+```bash
+forge-start --here --orchestrator codex --no-attach
+# Or, using ensure semantics (never a hot switch):
+FORGE_START_ATTACH=0 forge spawn --root "$PWD" --orchestrator codex
+```
+
+An absent, disabled, changed or unsupported profile refuses before session
+creation. A mismatched existing provider refuses without changing its panes.
+Omission preserves a qualified existing provider; a new session still defaults
+to Claude. A Codex-only profile does not silently change that default.
+
+Stage candidates from this separate development checkout with
+`bin/forge-orchestrator-package stage --root PATH --provider codex --model MODEL`.
+Staging copies and inventories helpers; it does not qualify or register them.
+Do not edit the checkout backing live `~/bin` symlinks, run the global installer,
+copy credentials, or overwrite an older candidate as part of rollout. Native
+`qualify --native` executes model calls and is outside the local-only acceptance
+scope; it must not be run implicitly by tests or readiness inspection. No new
+profile has been enabled by P6's local acceptance.
+
+Rollback uses the retained **operator management entry**, not the generic
+workspace `forge`. Its path is returned by
+`forge orchestrator-profile inspect --root PATH`. From that operator entry, run
+`orchestrator-profile disable --root PATH --expect-revision REVISION` using the
+observed current revision. Stale revisions refuse instead of overwriting a
+concurrent operator decision. Disabling preserves all snapshots and journals.
+
+After disable or input drift, new sends, continuations and delivery registration
+refuse. The original copied helpers remain available for read-only status,
+callback collection, wait/consume, owned callback reconciliation and safe
+terminal recovery. Their existing identity, evidence and ownership checks still
+apply: rollback does not authorize forged callbacks, forced lock release, or new
+privileged effects. Do not delete the old package, broker state, active delivery
+or infra lock to make admission pass. Finish or explicitly dispose of owned work
+before terminal handoff. A fresh Claude host requires a separate physical root
+or a proven-safe terminal boundary, never a second same-root owner.
+
+The repeatable local acceptance command is
+`python3 tests/forge-orchestrator/acceptance.py --output .dev/p6-acceptance-RUN`.
+It records suite commands, exits and log hashes against stable source/helper/
+protocol and local CLI identities. It forces model-led opt-ins off, records
+native cases and original defect requalification as not run, and cannot mint
+conformance or register a profile. See `tests/forge-orchestrator/p6-status.md`.
+
 ## Codex containment and rollout
 
 The default is `contain`. New panes use the exact-version-gated interactive

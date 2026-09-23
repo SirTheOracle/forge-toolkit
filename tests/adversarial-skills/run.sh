@@ -24,6 +24,19 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PASS=0; FAIL=0
 ok(){  PASS=$((PASS+1)); printf '  ok: %s\n' "$1"; }
 bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
+REPORT="$(mktemp)" || exit 1
+trap 'rm -f "$REPORT"' EXIT
+read_report(){
+  local rc="$1" line
+  while IFS= read -r line; do
+    case "$line" in
+      OK\|*)  ok  "${line#OK|}"  ;;
+      BAD\|*) bad "${line#BAD|}" ;;
+      *)      [ -n "$line" ] && printf '%s\n' "$line" ;;
+    esac
+  done < "$REPORT"
+  [ "$rc" = 0 ] || bad "Python checks failed (exit $rc)"
+}
 
 echo "== 1. The four watchdog rules, on all eight prose files =="
 # Every assertion runs over WHITESPACE-NORMALISED text. These are markdown paragraphs
@@ -35,14 +48,7 @@ echo "== 1. The four watchdog rules, on all eight prose files =="
 # distinct-path idea as free-floating prose while its retry rows said only "Re-spawn
 # C" — a lead reading the recovery table saw nothing about paths. Presence anywhere in
 # the file is NOT the property under test; presence in the recovery region is.
-while IFS= read -r line; do
-  case "$line" in
-    OK\|*)  ok  "${line#OK|}"  ;;
-    BAD\|*) bad "${line#BAD|}" ;;
-    *)      [ -n "$line" ] && printf '%s\n' "$line" ;;
-  esac
-done <<EOF
-$(python3 - "$ROOT" <<'PY'
+python3 - "$ROOT" > "$REPORT" <<'PY'
 import pathlib, re, sys
 
 root = pathlib.Path(sys.argv[1])
@@ -188,8 +194,7 @@ else:
 
 sys.exit(1 if failures else 0)
 PY
-)
-EOF
+read_report "$?"
 
 echo "== 2. forge-coder coding-stage runaway guards (issue #52), on both copies =="
 # WHY: a dispatched coding worker burned 1h25m on one turn — no commit, no callback,
@@ -206,14 +211,7 @@ echo "== 2. forge-coder coding-stage runaway guards (issue #52), on both copies 
 # what is complete and continue" — mechanically impossible, because the broker binds one
 # commit per delivery and a second attempt fails HEAD_MOVED, leaving the delivery open
 # and blocking every later dispatch to that pane. T7 fails against that wording.
-while IFS= read -r line; do
-  case "$line" in
-    OK\|*)  ok  "${line#OK|}"  ;;
-    BAD\|*) bad "${line#BAD|}" ;;
-    *)      [ -n "$line" ] && printf '%s\n' "$line" ;;
-  esac
-done <<EOF
-$(python3 - "$ROOT" <<'PY'
+python3 - "$ROOT" > "$REPORT" <<'PY'
 import pathlib, re, sys
 
 root = pathlib.Path(sys.argv[1])
@@ -395,19 +393,11 @@ if len(sections) == len(COPIES):
 
 sys.exit(1 if failures else 0)
 PY
-)
-EOF
+read_report "$?"
 
 echo "== 3. Operator-constraint carriage (#77b) =="
-while IFS= read -r line; do
-  case "$line" in
-    OK\|*)  ok  "${line#OK|}"  ;;
-    BAD\|*) bad "${line#BAD|}" ;;
-    *)      [ -n "$line" ] && printf '%s\n' "$line" ;;
-  esac
-done <<EOF
-$(FORGE_TEST_CLAUDE_SKILLS_DIR="${FORGE_TEST_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}" \
-  python3 - "$ROOT" <<'PY'
+FORGE_TEST_CLAUDE_SKILLS_DIR="${FORGE_TEST_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}" \
+  python3 - "$ROOT" > "$REPORT" <<'PY'
 import os, pathlib, re, subprocess, sys
 
 root = pathlib.Path(sys.argv[1])
@@ -790,7 +780,6 @@ else:
 
 sys.exit(1 if failures else 0)
 PY
-)
-EOF
+read_report "$?"
 
 printf '\nPASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"; [ "$FAIL" = 0 ]

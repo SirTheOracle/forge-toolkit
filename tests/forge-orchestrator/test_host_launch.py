@@ -156,6 +156,103 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(current, self.f.ctx.store.current())
         self.stop_session()
 
+    def test_rollout_uses_live_binding_and_never_hot_switches_provider(self):
+        self.assertEqual(self.start().returncode, 0)
+        current, panes = self.f.ctx.store.current(), self.panes()
+        for provider, expected in (("codex", 0), ("claude", 3)):
+            result = self.f.run("rollout", "--root", str(self.f.root), "--provider", provider, "--check")
+            self.assertEqual(result.returncode, expected, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["binding"]["launch_id"], current["record"]["launch_id"])
+            self.assertEqual(report["eligible"], provider == "codex")
+            if provider == "codex":
+                self.assertEqual(report["boundary"], "existing-session")
+        self.assertEqual(self.f.ctx.store.current(), current)
+        self.assertEqual(self.panes(), panes)
+
+    def test_rollout_allows_terminal_handoff_without_rewriting_old_binding(self):
+        self.assertEqual(self.start().returncode, 0)
+        current = self.f.ctx.store.current()
+        self.stop_session()
+        self.f.register(revision=1)
+        result = self.f.run("rollout", "--root", str(self.f.root), "--provider", "claude", "--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["boundary"], "new-session")
+        self.assertEqual(report["profile"]["revision"], 2)
+        self.assertEqual(report["binding"]["launch_id"], current["record"]["launch_id"])
+        self.assertEqual(self.f.ctx.store.current(), current)
+        unresolved = self.f.root / ".dev/forge-tmp/callbacks/unconsumed.txt"
+        unresolved.parent.mkdir(parents=True)
+        unresolved.write_text("unconsumed evidence")
+        result = self.f.run("rollout", "--root", str(self.f.root), "--provider", "claude", "--check")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["reason"]["code"], "HANDOFF_REQUIRED")
+        self.assertEqual(unresolved.read_text(), "unconsumed evidence")
+
+    def test_rollback_blocks_new_delivery_but_preserves_owned_callback_recovery(self):
+        self.assert_callback_recovery("disable")
+
+    def test_input_drift_blocks_new_delivery_but_preserves_owned_callback_recovery(self):
+        self.assert_callback_recovery("drift")
+
+    def assert_callback_recovery(self, change):
+        self.assertEqual(self.start().returncode, 0)
+        f, current = self.f, self.f.ctx.store.current()
+        def control(request):
+            return subprocess.run([str(f.package / "bin/forge-broker"), "control", "--root", str(f.root)],
+                                  input=json.dumps(request), env=f.env, cwd=f.root,
+                                  capture_output=True, text=True, timeout=15)
+
+        # Seed a previously admitted, owned workspace delivery. Only the rollback
+        # and real daemon reconciliation paths are under test, not model execution.
+        delivery_id = "delivery-" + "a" * 32
+        delivery = {"schema": host.broker.DELIVERY_SCHEMA,
+                    "delivery_id": delivery_id, "state": "open", "session": "fixture", "pane_index": 1,
+                    "physical_code_root": str(f.root), "root_identity": f.ctx.root_id,
+                    "session_incarnation": current["record"]["seat"]["incarnation"],
+                    "slug": "rollback", "stage": "review", "worker": "claude-opus",
+                    "capability_class": "workspace", "expires_at": "2099-01-01T00:00:00Z"}
+        for path in (f.ctx.protected / "deliveries" / (delivery_id + ".json"),
+                     f.ctx.protected / "active/fixture.p1.json"):
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(delivery))
+        if change == "disable":
+            disabled = f.run("orchestrator-profile", "disable", "--root", str(f.root), "--expect-revision", "1",
+                             entry=f.ctx.management_entry)
+            self.assertEqual(disabled.returncode, 0, disabled.stderr)
+            code = "PROFILE_DISABLED"
+        else:
+            (f.package / "assets/core").write_text("changed protocol")
+            code = "INPUT_CHANGED"
+        refused = control({"action": "register-delivery", "session": "fixture", "pane": "1"})
+        self.assertIn(code, refused.stderr)
+        diagnostic = f.run("rollout", "--root", str(f.root), "--check")
+        self.assertEqual(diagnostic.returncode, 3, diagnostic.stderr)
+        self.assertEqual(json.loads(diagnostic.stdout)["reason"]["code"], code)
+        active = control({"action": "active-delivery", "session": "fixture", "pane": "1"})
+        self.assertEqual(active.returncode, 0, active.stderr)
+        callback = f.root / ".dev/forge-tmp/callbacks/rollback.txt"
+        callback.parent.mkdir(parents=True, exist_ok=True)
+        callback.write_text("\n".join(f"{key}: {value}" for key, value in {
+            "slug": "rollback", "stage": "review", "worker": "claude-opus", "session": "fixture",
+            "incarnation": delivery["session_incarnation"], "delivery_id": delivery_id,
+            "status": "DONE", "selected_pending_timestamp": "2026-09-23T00:00:00Z"}.items()) + "\n")
+        log = f.root / ".dev/proposals/rollback/forge-log.yml"
+        log.parent.mkdir(parents=True)
+        log.write_text('entries:\n  - timestamp: "2026-09-23T00:00:00Z"\n    stage: review\n    response: FORGE_DONE\n')
+        request = {"action": "reconcile-delivery", "delivery_id": delivery_id, "terminal": "completed",
+                   "callback_path": str(callback), "callback_sha256": host.file_identity(callback)["sha256"]}
+        forged = control(dict(request, callback_sha256="0" * 64))
+        self.assertIn("LIFECYCLE_ARTIFACT_MISMATCH", forged.stderr)
+        self.assertTrue((f.ctx.protected / "active/fixture.p1.json").exists())
+        for _ in range(2):
+            recovered = control(request)
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(host.read_json(f.ctx.protected / "deliveries" / (delivery_id + ".json"))["state"], "completed")
+        self.assertFalse((f.ctx.protected / "active/fixture.p1.json").exists())
+        self.assertEqual(f.ctx.store.current(), current)
+
     def test_terminal_handoff_keeps_old_record_and_increments_generation(self):
         self.assertEqual(self.start().returncode, 0)
         old = self.f.ctx.store.current()

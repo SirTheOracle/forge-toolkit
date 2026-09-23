@@ -42,6 +42,7 @@
 #   forge parked --resolve <slug> <stage> [--note "…"]  clear a parked item (proxies bridge)
 #   forge codex-broker status|stop [--root PATH]          inspect/drain the host broker
 #   forge orchestrator-status --root PATH               read-only protected binding (not admission)
+#   forge orchestrator-rollout --root PATH [--provider claude|codex] [--check]
 #   forge orchestrator-profile inspect --root PATH [--from candidate.json]
 #                  register/disable require the distinct qualified management entry
 #   forge orchestrator-recover --root PATH --launch-id ID
@@ -3583,6 +3584,7 @@ case "${1:-help}" in
     codex-launch) shift; cmd_codex_launch "$@" ;;
     codex-broker) shift; cmd_codex_broker "$@" ;;
     orchestrator-status) shift; exec "$(_toolkit_root)/bin/forge-broker" orchestrator-status "$@" ;;
+    orchestrator-rollout) shift; exec /usr/bin/python3 -I "$(_toolkit_root)/bin/forge-orchestrator-host" rollout "$@" ;;
     orchestrator-profile) shift; exec /usr/bin/python3 -I "$(_toolkit_root)/bin/forge-orchestrator-host" orchestrator-profile "$@" ;;
     orchestrator-recover) shift; exec /usr/bin/python3 -I "$(_toolkit_root)/bin/forge-orchestrator-host" recover "$@" ;;
     orchestrator-hook)

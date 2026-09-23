@@ -414,6 +414,45 @@ def profile_command(ctx, args):
     return ctx.store.publish_profile(current["profile"]["candidate"], args.expect_revision, enabled=False)
 
 
+def rollout_status(ctx, provider):
+    """Read the actual admission gates without granting or changing authority."""
+    result = {"schema": "forge-orchestrator-rollout/1", "root": ctx.identity,
+              "provider": provider, "default_provider": "claude", "eligible": False,
+              "full_workflow_parity": "not-established", "profile": None, "binding": None,
+              "scope": "registered-prerequisites-only", "evidence": None, "boundary": None,
+              "recovery": "retained helpers and original ownership checks; no admission bypass"}
+    try:
+        profile, current = ctx.store.profile(), ctx.store.current()
+        if profile:
+            result["profile"] = {"sha256": profile["sha256"],
+                                 "revision": profile["profile"]["revision"],
+                                 "enabled": profile["profile"]["enabled"]}
+        if current:
+            record = current["record"]
+            result["binding"] = {"launch_id": record["launch_id"], "state": record["state"],
+                                 "provider": record["seat"]["provider"], "session": record["seat"]["session"],
+                                 "profile_sha256": record["profile_hash"]}
+        admitted = admitted_profile(ctx, provider)
+        candidate = admitted["profile"]["candidate"]
+        rt = Runtime(ctx, candidate)
+        # Match launch's distinction between ensuring a live host and starting
+        # after a proven terminal boundary. A retained record is not a live seat.
+        if current and current["record"]["state"] == "ready" and rt.at_root():
+            live_binding(ctx, rt, current, provider)
+            boundary = "existing-session"
+        else:
+            terminal_observation(ctx, rt, current)
+            boundary = "new-session"
+        result["evidence"] = {"inputs": candidate["inputs"], "conformance": candidate["conformance"],
+                              "provider": candidate["providers"][provider]}
+        require(ctx.store.profile() == profile and ctx.store.current() == current,
+                "REVISION_CONFLICT", "rollout inputs changed during inspection")
+        result.update(eligible=True, reason=None, boundary=boundary)
+    except (Refusal, broker.Refusal, OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
+        result["reason"] = {"code": getattr(exc, "code", "ORCHESTRATOR_UNAVAILABLE"), "detail": str(exc)}
+    return result
+
+
 def process(pid, version="host-launcher/1"):
     require(type(pid) is int and pid > 0, "PROCESS_UNAVAILABLE", "positive PID required")
     stamp = subprocess.check_output(["/bin/ps", "-p", str(pid), "-o", "lstart="],
@@ -1092,13 +1131,15 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare-management")
     prepare.add_argument("--root", required=True)
-    for name in ("start", "spawn", "populate", "admit", "route", "guard", "recover", "legacy-ensure", "hook", "observe"):
+    for name in ("start", "spawn", "populate", "admit", "route", "guard", "recover", "legacy-ensure", "hook", "observe", "rollout"):
         command = commands.add_parser(name)
         command.add_argument("--root", required=True)
         command.add_argument("--provider", choices=("claude", "codex"))
         command.add_argument("--session")
         if name == "observe":
             command.add_argument("--pane-id")
+        if name == "rollout":
+            command.add_argument("--check", action="store_true")
         command.add_argument("--launch-id")
         command.add_argument("--dry-run", action="store_true")
         attach = command.add_mutually_exclusive_group()
@@ -1121,6 +1162,10 @@ def main():
         result = prepare_management(ctx)
     elif args.command == "orchestrator-profile":
         result = profile_command(ctx, args)
+    elif args.command == "rollout":
+        result = rollout_status(ctx, args.provider or "codex")
+        print(json.dumps(result, sort_keys=True))
+        return 3 if args.check and not result["eligible"] else 0
     elif args.command == "route":
         current, profile = ctx.store.current(), ctx.store.profile()
         if args.provider == "codex" or current or profile:

@@ -24,7 +24,7 @@ Forge provides structured multi-agent workflows where independent agents investi
 | Component | Purpose |
 |-----------|---------|
 | `forge-bridge` | Cross-pane messaging between Claude/Codex instances in tmux |
-| `forge-start` | Launch a 4-pane tmux session (Claude + orchestrator + Codex A + Codex B) |
+| `forge-start` | Launch a 5-pane tmux session with an orchestrator and four workers |
 | `forge-dispatch-review` | Auto-dispatch commit reviews to Codex B |
 | `forge-orchestrator` | Pipeline orchestration skill for multi-stage workflows |
 | Post-commit hook | Queue code reviews for every git commit |
@@ -107,6 +107,27 @@ echo '.dev/' >> .gitignore
 ```
 
 ## Quick Start
+
+### Orchestrator Selection
+
+Claude remains the default. An explicitly selected Codex orchestrator uses the
+same build/fix protocol and worker pool; provider selection never converts a
+running session or changes worker eligibility.
+
+```bash
+forge orchestrator-rollout --root "$PWD" --provider codex --check
+# Only on a qualified physical root, at a new-session boundary:
+forge-start --here --orchestrator codex --no-attach
+```
+
+`orchestrator-rollout` is read-only. With `--check`, it exits 3 when admission
+is unavailable and reports the exact reason. Local acceptance tests do not
+register a profile: **Codex production rollout is not enabled by installation
+or by the local P1-P6 test passes.** Native workflow parity remains unqualified.
+There is no bypass flag or silent fallback to Claude.
+
+See the [rollout and rollback runbook](docs/forge-operator-guide.md#orchestrator-rollout-and-rollback)
+and [P6 acceptance scope](tests/forge-orchestrator/p6-status.md).
 
 ### Launch a Forge Session
 
