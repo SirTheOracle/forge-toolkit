@@ -78,7 +78,7 @@ PROMPT_NAMES=(
 # PROMPT_NAMES and must never exist on disk. T-CC6 is the trap.
 # Keep this array on ONE line and paren-free: T-PROMPT-INVENTORY parses it with
 # `^NAME=\(([^)]*)\)`, and a paren in the body degrades three checks to a vacuous pass.
-SYNTHETIC_PROMPTS=(_preamble _operator_constraints)
+SYNTHETIC_PROMPTS=(_preamble _operator_constraints _qa_completion)
 # EXCLUSION 2 — quarantined, and for an unrelated reason; do not conflate it with the
 # line above. env-fix and qa-live-retry are not project-agnostic templates: they bake one
 # private project's plaintext login, database UUIDs, schema, API routes, migration

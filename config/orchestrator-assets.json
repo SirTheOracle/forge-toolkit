@@ -5,7 +5,7 @@
     "codex": ["forge-orchestrator", "forge-coder", "fix-coder", "adversarial-proposal", "adversarial-lite", "adversarial-implementation", "adversarial-qa", "adversarial-verify", "docs-refresh", "proposal-reviewer"]
   },
   "required": ["skills/forge-orchestrator/SKILL.md", "skills/forge-orchestrator/references/claude.md", "skills/forge-orchestrator/references/codex.md", "codex-skills/forge-orchestrator/SKILL.md", "agents/forge-orchestrator.md", "commands/forge.md", "commands/forge-orchestrator.md", "commands/forge-status.md", "lib/forge_orchestrator.py", "lib/forge_assets.py"],
-  "synthetic": ["_preamble", "_operator_constraints"],
+  "synthetic": ["_preamble", "_operator_constraints", "_qa_completion"],
   "quarantined": ["env-fix", "qa-live-retry"],
   "stages": {
     "proposal": {"skill": "adversarial-proposal", "providers": ["claude", "codex"], "local": true, "artifacts": ["proposals/{slug}/final-plan.md"]},

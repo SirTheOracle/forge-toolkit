@@ -65,7 +65,7 @@ class Assets(unittest.TestCase):
             assets.template(sample, prompts, assets.manifest())
 
     def shell(self, commands):
-        names = ("_render_preamble", "_render_operator_constraints", "_render_template", "_stage_assets",
+        names = ("_render_preamble", "_render_operator_constraints", "_render_template", "_stage_assets", "_snapshot_qa_findings",
                  "_publish_render", "cmd_local_render", "_wait_emit_callback", "cmd_digest")
         source = (TREE / "bin/forge-bridge").read_text()
         functions = []

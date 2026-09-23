@@ -35,6 +35,11 @@ project instructions, mutable generic Forge hooks, or unrestricted shell rules.
 
 ## Gated Local QA
 
+First apply all local-QA prerequisites in `workflow-routes.md`. Confirm native
+live-QA tool access under the actual child policy; spawn_agent availability and
+ordinary worker QA success do not establish that capability. Missing access
+blocks fallback. Never substitute sequential parent QA or a shell model runner.
+
 Only under the canonical local build QA fallback, hold the infra lock and run
 `local-render --stage qa` (or qa-retry) with this host provider before logging
 pending work. Load the protected Codex adversarial-qa skill and implement its

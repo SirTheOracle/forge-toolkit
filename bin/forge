@@ -17,6 +17,7 @@
 #   forge ask  --session-scope "<question>"                 (called BY workers)
 #   forge ask  --slug S --stage T --worker W "<question>"
 #   forge preflight [--root PATH] [--allow-api-billing]
+#   forge route --stage STAGE [--root PATH --slug SLUG] [--worker WORKER]
 #   forge register <root> [--force]
 #   forge worktree ensure --session S [--from DIR] [--print-path]
 #                  [--allow-dirty-base] [--dry-run]
@@ -3395,25 +3396,12 @@ cmd_codex_lane() {
         --worker) worker="$2"; shift 2 ;; *) die "codex-lane: unknown flag $1" ;; esac; done
     [ -n "$root" ] && [ -n "$stage" ] || die "codex-lane requires --root and --stage"
     local toolkit; toolkit="$(_toolkit_root)"
-    python3 - "$toolkit/config/codex-forge-runtime.json" "$stage" "$rollout" "$worker" <<'PY'
-import json,sys
-cfg=json.load(open(sys.argv[1])); stage,rollout,worker=sys.argv[2:5]
-if rollout not in cfg['rollouts']: raise SystemExit('ERROR rollout-unknown')
-if stage not in cfg['stage_capabilities']: raise SystemExit('ERROR capability-unknown')
-cap=cfg['stage_capabilities'][stage]
-if not worker.startswith('codex'):
-    lane='claude' if cap in cfg['contain_codex_capabilities'] else 'reviewed-host'
-elif rollout in ('audit','contain','broker-shadow'):
-    lane='codex' if cap in cfg['contain_codex_capabilities'] else 'reviewed-host'
-elif rollout == 'enforce':
-    lane='codex' if cap in cfg['enforce_codex_capabilities'] else 'reviewed-host'
-else:
-    lane='codex' if cap in cfg['publish_codex_capabilities'] else 'reviewed-host'
-if worker.startswith('codex') and cap not in cfg['contain_codex_capabilities'] \
-        and not cfg['codex'].get('private_codex_home_default',False):
-    lane='reviewed-host'
-print(f'capability_class={cap}'); print(f'lane={lane}'); print(f'rollout={rollout}')
-PY
+    FORGE_CODEX_ROLLOUT="$rollout" python3 "$toolkit/lib/forge_assets.py" lane --stage "$stage" --worker "$worker"
+}
+
+cmd_route() {
+    local toolkit; toolkit="$(_toolkit_root)"
+    python3 "$toolkit/lib/forge_assets.py" select "$@"
 }
 
 cmd_codex_doctor() {
@@ -3653,6 +3641,7 @@ PY
     reply)     shift; cmd_reply "$@" ;;
     ask)       shift; cmd_ask "$@" ;;
     preflight) shift; cmd_preflight "$@" ;;
+    route) shift; cmd_route "$@" ;;
     register)  shift; cmd_register "$@" ;;
     worktree)  shift; cmd_worktree "$@" ;;
     spawn)     shift; cmd_spawn "$@" ;;

@@ -553,13 +553,8 @@ else:
 # The EXEMPT set FAILS SAFE: a stage nobody thinks about defaults to CARRYING the ledger
 # (noise), never to omitting it (silence). Curation is only fatal when its default is
 # silence. Each entry needs a WRITTEN REASON here, and this is the only place one lives.
-EXEMPT = {
-    "proposal": "orchestrator-local and NOT dispatchable — cmd_dispatch refuses "
-                "--stage proposal outright, so this template renders no includes and an "
-                "include here would never resolve. The frame-challenge clause reaches "
-                "that stage through skills/adversarial-proposal/SKILL.md and the "
-                "orchestrator's Spec Boundary section instead.",
-}
+# P3 local-render carries the same ledger into native proposal children.
+EXEMPT = {}
 miss = []
 for p in stage_prompts:
     need = {"_operator_constraints", "_constraint_check"}
@@ -735,18 +730,26 @@ else:
     ok("T-CC7 PROMPT_NAMES and DIGEST_NAMES both agree with the repo, both ways")
 
 # ---- T-CC8 · NOT_COVERED: on every non-underscore prompt (P43) ------------------------
-nc = [p.name for p in stage_prompts if "NOT_COVERED:" not in p.read_text()]
+nc = [p.name for p in stage_prompts if p.stem != "verify" and "NOT_COVERED:" not in p.read_text()]
 if nc:
     bad("T-CC8 these stage prompts do not require a NOT_COVERED: line: " + ", ".join(sorted(nc)))
 else:
-    ok("T-CC8 all %d non-underscore prompts require a NOT_COVERED: line" % len(stage_prompts))
+    ok("T-CC8 all %d non-YAML stage prompts require a NOT_COVERED: line" % (len(stage_prompts) - 1))
 # and the contract line it rides on
-bi = [p.name for p in stage_prompts if "BLOCKING_ITEMS:" not in p.read_text()]
+bi = [p.name for p in stage_prompts if p.stem != "verify" and "BLOCKING_ITEMS:" not in p.read_text()]
 if bi:
     bad("T-CC8 these stage prompts still have no BLOCKING_ITEMS: line: " + ", ".join(sorted(bi)))
 else:
-    ok("T-CC8 all %d non-underscore prompts carry the BLOCKING_ITEMS: contract line"
-       % len(stage_prompts))
+    ok("T-CC8 all %d non-YAML stage prompts carry the BLOCKING_ITEMS: contract line"
+       % (len(stage_prompts) - 1))
+
+# Verification is structured YAML, not a free-form producer confidence claim.
+verify = (pdir / "verify.txt").read_text()
+vdigest = (root / "digests/verify.txt").read_text()
+if all(token in verify for token in ("finding_results and check_results", "unexercised required checks", "Do not append free-form confidence")) and all(token in vdigest for token in ("CONFIDENCE:", "BLOCKING_ITEMS:")):
+    ok("T-CC8-VERIFY YAML evidence feeds the digest verdict without corrupting the schema")
+else:
+    bad("T-CC8-VERIFY missing structured evidence/digest contract")
 
 # ---- T-CC9 · qa / qa-retry lockstep, SECTION-SCOPED (P44) -----------------------------
 # The two files were byte-identical, which is WHY the build lane's retry stage could not

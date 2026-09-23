@@ -3855,6 +3855,14 @@ cmd_log() {
     _orchestrator_admission || return 1
     if [ "${FORGE_ASSETS_REQUIRED:-0}" = 1 ] && [ "$(canonical_pane_name "$to")" = claude ]; then
         case "$stage" in
+            qa|qa-retry)
+                _infra_lock_owned_by_me "$slug" "$stage" "$(_resolve_project_root "")" >/dev/null || {
+                    echo "INFRA_LOCK_REQUIRED: local $stage requires this session's slug/stage lock" >&2
+                    return 5
+                }
+                ;;
+        esac
+        case "$stage" in
             proposal|qa|qa-retry) prompt=$(cmd_local_render --slug "$slug" --stage "$stage") || return 2 ;;
         esac
     fi
@@ -5826,10 +5834,28 @@ INCLUDE_RE = re.compile(r'<<<INCLUDE\s+(\S+)\s*>>>')
 def resolve_include(name):
     if not re.fullmatch(r'[A-Za-z0-9_-]+', name):
         raise SystemExit('ERROR: unsafe include name: ' + name)
-    if name in ('_preamble', '_operator_constraints') and os.path.lexists(os.path.join(prompts_dir, name + '.txt')):
+    if name in ('_preamble', '_operator_constraints', '_qa_completion') and os.path.lexists(os.path.join(prompts_dir, name + '.txt')):
         raise SystemExit('ERROR: shadowed synthetic include: ' + name)
     if name == '_preamble':
         return preamble
+    if name == '_ask_escalation' and worker_pane == '0':
+        return ('If blocked, return the specific question to the host. Keep the local pending '
+                'and infra lock while the host obtains the answer; do not emit a worker callback.')
+    if name == '_qa_completion':
+        if stage not in ('qa', 'qa-retry'):
+            raise SystemExit('ERROR: QA completion include on a non-QA stage')
+        if worker_pane == '0':
+            return '''When complete, return the artifact paths to the host. The host closes its
+existing local pending with forge-bridge log-response --slug {slug} --to claude
+--stage {stage} --response "FORGE_DONE: {stage} - see .dev/qa/{slug}/issues.md".
+On terminal failure, close with FORGE_ERROR instead. Never emit a worker callback.
+Keep the lock through asks and running children. After all children terminate
+and no unsafe process remains, release the lock before the path-only digest.'''
+        return '''When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet --message "see .dev/qa/{slug}/issues.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet --message "{issue}"'''
     # Second synthetic (#77b). NOT _preamble's empty-on-miss contract: an absent,
     # unparseable, schema-invalid or oversized ledger EXITS 2, the same way an ordinary
     # missing include does below. A stage that runs without the operator's words is the
@@ -5875,6 +5901,15 @@ _stage_assets() {
         python3 "$(dirname "$sibling")/../lib/forge_assets.py" route --stage "$1" --worker "$2"
 }
 
+_snapshot_qa_findings() {
+    case "$1" in qa-retry|fix-qa-retry) ;; *) return 0 ;; esac
+    # Legacy/custom templates without the snapshot contract retain their behavior.
+    grep -q 'prior-.*issues.md' "$FORGE_PROMPTS_DIR/$1.txt" || return 0
+    local sibling="$(_forge_sibling_bin)"
+    python3 "$(dirname "$sibling")/../lib/forge_assets.py" snapshot-findings \
+        --stage "$1" --slug "$2" --root "$3" >/dev/null
+}
+
 # Publish complete renders only; failed retries never truncate the prior file.
 _publish_render() {
     local template="$1" slug="$2" stage="$3" worker="$4" pane="$5" root="$6" kind="$7"
@@ -5907,6 +5942,7 @@ cmd_local_render() {
     root=$(_resolve_project_root "")
     [ -n "$root" ] || return 2
     _stage_assets "$stage" "$provider" >/dev/null || return 2
+    _snapshot_qa_findings "$stage" "$slug" "$root" || return 2
     out=$(_publish_render "$FORGE_PROMPTS_DIR/$stage.txt" "$slug" "$stage" "$provider" 0 "$root" local) || return 2
     printf 'LOCAL_PROMPT: %s\n' "$out"
 }
@@ -6001,9 +6037,8 @@ cmd_dispatch() {
     # build-pipeline stages AND the fix-pipeline stages are constrained; commit-review,
     # pr-review and ad-hoc names stay deliberately unconstrained through an EXPLICIT
     # no-op `default` arm, so the vocabulary is closed by intent rather than by
-    # omission. The verify "!= latest QA
-    # worker" exclusion stays in orchestrator prose — the bridge enforces tier,
-    # not pipeline history.
+    # omission. Protected-package route preflight below also checks the latest
+    # QA worker; legacy dispatch retains this tier-only guard.
     case "$stage" in
         review|incorporate|implementation|impl-review|verify)
             case "$worker_canonical" in
@@ -6194,6 +6229,11 @@ cmd_dispatch() {
     # Candidate routes are checked before reset, supersede, pending or send.
     if [ "${FORGE_ASSETS_REQUIRED:-0}" = 1 ]; then
         _stage_assets "$stage" "$worker_canonical" >/dev/null || return 2
+        local route_check
+        route_check="$("$FORGE_FORGE_BIN" route --root "$project_root" --slug "$slug" --stage "$stage" --worker "$worker_canonical")" || {
+            printf '%s\n' "$route_check" >&2
+            return 2
+        }
     fi
     local tmpl_path="$FORGE_PROMPTS_DIR/$stage.txt"
     local rendered
@@ -6298,6 +6338,19 @@ PY
             fi
             ;;
     esac
+
+    # Lane refusal must precede reset, supersede and pending writes. Rendering a
+    # legacy dry run remains side-effect-free and does not admit a delivery.
+    local lane_info capability_class lane rollout
+    lane_info="$("${FORGE_FORGE_BIN:-forge}" codex-lane --root "$project_root" --stage "$stage" --worker "$worker_canonical")" || return 1
+    capability_class="$(printf '%s\n' "$lane_info" | sed -n 's/^capability_class=//p')"
+    lane="$(printf '%s\n' "$lane_info" | sed -n 's/^lane=//p')"
+    rollout="$(printf '%s\n' "$lane_info" | sed -n 's/^rollout=//p')"
+    if [[ "$worker_canonical" == codex-* ]] && [ "$lane" = reviewed-host ]; then
+        _emit_event LANE_REQUIRED "$slug" "stage=$stage worker=$worker_canonical capability=$capability_class rollout=$rollout"
+        echo "LANE_REQUIRED lane=reviewed-host stage=$stage capability=$capability_class rollout=$rollout" >&2
+        return 4
+    fi
 
     # --- Operator-constraint report-side set equality (#77b Step 6 check 3) ---
     # Evaluated at the SUCCESSOR stage's dispatch, using _evidence_stage_record's SELECTOR
@@ -6424,6 +6477,7 @@ PYEOF
     # (and lifecycle) lock via the RETURN trap, so no fd 10-13 can leak on an error path.
     trap _hygiene_release_all RETURN
     _worker_lock "$worker_canonical" || { _emit_event ERROR "$slug" "stage=$stage reason=worker-lock-busy worker=$worker_canonical"; return 1; }
+    _snapshot_qa_findings "$stage" "$slug" "$project_root" || { _worker_unlock "$worker_canonical"; return 2; }
     if [ "$_dmode" = enforce ]; then
         # P0-2: awaiting-verify-decision is a send-blocking terminal state (new work would
         # invalidate the exact verify callback binding finalization relies on).
@@ -6726,17 +6780,6 @@ PYEOF
 
     # P0-4: supersede's replacement prompt is written only now, after its reset+close.
     [ "$supersede" = true ] && printf '%s' "$rendered" > "$prompt_file"
-    local lane_info capability_class lane rollout
-    lane_info="$("${FORGE_FORGE_BIN:-forge}" codex-lane --root "$project_root" --stage "$stage" --worker "$worker_canonical")" || return 1
-    capability_class="$(printf '%s\n' "$lane_info" | sed -n 's/^capability_class=//p')"
-    lane="$(printf '%s\n' "$lane_info" | sed -n 's/^lane=//p')"
-    rollout="$(printf '%s\n' "$lane_info" | sed -n 's/^rollout=//p')"
-    if [[ "$worker_canonical" == codex-* ]] && [ "$lane" = reviewed-host ]; then
-        _emit_event LANE_REQUIRED "$slug" "stage=$stage worker=$worker_canonical capability=$capability_class rollout=$rollout"
-        echo "LANE_REQUIRED lane=reviewed-host stage=$stage capability=$capability_class rollout=$rollout" >&2
-        _worker_unlock "$worker_canonical"
-        return 4
-    fi
     local delivery_id delivery_inc physical_code_root root_id prompt_sha
     physical_code_root="$(ownership_root "$project_root")"; root_id="$(root_identity "$project_root")"
     prompt_sha="$(printf '%s' "$rendered" | shasum -a 256 | awk '{print $1}')"

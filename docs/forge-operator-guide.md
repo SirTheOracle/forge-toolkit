@@ -894,6 +894,45 @@ P4 local implementation is complete. Model-led attribution and the integrated
 P4b preview are not claimed by the local fixtures; production admission checks
 are unchanged.
 
+## Orchestrator workflow routing
+
+Before assigning build or fix work, use the read-only route preflight:
+
+```bash
+forge route --root "$PWD" --slug example --stage qa
+forge route --root "$PWD" --slug example --stage verify
+```
+
+It reports the requested and selected worker, reasoning tier, capability lane,
+and selection reason. Under contain, QA routes to claude-sonnet and verify to
+claude-opus, regardless of host provider. Fix stages remain HIGH-tier worker
+work; a Codex host can coordinate the existing Claude fix workers.
+
+Use `--worker NAME` for an explicit request, `--unavailable NAME` (repeatable)
+for observed unavailability before assignment, and `--assigned-worker NAME`
+once work is assigned. Explicit ineligible requests refuse; assigned workers
+are never silently substituted. Availability flags are observations, not
+authorization. Dispatch still enforces identity, policy, locks and ownership.
+Verify selection requires readable, unambiguous, closed QA/QA-retry history and
+excludes the latest QA worker.
+
+Only `selected` exits zero. `wait`, `refused`, and `local-prerequisites` exit 3;
+invalid inputs exit 2. Local proposal requires isolated native children. Local
+build QA additionally requires Codex B unavailable, no eligible throughput
+worker available, native live-QA support, and the owned infra lock. Missing
+native capability blocks this fallback; it never authorizes local fix work.
+
+QA retries preserve `prior-issues.md` or `prior-fix-issues.md` before report
+replacement. Retry digests compare those snapshots; digest-only retry neither
+reruns the worker nor replaces its prior findings. Local QA closes a local
+pending log instead of emitting a worker callback, then releases its lock before
+the digest. Fix-QA corrections use authorized HIGH-tier fix-code, not build
+qa-fix. Pipelines still stop for operator verification/PR instructions.
+
+These local implementation checks do not qualify native full-workflow parity
+or enable a production provider profile. See `tests/forge-orchestrator/p5-status.md`
+for the acceptance scope and retained qualification limits.
+
 ## Codex containment and rollout
 
 The default is `contain`. New panes use the exact-version-gated interactive

@@ -26,6 +26,10 @@ or generic Forge-prefix authority.
 
 ## Gated Local QA
 
+First apply all local-QA prerequisites in `workflow-routes.md`. Confirm native
+live-QA tool access for the child configuration, not merely that Agent exists.
+An unavailable capability blocks fallback; do not run QA in the parent context.
+
 Only under the canonical local build QA fallback, hold the infra lock, use
 `local-render --stage qa` (or qa-retry) before pending creation, and execute
 the protected Claude adversarial-qa skill with native Agent/SendMessage.

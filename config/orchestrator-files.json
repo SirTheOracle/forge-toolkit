@@ -230,6 +230,7 @@
     "skills/forge-orchestrator/references/commit-review.md",
     "skills/forge-orchestrator/references/pr-review.md",
     "skills/forge-orchestrator/references/stall-detection.md",
-    "skills/forge-orchestrator/references/technical.md"
+    "skills/forge-orchestrator/references/technical.md",
+    "skills/forge-orchestrator/references/workflow-routes.md"
   ]
 }
