@@ -435,6 +435,100 @@ class Package(unittest.TestCase):
         self.assertEqual(candidate["conformance"], {})
         self.assertIsNone(self.ctx.store.profile())
 
+    def local_capability_fixture(self):
+        if not self.ctx.management.exists():
+            package.host.prepare_management(self.ctx)
+        path, report = self.capability_fixture()
+        receipt = package.verify(self.path)
+        report.update(validation="local",
+                      management_sha256=package.host.records.digest(package.host.management_inputs(self.ctx)),
+                      qualifier=package.host.file_identity(self.path / "bin/forge-orchestrator-package"),
+                      provider=receipt["definition"]["executable"],
+                      worker=package.host.file_identity(receipt["worker_binaries"]["codex"]),
+                      management_entry={"status": "not-run", "operator_positive": True,
+                                        "observations": [{"kind": "worker", "pass": True}]})
+        report["checks"] = dict.fromkeys(package.ADMISSION_CHECKS, "not-run")
+        report["checks"].update(dict.fromkeys(package.LOCAL_RELEASE_CHECKS, "pass"))
+        report["checks"]["authentication"] = "unavailable"
+        path.write_text(package.encoded(report))
+        return path, report, receipt
+
+    def test_local_publication_keeps_native_grade_unverified_and_never_registers(self):
+        path, report, receipt = self.local_capability_fixture()
+        published = package.publish_candidate(self.path, path, local_release=True)
+        self.assertEqual(published["admission"], "local-release-not-registered")
+        candidate = package.host.read_json(published["candidate"])
+        package.host.validate_candidate(self.ctx, candidate)
+        self.assertEqual(candidate["providers"]["codex"]["evidence"]["native_policy"], "unverified")
+        self.assertIsNone(self.ctx.store.profile())
+        with self.assertRaisesRegex(package.host.Refusal, "promoted to native"):
+            package.validate_capability(self.path, receipt, path)
+        report["checks"]["native_policy"] = "pass"
+        path.write_text(package.encoded(report))
+        with self.assertRaisesRegex(package.host.Refusal, "disguise native results"):
+            package.validate_capability(self.path, receipt, path, local_release=True)
+
+    def test_local_publication_requires_every_local_gate_and_measured_worker_denial(self):
+        path, report, receipt = self.local_capability_fixture()
+        for gate in package.LOCAL_RELEASE_CHECKS:
+            for value in (None, "not-run", "fail", "unsupported"):
+                with self.subTest(gate=gate, value=value):
+                    report["checks"].pop(gate, None)
+                    if value is not None:
+                        report["checks"][gate] = value
+                    path.write_text(package.encoded(report))
+                    with self.assertRaisesRegex(package.host.Refusal, gate):
+                        package.validate_capability(self.path, receipt, path, local_release=True)
+            report["checks"][gate] = "pass"
+        for management in ({}, {"operator_positive": False, "observations": [{"kind": "worker", "pass": True}]},
+                           {"operator_positive": True, "observations": []},
+                           {"operator_positive": True, "observations": [{"kind": "native", "pass": True}]},
+                           {"operator_positive": True, "observations": [{"kind": "worker", "pass": False}]}):
+            report["management_entry"] = management
+            path.write_text(package.encoded(report))
+            with self.assertRaisesRegex(package.host.Refusal, "measured management worker denial"):
+                package.validate_capability(self.path, receipt, path, local_release=True)
+
+    def test_local_qualifier_never_loads_model_probes_or_authenticates(self):
+        receipt = package.verify(self.path)
+        expected_auth = [receipt["definition"]["executable"]["path"], "login", "status"]
+        original_run = package.subprocess.run
+        def run(argv, **kwargs):
+            if argv[0] == "/usr/bin/git":
+                return original_run(argv, **kwargs)
+            self.assertEqual(argv, expected_auth)
+            return subprocess.CompletedProcess(argv, 1, "", "not logged in")
+        with patch.object(package, "module", side_effect=AssertionError("native probe module loaded")), \
+                patch.object(package, "verify", return_value=receipt), \
+                patch.object(package.runtime, "measure", return_value={"status": "pass"}), \
+                patch.object(package, "policy_probes", return_value=("pass", [])), \
+                patch.object(package, "hook_transport", return_value={"status": "pass"}), \
+                patch.object(package, "management_probe", return_value={"status": "not-run", "operator_positive": True,
+                    "observations": [{"kind": "worker", "pass": True}]}), \
+                patch.object(package.subprocess, "run", side_effect=run), \
+                patch.object(package, "publish_candidate", return_value={"admission": "fixture-only"}) as publish:
+            # All effects are doubles; only exercise mode selection here.
+            result = package.qualify(self.path, local_release=True)
+            self.assertEqual(result["admission"], "fixture-only")
+            self.assertEqual(result["checks"]["native_loading"], "not-run")
+            self.assertEqual(result["checks"]["authentication"], "unavailable")
+            self.assertTrue(publish.call_args.kwargs["local_release"])
+        with self.assertRaisesRegex(package.host.Refusal, "never runs model-led"):
+            package.qualify(self.path, native=True, local_release=True)
+
+    def test_local_qualifier_cli_reports_failure_and_rejects_native_mode(self):
+        argv = ["forge-orchestrator-package", "qualify", "--package", str(self.path)]
+        for flags, admission, expected in (([], "unsupported", 0), (["--local-release"], "unsupported", 3),
+                                           (["--local-release"], "local-release-not-registered", 0)):
+            with self.subTest(flags=flags, admission=admission), \
+                    patch.object(package.sys, "argv", argv + flags), \
+                    patch.object(package, "qualify", return_value={"admission": admission}), patch("builtins.print"):
+                self.assertEqual(package.main(), expected)
+        with patch.object(package.sys, "argv", argv + ["--native", "--local-release"]), \
+                patch("sys.stderr"), self.assertRaises(SystemExit) as conflict:
+            package.main()
+        self.assertEqual(conflict.exception.code, 2)
+
     def test_candidate_publication_refuses_each_missing_or_failed_gate(self):
         path, report = self.capability_fixture()
         receipt = package.verify(self.path)

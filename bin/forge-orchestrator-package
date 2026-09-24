@@ -35,6 +35,8 @@ runtime = module("runtime", TREE / "lib/forge_runtime.py")
 ADMISSION_CHECKS = ("package_integrity", "worker_containment", "native_policy", "native_configuration",
                     "native_loading", "native_children", "native_reload", "native_duplicates",
                     "legacy_coexistence", "management_entry", "hook_transport", "runtime_closure", "topology")
+LOCAL_RELEASE_CHECKS = ("package_integrity", "worker_containment", "management_worker_boundary",
+                        "hook_transport", "runtime_closure", "topology")
 
 
 def write(path, data, mode=0o400):
@@ -615,7 +617,7 @@ def management_probe(package, receipt, directory, topology, worker, native_runne
         manifest = host.management_inputs(ctx)
         host.require(manifest.get("package") is not None, "MANAGEMENT_CLOSURE_REQUIRED",
                      "prepare management from a protected candidate, not the mutable source checkout")
-        before = ctx.store.profile()
+        before = ctx.store.profile_state()
         command = [str(ctx.management_entry), "orchestrator-profile", "probe", "--root", str(ctx.root)]
         positive = subprocess.run(command, cwd=ctx.root, env=receipt["environment"],
                                   text=True, capture_output=True, timeout=20)
@@ -661,7 +663,7 @@ def management_probe(package, receipt, directory, topology, worker, native_runne
                         directory / ("management-manual-" + str(index) + "-" + str(command_index) + ".jsonl"))
                     observations.append({"root": item["root"], "kind": "native-manual", "pass": denied["status"] == "pass",
                                          "result": denied})
-        host.require(ctx.store.profile() == before and host.management_inputs(ctx) == manifest,
+        host.require(ctx.store.profile_state() == before and host.management_inputs(ctx) == manifest,
                      "MANAGEMENT_PROBE_CHANGED_STATE", "profile or management inputs changed")
         result = {"status": ("pass" if native_runner or denial_runner else "not-run") if all(row["pass"] for row in observations) else "fail",
                   "operator_positive": True, "observations": observations}
@@ -692,7 +694,7 @@ def manual_policy(package, receipt, directory, topology, runner):
             "observations": observations}
 
 
-def validate_capability(package, receipt, report_path):
+def validate_capability(package, receipt, report_path, *, local_release=False):
     """Recheck raw measurement inputs at publication and every later admission."""
     package, report_path = Path(package), Path(report_path)
     ctx = host.Context(receipt["root"]["physical_root"])
@@ -703,9 +705,20 @@ def validate_capability(package, receipt, report_path):
                  and report.get("topology_sha256") == host.records.digest(host.topology(ctx)),
                  "QUALIFICATION_MISMATCH", "capability report does not bind these package/root/topology inputs")
     checks = report.get("checks", {})
-    missing = [name for name in ADMISSION_CHECKS if checks.get(name) != "pass"]
-    host.require(checks.get("authentication") == "available" and not missing,
+    host.require(report.get("validation", "native") == ("local" if local_release else "native"),
+                 "QUALIFICATION_MISMATCH", "local validation cannot be promoted to native qualification")
+    required = LOCAL_RELEASE_CHECKS if local_release else ADMISSION_CHECKS
+    missing = [name for name in required if checks.get(name) != "pass"]
+    host.require((local_release or checks.get("authentication") == "available") and not missing,
                  "ORCHESTRATOR_NOT_QUALIFIED", ", ".join(missing) or "authentication")
+    if local_release:
+        host.require(all(checks.get(name) == "not-run" for name in ADMISSION_CHECKS if name not in required),
+                     "QUALIFICATION_MISMATCH", "local release must not disguise native results")
+        management_probe = report.get("management_entry", {})
+        observations = management_probe.get("observations", [])
+        host.require(management_probe.get("operator_positive") is True and observations
+                     and all(row.get("kind") == "worker" and row.get("pass") is True for row in observations),
+                     "ORCHESTRATOR_NOT_QUALIFIED", "measured management worker denial required")
     # Recheck all raw evidence and the measured management inputs at publication.
     artifacts = report.get("artifacts", [])
     host.require(artifacts and all(report_path.parent in Path(item["path"]).parents for item in artifacts),
@@ -722,18 +735,20 @@ def validate_capability(package, receipt, report_path):
     return report
 
 
-def publish_candidate(package, report_path):
+def publish_candidate(package, report_path, *, local_release=False):
     """Called only after measurement; an incomplete check cannot mint admission."""
     package, report_path = Path(package), Path(report_path)
     receipt = verify(package)
-    report = validate_capability(package, receipt, report_path)
+    report = validate_capability(package, receipt, report_path, local_release=local_release)
     ctx = host.Context(receipt["root"]["physical_root"])
     management = host.management_inputs(ctx)
-    evidence = {"reports": [host.file_identity(report_path)["sha256"]], "loading": "behavioral",
-                "native_policy": "pass", "workflows": ["native-orchestration-primitives"]}
+    evidence = {"reports": [host.file_identity(report_path)["sha256"]],
+                "loading": "explicit-unverified" if local_release else "behavioral",
+                "native_policy": "unverified" if local_release else "pass",
+                "workflows": ["attended-local-release" if local_release else "native-orchestration-primitives"]}
     candidate = candidate_manifest(package, receipt, evidence)
     host.validate_candidate(ctx, candidate, qualification=False)
-    conformance = {"schema": "forge-orchestrator-qualification/1", "root": ctx.identity,
+    conformance = {"schema": "forge-orchestrator-local-release/1" if local_release else "forge-orchestrator-qualification/1", "root": ctx.identity,
                    "candidate_sha256": host.records.digest(host.candidate_body(candidate)), "checks": report["checks"],
                    "management_entry_sha256": host.file_identity(ctx.management_entry)["sha256"],
                    "management_sha256": host.records.digest(management),
@@ -746,12 +761,14 @@ def publish_candidate(package, report_path):
     host.validate_candidate(ctx, candidate)
     destination = report_path.parent / "candidate.json"
     write(destination, encoded(candidate))
-    return {"candidate": str(destination), "conformance": str(path), "admission": "qualified-not-registered"}
+    return {"candidate": str(destination), "conformance": str(path),
+            "admission": "local-release-not-registered" if local_release else "qualified-not-registered"}
 
 
-def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
+def qualify(package, worker_binary=None, *, native=False, legacy_model=None, local_release=False):
     """Measure native prerequisites, retaining failures without minting admission."""
     package = Path(package).absolute()
+    host.require(not (native and local_release), "VALIDATION_MODE_CONFLICT", "local release never runs model-led probes")
     receipt = verify(package)
     ctx = host.Context(receipt["root"]["physical_root"])
     worker = Path(worker_binary or receipt["worker_binaries"]["codex"]).resolve(strict=True)
@@ -826,9 +843,15 @@ def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
                                   native_runner=probes.policy_command if native and authenticated and provider == "codex" else None,
                                   denial_runner=probes.policy_denial if native and authenticated and provider == "claude" else None)
     checks["management_entry"] = management["status"]
-    # Utility containment and child primitives alone never mint admission.
-    complete = checks.get("authentication") == "available" and all(checks.get(name) == "pass" for name in ADMISSION_CHECKS)
+    if local_release:
+        checks["management_worker_boundary"] = ("pass" if management.get("operator_positive") is True
+            and management.get("observations") and all(row.get("kind") == "worker" and row.get("pass") is True
+                                                       for row in management["observations"]) else "fail")
+    required = LOCAL_RELEASE_CHECKS if local_release else ADMISSION_CHECKS
+    # Local release is a separate, explicitly accepted grade, not native parity.
+    complete = (local_release or checks.get("authentication") == "available") and all(checks.get(name) == "pass" for name in required)
     report = {"schema": "forge-orchestrator-capability/1", "root": ctx.identity,
+              "validation": "local" if local_release else "native",
               "qualifier": host.file_identity(Path(__file__).absolute()),
               "package": host.file_identity(package / "package.json"), "worker": worker_identity,
               "provider": receipt["definition"]["executable"], "checks": checks,
@@ -848,6 +871,10 @@ def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
               "limits": ["Native write-open utility evidence is not model policy evidence.",
                          "Authenticated native load/children/reload and runtime/management/hook closure remain required.",
                          "No credentials copied, no global discovery changed, no profile registered."]}
+    if local_release:
+        report["limits"] = ["Local-only attended release; native loading, child behavior and policy remain unverified.",
+                            "Normal native login may be required; no sign-in or model call was performed by validation.",
+                            "Worker containment, protected runtime and ownership checks remain enforced."]
     if ctx.management.exists():
         report["management_sha256"] = host.records.digest(host.management_inputs(ctx))
     try:
@@ -860,8 +887,8 @@ def qualify(package, worker_binary=None, *, native=False, legacy_model=None):
     report_path = report_dir / "report.json"
     write(report_path, encoded(report))
     result = {"report": str(report_path), "checks": checks, "admission": "unsupported"}
-    if checks.get("authentication") == "available" and all(checks.get(name) == "pass" for name in ADMISSION_CHECKS):
-        result.update(publish_candidate(package, report_path))
+    if (local_release or checks.get("authentication") == "available") and all(checks.get(name) == "pass" for name in required):
+        result.update(publish_candidate(package, report_path, local_release=local_release))
     return result
 
 
@@ -878,7 +905,9 @@ def main():
     qualification = sub.add_parser("qualify")
     qualification.add_argument("--package", required=True)
     qualification.add_argument("--worker-binary")
-    qualification.add_argument("--native", action="store_true", help="run authenticated model-led loading probes")
+    mode = qualification.add_mutually_exclusive_group()
+    mode.add_argument("--native", action="store_true", help="run authenticated model-led loading probes")
+    mode.add_argument("--local-release", action="store_true", help="measure local gates only; never claim native qualification")
     qualification.add_argument("--legacy-model", help="explicit Claude model for concurrent legacy read-only verification")
     login = sub.add_parser("auth", help="authenticate only the candidate's isolated native namespace")
     login.add_argument("--package", required=True)
@@ -887,14 +916,15 @@ def main():
     if args.action == "stage":
         result = stage(host.Context(args.root), args.provider, args.binary, args.model)
     elif args.action == "qualify":
-        result = qualify(args.package, args.worker_binary, native=args.native, legacy_model=args.legacy_model)
+        result = qualify(args.package, args.worker_binary, native=args.native, legacy_model=args.legacy_model,
+                         local_release=args.local_release)
     elif args.action == "auth":
         return authenticate(args.package, status=args.status)
     else:
         receipt = verify(args.package)
-        result = {"integrity": "pass", "entry": receipt["entry"], "admission": "requires-native-qualification"}
+        result = {"integrity": "pass", "entry": receipt["entry"], "admission": "requires-validation-and-registration"}
     print(encoded(result), end="")
-    return 0
+    return 3 if args.action == "qualify" and args.local_release and result["admission"] == "unsupported" else 0
 
 
 if __name__ == "__main__":

@@ -959,12 +959,12 @@ live processes or locks still refuse. The launcher rechecks everything at the
 actual effect boundary.
 Neither command registers, repairs, disables, migrates or switches anything.
 
-`scope=registered-prerequisites-only` is deliberate. Current native conformance
-describes orchestration primitives, not complete build/fix execution or all
+`scope=registered-prerequisites-only` applies to native conformance. It describes
+orchestration primitives, not complete build/fix execution or all
 local-QA fallbacks. `full_workflow_parity=not-established` is not upgraded by
 local tests, synthetic fixtures, a stored ready record or hook approval.
 
-For a separately qualified and operator-registered root, a new explicit start is:
+For a separately validated and operator-registered root, a new explicit start is:
 
 ```bash
 forge-start --here --orchestrator codex --no-attach
@@ -986,12 +986,75 @@ copy credentials, or overwrite an older candidate as part of rollout. Native
 scope; it must not be run implicitly by tests or readiness inspection. No new
 profile has been enabled by P6's local acceptance.
 
+### Local-only registration
+
+The attended local release is an explicit alternative to native qualification,
+not a claim that the model-led checks passed. It runs package/runtime integrity,
+worker containment, management-worker denial, hook transport and topology checks.
+It makes no model calls, performs no sign-in and copies no credentials. Missing
+native authentication is reported, not fabricated; using the provider may still
+require its normal subscription login in the isolated namespace.
+
+From this development checkout, stage **both** providers for the target physical
+`ROOT`. Set `CLAUDE_MODEL` and `CODEX_MODEL` to the intended installed CLI models:
+
+```bash
+bin/forge-orchestrator-package stage --root "$ROOT" --provider claude --model "$CLAUDE_MODEL"
+bin/forge-orchestrator-package stage --root "$ROOT" --provider codex --model "$CODEX_MODEL"
+```
+
+Use the returned `package` paths as `CLAUDE_PACKAGE` and `CODEX_PACKAGE`.
+Prepare the protected operator entry once, from a copied package, not source:
+
+```bash
+"$CLAUDE_PACKAGE/bin/forge-orchestrator-host" prepare-management --root "$ROOT"
+"$CLAUDE_PACKAGE/bin/forge-orchestrator-package" qualify --package "$CLAUDE_PACKAGE" --local-release
+"$CODEX_PACKAGE/bin/forge-orchestrator-package" qualify --package "$CODEX_PACKAGE" --local-release
+```
+
+Use the returned `management_entry` as `OPERATOR` and each returned `candidate`
+as `CLAUDE_CANDIDATE`/`CODEX_CANDIDATE`. A failed local gate exits 3 and emits no candidate;
+never manufacture its report or replace a protected management tree to proceed.
+An existing management entry must retain its matching original package.
+
+```bash
+"$OPERATOR" orchestrator-profile register --root "$ROOT" --provider claude --from "$CLAUDE_CANDIDATE" --expect-revision 0 --accept-local-validation
+"$OPERATOR" orchestrator-profile register --root "$ROOT" --provider codex --from "$CODEX_CANDIDATE" --expect-revision 0 --accept-local-validation
+bin/forge orchestrator-rollout --root "$ROOT" --provider codex --check
+```
+
+Revision zero is for first registration only. For updates, inspect with
+`bin/forge orchestrator-profile inspect --root "$ROOT" --provider PROVIDER` and
+use that provider's observed revision. Both providers have independent revisions
+and immutable snapshots; unspecified catalog mutations refuse. Registering Codex
+alone does not register Claude or change the default. Migrating an old single
+profile to a provider catalog refuses until the original session is terminal.
+First registration also refuses while an unbound legacy session owns the root;
+it does not change that session's admission or panes.
+
+Local reports and launches carry `validation=local`; rollout additionally reports
+`scope=attended-local-release`, `native_qualification=not-run` and
+`full_workflow_parity=not-established`. Native qualification still requires every
+original native gate and rejects local evidence. Starting an interactive provider
+is not part of local validation. Use the explicit start command above only at a
+safe new-session boundary; the existing session is never converted.
+
+Nested Git worktree layouts remain unsupported by the containment policy. This
+is a topology constraint, not a request for wider session permissions or paid
+testing. Neither local registration nor full access overrides it. No global
+installer, global symlink change, credential copy or live-session drain is part
+of this procedure.
+
+### Rollback
+
 Rollback uses the retained **operator management entry**, not the generic
 workspace `forge`. Its path is returned by
 `forge orchestrator-profile inspect --root PATH`. From that operator entry, run
-`orchestrator-profile disable --root PATH --expect-revision REVISION` using the
-observed current revision. Stale revisions refuse instead of overwriting a
-concurrent operator decision. Disabling preserves all snapshots and journals.
+`orchestrator-profile disable --root PATH --provider codex --expect-revision REVISION` using the
+observed Codex revision. Claude's registration remains unchanged. Stale revisions
+refuse instead of overwriting a concurrent operator decision. Disabling preserves
+all snapshots and journals. For an old single-profile registration, omit
+`--provider` to disable without migrating its format while a session is live.
 
 After disable or input drift, new sends, continuations and delivery registration
 refuse. The original copied helpers remain available for read-only status,

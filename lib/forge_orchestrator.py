@@ -174,9 +174,13 @@ def validate_evidence(value):
             "INVALID_EVIDENCE", "admission evidence required")
     require(isinstance(value["reports"], list) and value["reports"]
             and all(sha256(report) for report in value["reports"]), "INVALID_EVIDENCE", "report identities required")
-    require(isinstance(value["loading"], str) and value["loading"] in {"behavioral", "plaintext-attested"},
+    local = value["loading"] == "explicit-unverified" and value["native_policy"] == "unverified"
+    require(isinstance(value["loading"], str) and value["loading"] in {"behavioral", "plaintext-attested", "explicit-unverified"},
             "INVALID_EVIDENCE", "loading evidence required")
-    require(value["native_policy"] == "pass", "INVALID_EVIDENCE", "native policy must pass")
+    require(local or (value["native_policy"] == "pass" and value["loading"] != "explicit-unverified"),
+            "INVALID_EVIDENCE", "native qualification or explicit local-only evidence required")
+    if local:
+        require(value["workflows"] == ["attended-local-release"], "INVALID_EVIDENCE", "local release is not native parity")
     require(isinstance(value["workflows"], list) and value["workflows"]
             and all(isinstance(flow, str) and flow for flow in value["workflows"]),
             "INVALID_EVIDENCE", "supported workflow subset required")
@@ -396,7 +400,7 @@ class Store:
                 os.close(launches)
             return updated
 
-    def profile(self):
+    def profile_state(self):
         try:
             fd = directory(self.path)
         except FileNotFoundError:
@@ -405,20 +409,58 @@ class Store:
             value = read_at(fd, "profile.json", missing=True)
             if value is None:
                 return None
-            require(value.get("schema") == "forge-orchestrator-profile/1" and value.get("root") == self.root,
+            require(value.get("schema") in {"forge-orchestrator-profile/1", "forge-orchestrator-profile-set/1"}
+                    and value.get("root") == self.root,
                     "INVALID_PROFILE", "unknown schema or wrong root")
-            require(number(value.get("revision")) and value["revision"] > 0 and type(value.get("enabled")) is bool,
-                    "INVALID_PROFILE", "revision and enabled state required")
-            require(isinstance(value.get("candidate"), dict), "INVALID_PROFILE", "candidate manifest required")
+            require(number(value.get("revision")) and value["revision"] > 0, "INVALID_PROFILE", "revision required")
+            if value["schema"] == "forge-orchestrator-profile-set/1":
+                providers = value.get("providers")
+                require(isinstance(providers, dict) and providers and not set(providers) - {"claude", "codex"}
+                        and all(sha256(identity) for identity in providers.values()),
+                        "INVALID_PROFILE", "provider snapshot map required")
+            else:
+                require(type(value.get("enabled")) is bool and isinstance(value.get("candidate"), dict),
+                        "INVALID_PROFILE", "enabled state and candidate required")
             identity = digest(value)
             snapshots = directory(self.path / "profiles")
             try:
                 require(read_at(snapshots, identity + ".json") == value, "PROFILE_SNAPSHOT_MISMATCH", identity)
             finally:
                 os.close(snapshots)
-            return {"sha256": identity, "profile": value}
+            return value
         finally:
             os.close(fd)
+
+    def profiles(self):
+        return self._profiles(self.profile_state())
+
+    def _profiles(self, value):
+        if value is None:
+            return {}
+        if value["schema"] == "forge-orchestrator-profile/1":
+            return {name: {"sha256": digest(value), "profile": value}
+                    for name in value["candidate"].get("providers", {})}
+        result = {}
+        for provider, identity in value["providers"].items():
+            profile = self.profile_snapshot(identity)
+            require(provider in profile["candidate"].get("providers", {}),
+                    "INVALID_PROFILE", "profile set provider differs from candidate")
+            result[provider] = {"sha256": identity, "profile": profile}
+        return result
+
+    def profile(self, provider=None):
+        require(provider in {None, "claude", "codex"}, "INVALID_PROVIDER", "claude|codex required")
+        value = self.profile_state()
+        if value is None:
+            return None
+        if value["schema"] == "forge-orchestrator-profile/1":
+            if provider is not None and provider not in value["candidate"].get("providers", {}):
+                return None
+            return {"sha256": digest(value), "profile": value}
+        profiles = self._profiles(value)
+        # The unspecified form is inspection/presence only. Launch selection
+        # always supplies the actual provider and never falls back to Codex.
+        return profiles.get(provider or ("claude" if "claude" in profiles else "codex"))
 
     def profile_snapshot(self, identity):
         require(sha256(identity), "INVALID_PROFILE", "snapshot hash required")
@@ -427,17 +469,26 @@ class Store:
             value = read_at(fd, identity + ".json")
             require(digest(value) == identity and value.get("root") == self.root
                     and value.get("schema") == "forge-orchestrator-profile/1", "PROFILE_SNAPSHOT_MISMATCH", identity)
+            require(number(value.get("revision")) and value["revision"] > 0
+                    and type(value.get("enabled")) is bool and isinstance(value.get("candidate"), dict),
+                    "INVALID_PROFILE", "snapshot revision, enabled state and candidate required")
             return value
         finally:
             os.close(fd)
 
-    def publish_profile(self, candidate, expected_revision, *, enabled=True):
+    def publish_profile(self, candidate, expected_revision, *, enabled=True, provider=None):
         """Called only by the admitted operator entry after qualification checks."""
         require(number(expected_revision) and type(enabled) is bool, "INVALID_REVISION", "profile revision required")
         require(isinstance(candidate, dict) and candidate.get("root") == self.root,
                 "INVALID_PROFILE", "candidate belongs to another root")
+        require(provider in {None, "claude", "codex"}, "INVALID_PROVIDER", "claude|codex required")
+        if provider is not None:
+            require(provider in candidate.get("providers", {}), "PROVIDER_NOT_SUPPORTED", provider)
         with self.locked("profile.lock") as fd:
-            current = self.profile()
+            state = self.profile_state()
+            require(provider is not None or state is None or state["schema"] == "forge-orchestrator-profile/1",
+                    "PROVIDER_REQUIRED", "profile sets require an explicit provider for mutations")
+            current = self.profile(provider)
             revision = current["profile"]["revision"] if current else 0
             require(revision == expected_revision, "PROFILE_REVISION_CONFLICT", "profile revision changed")
             if not enabled:
@@ -450,8 +501,21 @@ class Store:
                 write_at(snapshots, digest(value) + ".json", value, exclusive=True)
             finally:
                 os.close(snapshots)
-            write_at(fd, "profile.json", value)
-            return self.profile()
+            if provider is None:
+                write_at(fd, "profile.json", value)
+            else:
+                providers = {name: entry["sha256"] for name, entry in self.profiles().items()}
+                providers[provider] = digest(value)
+                catalog = {"schema": "forge-orchestrator-profile-set/1", "root": self.root,
+                           "revision": state["revision"] + 1 if state else 1,
+                           "providers": providers, "registered_at": now()}
+                snapshots = directory(self.path / "profiles")
+                try:
+                    write_at(snapshots, digest(catalog) + ".json", catalog, exclusive=True)
+                finally:
+                    os.close(snapshots)
+                write_at(fd, "profile.json", catalog)
+            return self.profile(provider)
 
     def transition(self, launch_id, expected_revision, expected_generation, state, **observed):
         require(state in {"ready", "failed"}, "INVALID_TRANSITION", state)

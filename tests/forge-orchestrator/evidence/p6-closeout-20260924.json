@@ -1,0 +1,58 @@
+{
+  "schema": "forge-orchestrator-local-closeout/1",
+  "date": "2026-09-24",
+  "scope": "local-release implementation, broad and final scoped verification",
+  "admission_evidence": false,
+  "native_qualification": "not-run",
+  "production_rollout": "not-enabled",
+  "full_workflow_parity": "not-established",
+  "starting_head": "fdd5ce2c02cdfd03d8b4fd709861dedff86c0f7b",
+  "broad_run": {
+    "report": ".dev/p6-acceptance-20260924/report.json",
+    "sha256": "0f43db6c4812b309316e84bb0d502e4c4cdb38ce86cc3f511588edefb5f4136b",
+    "source_sha256": "18fd2bcd24d8d5d84e2f9194e0755f4c6a3f2074d31d346d33e802cdfb167329",
+    "source_stable": true,
+    "aggregate_status": "pass",
+    "suites": [
+      "forge-orchestrator", "forge-bridge", "forge-broker", "adversarial-skills",
+      "forge-fix-runner", "forge-start", "forge-recover", "forge-infra-lock"
+    ],
+    "orchestrator_tests": 290,
+    "orchestrator_native_opt_in_skips": 2,
+    "bridge_checks": 558
+  },
+  "post_broad_changes": [
+    "Refuse first provider-catalog registration while an unbound legacy session owns the root",
+    "Return exit 3 when explicit local qualification is unsupported",
+    "Add boundary and CLI tests and update their operator instructions",
+    "Give profile tests isolated tmux sockets instead of consulting the default server"
+  ],
+  "initial_focused_run": {
+    "log": ".dev/p6-final-20260924.log",
+    "sha256": "51f9ba8e1bc5fa30641d66403e49932f98c6d66038c87da9d87d9a234f426011",
+    "source_sha256": "6ef7157038aef88c922732f96daa58c7c75030bcf3f2ade3c55ae0ae68578d41",
+    "status": "fail",
+    "tests": 67,
+    "failures": 1,
+    "cause": "Profile fixture consulted the default tmux server; corrected to a disposable socket"
+  },
+  "final_focused_run": {
+    "working_directory": "tests/forge-orchestrator",
+    "command": [
+      "env", "FORGE_ORCHESTRATOR_NATIVE_MANAGEMENT=0", "FORGE_START_ATTACH=0",
+      "python3", "-m", "unittest", "test_host_launch", "test_profiles", "test_local_release", "test_records",
+      "test_package.Package.test_local_publication_keeps_native_grade_unverified_and_never_registers",
+      "test_package.Package.test_local_publication_requires_every_local_gate_and_measured_worker_denial",
+      "test_package.Package.test_local_qualifier_never_loads_model_probes_or_authenticates",
+      "test_package.Package.test_local_qualifier_cli_reports_failure_and_rejects_native_mode", "-v"
+    ],
+    "status": "pass",
+    "tests": 67,
+    "source_stable": true,
+    "source_sha256": "2562bf4e5417a62f3d4b064d88ef456042bca51eafdd414e0f5e6385fbf23c6b",
+    "log": ".dev/p6-final-20260924-rerun.log",
+    "sha256": "e29c7d84b7fc8a58c9db546298454329737c6c1bf9fcf0c8c6ac3b73de528093"
+  },
+  "all_suites_rerun_on_final_source": false,
+  "local_main_already_included": true
+}

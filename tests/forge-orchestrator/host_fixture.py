@@ -98,8 +98,12 @@ class Fixture:
         self.candidate_path = self.base / "candidate.json"
         self.qualify_double()
 
-    def qualify_double(self):
+    def qualify_double(self, *, local_release=False):
         """Test fixture, never an operator-facing qualification command."""
+        if local_release:
+            for provider in self.candidate["providers"].values():
+                provider["evidence"].update(loading="explicit-unverified", native_policy="unverified",
+                                            workflows=["attended-local-release"])
         report = {"schema": "forge-orchestrator-qualification/1", "root": self.ctx.identity,
                   "candidate_sha256": host.records.digest(host.candidate_body(self.candidate)),
                   "checks": {name: "pass" for name in ("native_policy", "management_entry", "hook_transport", "runtime_closure", "topology")},
@@ -107,6 +111,10 @@ class Fixture:
                   "management_sha256": host.records.digest(host.management_inputs(self.ctx)),
                   "topology_sha256": host.records.digest(host.topology(self.ctx)),
                   "supported_providers": sorted(self.candidate["providers"]), "fixture_only": True}
+        if local_release:
+            report["schema"] = "forge-orchestrator-local-release/1"
+            report["checks"] = dict.fromkeys(("package_integrity", "worker_containment", "management_worker_boundary",
+                                               "hook_transport", "runtime_closure", "topology"), "pass")
         directory = self.ctx.store.path / "reports"
         directory.mkdir(exist_ok=True)
         path = directory / (host.records.digest(report) + ".json")

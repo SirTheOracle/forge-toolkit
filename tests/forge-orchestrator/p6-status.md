@@ -1,14 +1,64 @@
 # P6 Status
 
-P6's local implementation and verification are **complete as of 2026-09-23**:
-rollout diagnostics, acceptance reporting and rollback regressions. The original plan's
-model-led qualification and production rollout are **not complete** and are
-not inferred from this phase's local checks.
+P6 now includes an explicit **attended local-release implementation**, in addition
+to the 2026-09-23 diagnostics and acceptance work. It supports protected local
+validation, operator opt-in registration, independent Claude/Codex profiles,
+new-session selection and provider-scoped disable. Native model qualification
+remains a separate, unchanged opt-in standard; local release does not establish
+full model-led workflow parity.
 
 The user's revised scope remains local-only: no paid API/model runs, sign-ins,
 browser tests, external environments, global install, or live-session migration.
 No production profile was registered or enabled. Existing sessions and Claude's
 default remain unchanged.
+
+## Local Release Implementation
+
+- `qualify --local-release` measures package integrity, runtime closure, worker
+  containment, management-worker denial, hook transport and topology without
+  model calls or sign-in. It emits `forge-orchestrator-local-release/1` only when
+  all local gates pass; failed local validation exits 3 without a candidate.
+  Native checks remain `not-run`.
+- Registration requires the protected operator entry, explicit `--provider` and
+  `--accept-local-validation`. The native qualification path rejects local-grade
+  evidence. Raw artifacts, management closure and package/provider/tool hashes
+  are rechecked at every admission, just as for native qualification.
+- A root-scoped provider catalog preserves each provider's immutable profile
+  and revision. Codex registration/disable no longer replaces Claude. Old
+  snapshots remain readable, and migration refuses while old helpers still own
+  session resources. First registration also refuses while an unbound legacy
+  session owns the root. New sessions default to Claude even after a stopped Codex
+  session; ensuring a live Codex session still preserves its provider.
+- Launch, ensure and readiness expose `validation=local`. Readiness also reports
+  `native_qualification=not-run` and `scope=attended-local-release`; it never
+  upgrades full-workflow parity. Model-free fixture launches cover both providers,
+  default selection, no hot switch, disabled admission and retained bindings.
+- The operator guide contains the complete stage/validate/register/start/disable
+  procedure using copied helpers and independent provider revisions. Local
+  registration does not waive nested-worktree containment limits or create a
+  second same-root owner. Activation of this current live worktree is not part
+  of the implementation and has not been performed.
+
+## Verification (2026-09-24)
+
+The source-stable broad run in `.dev/p6-acceptance-20260924/` passed all eight
+local suites: orchestrator (290 tests, two intentional native opt-in skips),
+bridge (558 checks), broker, skills, fix-runner, launcher, recovery and infra-lock.
+No model calls, sign-ins or global installation were performed.
+
+After that run, final changes added first-registration legacy-session refusal,
+the local qualifier's failure exit code, their tests and corresponding guide
+text. The first 67-test focused run passed 66 tests and exposed a profile fixture
+consulting the default tmux server. Giving profile tests disposable sockets
+fixed the isolation defect without relaxing the production check. The complete
+67-test focused rerun passed against unchanged final source inputs. It covers
+host launch/recovery, provider profiles, local release, protected records and
+copied-package local publication/CLI behavior.
+
+The eight-suite run was not repeated after those narrow final changes. Exact
+source/log hashes and both focused outcomes are retained in
+[`evidence/p6-closeout-20260924.json`](evidence/p6-closeout-20260924.json).
+These are implementation tests, not production admission or native parity proof.
 
 ## Delivered
 
@@ -17,7 +67,7 @@ default remain unchanged.
   package/protocol/helper and provider identities, binding and refusal reason.
   Normal inspection exits zero; `--check` exits 3 when ineligible. Neither
   invocation starts a model, writes a profile, replaces a pane or grants authority.
-- Eligibility is labelled `registered-prerequisites-only`. Existing native
+- Native eligibility is labelled `registered-prerequisites-only`. Existing native
   conformance covers primitives; the command explicitly reports
   `full_workflow_parity=not-established`. No new bypass or fabricated pass was
   introduced. The launcher and dispatch boundaries still revalidate admission.
@@ -66,7 +116,7 @@ is absent`. The explicit Codex launch option is implemented, but installation
 and local test success alone do not enable it. This status is a rollout decision,
 not a filesystem-permission problem and not a request to restart the session.
 
-## Verification
+## Earlier Verification (2026-09-23)
 
 The broad run in `.dev/p6-acceptance-01/` retained stable source/tool inputs:
 

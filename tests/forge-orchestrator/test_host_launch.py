@@ -146,6 +146,48 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(self.panes(), before)
         self.stop_session()
 
+    def test_provider_catalog_changes_do_not_invalidate_another_live_provider(self):
+        f = self.f
+        def register(provider, revision):
+            return f.run("orchestrator-profile", "register", "--provider", provider,
+                         "--root", str(f.root), "--from", str(f.candidate_path),
+                         "--expect-revision", str(revision), entry=f.ctx.management_entry)
+        migrated = register("claude", 1)
+        self.assertEqual(migrated.returncode, 0, migrated.stderr)
+        self.assertEqual(self.start("claude").returncode, 0)
+        before, panes = f.ctx.store.current(), self.panes()
+        added = register("codex", 1)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        disabled = f.run("orchestrator-profile", "disable", "--provider", "codex",
+                         "--root", str(f.root), "--expect-revision", "2", entry=f.ctx.management_entry)
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertEqual(self.start("claude").returncode, 0)
+        guard = f.run("guard", "--root", str(f.root), "--session", "fixture")
+        self.assertEqual(guard.returncode, 0, guard.stderr)
+        self.assertEqual(f.ctx.store.current(), before)
+        self.assertEqual(self.panes(), panes)
+
+    def test_live_legacy_profile_cannot_be_migrated_to_catalog(self):
+        self.assertEqual(self.start().returncode, 0)
+        before = self.f.ctx.store.profile_state()
+        result = self.f.run("orchestrator-profile", "register", "--provider", "claude",
+                            "--root", str(self.f.root), "--from", str(self.f.candidate_path),
+                            "--expect-revision", "1", entry=self.f.ctx.management_entry)
+        self.assertIn("HANDOFF_REQUIRED", result.stderr)
+        self.assertEqual(self.f.ctx.store.profile_state(), before)
+        disabled = self.f.run("orchestrator-profile", "disable", "--provider", "claude",
+                              "--root", str(self.f.root), "--expect-revision", "1",
+                              entry=self.f.ctx.management_entry)
+        self.assertIn("HANDOFF_REQUIRED", disabled.stderr)
+        self.assertEqual(self.f.ctx.store.profile_state(), before)
+
+    def test_omitted_provider_after_terminal_codex_session_defaults_to_claude(self):
+        self.assertEqual(self.start().returncode, 0)
+        self.stop_session()
+        result = self.f.run("start", "--root", str(self.f.root), "--session", "fixture", "--no-attach")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["provider"], "claude")
+
     def test_disabled_profile_refuses_new_admission_without_stopping_broker(self):
         self.assertEqual(self.start().returncode, 0)
         current = self.f.ctx.store.current()

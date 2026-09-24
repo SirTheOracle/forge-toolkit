@@ -12,7 +12,7 @@ from host_fixture import Fixture, ROOT, host
 
 class ProfileTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = Fixture()
+        self.fixture = Fixture(tmux=True)
         self.addCleanup(self.fixture.close)
 
     def test_operator_entry_register_disable_retains_snapshots(self):
@@ -26,6 +26,33 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(f.ctx.store.profile_snapshot(first["sha256"]), first["profile"])
         route = f.run("route", "--root", str(f.root), "--provider", "codex")
         self.assertIn("PROFILE_DISABLED", route.stderr)
+
+    def test_single_provider_candidates_coexist_without_replacing_claude(self):
+        f = self.fixture
+        original = copy.deepcopy(f.candidate)
+        registered = {}
+        for provider in ("claude", "codex"):
+            f.candidate = copy.deepcopy(original)
+            f.candidate["providers"] = {provider: original["providers"][provider]}
+            f.candidate["on_spawn"]["supported_providers"] = [provider]
+            f.qualify_double()
+            result = f.run("orchestrator-profile", "register", "--provider", provider,
+                           "--root", str(f.root), "--from", str(f.candidate_path),
+                           "--expect-revision", "0", entry=f.ctx.management_entry)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            registered[provider] = json.loads(result.stdout)
+        self.assertEqual(f.ctx.store.profile("claude"), registered["claude"])
+        self.assertEqual(f.ctx.store.profile("codex"), registered["codex"])
+        for provider in ("claude", "codex"):
+            result = f.run("route", "--root", str(f.root), "--provider", provider)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        result = f.run("route", "--root", str(f.root))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = f.run("orchestrator-profile", "disable", "--provider", "codex", "--root", str(f.root),
+                       "--expect-revision", "1", entry=f.ctx.management_entry)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(f.ctx.store.profile("claude"), registered["claude"])
+
 
     def test_management_probe_never_publishes_or_changes_profile(self):
         f = self.fixture

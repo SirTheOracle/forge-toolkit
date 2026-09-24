@@ -49,6 +49,39 @@ class RecordTests(unittest.TestCase):
         self.assertIsNone(self.store.current())
         self.assertFalse(self.protected.exists())
 
+    def test_provider_profiles_have_independent_revisions_and_snapshots(self):
+        claude = {"root": self.root, "providers": {"claude": {}}}
+        codex = {"root": self.root, "providers": {"codex": {}}}
+        first = self.store.publish_profile(claude, 0, provider="claude")
+        second = self.store.publish_profile(codex, 0, provider="codex")
+        self.assertEqual(self.store.profile("claude"), first)
+        self.assertEqual(self.store.profile(), first)
+        self.assertEqual(set(self.store.profiles()), {"claude", "codex"})
+        disabled = self.store.publish_profile(codex, 1, provider="codex", enabled=False)
+        self.assertFalse(disabled["profile"]["enabled"])
+        self.assertEqual(self.store.profile("claude"), first)
+        self.assertEqual(self.store.profile_snapshot(second["sha256"]), second["profile"])
+        with self.assertRaisesRegex(records.Refusal, "profile revision changed"):
+            self.store.publish_profile(codex, 1, provider="codex")
+        with self.assertRaises(records.Refusal) as failure:
+            self.store.publish_profile(codex, 2)
+        self.assertEqual(failure.exception.code, "PROVIDER_REQUIRED")
+
+    def test_legacy_profile_migration_preserves_unselected_provider_identity(self):
+        both = {"root": self.root, "providers": {"claude": {}, "codex": {}}}
+        original = self.store.publish_profile(both, 0)
+        selected = self.store.publish_profile(both, 1, provider="codex")
+        self.assertEqual(self.store.profile("claude"), original)
+        self.assertEqual(self.store.profile("codex"), selected)
+        self.assertEqual(self.store.profile_state()["schema"], "forge-orchestrator-profile-set/1")
+
+    def test_provider_alias_cannot_select_another_candidates_snapshot(self):
+        candidate = {"root": self.root, "providers": {"claude": {}}}
+        with self.assertRaises(records.Refusal) as failure:
+            self.store.publish_profile(candidate, 0, provider="codex")
+        self.assertEqual(failure.exception.code, "PROVIDER_NOT_SUPPORTED")
+        self.assertIsNone(self.store.profile())
+
     def test_preparing_then_ready_has_separate_revision_and_generation(self):
         ready = self.ready()
         self.assertEqual(ready["revision"], 2)

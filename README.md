@@ -116,15 +116,20 @@ running session or changes worker eligibility.
 
 ```bash
 forge orchestrator-rollout --root "$PWD" --provider codex --check
-# Only on a qualified physical root, at a new-session boundary:
+# On an explicitly registered physical root, at a new-session boundary:
 forge-start --here --orchestrator codex --no-attach
 ```
 
 `orchestrator-rollout` is read-only. With `--check`, it exits 3 when admission
 is unavailable and reports the exact reason. Local acceptance tests do not
 register a profile: **Codex production rollout is not enabled by installation
-or by the local P1-P6 test passes.** Native workflow parity remains unqualified.
-There is no bypass flag or silent fallback to Claude.
+or by the local P1-P6 test passes.** Operators can choose model-free local
+validation with `qualify --local-release`, then explicitly register with
+`--provider codex --accept-local-validation`. That attended release is labelled
+`validation=local`; native workflow parity remains unverified. Native
+qualification remains a separate opt-in path. Neither path bypasses package,
+worker-containment or ownership checks, and neither silently falls back to Claude.
+Provider profiles coexist: registering or disabling Codex does not replace Claude.
 
 See the [rollout and rollback runbook](docs/forge-operator-guide.md#orchestrator-rollout-and-rollback)
 and [P6 acceptance scope](tests/forge-orchestrator/p6-status.md).

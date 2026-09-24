@@ -207,7 +207,7 @@ def prepare_management(ctx):
         records.write_at(fd, "entry.json", manifest, exclusive=True)
     finally:
         os.close(fd)
-    return {"management_entry": str(ctx.management_entry), "admission": "requires-native-qualification"}
+    return {"management_entry": str(ctx.management_entry), "admission": "requires-explicit-registration"}
 
 
 def candidate_body(candidate):
@@ -288,11 +288,18 @@ def validate_candidate(ctx, candidate, *, qualification=True):
         report_path = Path(report_item["path"])
         require(ctx.store.path / "reports" in report_path.parents, "QUALIFICATION_UNPROTECTED", str(report_path))
         report = read_json(report_path)
-        require(report.get("schema") == "forge-orchestrator-qualification/1" and report.get("root") == ctx.identity
+        local_release = report.get("schema") == "forge-orchestrator-local-release/1"
+        require(report.get("schema") in {"forge-orchestrator-qualification/1", "forge-orchestrator-local-release/1"}
+                and report.get("root") == ctx.identity
                 and report.get("candidate_sha256") == records.digest(candidate_body(candidate)),
                 "QUALIFICATION_MISMATCH", "report is not for these exact inputs")
-        for check in ("native_policy", "management_entry", "hook_transport", "runtime_closure", "topology"):
+        checks = (("package_integrity", "worker_containment", "management_worker_boundary", "hook_transport", "runtime_closure", "topology")
+                  if local_release else ("native_policy", "management_entry", "hook_transport", "runtime_closure", "topology"))
+        for check in checks:
             require(report.get("checks", {}).get(check) == "pass", "ORCHESTRATOR_NOT_QUALIFIED", check)
+        for provider in providers.values():
+            require((provider["evidence"]["native_policy"] == "unverified") == local_release,
+                    "QUALIFICATION_MISMATCH", "provider evidence validation grade differs")
         require(report.get("management_entry_sha256") == file_identity(ctx.management_entry)["sha256"],
                 "QUALIFICATION_MISMATCH", "operator entry changed")
         require(report.get("management_sha256") == records.digest(management_inputs(ctx)),
@@ -306,7 +313,8 @@ def validate_candidate(ctx, candidate, *, qualification=True):
             package_root = Path(candidate["inputs"]["package"]["path"]).parent
             control = module("forge_package", package_root / "bin/forge-orchestrator-package")
             try:
-                measured = control.validate_capability(package_root, package, Path(capability["path"]))
+                measured = control.validate_capability(package_root, package, Path(capability["path"]),
+                                                       **({"local_release": True} if local_release else {}))
             except control.host.Refusal as exc:
                 raise Refusal(exc.code, exc.detail) from exc
             require(measured["checks"] == report["checks"]
@@ -372,7 +380,10 @@ def project_request(ctx, candidate):
 
 
 def admitted_profile(ctx, provider=None, snapshot=None):
-    current = ctx.store.profile()
+    if provider is None:
+        binding = ctx.store.current()
+        provider = binding["record"]["seat"]["provider"] if binding else "claude"
+    current = ctx.store.profile(provider)
     require(current is not None, "ORCHESTRATOR_NOT_QUALIFIED", "operator profile is absent")
     require(current["profile"]["enabled"], "PROFILE_DISABLED", "new admission is disabled")
     if snapshot is not None:
@@ -384,13 +395,40 @@ def admitted_profile(ctx, provider=None, snapshot=None):
     return current
 
 
+def requested_provider(ctx, provider):
+    if provider is not None:
+        return provider
+    current = ctx.store.current()
+    if current and current["record"]["state"] == "ready":
+        original = ctx.store.profile_snapshot(current["record"]["profile_hash"])
+        candidate = validate_candidate(ctx, original["candidate"], qualification=False)
+        if Runtime(ctx, candidate).at_root():
+            return current["record"]["seat"]["provider"]
+    return "claude"
+
+
+def profile_catalog_boundary(ctx, provider, candidate):
+    if provider is None:
+        return
+    previous, current = ctx.store.profile_state(), ctx.store.current()
+    # Older retained helpers cannot read the new catalog schema. Never change
+    # their registration format while they still own session resources.
+    if previous is None or previous["schema"] == "forge-orchestrator-profile/1":
+        if current:
+            original = ctx.store.profile_snapshot(current["record"]["profile_hash"])
+            candidate = original["candidate"]
+        retained = validate_candidate(ctx, candidate, qualification=False)
+        terminal_observation(ctx, Runtime(ctx, retained), current)
+
+
 def profile_command(ctx, args):
     if args.profile_action == "inspect":
         if args.source:
             candidate = validate_candidate(ctx, read_json(args.source), qualification=False)
             return {"candidate": candidate, "candidate_sha256": records.digest(candidate_body(candidate)),
                     "management_entry": str(ctx.management_entry), "admission": "unverified"}
-        return {"profile": ctx.store.profile(), "management_entry": str(ctx.management_entry)}
+        return {"profile": ctx.store.profile(args.provider), "providers": ctx.store.profiles(),
+                "management_entry": str(ctx.management_entry)}
     management_admission(ctx)
     if args.profile_action == "probe":
         # Exercise the management entry and protected write boundary without
@@ -407,11 +445,20 @@ def profile_command(ctx, args):
     if args.profile_action == "register":
         require(args.source is not None, "INVALID_PROFILE", "register requires --from")
         candidate = validate_candidate(ctx, read_json(args.source))
+        if any(value["evidence"]["native_policy"] == "unverified" for value in candidate["providers"].values()):
+            require(args.accept_local_validation, "LOCAL_VALIDATION_ACCEPTANCE_REQUIRED",
+                    "register requires --accept-local-validation; native model behavior is unverified")
+            require(args.provider is not None, "PROVIDER_REQUIRED", "local release requires --provider")
         project_request(ctx, candidate)
-        return ctx.store.publish_profile(candidate, args.expect_revision)
-    current = ctx.store.profile()
+        if args.provider is not None:
+            require(args.provider in candidate["providers"], "PROVIDER_NOT_SUPPORTED", args.provider)
+        profile_catalog_boundary(ctx, args.provider, candidate)
+        return ctx.store.publish_profile(candidate, args.expect_revision, provider=args.provider)
+    current = ctx.store.profile(args.provider)
     require(current is not None, "PROFILE_ABSENT", "no profile to disable")
-    return ctx.store.publish_profile(current["profile"]["candidate"], args.expect_revision, enabled=False)
+    profile_catalog_boundary(ctx, args.provider, current["profile"]["candidate"])
+    return ctx.store.publish_profile(current["profile"]["candidate"], args.expect_revision,
+                                     enabled=False, provider=args.provider)
 
 
 def rollout_status(ctx, provider):
@@ -422,7 +469,7 @@ def rollout_status(ctx, provider):
               "scope": "registered-prerequisites-only", "evidence": None, "boundary": None,
               "recovery": "retained helpers and original ownership checks; no admission bypass"}
     try:
-        profile, current = ctx.store.profile(), ctx.store.current()
+        profile, current = ctx.store.profile(provider), ctx.store.current()
         if profile:
             result["profile"] = {"sha256": profile["sha256"],
                                  "revision": profile["profile"]["revision"],
@@ -434,6 +481,11 @@ def rollout_status(ctx, provider):
                                  "profile_sha256": record["profile_hash"]}
         admitted = admitted_profile(ctx, provider)
         candidate = admitted["profile"]["candidate"]
+        local_release = candidate["providers"][provider]["evidence"]["native_policy"] == "unverified"
+        result["validation"] = "local" if local_release else "native"
+        result["native_qualification"] = "not-run" if local_release else "passed-primitives-only"
+        if local_release:
+            result["scope"] = "attended-local-release"
         rt = Runtime(ctx, candidate)
         # Match launch's distinction between ensuring a live host and starting
         # after a proven terminal boundary. A retained record is not a live seat.
@@ -445,7 +497,7 @@ def rollout_status(ctx, provider):
             boundary = "new-session"
         result["evidence"] = {"inputs": candidate["inputs"], "conformance": candidate["conformance"],
                               "provider": candidate["providers"][provider]}
-        require(ctx.store.profile() == profile and ctx.store.current() == current,
+        require(ctx.store.profile(provider) == profile and ctx.store.current() == current,
                 "REVISION_CONFLICT", "rollout inputs changed during inspection")
         result.update(eligible=True, reason=None, boundary=boundary)
     except (Refusal, broker.Refusal, OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
@@ -633,6 +685,10 @@ def provider_process(rt, record):
     return observed
 
 
+def validation_grade(evidence):
+    return "local" if evidence["native_policy"] == "unverified" else "native"
+
+
 def live_binding(ctx, rt, current, provider=None, observed_broker=None):
     require(current is not None, "ORCHESTRATOR_BINDING_UNAVAILABLE", "protected launch is absent")
     record = current["record"]
@@ -653,7 +709,7 @@ def live_binding(ctx, rt, current, provider=None, observed_broker=None):
                          record["profile_hash"], rt.candidate["inputs"]["package"]["sha256"])
     require(ctx.store.current() == current, "REVISION_CONFLICT", "binding changed during live observation")
     return {"role": "orchestrator", "provider": record["seat"]["provider"], "session": record["seat"]["session"],
-            "launch_id": record["launch_id"], "admission": "verified"}
+            "launch_id": record["launch_id"], "admission": "verified", "validation": validation_grade(record["evidence"])}
 
 
 def admission_guard(ctx, session, observed_broker=None):
@@ -1008,7 +1064,7 @@ def populate_launch(ctx, rt, current):
         ready = True
         rt.tmux("select-pane", "-t", host, check=False)
         return {"role": "orchestrator", "provider": record["seat"]["provider"], "session": session,
-                "launch_id": record["launch_id"], "admission": "verified"}
+                "launch_id": record["launch_id"], "admission": "verified", "validation": validation_grade(record["evidence"])}
     except BaseException as exc:
         if ready:
             raise
@@ -1057,7 +1113,8 @@ def launch(ctx, args):
             and args.session.isascii(), "INVALID_SESSION", "explicit ASCII session name required")
     if args.dry_run:
         terminal_observation(ctx, rt, current)
-        return {"plan": "create", "provider": args.provider, "session": args.session, "root": str(ctx.root)}
+        return {"plan": "create", "provider": args.provider, "session": args.session, "root": str(ctx.root),
+                "validation": validation_grade(candidate["providers"][args.provider]["evidence"])}
     current = reserve_launch(ctx, rt, profile, args.session, args.provider)
     launch_id = current["record"]["launch_id"]
     try:
@@ -1150,12 +1207,16 @@ def main():
     for action in ("inspect", "register", "disable", "probe"):
         command = actions.add_parser(action)
         command.add_argument("--root", required=True)
+        command.add_argument("--provider", choices=("claude", "codex"))
         if action in {"inspect", "register"}:
             command.add_argument("--from", dest="source", required=action == "register")
         else:
             command.set_defaults(source=None)
         if action in {"register", "disable"}:
             command.add_argument("--expect-revision", type=int, required=True)
+        if action == "register":
+            command.add_argument("--accept-local-validation", action="store_true",
+                                 help="accept local gates without claiming native model qualification")
     args = parser.parse_args()
     ctx = Context(args.root)
     if args.command == "prepare-management":
@@ -1169,7 +1230,7 @@ def main():
     elif args.command == "route":
         current, profile = ctx.store.current(), ctx.store.profile()
         if args.provider == "codex" or current or profile:
-            admitted_profile(ctx, args.provider)
+            admitted_profile(ctx, requested_provider(ctx, args.provider))
             print("qualified")
         else:
             print("legacy")
@@ -1190,9 +1251,7 @@ def main():
     elif args.command == "hook":
         result = run_hook(ctx, args)
     else:
-        if args.provider is None:
-            current = ctx.store.current()
-            args.provider = current["record"]["seat"]["provider"] if current else "claude"
+        args.provider = requested_provider(ctx, args.provider)
         result = launch(ctx, args)
     print(json.dumps(result, sort_keys=True))
     return 0
