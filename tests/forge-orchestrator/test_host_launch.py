@@ -44,6 +44,22 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.f.ctx.store.current()["record"]["state"], "ready")
 
+    def test_worker_launches_use_high_for_codex_a_and_medium_for_codex_b(self):
+        result = self.start()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with patch.dict(os.environ, {"TMUX": self.f.env["TMUX"]}):
+            rt = host.Runtime(self.f.ctx, self.f.candidate)
+        for pane, effort in ((3, "high"), (4, "medium")):
+            deadline = time.monotonic() + 5
+            while True:
+                pid = int(rt.tmux("display-message", "-p", "-t", "fixture:." + str(pane), "#{pane_pid}").stdout)
+                argv = host.process(pid)["argv"]
+                if "--worker" in argv or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            self.assertIn("--worker", argv)
+            self.assertEqual(argv[argv.index("--effort") + 1], effort)
+
     def test_contradictory_advisory_metadata_does_not_override_binding(self):
         self.assertEqual(self.start().returncode, 0)
         current = self.f.ctx.store.current()

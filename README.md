@@ -114,6 +114,10 @@ Claude remains the default. An explicitly selected Codex orchestrator uses the
 same build/fix protocol and worker pool; provider selection never converts a
 running session or changes worker eligibility.
 
+New Codex worker launches use `gpt-5.6-sol`: `codex-a` (pane 3) with `high` reasoning
+and `codex-b` (pane 4) with `medium` reasoning. Existing sessions and protected
+package copies retain their original settings until explicitly replaced.
+
 ```bash
 forge orchestrator-rollout --root "$PWD" --provider codex --check
 # On an explicitly registered physical root, at a new-session boundary:

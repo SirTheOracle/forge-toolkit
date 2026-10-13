@@ -1050,7 +1050,7 @@ def populate_launch(ctx, rt, current):
             rt.tmux("respawn-pane", "-k", "-t", pane, "-c", str(ctx.root),
                     *rt.child_argv(session, [rt.candidate["tools"]["claude_worker"], "--model", model,
                                            "--permission-mode", "acceptEdits"], pane=pane, role="worker"))
-        for index, effort in ((3, "xhigh"), (4, "medium")):
+        for index, effort in ((3, "high"), (4, "medium")):
             rt.tmux("respawn-pane", "-k", "-t", panes[index], "-c", str(ctx.root),
                     *rt.child_argv(session, [rt.candidate["tools"]["forge"], "codex-launch", "--root", str(ctx.root),
                                            "--session", session, "--pane", str(index), "--effort", effort], pane=panes[index]))
