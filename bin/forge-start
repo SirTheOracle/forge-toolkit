@@ -218,7 +218,7 @@ tmux set -g mouse on
 tmux send-keys -t "$SESSION:.0" "${_RP0}claude --model claude-opus-5" Enter
 tmux send-keys -t "$SESSION:.1" "${_RP1}claude --model claude-opus-5 --permission-mode acceptEdits" Enter
 tmux send-keys -t "$SESSION:.2" "${_RP2}claude --model claude-sonnet-5 --permission-mode acceptEdits" Enter
-tmux send-keys -t "$SESSION:.3" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 3 --effort xhigh" Enter
+tmux send-keys -t "$SESSION:.3" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 3 --effort high" Enter
 tmux send-keys -t "$SESSION:.4" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 4 --effort medium" Enter
 
 # Construction-only geometry proof. Runtime guards use identity receipts, not geometry.

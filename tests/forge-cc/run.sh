@@ -1098,8 +1098,8 @@ for f in "$ROOT/skills/forge-orchestrator/SKILL.md" "$ROOT/agents/forge-orchestr
     'Pane 0: `claude --model claude-opus-5` (NO acceptEdits' \
     'Pane 1: `claude --model claude-opus-5 --permission-mode acceptEdits`' \
     'Pane 2: `claude --model claude-sonnet-5 --permission-mode acceptEdits`' \
-    'Pane 3: `codex -m gpt-5.5 -c model_reasoning_effort=xhigh' \
-    'Pane 4: `codex -m gpt-5.5 -c model_reasoning_effort=medium' \
+    'Pane 3: `codex -m gpt-5.6-sol -c model_reasoning_effort=high' \
+    'Pane 4: `codex -m gpt-5.6-sol -c model_reasoning_effort=medium' \
     "Batch planning (two or more tasks)" \
     "in \`observe\` mode, and on the orchestrator (pane 0)." \
     "FORGE_ORCHESTRATOR_ALERT_HEADROOM"; do

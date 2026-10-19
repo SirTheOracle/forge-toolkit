@@ -25,8 +25,8 @@ You are the orchestrator running in tmux pane 0. **You COORDINATE — you
 never execute stage work in your own pane.** There are FOUR worker panes
 you dispatch to:
 - **The claude-opus worker (pane 1)** — HIGH-reasoning. Runs `incorporate` and `impl-review`, and is the HIGH-tier fallback for `implementation` and `verify`. Dispatch with `--worker claude-opus`. **This is NOT you — you are the orchestrator (pane 0).**
-- **The codex-a worker (pane 3)**: Codex A — `gpt-5.5-codex` with extra thinking. Slower, higher quality. HIGH-reasoning. Default for `review`, `implementation`, and `verify` — the high-thought stages.
-- **The codex-b worker (pane 4)**: Codex B — `gpt-5.5-codex` medium. Faster, cheaper. THROUGHPUT-tier. Default for `qa` / `qa-retry`.
+- **The codex-a worker (pane 3)**: Codex A — `gpt-5.6-sol` high. Slower, higher quality. HIGH-reasoning. Default for `review`, `implementation`, and `verify` — the high-thought stages.
+- **The codex-b worker (pane 4)**: Codex B — `gpt-5.6-sol` medium. Faster, cheaper. THROUGHPUT-tier. Default for `qa` / `qa-retry`.
 - **The claude-sonnet worker (pane 2)** — THROUGHPUT-tier. Runs `coding`, `qa-fix`, and `qa` (local fallback). Dispatch with `--worker claude-sonnet`.
 
 Pane names: claude/orchestrator (0), claude-opus/opus (1), claude-sonnet/sonnet (2), codex/codex-a (3), codex-b (4)
@@ -1470,8 +1470,8 @@ Background agent failures follow this protocol:
       Pane 0: `claude --model claude-opus-5` (NO acceptEdits — operator seat)
       Pane 1: `claude --model claude-opus-5 --permission-mode acceptEdits`
       Pane 2: `claude --model claude-sonnet-5 --permission-mode acceptEdits`
-      Pane 3: `codex -m gpt-5.5 -c model_reasoning_effort=xhigh -c service_tier=fast`
-      Pane 4: `codex -m gpt-5.5 -c model_reasoning_effort=medium -c service_tier=fast`
+      Pane 3: `codex -m gpt-5.6-sol -c model_reasoning_effort=high -c service_tier=fast`
+      Pane 4: `codex -m gpt-5.6-sol -c model_reasoning_effort=medium -c service_tier=fast`
 
     Worker idents are REPO-LOCAL ONLY, set inside the dispatch prompt body:
       `git -C "$PROJECT_ROOT" config user.name  "claude-opus (forge pane 1)"`

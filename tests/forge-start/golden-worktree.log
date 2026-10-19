@@ -9,7 +9,7 @@ set -g mouse on
 send-keys -t worktree:.0 claude --model claude-opus-5 Enter
 send-keys -t worktree:.1 claude --model claude-opus-5 --permission-mode acceptEdits Enter
 send-keys -t worktree:.2 claude --model claude-sonnet-5 --permission-mode acceptEdits Enter
-send-keys -t worktree:.3 forge codex-launch --root '__WT__' --session 'worktree' --pane 3 --effort xhigh Enter
+send-keys -t worktree:.3 forge codex-launch --root '__WT__' --session 'worktree' --pane 3 --effort high Enter
 send-keys -t worktree:.4 forge codex-launch --root '__WT__' --session 'worktree' --pane 4 --effort medium Enter
 list-panes -t worktree -F #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{window_width}
 set-option -p -t worktree:.0 @forge-worker claude
