@@ -125,6 +125,10 @@ explicit contain policy; direct Git/network authority is not part of the worker
 contract. Commit and PR publication use the delivery-bound host broker only
 after their rollout gates pass, and unsupported stages use the reviewed lane.
 
+New Codex worker launches use `gpt-5.6-sol`: `codex-a` (pane 3) with `high` reasoning
+and `codex-b` (pane 4) with `medium` reasoning. Already-running panes keep the model
+they were launched with until they are relaunched.
+
 ```
 +------------------+------------------+
 |                  |  Claude          |

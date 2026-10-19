@@ -9,7 +9,7 @@ set -g mouse on
 send-keys -t forge-1:.0 claude --model claude-opus-5 Enter
 send-keys -t forge-1:.1 claude --model claude-opus-5 --permission-mode acceptEdits Enter
 send-keys -t forge-1:.2 claude --model claude-sonnet-5 --permission-mode acceptEdits Enter
-send-keys -t forge-1:.3 forge codex-launch --root '__DIR__' --session 'forge-1' --pane 3 --effort xhigh Enter
+send-keys -t forge-1:.3 forge codex-launch --root '__DIR__' --session 'forge-1' --pane 3 --effort high Enter
 send-keys -t forge-1:.4 forge codex-launch --root '__DIR__' --session 'forge-1' --pane 4 --effort medium Enter
 list-panes -t forge-1 -F #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{window_width}
 set-option -p -t forge-1:.0 @forge-worker claude

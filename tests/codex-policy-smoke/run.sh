@@ -27,7 +27,16 @@ out="$(FORGE_CODEX_ROLLOUT=contain "$ROOT/bin/forge" codex-lane --root "$ROOT" -
 grep -q '^lane=claude$' <<<"$out"
 out="$(FORGE_CODEX_ROLLOUT=enforce "$ROOT/bin/forge" codex-lane --root "$ROOT" --stage coding --worker codex-a)"
 grep -q '^lane=reviewed-host$' <<<"$out" # private runtime/origin gate remains unproven
-"$ROOT/bin/forge" codex-launch --root "$ROOT" --session test --pane 3 --effort xhigh --print 2>/dev/null | grep -F -- '--ask-for-approval never'
+for spec in '3 high' '4 medium'; do
+  read -r pane effort <<<"$spec"
+  launch="$("$ROOT/bin/forge" codex-launch --root "$ROOT" --session test --pane "$pane" --effort "$effort" --print)"
+  grep -F -- '--ask-for-approval never' <<<"$launch"
+  grep -F -- "-m gpt-5.6-sol -c model_reasoning_effort=$effort" <<<"$launch"
+done
+# --print and exec are separate argv strings in cmd_codex_launch. Pin both to the
+# same model so a half-edit cannot ship a launch that prints one and runs another.
+[ "$(grep -c -- '-m gpt-5.6-sol ' "$ROOT/bin/forge")" -eq 2 ]
+! grep -q -- '-m gpt-5\.5 ' "$ROOT/bin/forge"
 if [ "${1:-}" != "--live" ]; then echo "policy smoke: hermetic PASS (live gates skipped)"; exit 0; fi
 doctor="$($ROOT/bin/forge codex-doctor "$ROOT" || true)"
 # Do NOT pin the installed version to the last recorded one: Homebrew moves
