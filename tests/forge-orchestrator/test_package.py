@@ -259,6 +259,14 @@ class Package(unittest.TestCase):
                 attention.write_bytes(before)
                 attention.chmod(0o400)
 
+    def test_codex_host_disables_remote_plugins(self):
+        # codex-cli 0.171 installs curated remote plugins into CODEX_HOME at TUI
+        # startup unless remote_plugin is disabled; that drifts discovery inputs.
+        argv = package.verify(self.path)["provider_argv"]
+        pairs = list(zip(argv, argv[1:]))
+        self.assertIn(("--disable", "plugins"), pairs)
+        self.assertIn(("--disable", "remote_plugin"), pairs)
+
     def test_native_hook_trust_is_the_only_mutable_auth_configuration(self):
         receipt = package.verify(self.path)
         config = Path(receipt["environment"]["CODEX_HOME"]) / "config.toml"

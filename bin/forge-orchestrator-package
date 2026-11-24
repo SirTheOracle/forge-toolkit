@@ -148,7 +148,7 @@ def authentication_seed(ctx, codex):
         # Seed them before freezing inventory, offline and without a model turn.
         home = auth / "bootstrap-home"
         os.close(host.records.directory(home, create=True))
-        argv = [str(codex), "app-server", "--disable", "hooks", "--disable", "plugins",
+        argv = [str(codex), "app-server", "--disable", "hooks", "--disable", "plugins", "--disable", "remote_plugin",
                 "--enable", "skip_host_skill_discovery"]
         if sys.platform == "darwin":
             argv = ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)(deny network*)", *argv]
@@ -340,7 +340,9 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
         argv = [str(binary), "-C", str(ctx.root), "--strict-config", "--sandbox", "workspace-write",
                 "--ask-for-approval", "on-request", "-c", "allow_login_shell=false",
                 "-c", "shell_environment_policy.experimental_use_profile=false",
-                "--disable", "plugins", "--enable", "hooks", "--disable", "shell_snapshot",
+                # codex-cli 0.171 installs OpenAI curated remote plugins at TUI startup
+                # unless remote_plugin is off; `--disable plugins` alone does not stop it.
+                "--disable", "plugins", "--disable", "remote_plugin", "--enable", "hooks", "--disable", "shell_snapshot",
                 "-c", "hooks=" + toml_value(hook_block),
                 "--enable", "skip_host_skill_discovery",
                 *project_policy, "-m", model, prompt]
