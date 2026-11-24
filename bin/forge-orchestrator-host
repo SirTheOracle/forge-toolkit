@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import shlex
@@ -620,10 +621,17 @@ class Runtime:
         require(not check or cp.returncode == 0, "TMUX_REFUSED", cp.stderr.strip())
         return cp
 
-    def child_argv(self, session, argv, *, pane=None, role=None):
+    def child_argv(self, session, argv, *, pane=None, role=None, operator_profile=False):
         # A long-lived tmux server retains its own ambient environment. Merely
         # cleaning the tmux client environment does not clean the spawned pane.
         env = dict(self.env, TMUX_SESSION=session, FORGE_ROOT=str(self.ctx.root), FORGE_INITIATIVE=session)
+        if operator_profile:
+            # Worker panes run exactly like legacy forge-start workers: on the
+            # operator's own HOME, Claude and Codex profiles and subscription login.
+            # Only the orchestrator seat uses the isolated native namespace.
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            env.pop("CODEX_HOME", None)
+            env["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
         if pane:
             env["TMUX_PANE"] = pane
             env["TMUX"] = self.tmux("display-message", "-p", "-t", pane, "#{socket_path},#{pid},0").stdout.strip()
@@ -1096,11 +1104,13 @@ def populate_launch(ctx, rt, current):
         for pane, model in ((panes[1], "claude-opus-5"), (panes[2], "claude-sonnet-5")):
             rt.tmux("respawn-pane", "-k", "-t", pane, "-c", str(ctx.root),
                     *rt.child_argv(session, [rt.candidate["tools"]["claude_worker"], "--model", model,
-                                           "--permission-mode", "acceptEdits"], pane=pane, role="worker"))
+                                           "--permission-mode", "acceptEdits"], pane=pane, role="worker",
+                                   operator_profile=True))
         for index, effort in ((3, "high"), (4, "medium")):
             rt.tmux("respawn-pane", "-k", "-t", panes[index], "-c", str(ctx.root),
                     *rt.child_argv(session, [rt.candidate["tools"]["forge"], "codex-launch", "--root", str(ctx.root),
-                                           "--session", session, "--pane", str(index), "--effort", effort], pane=panes[index]))
+                                           "--session", session, "--pane", str(index), "--effort", effort], pane=panes[index],
+                                   operator_profile=True))
         assert_claim(ctx, rt, current, idle=False)
         require(provider_process(rt, record) == observed, "PROVIDER_PROCESS_MISMATCH", "provider changed during construction")
         require(rt.broker_binding(active_broker["runtime_sha256"]) == active_broker,

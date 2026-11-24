@@ -994,6 +994,9 @@ worker containment, management-worker denial, hook transport and topology checks
 It makes no model calls, performs no sign-in and copies no credentials. Missing
 native authentication is reported, not fabricated; using the provider may still
 require its normal subscription login in the isolated namespace.
+Only the orchestrator seat uses that isolated namespace: the four worker panes
+launch on the operator's own `HOME`, `~/.claude` and `~/.codex` and their existing
+subscription login, exactly like legacy `forge-start` workers.
 
 From this development checkout, stage **both** providers for the target physical
 `ROOT`. Set `CLAUDE_MODEL` and `CODEX_MODEL` to the intended installed CLI models:
