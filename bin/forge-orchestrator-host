@@ -40,7 +40,8 @@ broker = module("forge_broker", TREE / "bin/forge-broker")
 Refusal, require = records.Refusal, records.require
 
 
-def file_bytes(path, limit=256 * 1024 * 1024):
+def _safe_read(path, consume, limit=None):
+    # One no-follow, single-link regular-file open shared by content reads and hashing.
     path = Path(path)
     require(path.is_absolute(), "UNSAFE_PATH", str(path))
     parent = records.directory(path.parent)
@@ -48,16 +49,31 @@ def file_bytes(path, limit=256 * 1024 * 1024):
     try:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         info = os.fstat(fd)
-        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= limit,
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                and (limit is None or info.st_size <= limit),
                 "UNSAFE_INPUT", str(path))
         with os.fdopen(fd, "rb", closefd=False) as stream:
-            data = stream.read(limit + 1)
-        require(len(data) <= limit, "UNSAFE_INPUT", str(path))
-        return data
+            return consume(stream)
     finally:
         if fd is not None:
             os.close(fd)
         os.close(parent)
+
+
+def file_bytes(path, limit=256 * 1024 * 1024):
+    data = _safe_read(path, lambda stream: stream.read(limit + 1), limit)
+    require(len(data) <= limit, "UNSAFE_INPUT", str(path))
+    return data
+
+
+def file_sha256(path):
+    # Identity hashing streams, so large native executables (codex-cli > 256 MiB) are not capped.
+    def digest(stream):
+        h = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+        return h.hexdigest()
+    return _safe_read(path, digest)
 
 
 def read_json(path):
@@ -70,6 +86,8 @@ def read_json(path):
 
 
 def file_identity(path, kind=None):
+    if kind is None:
+        return {"path": str(path), "sha256": file_sha256(path)}
     data = file_bytes(path)
     if kind == "codex-hook-trust":
         location = Path(path)

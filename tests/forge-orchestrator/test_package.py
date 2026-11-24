@@ -663,7 +663,8 @@ class Package(unittest.TestCase):
             data = original(path)
             if str(path) == str(TREE / "digests/coding.txt"):
                 reads += 1
-                if reads > 1:
+                # Identity is hashed via file_sha256, so the staging copy is the first file_bytes read.
+                if reads == 1:
                     return data + b"\nchanged"
             return data
         with patch.object(package.host, "file_bytes", side_effect=changed):
