@@ -93,7 +93,7 @@ def verify(package):
                  "TOPOLOGY_CHANGED", "re-stage and qualify this topology")
     host.require(receipt["os_build"] == runtime.os_identity(), "OS_RUNTIME_CHANGED", "requalify OS runtime")
     metadata = host.read_json(package / "runtime/runtime.json")
-    host.require(metadata.get("implicit_inputs") == runtime.implicit_inputs(),
+    host.require(metadata.get("implicit_inputs") == runtime.implicit_inputs(metadata.get("stdlib")),
                  "NATIVE_STARTUP_CHANGED", "Python archive, shell startup or managed policy inputs changed")
     for item in receipt["files"]:
         host.verify_file(item)

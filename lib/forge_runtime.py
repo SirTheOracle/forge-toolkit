@@ -4,6 +4,7 @@ import importlib.metadata
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -64,11 +65,19 @@ def python_files(stdlib):
             and path.is_file() and path.suffix in {".py", ".pyc", ".so", ".dylib", ".zip"}]
 
 
-def implicit_inputs():
-    """Include absence: adding an earlier Python zip or global startup file drifts."""
-    stdlib = Path(sysconfig.get_path("stdlib")).resolve(strict=True)
+def implicit_inputs(stdlib=None):
+    """Include absence: adding an earlier Python zip or global startup file drifts.
+
+    Verification passes the package's recorded stdlib, so the result describes the
+    packaged interpreter, not whichever Python runs the check (forge-start uses
+    /usr/bin/python3 while staging may run under another python3).
+    """
+    stdlib = Path(stdlib or sysconfig.get_path("stdlib")).resolve(strict=True)
+    match = re.fullmatch(r"python(\d+)\.(\d+)", stdlib.name)
+    if not match:
+        raise ValueError("unrecognized stdlib directory: " + str(stdlib))
     etc = Path("/private/etc" if sys.platform == "darwin" else "/etc")
-    paths = [stdlib.parent / ("python" + str(sys.version_info.major) + str(sys.version_info.minor) + ".zip"),
+    paths = [stdlib.parent / ("python" + match.group(1) + match.group(2) + ".zip"),
              etc / "zshenv", etc / "zsh/zshenv", etc / "codex"]
     paths.append(Path("/Library/Application Support/ClaudeCode") if sys.platform == "darwin" else etc / "claude-code")
     result = []
@@ -255,7 +264,7 @@ def audit(package, receipt):
                 scripts.append(str(path))
     blockers = []
     implicit = metadata.get("implicit_inputs")
-    if implicit != implicit_inputs():
+    if implicit != implicit_inputs(metadata.get("stdlib")):
         blockers.append("Implicit startup inputs changed.")
     if any(item["kind"] != "absent" for item in implicit or []):
         blockers.append("Custom global startup/archive/policy inputs require a separate closure audit.")
