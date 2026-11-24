@@ -315,7 +315,14 @@ class Package(unittest.TestCase):
                               '[tui.model_availability_nux]\n"gpt-6.1-sol" = 1\n\n[notice]\nhide_full_access_warning = true\n')
             package.host.verify_file(item)
             package.verify(self.path)
+            # Worker panes share this namespace and persist folder trust for the root only.
+            config.write_text(before.decode() + f'\n[projects."{self.root}"]\ntrust_level = "trusted"\n')
+            package.host.verify_file(item)
+            package.verify(self.path)
             for suffix in ('sandbox_mode = "danger-full-access"\n',
+                           '[projects."/tmp/elsewhere"]\ntrust_level = "trusted"\n',
+                           f'[projects."{self.root}"]\ntrust_level = "always"\n',
+                           f'[projects."{self.root}"]\ntrust_level = "trusted"\nhooks = "x"\n',
                            '[tui]\nscreen_reader_detection_done = "true"\n',
                            '[tui.nested]\nflag = "on"\n',
                            '[tui]\nlevel = 1.5\n',

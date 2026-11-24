@@ -108,8 +108,19 @@ def file_identity(path, kind=None):
             # Apple's isolated Python 3.9 ships the same parser with pip.
             from pip._vendor import tomli as tomllib
         config = tomllib.loads(data.decode("utf-8"))
-        require(set(config) <= {"cli_auth_credentials_store", "hooks", "tui", "notice"}
+        require(set(config) <= {"cli_auth_credentials_store", "hooks", "tui", "notice", "projects"}
                 and config.get("cli_auth_credentials_store") == "keyring",
+                "AUTH_CONFIG_CHANGED", str(path))
+        # Codex worker panes share this namespace and persist the operator's folder
+        # trust answer for the Forge root. Only that root, only the trust enum; the
+        # host's argv always overrides its own root to untrusted.
+        parts = location.absolute().parts
+        root = str(Path(*parts[:parts.index(".git")])) if ".git" in parts else None
+        projects = config.get("projects", {})
+        require(isinstance(projects, dict) and all(
+                    key == root and isinstance(value, dict) and set(value) == {"trust_level"}
+                    and value["trust_level"] in ("trusted", "untrusted")
+                    for key, value in projects.items()),
                 "AUTH_CONFIG_CHANGED", str(path))
         # Codex records its own first-run UI acknowledgements here at startup (e.g.
         # tui.screen_reader_detection_done, tui.model_availability_nux."<model>" = 1).
