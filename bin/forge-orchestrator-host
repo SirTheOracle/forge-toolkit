@@ -101,9 +101,15 @@ def file_identity(path, kind=None):
             # Apple's isolated Python 3.9 ships the same parser with pip.
             from pip._vendor import tomli as tomllib
         config = tomllib.loads(data.decode("utf-8"))
-        require(set(config) <= {"cli_auth_credentials_store", "hooks"}
+        require(set(config) <= {"cli_auth_credentials_store", "hooks", "tui", "notice"}
                 and config.get("cli_auth_credentials_store") == "keyring",
                 "AUTH_CONFIG_CHANGED", str(path))
+        # Codex records its own first-run UI acknowledgements here at startup (e.g.
+        # tui.screen_reader_detection_done). Boolean flags only: no policy, code or nesting.
+        for table in ("tui", "notice"):
+            flags = config.get(table, {})
+            require(isinstance(flags, dict) and all(isinstance(k, str) and type(v) is bool for k, v in flags.items()),
+                    "AUTH_CONFIG_CHANGED", str(path))
         hooks = config.get("hooks", {})
         require(isinstance(hooks, dict) and set(hooks) <= {"state"}, "AUTH_CONFIG_CHANGED", str(path))
         state = hooks.get("state", {})
