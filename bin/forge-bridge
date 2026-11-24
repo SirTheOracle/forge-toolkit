@@ -9342,7 +9342,7 @@ live={}
 seam=os.environ.get('FORGE_BLOCKED_AUDIT_TMUX_LIST','')
 try:
     lines=(open(seam).read().splitlines() if seam else
-           subprocess.check_output(['tmux','list-sessions','-F',
+           subprocess.check_output(['tmux','-u','list-sessions','-F',
              '#{session_name}\t#{session_path}\t#{session_id}\t#{session_created}'],
              text=True,stderr=subprocess.DEVNULL,timeout=5).splitlines())
 except Exception: lines=[]

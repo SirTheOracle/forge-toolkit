@@ -586,7 +586,8 @@ class Runtime:
         self.binary = candidate["tools"]["tmux"]
 
     def tmux(self, *args, check=True):
-        argv = [self.binary] + (["-S", self.socket] if self.socket else []) + list(args)
+        # -u: under the pinned LC_ALL=C, tmux >= 3.6 rewrites tab separators in -F output to "_".
+        argv = [self.binary, "-u"] + (["-S", self.socket] if self.socket else []) + list(args)
         cp = subprocess.run(argv, cwd=self.ctx.root, env=self.env, text=True, capture_output=True, timeout=10)
         require(not check or cp.returncode == 0, "TMUX_REFUSED", cp.stderr.strip())
         return cp

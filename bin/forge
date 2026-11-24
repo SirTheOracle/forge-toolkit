@@ -856,7 +856,7 @@ pane_index = ""; session = ""; root = ""; window_panes = ""
 if not root_override and tmux_pane:
     try:
         meta = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", tmux_pane,
+            ["tmux", "-u", "display-message", "-p", "-t", tmux_pane,
              "#{pane_index}\t#{session_name}\t#{session_path}\t#{window_panes}"],
             capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
@@ -2522,7 +2522,7 @@ def tmux_snapshot():
             return "INSPECT_FAILED", {}
     try:
         out = subprocess.run(
-            ["tmux", "list-sessions", "-F",
+            ["tmux", "-u", "list-sessions", "-F",
              "#{session_name}\t#{session_path}\t#{session_id}\t#{session_created}"],
             capture_output=True, text=True, timeout=5)
     except Exception:

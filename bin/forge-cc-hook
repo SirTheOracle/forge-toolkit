@@ -43,7 +43,7 @@ if meta is None:
     if pane:
         try:
             meta = subprocess.run(
-                ['tmux', 'display-message', '-p', '-t', pane,
+                ['tmux', '-u', 'display-message', '-p', '-t', pane,
                  '#{pane_index}\t#{session_name}\t#{session_path}\t#{window_panes}'],
                 capture_output=True, text=True, timeout=5).stdout.strip()
         except (OSError, subprocess.SubprocessError):
