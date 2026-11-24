@@ -267,6 +267,30 @@ class Package(unittest.TestCase):
         self.assertIn(("--disable", "plugins"), pairs)
         self.assertIn(("--disable", "remote_plugin"), pairs)
 
+    def test_codex_plugin_directory_is_sealed(self):
+        # The 0.171 TUI installs remote plugins despite the feature flags; a sealed
+        # empty plugins directory makes that write fail instead of drifting discovery.
+        receipt = package.verify(self.path)
+        plugins = Path(receipt["environment"]["CODEX_HOME"]) / "plugins"
+        info = os.lstat(plugins)
+        self.assertTrue(plugins.is_dir() and not plugins.is_symlink())
+        self.assertEqual(info.st_mode & 0o222, 0)
+        self.assertEqual(list(plugins.iterdir()), [])
+        with self.assertRaises(PermissionError):
+            (plugins / "cache").mkdir()
+        try:
+            plugins.chmod(0o700)
+            with self.assertRaises(package.host.Refusal) as caught:
+                package.stage(self.ctx, "codex", "/bin/echo", "fixture-no-native-qualification")
+            self.assertEqual(caught.exception.code, "NATIVE_DISCOVERY_CHANGED")
+            (plugins / "cache").mkdir()
+            with self.assertRaises(package.host.Refusal):
+                package.verify(self.path)
+        finally:
+            shutil.rmtree(plugins / "cache", ignore_errors=True)
+            plugins.chmod(0o500)
+        package.verify(self.path)
+
     def test_native_hook_trust_is_the_only_mutable_auth_configuration(self):
         receipt = package.verify(self.path)
         config = Path(receipt["environment"]["CODEX_HOME"]) / "config.toml"

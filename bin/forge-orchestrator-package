@@ -13,6 +13,7 @@ import pwd
 from pathlib import Path
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -143,6 +144,17 @@ def authentication_seed(ctx, codex):
             host.require(host.file_bytes(path) == contents.encode(), "AUTH_CONFIG_CHANGED", str(path))
     env = {"CODEX_HOME": str(auth / "codex"), "CLAUDE_CONFIG_DIR": str(auth / "claude")}
     marker = auth / "native-discovery.json"
+    # codex-cli 0.171's TUI installs curated remote plugins into CODEX_HOME/plugins
+    # even with plugins and remote_plugin disabled. A sealed, empty directory makes
+    # that install fail closed instead of drifting the frozen discovery inventory.
+    plugins = auth / "codex/plugins"
+    if not marker.exists() and not plugins.exists():
+        os.mkdir(plugins, 0o500)
+        os.chmod(plugins, 0o500)
+    info = os.lstat(plugins) if os.path.lexists(plugins) else None
+    host.require(info is not None and stat.S_ISDIR(info.st_mode) and not info.st_mode & 0o222
+                 and not any(plugins.iterdir()), "NATIVE_DISCOVERY_CHANGED",
+                 f"{plugins} must stay an empty read-only directory")
     if not marker.exists():
         # Native startup materializes bundled skills even with discovery disabled.
         # Seed them before freezing inventory, offline and without a model turn.
