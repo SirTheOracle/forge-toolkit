@@ -40,6 +40,13 @@ broker = module("forge_broker", TREE / "bin/forge-broker")
 Refusal, require = records.Refusal, records.require
 
 
+def sealed_system_file(fd, info):
+    # macOS ships hard-link aliases (grep/egrep, rm/unlink, ...) on the sealed,
+    # read-only system volume. A link there cannot be created or redirected, so the
+    # single-link rule is unnecessary; everywhere writable it still applies.
+    return info.st_uid == 0 and bool(os.fstatvfs(fd).f_flag & os.ST_RDONLY)
+
+
 def _safe_read(path, consume, limit=None):
     # One no-follow, single-link regular-file open shared by content reads and hashing.
     path = Path(path)
@@ -49,7 +56,7 @@ def _safe_read(path, consume, limit=None):
     try:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         info = os.fstat(fd)
-        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+        require(stat.S_ISREG(info.st_mode) and (info.st_nlink == 1 or sealed_system_file(fd, info))
                 and (limit is None or info.st_size <= limit),
                 "UNSAFE_INPUT", str(path))
         with os.fdopen(fd, "rb", closefd=False) as stream:
@@ -105,10 +112,14 @@ def file_identity(path, kind=None):
                 and config.get("cli_auth_credentials_store") == "keyring",
                 "AUTH_CONFIG_CHANGED", str(path))
         # Codex records its own first-run UI acknowledgements here at startup (e.g.
-        # tui.screen_reader_detection_done). Boolean flags only: no policy, code or nesting.
+        # tui.screen_reader_detection_done, tui.model_availability_nux."<model>" = 1).
+        # Booleans and integers only, at any depth: no strings, so no paths or commands.
+        def ui_state(value):
+            if isinstance(value, dict):
+                return all(isinstance(k, str) and ui_state(v) for k, v in value.items())
+            return type(value) in (bool, int)
         for table in ("tui", "notice"):
-            flags = config.get(table, {})
-            require(isinstance(flags, dict) and all(isinstance(k, str) and type(v) is bool for k, v in flags.items()),
+            require(isinstance(config.get(table, {}), dict) and ui_state(config.get(table, {})),
                     "AUTH_CONFIG_CHANGED", str(path))
         hooks = config.get("hooks", {})
         require(isinstance(hooks, dict) and set(hooks) <= {"state"}, "AUTH_CONFIG_CHANGED", str(path))

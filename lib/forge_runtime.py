@@ -65,6 +65,12 @@ def python_files(stdlib):
             and path.is_file() and path.suffix in {".py", ".pyc", ".so", ".dylib", ".zip"}]
 
 
+def sealed_system_path(path):
+    """Root-owned file on a read-only (sealed system) volume."""
+    info = os.stat(path)
+    return info.st_uid == 0 and bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+
+
 def implicit_inputs(stdlib=None):
     """Include absence: adding an earlier Python zip or global startup file drifts.
 
@@ -165,9 +171,10 @@ def stage(package, *, yaml_source=None):
     tools = {}
     for name, selected in selected_tools().items():
         resolved = str(Path(selected).resolve(strict=True))
-        if Path(resolved).stat().st_nlink != 1:
-            # Some sealed-system tools have hardlink aliases. Pin independent
-            # bytes instead of weakening the candidate no-hardlink invariant.
+        if Path(resolved).stat().st_nlink != 1 and not sealed_system_path(resolved):
+            # Hard-linked tools off the sealed volume get independent pinned bytes.
+            # Sealed-system tools must run in place: macOS launch constraints
+            # SIGKILL a copied Apple platform binary (grep, rm, pgrep, readlink).
             copied = runtime / "native" / name
             copied.parent.mkdir(exist_ok=True)
             shutil.copyfile(resolved, copied)

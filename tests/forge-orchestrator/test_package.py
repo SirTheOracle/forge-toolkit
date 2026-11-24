@@ -279,12 +279,14 @@ class Package(unittest.TestCase):
             package.verify(self.path)
             self.assertEqual(package.stage(self.ctx, "codex", "/bin/echo", "fixture-no-native-qualification"), self.result)
             # Codex 0.171 writes its own first-run UI acknowledgement on startup.
-            config.write_text(before.decode() + '\n[tui]\nscreen_reader_detection_done = true\n\n[notice]\nhide_full_access_warning = true\n')
+            config.write_text(before.decode() + '\n[tui]\nscreen_reader_detection_done = true\n\n'
+                              '[tui.model_availability_nux]\n"gpt-6.1-sol" = 1\n\n[notice]\nhide_full_access_warning = true\n')
             package.host.verify_file(item)
             package.verify(self.path)
             for suffix in ('sandbox_mode = "danger-full-access"\n',
                            '[tui]\nscreen_reader_detection_done = "true"\n',
-                           '[tui.nested]\nflag = true\n',
+                           '[tui.nested]\nflag = "on"\n',
+                           '[tui]\nlevel = 1.5\n',
                            '[notice]\nmodel_migrations = { a = "b" }\n',
                            '[hooks]\nUserPromptSubmit = []\n',
                            '[hooks.state.fixture]\ncommand = "/bin/true"\n',
