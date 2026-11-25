@@ -20,7 +20,10 @@ host = importlib.util.module_from_spec(spec)
 loader.exec_module(host)
 
 ISOLATED = {"HOME": "/protected/home", "CLAUDE_CONFIG_DIR": "/protected/auth/claude",
-            "CODEX_HOME": "/protected/auth/codex", "PATH": "/usr/bin:/bin", "LANG": "C"}
+            "CODEX_HOME": "/protected/auth/codex", "PATH": "/pkg/runtime/bin", "LANG": "C", "LC_ALL": "C",
+            "GIT_CONFIG_GLOBAL": "/dev/null"}
+OPERATOR = ("PATH=/opt/homebrew/bin:/usr/bin:/bin\nLANG=en_US.UTF-8\nSSH_AUTH_SOCK=/tmp/agent\n"
+            "TMUX=/stale,1,0\n-REMOVED\nSHLVL=3\n")
 
 
 def env_of(argv):
@@ -31,8 +34,14 @@ def env_of(argv):
 
 class WorkerProfile(unittest.TestCase):
     def runtime(self):
-        return SimpleNamespace(env=dict(ISOLATED), ctx=SimpleNamespace(root=Path("/root")),
-                               tmux=lambda *a: SimpleNamespace(stdout="/sock,1,0\n"))
+        def tmux(*args, check=True):
+            if args[:2] == ("show-environment", "-g"):
+                return SimpleNamespace(returncode=0, stdout=OPERATOR)
+            return SimpleNamespace(returncode=0, stdout="/sock,1,0\n")
+        rt = SimpleNamespace(env=dict(ISOLATED, FORGE_BRIDGE_BIN="/pkg/bin/forge-bridge"),
+                             ctx=SimpleNamespace(root=Path("/root")), tmux=tmux)
+        rt.operator_env = lambda: host.Runtime.operator_env(rt)
+        return rt
 
     def test_orchestrator_seat_keeps_isolated_namespace(self):
         env = env_of(host.Runtime.child_argv(self.runtime(), "s", ["codex"], pane="%0", role="orchestrator"))
@@ -47,13 +56,34 @@ class WorkerProfile(unittest.TestCase):
         self.assertNotIn("CLAUDE_CONFIG_DIR", env)
         self.assertNotIn("CODEX_HOME", env)
         self.assertEqual(env["FORGE_ROLE"], "worker")
+        # Operator PATH (keychain via /usr/bin/security), UTF-8 locale, real git config.
+        self.assertEqual(env["PATH"], "/opt/homebrew/bin:/usr/bin:/bin")
+        self.assertEqual(env["LANG"], "en_US.UTF-8")
+        self.assertNotIn("LC_ALL", env)
+        self.assertNotIn("GIT_CONFIG_GLOBAL", env)
+        self.assertEqual(env["SSH_AUTH_SOCK"], "/tmp/agent")
+        self.assertEqual(env["TMUX"], "/sock,1,0")
+        self.assertNotIn("SHLVL", env)
+        self.assertNotIn("REMOVED", env)
+        self.assertEqual(env["FORGE_BRIDGE_BIN"], "/pkg/bin/forge-bridge")
 
     def test_every_worker_launch_opts_into_operator_profile(self):
         source = (TREE / "bin/forge-orchestrator-host").read_text()
         claude = source[source.index('rt.candidate["tools"]["claude_worker"]'):][:400]
         codex = source[source.index('"codex-launch", "--root"'):][:400]
+        # The packaged forge wrapper re-pins the isolated environment; workers run its body.
+        self.assertIn('worker_forge(', source[source.index('"codex-launch", "--root"') - 200:][:200])
         self.assertIn("operator_profile=True", claude)
         self.assertIn("operator_profile=True", codex)
+
+    def test_worker_forge_runs_packaged_body(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            forge = Path(tmp) / "forge"
+            forge.write_text("#!/bin/sh\n")
+            self.assertEqual(host.worker_forge(str(forge)), [str(forge)])
+            (Path(tmp) / ".forge-body").write_text("#!/bin/bash\n")
+            self.assertEqual(host.worker_forge(str(forge)), ["/bin/bash", str(Path(tmp) / ".forge-body")])
 
 
 if __name__ == "__main__":

@@ -607,6 +607,16 @@ def alive(expected):
         return False
 
 
+def worker_forge(forge):
+    # The packaged forge wrapper re-pins the isolated environment with env -i;
+    # worker panes run its pinned body directly so they keep the operator's own.
+    body = Path(forge).with_name("." + Path(forge).name + "-body")
+    return ["/bin/bash", str(body)] if body.is_file() else [str(forge)]
+
+
+OPERATOR_ENV_DROP = {"TMUX", "TMUX_PANE", "TMUX_SESSION", "PWD", "OLDPWD", "SHLVL", "_"}
+
+
 class Runtime:
     def __init__(self, ctx, candidate):
         self.ctx, self.candidate = ctx, candidate
@@ -624,20 +634,38 @@ class Runtime:
     def child_argv(self, session, argv, *, pane=None, role=None, operator_profile=False):
         # A long-lived tmux server retains its own ambient environment. Merely
         # cleaning the tmux client environment does not clean the spawned pane.
-        env = dict(self.env, TMUX_SESSION=session, FORGE_ROOT=str(self.ctx.root), FORGE_INITIATIVE=session)
         if operator_profile:
-            # Worker panes run exactly like legacy forge-start workers: on the
-            # operator's own HOME, Claude and Codex profiles and subscription login.
-            # Only the orchestrator seat uses the isolated native namespace.
-            env.pop("CLAUDE_CONFIG_DIR", None)
-            env.pop("CODEX_HOME", None)
-            env["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
+            # Worker panes run exactly like legacy forge-start workers: in the
+            # operator's own environment (PATH, UTF-8 locale, HOME, ~/.claude,
+            # ~/.codex, keychain login). Only Forge tool pins come from the
+            # package. The orchestrator seat alone uses the isolated namespace.
+            env = self.operator_env()
+            env.update({k: v for k, v in self.env.items() if k.startswith("FORGE_")})
+            env.update(TMUX_SESSION=session, FORGE_ROOT=str(self.ctx.root), FORGE_INITIATIVE=session)
+        else:
+            env = dict(self.env, TMUX_SESSION=session, FORGE_ROOT=str(self.ctx.root), FORGE_INITIATIVE=session)
         if pane:
             env["TMUX_PANE"] = pane
             env["TMUX"] = self.tmux("display-message", "-p", "-t", pane, "#{socket_path},#{pid},0").stdout.strip()
         if role:
             env["FORGE_ROLE"] = role
         return ["/usr/bin/env", "-i", *[key + "=" + value for key, value in sorted(env.items())], *argv]
+
+    def operator_env(self):
+        # The tmux server's global environment is what legacy forge-start panes
+        # inherit: the operator's login environment when the server started.
+        cp = self.tmux("show-environment", "-g", check=False)
+        env = {}
+        for line in (cp.stdout.splitlines() if cp.returncode == 0 else []):
+            key, sep, value = line.partition("=")
+            if sep and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and key not in OPERATOR_ENV_DROP:
+                env[key] = value
+        account = pwd.getpwuid(os.getuid())
+        env.update(HOME=account.pw_dir, USER=account.pw_name, LOGNAME=account.pw_name)
+        env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        env.setdefault("LANG", "en_US.UTF-8")
+        env.setdefault("TERM", "xterm-256color")
+        return env
 
     def sessions(self):
         cp = self.tmux("list-sessions", "-F", "#{session_name}\t#{session_path}\t#{session_created}\t#{session_id}", check=False)
@@ -1108,7 +1136,8 @@ def populate_launch(ctx, rt, current):
                                    operator_profile=True))
         for index, effort in ((3, "high"), (4, "medium")):
             rt.tmux("respawn-pane", "-k", "-t", panes[index], "-c", str(ctx.root),
-                    *rt.child_argv(session, [rt.candidate["tools"]["forge"], "codex-launch", "--root", str(ctx.root),
+                    *rt.child_argv(session, [*worker_forge(rt.candidate["tools"]["forge"]),
+                                           "codex-launch", "--root", str(ctx.root),
                                            "--session", session, "--pane", str(index), "--effort", effort], pane=panes[index],
                                    operator_profile=True))
         assert_claim(ctx, rt, current, idle=False)
