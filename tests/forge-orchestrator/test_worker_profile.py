@@ -48,6 +48,8 @@ class WorkerProfile(unittest.TestCase):
         self.assertEqual(env["HOME"], ISOLATED["HOME"])
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], ISOLATED["CLAUDE_CONFIG_DIR"])
         self.assertEqual(env["CODEX_HOME"], ISOLATED["CODEX_HOME"])
+        self.assertNotIn("LC_ALL", env)
+        self.assertEqual(env["LANG"], "en_US.UTF-8")
 
     def test_workers_use_operator_profiles(self):
         env = env_of(host.Runtime.child_argv(self.runtime(), "s", ["claude"], pane="%1", role="worker",

@@ -323,7 +323,7 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
     (home / ".codex").mkdir(parents=True, mode=0o700)
     (home / ".claude").mkdir(mode=0o700)
     # These are policy-only inputs. Never copy auth.json, credentials or global hooks.
-    codex_config = 'cli_auth_credentials_store = "keyring"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\n'
+    codex_config = 'cli_auth_credentials_store = "keyring"\napproval_policy = "on-request"\nsandbox_mode = "danger-full-access"\n'
     write(home / ".codex/config.toml", codex_config)
     hook_block = json.loads((package / "config" / (provider + "-cc-hooks.json")).read_text())
     for entries in hook_block.values():
@@ -349,7 +349,9 @@ def stage_contents(ctx, provider, binary, model, files, worker_binaries, definit
     if provider == "codex":
         project_policy = ["-c", "projects={" + ",".join(json.dumps(item["root"]) + '={trust_level="untrusted"}'
                                                        for item in host.topology(ctx)) + "}"]
-        argv = [str(binary), "-C", str(ctx.root), "--strict-config", "--sandbox", "workspace-write",
+        # The orchestrator drives tmux and the Forge bridge directly, like the Claude
+        # orchestrator; Codex's workspace sandbox denies the tmux socket (EPERM).
+        argv = [str(binary), "-C", str(ctx.root), "--strict-config", "--sandbox", "danger-full-access",
                 "--ask-for-approval", "on-request", "-c", "allow_login_shell=false",
                 "-c", "shell_environment_policy.experimental_use_profile=false",
                 # codex-cli 0.171 installs OpenAI curated remote plugins at TUI startup

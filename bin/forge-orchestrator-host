@@ -649,6 +649,10 @@ class Runtime:
             env["TMUX"] = self.tmux("display-message", "-p", "-t", pane, "#{socket_path},#{pid},0").stdout.strip()
         if role:
             env["FORGE_ROLE"] = role
+        if role == "orchestrator":
+            # Render the native TUI in UTF-8; packaged helpers re-pin LC_ALL=C themselves.
+            env.pop("LC_ALL", None)
+            env["LANG"] = env["LC_CTYPE"] = "en_US.UTF-8"
         return ["/usr/bin/env", "-i", *[key + "=" + value for key, value in sorted(env.items())], *argv]
 
     def operator_env(self):

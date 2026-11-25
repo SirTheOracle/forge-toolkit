@@ -214,7 +214,9 @@ class Package(unittest.TestCase):
         argv = receipt["provider_argv"]
         project_arg = next(arg for arg in argv if arg.startswith("projects="))
         self.assertEqual(tomllib.loads(project_arg)["projects"][str(self.root)]["trust_level"], "untrusted")
-        self.assertNotIn("danger-full-access", argv)
+        # The host must reach the tmux socket, which the workspace sandbox denies.
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "danger-full-access")
+        self.assertEqual(argv[argv.index("--ask-for-approval") + 1], "on-request")
         self.assertIn("allow_login_shell=false", argv)
         self.assertIn("skip_host_skill_discovery", argv)
         hook_arg = next(arg for arg in argv if arg.startswith("hooks="))

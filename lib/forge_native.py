@@ -210,7 +210,7 @@ def configuration(receipt, directory):
         with Rpc(codex_argv(receipt), receipt["environment"], receipt["root"]["physical_root"],
                  directory / "codex-configuration.jsonl") as client:
             config = client.call("config/read", {"cwd": receipt["root"]["physical_root"], "includeLayers": False})["config"]
-        expected = {"model": receipt["definition"]["model"], "sandbox_mode": "workspace-write",
+        expected = {"model": receipt["definition"]["model"], "sandbox_mode": "danger-full-access",
                     "approval_policy": "on-request", "allow_login_shell": False}
         features = {"hooks": bool(receipt.get("attention_hooks")), "plugins": False, "remote_plugin": False,
                     "shell_snapshot": False, "skip_host_skill_discovery": True}
