@@ -1,0 +1,195 @@
+{
+  "child_policy": "native metadata: workspace-write, network disabled, on-request; readable dummy token demonstrates shared readability",
+  "codex_child": {
+    "all_denied": true,
+    "all_unchanged": true,
+    "files": 2088,
+    "status": "PASS"
+  },
+  "date": "2026-09-14",
+  "evidence": [
+    {
+      "path": ".dev/forge-p1/runtime-20260914-01/isolated-import.json",
+      "sha256": "ca295b14e6a126b5111528a0963252bfef4cb46867a572e1650f41ab53d4215d"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-02/native-runtime-reviewed.json",
+      "sha256": "979c62755fce4ccfed20796c359cf8d55c90baf39e56cd1661be730abfcfbe37"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-02/host-14bf2203/report.json",
+      "sha256": "3e9e4a1fe199addb5e9771d471c81a986da242b76007c47660df8241d83130af"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/package.json",
+      "sha256": "4d796a87e5af23e0fcd441dda98d79f002b5376e10aac1f36664748c532d1dde"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/run-cc5b0ea37ec4c5fc/report.json",
+      "sha256": "a7db0e49f06ee6ac6f8fd732370876ebe462b983f2197431a8fa33badd4ace1f"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/package-access-e496ab9333af817f/report.json",
+      "sha256": "c074710962da7681997d5c67b8e932d20c703f8245bfcf19238b3824d2d89ab9"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/runtime-audit-8e4c04612d41a2d1/report.json",
+      "sha256": "0f0e497a34970106a014e540e844880df711fd08bdfea2e6bb971ae517421949"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/runtime-audit-8e4c04612d41a2d1/dependencies.json",
+      "sha256": "93cdab5e4e6ca0f2f38f4709aad5303b23c3df2ac057f711ad6904842910e838"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/native-worker-fab24055416bc6b2/report.json",
+      "sha256": "b375f034e17677da5f243363ebd26d4260b5050ad14ea42944af4f0cc42ccde3"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/native-worker-23c06b965202ac20/report.json",
+      "sha256": "7ad798fd695b21daedd3cb32d91588d38eb2c603b99a300ed3805a713d301707"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/host-8d2b8bec/registration.json",
+      "sha256": "8783d5cdca458711c6c485169357ed2e37824b1fd94e1a268046916f6e707bbe"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/host-8d2b8bec/host-identity-approved.json",
+      "sha256": "2fc59bed6b86502f41286f263daa4bf9cb9e4e1a1f38cde1fbddefe0cf238333"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/host-8d2b8bec/codex-interactive-reviewed.json",
+      "sha256": "6320ccef7d44395de8e9c3332cb2bbbad44178671e460de35f10ac10537d05f5"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/host-8d2b8bec/codex-duplicate-reviewed.json",
+      "sha256": "3b691b8005aa47d1d05d20b8ae63523b8037309fda98e305ddf3d66d61dbcf44"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/host-8d2b8bec/codex-post-compact-capture.json",
+      "sha256": "a99f48703139a19d4fa49507891a68af979da1c46c5193987a652d6df97c9c37"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/host-8d2b8bec/codex-resume-capture.json",
+      "sha256": "fc24150404b7d872e0566d48bc42e37a8728ca13ecaa70c79e0200de92e278d0"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/host-8d2b8bec/codex-fresh-duplicate-capture.json",
+      "sha256": "c51a9df2b509395a6a3f290a339750a7b208573eb83a1d6a67f30c1fecc1d9ed"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/host-8d2b8bec/codex-local-change-capture.json",
+      "sha256": "1e73479f568c83573318797d941c8dc9d8746136aabf70ea24a9b1f8e3248128"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/host-8d2b8bec/claude-interactive-reviewed.json",
+      "sha256": "dbfd9f7416fd1a618a690cbb6aee580f8e9c2fb26731afab3fcce62bb235eb0c"
+    },
+    {
+      "path": ".dev/forge-p1/runtime-20260914-03/host-8d2b8bec/cleanup.json",
+      "sha256": "bead0b1cb559a36736348d4a50e9b5f74be5737605ad5f55f77031e4b0ef410d"
+    }
+  ],
+  "host_control": {
+    "broker_registration": "real contained worker attestation, authenticated operator-driven registration and normal cancellation",
+    "native_codex_approvals": {
+      "approved": 2,
+      "persistent_rules": 0,
+      "rejected": 1,
+      "reviewer": "P1 test controller, not a human usability study"
+    },
+    "native_codex_identity": "MATCH after exact one-time approval",
+    "production_fix": "broker retains validated custom tmux socket, refuses cross-socket reuse",
+    "shared_lock": "operator-driven acquire/contention/status/normal release; not integrated native-host acceptance"
+  },
+  "limitations": [
+    "source-root audit tests nested fixture pointers, not original production worktree .git pointer",
+    "nonmutating write-open is measured; pointer bytes were never changed",
+    "no production selector, profile admission, worker bypass or lifecycle action added"
+  ],
+  "native_loading": {
+    "claude": "explicit-load-tool-traced: interactive fresh and corrected post-compaction Read; first post-compaction answer lacked a new tool call",
+    "codex": "explicit-load-tool-traced: fresh, local duplicate/change, compaction, process resume and fresh-thread restart"
+  },
+  "native_workers": {
+    "linked": {
+      "all_denied": true,
+      "all_unchanged": true,
+      "exact_command_traced": true,
+      "file_count": 2088,
+      "status": "PASS"
+    },
+    "primary": {
+      "all_denied": true,
+      "all_unchanged": true,
+      "exact_command_traced": true,
+      "file_count": 2088,
+      "status": "PASS"
+    }
+  },
+  "p1_status": "INCOMPLETE",
+  "package_files": 121,
+  "provider_admitted": false,
+  "remaining": [
+    "global discovery and full provider/topology loading reconciliation",
+    "remaining child policy/token inheritance and opaque disjoint-input attestation",
+    "profile-management authority and remaining runtime/alias closure",
+    "native-host broker/lock integration, legal dispatch/wait",
+    "rendered digest and missing-template retry, ask/answer, callback recovery",
+    "genuine provider-aware hooks/attention (disabled in isolated loading probes)"
+  ],
+  "runtime": {
+    "os_cached_libraries": 16,
+    "python_flags": [
+      "-I",
+      "-S",
+      "-B"
+    ],
+    "scope": "inventoried runtime and measured helper forms, not a universal production closure",
+    "unresolved_native_libraries": [],
+    "yaml": "protected pure-Python copy"
+  },
+  "schema": "forge-orchestrator-p1-measurements/1",
+  "standalone_runtime": {
+    "linked": {
+      "allowed_write_opens": [],
+      "files": 1967,
+      "status": "PASS"
+    },
+    "nested-linked": {
+      "allowed_write_opens": [],
+      "files": 1967,
+      "status": "PASS"
+    },
+    "primary": {
+      "allowed_write_opens": [],
+      "files": 1967,
+      "status": "PASS"
+    },
+    "primary-nested": {
+      "allowed_write_opens": [
+        ".dev/forge-p1/runtime-20260914-03/workspaces/primary-nested/nested/.git"
+      ],
+      "files": 1967,
+      "status": "FAIL"
+    },
+    "source-worktree": {
+      "allowed_write_opens": [
+        ".dev/forge-p1/runtime-20260914-03/workspaces/linked/.git",
+        ".dev/forge-p1/runtime-20260914-03/workspaces/primary-nested/nested/.git"
+      ],
+      "files": 1967,
+      "status": "FAIL"
+    }
+  },
+  "tests": {
+    "broker_socket_unit": 5,
+    "broker_suite": "PASS",
+    "codex_policy_smoke": "hermetic PASS; live gates skipped",
+    "full_aggregate": "NOT_RUN",
+    "orchestrator_harness": 37
+  },
+  "versions": {
+    "claude": "interactive 2.1.271; Fable 5.1; earlier unauthed tmux attempt 2.1.266",
+    "codex": "0.153.4; host gpt-6-astra; attested worker gpt-5.5"
+  }
+}

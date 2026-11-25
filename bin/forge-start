@@ -15,8 +15,8 @@
 #   └──────────────────┴──────────────────┘
 #
 # Usage:
-#   forge-start [--here] [--allow-dirty-base] [--no-attach] [name]
-#   forge-start --populate-existing <name>
+#   forge-start [--here] [--allow-dirty-base] [--no-attach] [--orchestrator claude|codex] [name]
+#   forge-start --populate-existing <name> [--orchestrator claude|codex]
 #
 # Plain starts provision a Git worktree by default, under .forge-worktrees/
 # inside the project being worked on (anchored at the main working tree, so
@@ -43,16 +43,105 @@ FORGE_START_ATTACH="${FORGE_START_ATTACH:-auto}"
 
 DIR="$(pwd)"
 POPULATE=0
+INSPECT_REQUEST=0
 ALLOW_DIRTY=""
 FORGE_LAYOUT_VERSION="${FORGE_LAYOUT_VERSION:-2}"
+SESSION=""
+ORCHESTRATOR=""
+_ORCHESTRATOR_EXPLICIT=0
+_AUTO_NAMED=0
 
-# Plain-mode flags are shifted before the existing positional-name branch.
+# Parse every argument before even a read-only tmux call. A trailing provider
+# request must not be discarded after a positional session name.
 while [ $# -gt 0 ]; do case "$1" in
+    --inspect-request) INSPECT_REQUEST=1; shift ;;
     --here) FORGE_START_WORKTREE=0; shift ;;
     --allow-dirty-base) ALLOW_DIRTY=1; shift ;;
     --no-attach) FORGE_START_ATTACH=0; shift ;;
-    *) break ;;
+    --orchestrator)
+        [ $# -ge 2 ] && [ -n "$2" ] || { echo "forge-start: --orchestrator requires claude|codex" >&2; exit 2; }
+        [ "$_ORCHESTRATOR_EXPLICIT" = 0 ] || { echo "forge-start: duplicate --orchestrator" >&2; exit 2; }
+        ORCHESTRATOR="$2"; _ORCHESTRATOR_EXPLICIT=1; shift 2 ;;
+    --populate-existing)
+        [ $# -ge 2 ] && [ -n "$2" ] && [ -z "$SESSION" ] && [ "$POPULATE" = 0 ] \
+            || { echo "forge-start: --populate-existing requires one session name" >&2; exit 2; }
+        case "$2" in --*) echo "forge-start: --populate-existing requires a session name, not a flag" >&2; exit 2 ;; esac
+        POPULATE=1; SESSION="$2"; shift 2 ;;
+    --*) echo "forge-start: unknown flag $1" >&2; exit 2 ;;
+    *) [ -n "$1" ] && [ -z "$SESSION" ] \
+           || { echo "forge-start: expected one session name" >&2; exit 2; }
+       SESSION="$1"; shift ;;
 esac; done
+
+# The spawn request is versioned transport, never evidence of host authority.
+# Ordinary standalone starts ignore ambient stamps; only populate consumes one.
+if [ "$POPULATE" = 1 ] && { [ "${FORGE_ORCHESTRATOR_PROVIDER+x}" = x ] || [ "${FORGE_ORCHESTRATOR_REQUEST_VERSION+x}" = x ]; }; then
+    [ "${FORGE_ORCHESTRATOR_REQUEST_VERSION:-}" = 1 ] \
+        || { echo "forge-start: unsupported orchestrator request transport version" >&2; exit 2; }
+    case "${FORGE_ORCHESTRATOR_PROVIDER:-}" in
+        claude|codex) ;;
+        *) echo "forge-start: invalid orchestrator request provider" >&2; exit 2 ;;
+    esac
+    if [ "$_ORCHESTRATOR_EXPLICIT" = 1 ] && [ "$ORCHESTRATOR" != "$FORGE_ORCHESTRATOR_PROVIDER" ]; then
+        echo "forge-start: contradictory orchestrator request" >&2; exit 2
+    fi
+    ORCHESTRATOR="$FORGE_ORCHESTRATOR_PROVIDER"
+fi
+ORCHESTRATOR="${ORCHESTRATOR:-claude}"
+case "$ORCHESTRATOR" in
+    claude|codex) ;;
+    *) echo "forge-start: --orchestrator must be claude|codex" >&2; exit 2 ;;
+esac
+
+if [ "$INSPECT_REQUEST" = 1 ]; then
+    [ "$POPULATE" = 1 ] && [ "${FORGE_ORCHESTRATOR_REQUEST_VERSION:-}" = 1 ] \
+        && [ -n "${FORGE_ORCHESTRATOR_LAUNCH_ID:-}" ] \
+        || { echo "forge-start: complete populate request required for inspection" >&2; exit 2; }
+    /usr/bin/python3 -I -c 'import json,sys; print(json.dumps(dict(zip(("provider","session","launch_id","transport_version"),sys.argv[1:]))))' \
+        "$ORCHESTRATOR" "$SESSION" "$FORGE_ORCHESTRATOR_LAUNCH_ID" "$FORGE_ORCHESTRATOR_REQUEST_VERSION"
+    exit $?
+fi
+
+# The qualified launcher is a separate path. Its profile and protected handoff
+# are mandatory; missing evidence never falls through into legacy population.
+_start_toolkit_root() {
+    local src="$0" dir
+    while [ -L "$src" ]; do
+        dir="$(cd "$(dirname "$src")" && pwd)"; src="$(readlink "$src")"
+        case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+    done
+    ( cd "$(dirname "$src")/.." && pwd -P )
+}
+_host_backend="$(_start_toolkit_root)/bin/forge-orchestrator-host"
+_host_root="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+_host_mode=legacy
+_host_provider=()
+if [ "$_ORCHESTRATOR_EXPLICIT" = 1 ] || [ "$POPULATE" = 1 ]; then
+    _host_provider=(--provider "$ORCHESTRATOR")
+fi
+if [ -n "$_host_root" ]; then
+    _host_root="$(cd "$_host_root" && pwd -P)"
+    _host_mode="$(/usr/bin/python3 -I "$_host_backend" route --root "$_host_root" ${_host_provider[@]+"${_host_provider[@]}"})" || exit $?
+elif [ "$ORCHESTRATOR" = codex ]; then
+    echo "forge-start: ORCHESTRATOR_NOT_QUALIFIED: physical qualified root required" >&2; exit 3
+fi
+if [ "$_host_mode" = qualified ] || { [ "$POPULATE" = 1 ] && [ -n "${FORGE_ORCHESTRATOR_LAUNCH_ID:-}" ]; }; then
+    if [ "$POPULATE" = 1 ]; then
+        exec /usr/bin/python3 -I "$_host_backend" populate --root "$_host_root" --provider "$ORCHESTRATOR" \
+            --session "$SESSION" --launch-id "${FORGE_ORCHESTRATOR_LAUNCH_ID:-}"
+    fi
+    if [ "$FORGE_START_WORKTREE" = 1 ]; then
+        echo "forge-start: QUALIFIED_ROOT_REQUIRED: provision and qualify the physical worktree, then launch there with --here" >&2
+        exit 3
+    fi
+    _host_flags=()
+    case "$FORGE_START_ATTACH" in
+        0|no|false) _host_flags=(--no-attach) ;;
+        1|yes|true|force) _host_flags=(--attach) ;;
+    esac
+    exec /usr/bin/python3 -I "$_host_backend" start --root "$_host_root" ${_host_provider[@]+"${_host_provider[@]}"} \
+        --session "$SESSION" ${_host_flags[@]+"${_host_flags[@]}"}
+fi
 
 # Test hook (addendum 4): force a mid-layout failure ONLY in populate mode so the
 # error-trap's partial-split contract is exercisable. No-op in manual mode.
@@ -89,10 +178,7 @@ _populate_trap() {
     exit 1
 }
 
-if [ "${1:-}" = "--populate-existing" ]; then
-    POPULATE=1
-    SESSION="${2:-}"
-    [ -n "$SESSION" ] || { echo "ERROR: --populate-existing requires <session>" >&2; exit 2; }
+if [ "$POPULATE" = 1 ]; then
     tmux has-session -t "$SESSION" 2>/dev/null \
         || { echo "ERROR: --populate-existing: session '$SESSION' does not exist" >&2; exit 2; }
     _pc=$(tmux list-panes -t "$SESSION" -F '#{pane_index}' 2>/dev/null | grep -c .)
@@ -100,9 +186,8 @@ if [ "${1:-}" = "--populate-existing" ]; then
         || { echo "ERROR: --populate-existing requires a 1-pane session ('$SESSION' has $_pc)" >&2; exit 2; }
     DIR="$(tmux display-message -p -t "$SESSION" '#{session_path}')"
     trap _populate_trap EXIT
-elif [ -n "${1:-}" ]; then
-    SESSION="$1"
-else
+elif [ -z "$SESSION" ]; then
+    _AUTO_NAMED=1
     COUNT=1
     while tmux has-session -t "forge-$COUNT" 2>/dev/null; do
         COUNT=$((COUNT + 1))
@@ -113,7 +198,7 @@ fi
 if [ "$POPULATE" = 0 ]; then
     # Auto-naming's loop already proved its selected name absent; explicit names
     # need the same pre-provision check without adding a second HC4 tmux call.
-    if [ -n "${1:-}" ] && tmux has-session -t "$SESSION" 2>/dev/null; then
+    if [ "$_AUTO_NAMED" = 0 ] && tmux has-session -t "$SESSION" 2>/dev/null; then
         echo "forge-start: session '$SESSION' already exists — attach with: tmux attach -t $SESSION" >&2
         exit 2
     fi
@@ -218,7 +303,7 @@ tmux set -g mouse on
 tmux send-keys -t "$SESSION:.0" "${_RP0}claude --model claude-opus-5" Enter
 tmux send-keys -t "$SESSION:.1" "${_RP1}claude --model claude-opus-5 --permission-mode acceptEdits" Enter
 tmux send-keys -t "$SESSION:.2" "${_RP2}claude --model claude-sonnet-5 --permission-mode acceptEdits" Enter
-tmux send-keys -t "$SESSION:.3" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 3 --effort xhigh" Enter
+tmux send-keys -t "$SESSION:.3" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 3 --effort high" Enter
 tmux send-keys -t "$SESSION:.4" "forge codex-launch --root '$PHYSICAL_ROOT' --session '$SESSION' --pane 4 --effort medium" Enter
 
 # Construction-only geometry proof. Runtime guards use identity receipts, not geometry.

@@ -39,6 +39,11 @@ green() { printf '\033[0;32m%s\033[0m\n' "$1"; }
 ok()  { PASS=$((PASS+1)); green "  ok: $1"; }
 bad() { FAIL=$((FAIL+1)); red   "  FAIL: $1"; }
 
+# Includes a real uniquely named tmux syntax probe; every lock and callback is isolated.
+python3 "$ROOT/tests/forge-bridge/p0-tests.py" WebInfraTargetTests WebNativeInfraTests \
+  && ok "C1 validated target infrastructure ownership" \
+  || bad "C1 validated target infrastructure ownership"
+
 [ -x "$BRIDGE" ] || { red "bin/forge-bridge not found/executable at $BRIDGE"; exit 1; }
 command -v tmux >/dev/null 2>&1 || { red "tmux required for liveness tests"; exit 1; }
 
@@ -847,8 +852,14 @@ SK="$ROOT/skills/forge-orchestrator/SKILL.md"
 grep -q 'Rule 23' "$SK" 2>/dev/null && ok "orchestrator SKILL.md carries Hard Rule 23 (terminality/lock)" || bad "Rule 23 absent from SKILL.md"
 grep -q 'infra-lock acquire' "$SK" 2>/dev/null && ok "SKILL.md wraps infra stages with infra-lock acquire" || bad "SKILL.md has no infra-lock acquire wrapping"
 grep -q 'callback-consume' "$SK" 2>/dev/null && ok "SKILL.md references callback-consume in the BLOCKED flow" || bad "SKILL.md missing callback-consume"
-grep -qi 'Cross-Worktree Infra Lock' "$ROOT/docs/forge-technical-reference.md" 2>/dev/null \
-    && ok "technical reference documents the Cross-Worktree Infra Lock" || bad "tech ref missing infra-lock section"
+# This private generated document is ignored and absent in a clean checkout.
+# When present it still must be current; the tracked operator guide is mandatory.
+if [ -f "$ROOT/docs/forge-technical-reference.md" ]; then
+    grep -qi 'Cross-Worktree Infra Lock' "$ROOT/docs/forge-technical-reference.md" \
+        && ok "technical reference documents the Cross-Worktree Infra Lock" || bad "tech ref missing infra-lock section"
+else
+    printf '  note: optional private technical reference absent; not checked\n'
+fi
 grep -qi 'Multi-Worktree Concurrency' "$ROOT/docs/forge-operator-guide.md" 2>/dev/null \
     && ok "operator guide documents Multi-Worktree Concurrency" || bad "operator guide missing concurrency section"
 

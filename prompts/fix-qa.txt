@@ -12,7 +12,9 @@ You are executing the 'fix-qa' stage of a forge fix-pipeline.
 
 Slug: {slug}
 
-Follow the adversarial-fix-qa skill at ~/.claude/skills/adversarial-fix-qa/SKILL.md
+Follow the adversarial-fix-qa skill at {worker_skill}
+
+Use --input-dir .dev/proposals/{slug} --output-dir .dev/qa/{slug}.
 
 The skill spawns 3 persistent teammates (QA Confirmer A, Regression Hunter B, Synthesizer C) across 4 rounds:
   Round 1 — A and B test the COMMITTED fix independently, with zero knowledge of each other:
@@ -34,12 +36,12 @@ Also check the live code state:
 - git log --oneline origin/main..HEAD  (commit groups)
 
 Outputs (the skill produces all of these; do not skip any):
-- .dev/qa/{slug}/fix-confirmer-report.md  (A's report — fix-closes-bug verdict)
-- .dev/qa/{slug}/regression-hunter-report.md (B's report — regression findings)
-- .dev/qa/{slug}/fix-qa-synthesis.md
-- .dev/qa/{slug}/fix-qa-review-for-A.md
-- .dev/qa/{slug}/fix-qa-review-for-B.md
-- .dev/qa/{slug}/fix-qa-reconciliation-notes.md
+- .dev/qa/{slug}/qa-A.md  (A's report — fix-closes-bug verdict)
+- .dev/qa/{slug}/qa-B.md (B's report — regression findings)
+- .dev/qa/{slug}/qa-C.md
+- .dev/qa/{slug}/review-for-A.md
+- .dev/qa/{slug}/review-for-B.md
+- .dev/qa/{slug}/reconciliation-notes.md
 - .dev/qa/{slug}/fix-issues.md (canonical issue list — what downstream consumers read)
 - .dev/qa/{slug}/fix-manifest.yaml (machine-readable severity counts + issue index)
 

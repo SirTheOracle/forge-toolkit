@@ -1,0 +1,244 @@
+#!/bin/bash
+# forge-web — launcher for the local Forge control center (web/).
+#
+# A LAUNCHER, not a service. It resolves THIS script's symlink chain back to the repository
+# checkout, pins EVERY nested Forge executable to that same checkout's bin/, proves the
+# environment can run the app, and execs ONE foreground server bound to literal 127.0.0.1.
+# PATH and a stale ~/bin copy are never consulted: a partially upgraded install that accepts
+# cross-session park while silently ignoring expectation operands is exactly the failure the
+# contract marker exists to stop. It installs nothing, starts no daemon, modifies no .envrc,
+# and never writes pipeline state.
+#
+# NO REDACTOR LIVES HERE, and this file must not even quote one:
+# tests/forge-bridge/p0-harness.py:126-128 counts the secrets-redactor literal across every
+# executable in bin/ and requires exactly three OCCURRENCES.
+#
+#   forge-web [--port N] [--check]
+#     --check   run every precondition, report, and exit (0 = ready, 1 = not ready)
+set -euo pipefail
+
+die() { printf 'forge-web: %s\n' "$*" >&2; exit 1; }
+
+# The help window WALKS THE LEADING COMMENT BLOCK. A fixed `sed -n '2,Np'` is a line-number
+# trap in a file whose header will be edited: the reviewed draft's `2,19p` printed
+# `set -euo pipefail`, and its own test asserted that it did not.
+_usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
+
+# Walk the symlink chain portably — BSD readlink has no -f on macOS (bin/forge:68-76 idiom).
+_src="$0"
+while [ -L "$_src" ]; do
+    _dir="$(cd "$(dirname "$_src")" && pwd -P)"
+    _src="$(readlink "$_src")"
+    case "$_src" in /*) ;; *) _src="$_dir/$_src" ;; esac
+done
+BIN_DIR="$(cd "$(dirname "$_src")" && pwd -P)"
+CHECKOUT="$(cd "$BIN_DIR/.." && pwd -P)"
+BACKEND="$CHECKOUT/web/backend"
+FRONTEND_DIST="$CHECKOUT/web/frontend/dist"
+CONTRACT="forge-web-contract/1"
+PY_MIN_MAJOR=3
+PY_MIN_MINOR=11
+
+# THE NESTED EXECUTABLE GRAPH, inventoried rather than assumed (review R7):
+#   forge-web -> forge, forge-bridge, forge-watch, forge-start
+#   forge-start:37-39  -> FORGE_BRIDGE_BIN, FORGE_BIN, and FORGE_CODEX_DOCTOR_BIN, which
+#                         DEFAULTS INDEPENDENTLY to ~/bin/forge — pinning FORGE_BIN does not
+#                         pin it, so a browser spawn could pass both contract checks and
+#                         still run an older checkout's codex doctor.
+#   forge-start:200    -> FORGE_BROKER_BIN, default ~/bin/forge-broker
+#   forge-bridge:129   -> FORGE_BROKER_BIN, default bare `forge-broker` (PATH!)
+#   forge-bridge:130   -> FORGE_FORGE_BIN, default _forge_sibling_bin
+#   forge-watch:124    -> honours an INHERITED FORGE_BROKER_BIN
+#   bin/forge:51       -> FORGE_TMUX_BIN, default bare `tmux`
+# Every one of them is pinned below, and forge-broker is a REQUIRED executable here.
+REQUIRED_BINS="forge forge-bridge forge-watch forge-start forge-broker"
+# The set the backend fingerprints and re-checks before every mutation (P30). Exported so the
+# two lists cannot drift: the backend reads this, it does not maintain its own copy.
+PINNED_BINS="$REQUIRED_BINS"
+
+PORT="${FORGE_WEB_PORT:-8765}"
+CHECK=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --port)  PORT="${2:-}"; [ -n "$PORT" ] || die "--port requires a value"; shift 2 ;;
+        --check) CHECK=1; shift ;;
+        -h|--help) _usage; exit 0 ;;
+        *) die "unknown argument '$1' (usage: forge-web [--port N] [--check])" ;;
+    esac
+done
+case "$PORT" in ''|*[!0-9]*) die "--port must be numeric (got '$PORT')" ;; esac
+{ [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]; } || die "--port out of range: $PORT"
+
+# --check must report EVERY unmet precondition, not just the first: an operator setting this
+# up is usually missing two or three things at once.
+problems=0
+note() { printf 'forge-web: MISSING %s\n' "$1" >&2; printf '  fix: %s\n' "$2" >&2; problems=$((problems+1)); }
+
+# ── 1. This checkout must contain the application ────────────────────────────
+[ -d "$BACKEND/src/forge_web" ] \
+    || note "the backend package at $BACKEND/src/forge_web (this launcher resolved to $CHECKOUT)" \
+            "check that ~/bin/forge-web points at your forge-toolkit checkout"
+[ -f "$FRONTEND_DIST/index.html" ] \
+    || note "the built frontend ($FRONTEND_DIST/index.html)" \
+            "npm --prefix '$CHECKOUT/web/frontend' ci && npm --prefix '$CHECKOUT/web/frontend' run build"
+
+# ── 2. ONE probe: interpreter version, package location, runtime libraries ───
+# direnv has already activated the environment: no `source`, no PYTHONPATH= prefix.
+#
+# `import forge_web` alone proves NONE of this — a lightweight __init__.py imports fine on
+# 3.9 with no FastAPI installed, and the server then dies after the browser is already open
+# (review R16). This probe starts nothing: it imports the libraries and prints a report.
+command -v python3 >/dev/null 2>&1 || note "python3" "install Python ${PY_MIN_MAJOR}.${PY_MIN_MINOR}+"
+if command -v python3 >/dev/null 2>&1; then
+    _want="$(cd "$BACKEND/src/forge_web" 2>/dev/null && pwd -P || echo /nonexistent)"
+    _probe="$(FW_MIN_MAJOR="$PY_MIN_MAJOR" FW_MIN_MINOR="$PY_MIN_MINOR" python3 - <<'PY' 2>/dev/null || true
+import importlib, os, sys
+bad = []
+if sys.version_info < (int(os.environ["FW_MIN_MAJOR"]), int(os.environ["FW_MIN_MINOR"])):
+    bad.append("interpreter=%d.%d" % sys.version_info[:2])
+path = ""
+try:
+    import forge_web
+    path = os.path.realpath(os.path.dirname(forge_web.__file__))
+except Exception:
+    bad.append("forge_web")
+for mod, label in (("fastapi", "fastapi"), ("uvicorn", "uvicorn"),
+                   ("yaml", "pyyaml"), ("pydantic", "pydantic")):
+    try:
+        m = importlib.import_module(mod)
+        if mod == "pydantic" and not getattr(m, "VERSION", "1").startswith("2"):
+            bad.append("pydantic>=2")
+    except Exception:
+        bad.append(label)
+print("path=%s" % path)
+print("missing=%s" % ",".join(bad))
+PY
+)"
+    _pkg="$(printf '%s\n' "$_probe" | sed -n 's/^path=//p')"
+    _missing="$(printf '%s\n' "$_probe" | sed -n 's/^missing=//p')"
+    if [ -z "$_probe" ]; then
+        note "a working python3 (the environment probe itself failed)" \
+             "check the direnv-activated interpreter for this checkout"
+    else
+        [ -z "$_missing" ] \
+            || note "python runtime requirements: $_missing" \
+                    "python3 -m pip install -e '$BACKEND[test]'  (needs Python ${PY_MIN_MAJOR}.${PY_MIN_MINOR}+)"
+        if [ -n "$_pkg" ] && [ "$_pkg" != "$_want" ]; then
+            # A second editable install from another worktree would silently drive this UI
+            # with different code.
+            note "forge_web resolved to '$_pkg', not $_want" \
+                 "python3 -m pip install -e '$BACKEND[test]'"
+        fi
+    fi
+fi
+
+# ── 3. Pin EVERY nested Forge executable to THIS checkout ────────────────────
+for _t in $REQUIRED_BINS; do
+    [ -x "$BIN_DIR/$_t" ] || note "$BIN_DIR/$_t" "re-run $CHECKOUT/install.sh"
+done
+# tmux is NORMALISED, never inherited: forge:51 defaults FORGE_TMUX_BIN to a bare `tmux`, so
+# an inherited override would let spawn operate against a different tmux server than the one
+# discovery and message delivery use (review R7). One resolved absolute path, or none.
+TMUX_BIN="$(command -v tmux 2>/dev/null || true)"
+[ -n "$TMUX_BIN" ] || note "tmux" "install tmux; the control center cannot address panes without it"
+
+# ── 4. Capability probe — EXACT marker, COMPLETE stdout, rc 0 ────────────────
+# An older forge-bridge falls through to `help|*` and exits 0 with help on stdout; an older
+# forge dies with "unknown verb". Only a byte-exact marker proves the contract, so the
+# COMPLETE stdout is compared and the exit status is checked — `head -1` would accept a
+# bridge whose help happens to begin with the marker, and swallowing the rc would accept a
+# binary that printed it and then failed (review R16). A mismatch does NOT abort the launch:
+# the backend starts with mutations DISABLED and says so in the UI. There is no fallback to
+# unguarded commands.
+MUTATIONS=1
+for _t in forge forge-bridge; do
+    if [ -x "$BIN_DIR/$_t" ]; then
+        _m=""; _mrc=0
+        _m="$("$BIN_DIR/$_t" web-contract-version 2>/dev/null)" || _mrc=$?
+        if [ "$_mrc" -ne 0 ] || [ "$_m" != "$CONTRACT" ]; then
+            MUTATIONS=0
+            printf 'forge-web: WARNING %s advertises %s (rc=%s, want %s rc=0) — mutations will be DISABLED (read-only mode).\n' \
+                "$BIN_DIR/$_t" "${_m:-<nothing>}" "$_mrc" "$CONTRACT" >&2
+        fi
+    fi
+done
+
+# ── 5. Port conflict is an early, clear failure ──────────────────────────────
+if command -v python3 >/dev/null 2>&1 && python3 - "$PORT" <<'PY'
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(0)          # in use
+finally:
+    s.close()
+sys.exit(1)              # free
+PY
+then
+    printf 'forge-web: 127.0.0.1:%s is already in use. Choose another: forge-web --port %s\n' "$PORT" "$((PORT+1))" >&2
+    problems=$((problems+1))
+fi
+
+if [ "$problems" -ne 0 ]; then
+    [ "$CHECK" = 1 ] && exit 1
+    die "$problems precondition(s) failed (see above); nothing was started"
+fi
+if [ "$CHECK" = 1 ]; then
+    printf 'checkout=%s\nbackend=%s\nfrontend_dist=%s\nport=%s\nmutations=%s\ntmux=%s\n' \
+        "$CHECKOUT" "$BACKEND" "$FRONTEND_DIST" "$PORT" "$MUTATIONS" "$TMUX_BIN"
+    for _t in $PINNED_BINS; do printf 'pinned=%s=%s\n' "$_t" "$BIN_DIR/$_t"; done
+    exit 0
+fi
+
+# ── 6. Launch on literal 127.0.0.1 ───────────────────────────────────────────
+# WHAT A WEB CHILD MAY AND MAY NOT INHERIT (review R7).
+#
+# CLEARED — ambient ROUTING and ROLE: a web child must not inherit the operator's TMUX_PANE
+# and resolve an in-pane identity, and park's optional host notification must not reach
+# whatever pane launched the server. Not a substitute for the _infra_lock_identity fix
+# (Step 10) — the other half of the same hazard.
+#
+# CLEARED — AUTHORIZATION and ROLLOUT kill switches. FORGE_IDENTITY_ENFORCE=0 is the legacy
+# identity-rollout switch and FORGE_CWD_GUARD_MODE=observe downgrades the root-cwd refusal to
+# a warning; an operator shell carrying either would silently weaken every guard the browser
+# then relies on. Step 4 makes EXPLICIT expectation operands independent of the first one, so
+# this is defence in depth, not the mechanism. FORGE_EVENT_PROVENANCE and
+# FORGE_TMUX_PROBE_TIMEOUT_S are reset to their defaults for the same reason: the UI's
+# ownership rendering must not depend on the launching shell.
+#
+# CLEARED — TEST SEAMS. FORGE_TMUX_LIST, FORGE_DISPATCH_DRY_RUN, FORGE_WATCH_TRIGGER,
+# FORGE_LOCK_SELF_*, FORGE_CALLBACK_PRELOCK_* and FORGE_INFRA_LOCK_DIR exist for hermetic
+# suites. A web child that inherited one would read a fabricated tmux inventory or skip a
+# lock. NONE are permitted.
+#
+# PERMITTED — exactly what this launcher sets below: the pinned executables, the checkout
+# paths, the bind address/port, the contract string and the mutation flag. That is the whole
+# permitted set; anything else the backend needs is a CLI argument, not an inherited variable.
+exec env \
+    -u TMUX -u TMUX_PANE -u TMUX_SESSION \
+    -u FORGE_ROLE -u FORGE_SENDER -u FORGE_INITIATIVE \
+    -u FORGE_IDENTITY_ENFORCE -u FORGE_CWD_GUARD_MODE -u FORGE_EVENT_PROVENANCE \
+    -u FORGE_TMUX_PROBE_TIMEOUT_S -u FORGE_WORKER_HYGIENE_MODE -u FORGE_CONSTRAINTS_MODE \
+    -u FORGE_TMUX_LIST -u FORGE_DISPATCH_DRY_RUN -u FORGE_WATCH_TRIGGER \
+    -u FORGE_INFRA_LOCK_DIR -u FORGE_LOCK_SELF_SESSION -u FORGE_LOCK_SELF_ID \
+    -u FORGE_LOCK_SELF_CREATED -u FORGE_LOCK_SELF_PID \
+    -u FORGE_CALLBACK_PRELOCK_READY -u FORGE_CALLBACK_PRELOCK_RELEASE \
+    FORGE_BIN="$BIN_DIR/forge" \
+    FORGE_FORGE_BIN="$BIN_DIR/forge" \
+    FORGE_CODEX_DOCTOR_BIN="$BIN_DIR/forge" \
+    FORGE_BRIDGE_BIN="$BIN_DIR/forge-bridge" \
+    FORGE_WATCH_BIN="$BIN_DIR/forge-watch" \
+    FORGE_START_BIN="$BIN_DIR/forge-start" \
+    FORGE_BROKER_BIN="$BIN_DIR/forge-broker" \
+    FORGE_TMUX_BIN="$TMUX_BIN" \
+    FORGE_WEB_CHECKOUT="$CHECKOUT" \
+    FORGE_WEB_BIN_DIR="$BIN_DIR" \
+    FORGE_WEB_PINNED_BINS="$PINNED_BINS" \
+    FORGE_WEB_FRONTEND_DIST="$FRONTEND_DIST" \
+    FORGE_WEB_HOST=127.0.0.1 \
+    FORGE_WEB_PORT="$PORT" \
+    FORGE_WEB_CONTRACT="$CONTRACT" \
+    FORGE_WEB_MUTATIONS_ENABLED="$MUTATIONS" \
+    python3 -m forge_web

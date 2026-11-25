@@ -8,19 +8,20 @@
 
 <<<INCLUDE _constraint_check>>>
 
-Note: this skill refers to "lead" — in forge usage, "lead" = the orchestrator in pane 1.
+Note: this skill refers to "lead" — in forge usage, "lead" = the orchestrator in pane 0.
 
 Follow adversarial-verify skill at
-~/.claude/skills/adversarial-verify/SKILL.md
+{worker_skill}
 Slug: {slug}
 Project config: .claude/forge-project.yml
 Manifest: .dev/qa/{slug}/manifest.yaml
 
 Write `.dev/qa/{slug}/verification-report.yaml`.
 
-CONFIDENCE: HIGH/MEDIUM/LOW
-BLOCKING_ITEMS: N
-NOT_COVERED: <one line per axis / surface / entry path you did NOT exercise, or NONE with a justification>
+Preserve the skill's YAML report schema, including verdict, summary counts,
+finding_results and check_results. Record unexercised required checks as such,
+never as passes. Do not append free-form confidence lines to the YAML; the
+orchestrator's digest derives confidence and blockers from this evidence.
 
 When complete:
   ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet \

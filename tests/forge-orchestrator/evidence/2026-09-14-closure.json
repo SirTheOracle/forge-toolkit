@@ -1,0 +1,476 @@
+{
+  "schema": "forge-orchestrator-p1-measurements/1",
+  "date": "2026-09-14",
+  "p1_status": "INVESTIGATION_COMPLETE_WITH_LIMITATIONS",
+  "native_acceptance": "PARTIAL: individual measurements only; no all-green admission result",
+  "provider_admitted": false,
+  "decision": "Codex native orchestration is feasible. Continue P2-P6 implementation with explicit protected loading and measured native children; no provider selector shipped by P1.",
+  "matrix": "tests/forge-orchestrator/evidence/p1-closeout.md",
+  "prior_indices": [
+    "2026-09-14.json",
+    "2026-09-14-runtime.json",
+    "2026-09-14-workflow.json"
+  ],
+  "package_files": 127,
+  "runtime_union": 2097,
+  "standalone_canaries": 145,
+  "nested_pointer": {
+    "baseline": "FAIL: actual nested .git write-open allowed; unchanged",
+    "candidate": "PASS: native exact-pointer profile denies 2097 opens",
+    "repeatable_harness": "native-worker-82327da10c40edeb/report.json; PASS; exact command traced",
+    "read_only_glob": "BLOCKED: CLI rejects",
+    "production_admitted": false,
+    "remaining": "Future pointers, rename/unlink and dependency alias replacement unqualified; P2/P3 fail closed until qualified"
+  },
+  "native_hosts": {
+    "codex": {
+      "version": "0.153.4",
+      "model": "gpt-6-astra",
+      "policy": "workspace-write; network restricted; on-request; invocation-only exact-hash hooks",
+      "identity": "MATCH"
+    },
+    "claude": {
+      "version": "2.1.272",
+      "model": "claude-opus-5[1m]",
+      "policy": "default/manual; native Agent/Read/SendMessage; command approval one invocation at a time",
+      "identity": "MATCH"
+    }
+  },
+  "native_children": {
+    "codex": "Native fork_turns:none, A/B follow-up/join and C observed; opaque message plaintext NOT_ATTESTED. Shared dummy-token readability; seven protected write-opens denied without escalation.",
+    "claude": "Exact disjoint Agent input and A/B follow-up traced; C prompt Add 11 and 17 returns 28. Exact path-only digest child reads once. Shared tmux identity and dummy-token readability; seven protected write-opens allowed after one-time command approval. No bytes changed."
+  },
+  "discovery": {
+    "explicit_entry": "explicit-load-tool-traced for both providers",
+    "claude_lifecycle": "Fresh read after resume, compaction and separate fresh-session restart",
+    "changed_global": "Codex native skills/list observes metadata refresh; authenticated invocation NOT_RUN for both credential-free homes",
+    "automatic_precedence": "NOT_CERTIFIED; Claude slash entry unavailable in isolated settings profile; explicit pinned read passes changed local decoys"
+  },
+  "hooks": {
+    "native_events": true,
+    "worker_stop_preserves_host": true,
+    "codex_worker_denials": 7,
+    "adapter_permission_output": "7 genuine PermissionRequest results: exit 0, empty stdout/stderr",
+    "host_provider_field": "MISSING in legacy envelope; native provider observed independently; P4 implementation required",
+    "attention_projection": "Event-file/adapter proof only; copied watch trigger disabled",
+    "codex_compatibility_label": "never approvals appears as bypassPermissions in hooks; restricted native permission profile plus denied writes attest actual containment",
+    "global_hook_changes": "No global trust edits; exact reviewed session hashes only; ambient hook explicitly disabled"
+  },
+  "remaining_implementation": [
+    "P2: provider/model selection, protected profile authority, revision/session binding and unqualified-layout refusal",
+    "P3: reproducible runtime/dependency closure, explicit loading, canonical skill/native-child adaptation and digest inventory",
+    "P4/P4b: provider-aware attention and integrated attended preview",
+    "P5/P6: complete workflow/fallback parity and new-session rollout",
+    "Cross-root answer callback cleanup warning retained from workflow packet"
+  ],
+  "unverified_assertions": [
+    "Opaque Codex message bodies cannot attest exact plaintext disjoint inputs or path-only message body",
+    "Authenticated changed-global discovery unsupported by the credential-free experiment; automatic entry not qualified",
+    "P2 profile-management verbs do not exist; verb-level authority NOT_RUN",
+    "Production nested-pointer/alias mutation and arbitrary helper closure not qualified"
+  ],
+  "tests": {
+    "harness": {
+      "passed": 54,
+      "failed": 0,
+      "command": "bash tests/forge-orchestrator/run.sh"
+    },
+    "shell_syntax": "PASS",
+    "codex_policy_smoke": "PASS; live gates skipped",
+    "command_center": "Not rerun; previous 238 PASS / 39 FAIL matched immutable baseline",
+    "full_aggregate": "NOT_RUN"
+  },
+  "cleanup": {
+    "native_clients_exited": true,
+    "owned_server_stopped": true,
+    "broker_started": false,
+    "lock_acquired": false,
+    "production_sessions_touched": false
+  },
+  "native_summary": {
+    "claude_digest": {
+      "agent_id": "abf0c240db1b336ba",
+      "artifact": {
+        "mode": 420,
+        "path": "/Users/sirdrafton/sirtheoracle/automation/forge-toolkit/.forge-worktrees/forge-toolkit-forgetoolB/.dev/forge-p1/closure-20260914-01/workspaces/linked/.dev/p1-digest-only.txt",
+        "resolved_path": "/Users/sirdrafton/sirtheoracle/automation/forge-toolkit/.forge-worktrees/forge-toolkit-forgetoolB/.dev/forge-p1/closure-20260914-01/workspaces/linked/.dev/p1-digest-only.txt",
+        "sha256": "d8e9f242243cfcea133aebdc16cfb9b027da98244cc4917231f8cd8f7db37a9b"
+      },
+      "exact_path_only_agent_input": true,
+      "one_child_read": true,
+      "parent_artifact_reads": 0
+    },
+    "claude_loading_transitions": [
+      {
+        "first_protected_read_ns": null,
+        "session_id": "552e63e5-218a-4b6b-a37a-b05ac1de6ebd",
+        "source": "startup",
+        "start_time_ns": 1789437690877949000
+      },
+      {
+        "first_protected_read_ns": 1789437786921722000,
+        "session_id": "9e4d0e76-a34b-4a6c-a2ac-8b2177732718",
+        "source": "startup",
+        "start_time_ns": 1789437780875320000
+      },
+      {
+        "first_protected_read_ns": 1789438364546081000,
+        "session_id": "9e4d0e76-a34b-4a6c-a2ac-8b2177732718",
+        "source": "resume",
+        "start_time_ns": 1789438310471340000
+      },
+      {
+        "first_protected_read_ns": 1789438980063876000,
+        "session_id": "9e4d0e76-a34b-4a6c-a2ac-8b2177732718",
+        "source": "compact",
+        "start_time_ns": 1789438819950771000
+      },
+      {
+        "first_protected_read_ns": 1789439018393220000,
+        "session_id": "2dae7d48-1343-4277-b4d9-2ed5c1c1841f",
+        "source": "startup",
+        "start_time_ns": 1789439010561257000
+      }
+    ],
+    "claude_protected_reads": 6,
+    "hook_counts": {
+      "claude": {
+        "Notification": 9,
+        "PermissionRequest": 5,
+        "PostToolUse": 37,
+        "PreCompact": 1,
+        "PreToolUse": 39,
+        "SessionStart": 5,
+        "Stop": 17,
+        "SubagentStart": 7,
+        "SubagentStop": 27,
+        "UserPromptSubmit": 21
+      },
+      "claude-worker": {
+        "Stop": 1,
+        "UserPromptSubmit": 1
+      },
+      "codex": {
+        "PermissionRequest": 2,
+        "PostToolUse": 26,
+        "PreToolUse": 27,
+        "SessionStart": 1,
+        "Stop": 6,
+        "SubagentStart": 4,
+        "SubagentStop": 8,
+        "UserPromptSubmit": 7
+      },
+      "codex-worker": {
+        "PostToolUse": 1,
+        "PreToolUse": 1,
+        "SessionStart": 2,
+        "Stop": 2,
+        "UserPromptSubmit": 2
+      }
+    },
+    "notes": [
+      "The first unauthenticated Claude startup has no protected read and is not a pass.",
+      "Codex hooks call never-approval mode bypassPermissions; real turn_context and write denial, not that label, attest sandbox policy.",
+      "Native messages remain opaque. No hidden reasoning or encrypted message body is exported."
+    ],
+    "package": {
+      "path": "/Users/sirdrafton/sirtheoracle/automation/forge-toolkit/.forge-worktrees/forge-toolkit-forgetoolB/.dev/forge-p1/closure-20260914-01/package.json",
+      "sha256": "8c3bce40315084255aa95ccbccf592776cd77b60f1b31bb3e864b45aaf8e56c3"
+    },
+    "permission_hook_results": {
+      "claude": [
+        {
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        {
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        {
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        {
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        {
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        }
+      ],
+      "claude-worker": [],
+      "codex": [
+        {
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        {
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        }
+      ],
+      "codex-worker": []
+    },
+    "schema": "forge-p1-native-closure/1",
+    "worker_hook_audit": {
+      "exact_post_tool_command": true,
+      "files": 7,
+      "pass": true
+    }
+  },
+  "evidence": [
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/package.json",
+      "sha256": "8c3bce40315084255aa95ccbccf592776cd77b60f1b31bb3e864b45aaf8e56c3"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/packet.json",
+      "sha256": "3aba9c2a52b086a7644274d7dfc2074faeef1ce4b6d32a7a1e869ad6bee56563"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/controller.py",
+      "sha256": "cbefe519faaf7e0845d46bc9565e1ecf306437db6d869c6af2c815ddbdfa514f"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/collect.py",
+      "sha256": "dc0210e807a4da10958687a036c70523c0abe591d4ebdfcce92aca668957cddd"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/native-worker-088014595e034631/report.json",
+      "sha256": "7cdaf5596e18eb7dbf7ac6f05eea98cf83ede53cf2fe2d403717cb84003b6cc4"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/native-worker-82327da10c40edeb/report.json",
+      "sha256": "3c5792925f35375d0cdfa9e8a75da7fcee6b63ef58bbd4b925b01aab0cb85567"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/package-access-29f1107e17bacde8/report.json",
+      "sha256": "a7e6a3ab1419bed771bf58a7d204501e69c70d8f71915ed2aa78a0f193ae0625"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/run-eb5115e351d7846c/report.json",
+      "sha256": "7452fa7b51b6a2fe2e11d30742a18a82c7d94cb32b29c0cdae75fc7ed59490f3"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/runtime-audit-e1648cce4ce0455b/report.json",
+      "sha256": "216f748dffdef55d3fff38879728988a88e5e57e2ed0ea261848caaf4aade4a4"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/runtime-audit-e1648cce4ce0455b/dependencies.json",
+      "sha256": "411a3edc45c66ba5debdb6c0f073e590245cc7bbce141a45e1d4fa9e697999d0"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-child-policy-approved.json",
+      "sha256": "3bb196feb1875801a3a1e761c8b554cbb3288aaf7a771673885f2c24237a50b5"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-child-policy-command.json",
+      "sha256": "129444a69f457c355dc85bef67e1a082ac07cc687d60fb29bdac986ebe75eb41"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-decoy-ONE.json",
+      "sha256": "d4b43e96739e1dc77dbd782cbde2ce5d48bb53c0747fcc6a0fe244e385183397"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-decoy-TWO.json",
+      "sha256": "5b87ab3e8f170be98307a33b1b84517f51b4168ba5e01395b6748edf6dd534e6"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-digest-input.json",
+      "sha256": "600da4f6c12e783208f81ba9df416ac1fd7f3b7f50964dd7a064e89ad4466272"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-hook-input.json",
+      "sha256": "a36b1df850810b4e5fa9f57157a1efde9c1519efd54978727ac7d63f43b49dea"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-identity-approved.json",
+      "sha256": "34aa994547bd62a84a2bfb7f50fa3e72ecef120bd1eb6ce48d85ca5b0c9e1e53"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-identity-command.json",
+      "sha256": "a4b3d9a336b6679cb75f4ff661ea5990e169dd1eaacb6d98e979924df192e7c1"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-native-launch-auth.json",
+      "sha256": "0780d39cca8146fb04872d17188b37cd4ac5eff1bd3b5987a71008744a1f1d05"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-native-launch.json",
+      "sha256": "68165a90799aa4dd18077854329a2fd435490c21d0c5b3192bc654eedfe70d32"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-native-restart.json",
+      "sha256": "4a46d340e82756bdb93c6506e0df78857181d0d13bb84ac931d03573851904b8"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-native-resume.json",
+      "sha256": "a99e73afe2535e4907931ff5ad7c5f83cb90e82e8b7440a5dbd5568b508f5388"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-worker-hook-input.json",
+      "sha256": "41ba47e1b2bde9052d8cc82f0ed19b678ce093072dc6d4f41f8a88cfb9c2a64c"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/claude-worker-native-launch.json",
+      "sha256": "6760ae5eddbc3ff8606a35b4faf07d0f72fbe22d55af8b39c024fb30c5b43f2d"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/cleanup.json",
+      "sha256": "e342cd2957f6fc28f0e137259e571f9a379caf250694dcd9bb7c12a05fbb502e"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-child-policy-command.json",
+      "sha256": "5b69ecba8d8b74d612dd19586ac610d0fc3278e5abc084748f730aba20f9edc2"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-hook-input.json",
+      "sha256": "1b523c4908778c5c2129c8e287211f6aa8023bb9191c871ccbe1c7138de8a408"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-hooks-reviewed.json",
+      "sha256": "5e6e113f4aee444079146afb228da22ab97841bb683f28f1a1191fd89f5042a8"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-hooks-untrusted-map.json",
+      "sha256": "d4d678ee0a1881ce5c03a8de15e5c4c434b714a723eecea96fe6a771f5aced69"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-hooks-untrusted.json",
+      "sha256": "aff675c386e744c49cdae5bc3e4901362d4133cb42304923102bc3cd6caca4be"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-identity-approved.json",
+      "sha256": "7f8c48aa9745d5b82d7980660080cd4a3284b327d2e08095f7d69f235c9bcf01"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-identity-command.json",
+      "sha256": "4bdc0d63e87ac9701d4d58769854f4587d44275c744bfde6aff5c6aecdea1caa"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-native-launch.json",
+      "sha256": "f7c633cf76114ab1685e4528b2c8ff7de4ed9fe404d73aedaf1d3ccdcd12b6f0"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-worker-hook-audit-launch.json",
+      "sha256": "e71517db9d3a818cf49efe1c416b652ca7bd74be6d9ee4020d2b66896c59c3b5"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-worker-hook-input.json",
+      "sha256": "6edc6101910081800ea005ce41e16d33bec3545412ff3b14428f6a29c13ef431"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/codex-worker-native-launch.json",
+      "sha256": "4cad94f25416378db0238b9298e8536f9348acd5ad7c84575d2112b50ee92897"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/discovery-global-and-local.json",
+      "sha256": "9727deba55243215a4597bd970d78494232e4b4fb9dd46f0027d4899c64c946e"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/discovery-global-changed.json",
+      "sha256": "63609a586cd169e56465e0356e6cd637509271ce9165ad8140e498408235d4cc"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/discovery-local-removed.json",
+      "sha256": "001ee6df9d1b92c1630cd5d16cd497e0fe0147c8a8035767578098f518df9014"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/fixture.json",
+      "sha256": "0f04cb1971549304a284885fc88f97084c01ad3f32e87efd74f447c931952716"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/hook-config-audit-sorted.json",
+      "sha256": "1813cfdf4a17e81f520f1685852b47b1b90addd84e4188d00f6fdf203f97c87f"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/hook-config-audit.json",
+      "sha256": "eed990cd0108716e2cbd7aed87ea9b754e6ef0999d5a526b53f3b05b180de945"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/hook-config-inputs-sorted.json",
+      "sha256": "8eac1981fddc411bb5502279ba7d7f2df82163f44ff4ba6777d4b3d8e6d3c74b"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/hook-config-inputs.json",
+      "sha256": "8eac1981fddc411bb5502279ba7d7f2df82163f44ff4ba6777d4b3d8e6d3c74b"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/isolated-discovery-auth.json",
+      "sha256": "c6bcc99f159a1a6b65a8126411bd15e2aefd895479ab0ee80b3d4e7226fc2c13"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/key-review-1789437690713142000.json",
+      "sha256": "2153210439a4d1bc8e0587cabc968be3aedd527b03b9d4fcaa619f0e1caaa4b1"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/key-review-1789437730769078000.json",
+      "sha256": "735e82405551fa6cc4a668c2fdab24aae5789da6ae4f1226e1694253b71c24d0"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/key-review-1789437856950161000.json",
+      "sha256": "b495ac0cdfacb39afb5fee8deaf1c2b6db6e105dd807e9feb2b2632f020017c4"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/key-review-1789438116997247000.json",
+      "sha256": "c33a05662f8d194116ea715b1aef15b59e61f6218c6db4f4845dda4eec58d3ee"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/key-review-1789438162634345000.json",
+      "sha256": "dd6002842364bca0fcfcb53700ff0de9fc57c5a353df3a04ede8bdca698efae7"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/key-review-1789438488089167000.json",
+      "sha256": "842c35b0c7b4d48e37730b33685702eb8cfded538f88e231fefc94afad7bd337"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/native-hooks-final.json",
+      "sha256": "3482c91b29a7748033a295d02f95e304036b60d25b17dc6ad697f6ce9e87abed"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/native-hooks-reviewed.json",
+      "sha256": "245c3ec604a7d7698aadf398b9fcef21999d5562146cd24554c583372b1e37de"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/native-nested-baseline-profile.json",
+      "sha256": "76db55ca11f23f32f151215785e70518094e09a5f1a3d7e4691de68e953ec5ba"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/native-nested-profile.json",
+      "sha256": "d9b264698365d13fad3a743f4cc4cd8510e770b570a8219e0d6abfcee2e0b950"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/native-worker-hook-isolation.json",
+      "sha256": "3fbcba7f72288779712b46272e410eeafe55f95ac102dfdbf0213cc752164b5e"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/nested-profile-candidate.json",
+      "sha256": "39b8a0b182705eae80c13ee8de6d11b51f6710901f6c35c637c7e0ced837a0d0"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/host-e6363a3a/nested-profile-exact-candidate.json",
+      "sha256": "ef435d8a9db459dde3ff9860a05b986a30cbccde35a948877b2c4767fc1a268b"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/workspaces/primary/codex-child-policy.json",
+      "sha256": "759084ef675d8da6e2d18f30afc93d823549ea4d3647e9c9da27d70663369ae3"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/workspaces/linked/claude-child-policy.json",
+      "sha256": "562ed5d5ce34cf95d96b6ad5e34a57f1c69dea2f0077e70dc5ce86009c00d651"
+    },
+    {
+      "path": ".dev/forge-p1/closure-20260914-01/workspaces/primary/codex-worker-hook-audit.json",
+      "sha256": "759084ef675d8da6e2d18f30afc93d823549ea4d3647e9c9da27d70663369ae3"
+    }
+  ]
+}

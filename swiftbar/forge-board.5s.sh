@@ -132,7 +132,8 @@ if acked:
 for r in orch[:3]:
     who = esc(r.get("session") or r.get("label") or "")
     msg = esc(r.get("msg") or "working")
-    print(f"▶ {who} · {msg} | color=blue")
+    provider = esc(r.get("provider") or "unknown")
+    print(f"▶ {who} · {provider} · {msg} | color=blue")
 if len(orch) > 3:
     print(f"+{len(orch)-3} more orchestrator session(s) working | color=gray")
 for r in parked[:3]:
@@ -147,7 +148,8 @@ if len(parked) > 3:
 for r in ctx[:4]:
     who = esc(r.get("session") or r.get("label") or "?")
     w = esc(r.get("worker") or "?")
-    tail = " · pane 0 — handoff, never a reset" if r.get("role") == "orchestrator" else ""
+    tail = (f" · {esc(r.get('provider') or 'unknown')} · pane 0 — handoff, never a reset"
+            if r.get("role") == "orchestrator" else "")
     print(f'◐ {who}/{w} · {r.get("headroom")}% headroom{tail} | color=orange')
 if len(ctx) > 4:
     print(f"+{len(ctx) - 4} more low-context · forge board | color=gray")

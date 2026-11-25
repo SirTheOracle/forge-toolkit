@@ -3,8 +3,10 @@
 # (hermetic FORGE_CC_PANE_META branches + a real-tmux structural role-gate test).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-FORGE="$ROOT/bin/forge"; HOOK="$ROOT/bin/forge-cc-hook"
+# Optional immutable baseline copy for before/after regression comparisons.
+FORGE="${FORGE_CC_FORGE_BIN:-$ROOT/bin/forge}"; HOOK="$ROOT/bin/forge-cc-hook"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fc.XXXXXX")"; SESS="fctest-$$"
+WORK="$(cd "$WORK" && pwd -P)"
 trap 'tmux kill-session -t "$SESS" 2>/dev/null; rm -rf "$WORK"' EXIT
 PASS=0; FAIL=0
 export FORGE_WATCH_TRIGGER=0     # Step 6: no test spawns a background forge-watch check
@@ -39,6 +41,10 @@ new_root(){
   done
 }
 meta(){ printf '%s\t%s\t%s\t%s' "$1" "forge-x" "$2" "${3:-5}"; }   # pane_index, session, path, window_panes
+
+# C1 web CLI coverage is independent of later web/backend and frontend files.
+python3 "$ROOT/tests/forge-bridge/p0-tests.py" WebCCContractTests \
+  && ok "C1 web dispatch/answer contract" || bad "C1 web dispatch/answer contract"
 
 echo "── dispatch: inline schema + marker (hermetic) ──"
 new_root d1
@@ -920,7 +926,7 @@ new_root sb1
 BRIDGE_LOG="$WORK/blsb"; : > "$BRIDGE_LOG"
 FORGE_TMUX_LIST="$TSV" FORGE_BRIDGE_BIN="$STUB" BRIDGE_LOG="$BRIDGE_LOG" \
   "$FORGE" dispatch @forge-x "rootbind probe" --allow-api-billing >/dev/null 2>&1
-grep -q -- 'send --target-session forge-x --cross-session claude' "$BRIDGE_LOG" \
+grep -q -- 'send --target-session forge-x --cross-session -- claude' "$BRIDGE_LOG" \
   && ok "seat dispatch passes --target-session/--cross-session to send" \
   || bad "seat dispatch argv wrong: $(cat "$BRIDGE_LOG")"
 grep -q 'TMUX_SESSION' "$BRIDGE_LOG" && bad "seat dispatch still leans on TMUX_SESSION" || ok "no TMUX_SESSION in the seat send path"
@@ -946,10 +952,16 @@ if command -v tmux >/dev/null 2>&1; then
   mkdir -p "$R/.claude" "$R/.dev/proposals/p-rr" "$R/.dev/forge-tmp/callbacks"
   printf 'name: rr1\n' > "$R/.claude/forge-project.yml"
   tmux new-session -d -s "$RELSESS" -x 200 -y 50 -c "$R"
+  tmux set-environment -t "$RELSESS" FORGE_LAYOUT 2
   RELINC="$(tmux display-message -p -t "$RELSESS" '#{session_created}')"
   printf 'entries:\n  - timestamp: "2026-07-11T00:00:01Z"\n    stage: coding\n    to: codex-a\n    session: %s\n    incarnation: %s\n    response: null\n' "$RELSESS" "$RELINC" > "$R/.dev/proposals/p-rr/forge-log.yml"
   _i=0; while [ "$_i" -lt 4 ]; do tmux split-window -d -t "$RELSESS:0" -c "$R"; tmux select-layout -t "$RELSESS:0" tiled >/dev/null 2>&1; _i=$((_i+1)); done
-  env -u TMUX -u TMUX_PANE FORGE_WATCH_TRIGGER=0 TMUX_SESSION="$RELSESS" \
+  _i=0
+  for _worker in claude claude-opus claude-sonnet codex-a codex-b; do
+    tmux set-option -p -t "$RELSESS:0.$_i" @forge-worker "$_worker"
+    _i=$((_i+1))
+  done
+  env -u TMUX -u TMUX_PANE FORGE_WATCH_TRIGGER=0 FORGE_BRIDGE_BIN="$ROOT/bin/forge-bridge" TMUX_SESSION="$RELSESS" \
     "$FORGE" ask --slug p-rr --stage coding --worker codex-a "report-only relay?" --root "$R" >/dev/null 2>&1
   RR_CB="$R/.dev/forge-tmp/callbacks/p-rr-coding.${RELSESS}.${RELINC}.callback"
   RR_OLD_CB="$R/.dev/forge-tmp/callbacks/p-rr-coding.${RELSESS}.callback"
@@ -969,11 +981,10 @@ else
   echo "  (skip T-SEAT-RELAY-REPORTONLY: no tmux)"
 fi
 
-echo "── T-LOCKSTEP: identity rule in lockstep across repo + installed prose copies ──"
-for f in "$HOME/.claude/skills/forge-orchestrator/SKILL.md" \
-         "$HOME/.claude/commands/forge.md" "$HOME/.claude/agents/forge-orchestrator.md" \
-         "$ROOT/skills/forge-orchestrator/SKILL.md" \
-         "$ROOT/commands/forge.md" "$ROOT/agents/forge-orchestrator.md"; do
+echo "── T-LOCKSTEP: canonical identity rule and native loader ──"
+grep -q '~/.claude/skills/forge-orchestrator/SKILL.md' "$ROOT/agents/forge-orchestrator.md" \
+  && ok "agent stub loads the canonical protocol" || bad "agent stub missing canonical loader"
+for f in "$ROOT/skills/forge-orchestrator/SKILL.md" "$ROOT/commands/forge.md"; do
   [ -f "$f" ] || continue
   grep -q 'export TMUX_SESSION' "$f" && bad "export TMUX_SESSION in $f" || ok "no export TMUX_SESSION: $(basename "$f")"
   grep -q 'forge-bridge identity' "$f" && ok "references forge-bridge identity: $(basename "$f")" || bad "missing forge-bridge identity: $f"
@@ -1073,8 +1084,7 @@ for et in RESET HYGIENE_DECISION HYGIENE_ABANDON HYGIENE_BYPASSED RESET_UNAVAILA
   grep -qE "(\||^| )$et(\||\)| )" "$BRIDGE_BIN" \
     && ok "emit whitelist declares $et" || bad "emit whitelist missing $et"
 done
-for f in "$ROOT/skills/forge-orchestrator/SKILL.md" "$ROOT/agents/forge-orchestrator.md" \
-         "$HOME/.claude/skills/forge-orchestrator/SKILL.md" "$HOME/.claude/agents/forge-orchestrator.md"; do
+for f in "$ROOT/skills/forge-orchestrator/SKILL.md"; do
   [ -f "$f" ] || continue
   for needle in "bridge owns context" "FORGE_WORKER_MIN_HEADROOM" "verify-decision" "finalize"; do
     grep -q "$needle" "$f" && ok "T-HYG-LOCKSTEP has '$needle': $(basename "$f")" \
@@ -1098,8 +1108,8 @@ for f in "$ROOT/skills/forge-orchestrator/SKILL.md" "$ROOT/agents/forge-orchestr
     'Pane 0: `claude --model claude-opus-5` (NO acceptEdits' \
     'Pane 1: `claude --model claude-opus-5 --permission-mode acceptEdits`' \
     'Pane 2: `claude --model claude-sonnet-5 --permission-mode acceptEdits`' \
-    'Pane 3: `codex -m gpt-5.5 -c model_reasoning_effort=xhigh' \
-    'Pane 4: `codex -m gpt-5.5 -c model_reasoning_effort=medium' \
+    'Pane 3: `codex -m gpt-5.6-sol -c model_reasoning_effort=high' \
+    'Pane 4: `codex -m gpt-5.6-sol -c model_reasoning_effort=medium' \
     "Batch planning (two or more tasks)" \
     "in \`observe\` mode, and on the orchestrator (pane 0)." \
     "FORGE_ORCHESTRATOR_ALERT_HEADROOM"; do
@@ -1119,7 +1129,9 @@ done
 
 echo "── T-HYG-INSTALL: clean-install seeds fail-closed reset-capability ──"
 IH="$(mktemp -d)"
-( cd "$ROOT" && HOME="$IH" bash install.sh ) >/dev/null 2>&1 || true
+IH="$(cd "$IH" && pwd -P)"
+( cd "$ROOT" && HOME="$IH" FORGE_CONFIG_DIR="$IH/.config/forge" \
+    FORGE_RESET_CAPABILITY_FILE="$IH/.config/forge/reset-capability.yml" bash install.sh ) >/dev/null 2>&1 || true
 if [ -f "$IH/.config/forge/reset-capability.yml" ] \
    && grep -q 'proven: false' "$IH/.config/forge/reset-capability.yml" \
    && ! grep -q 'proven: true' "$IH/.config/forge/reset-capability.yml"; then

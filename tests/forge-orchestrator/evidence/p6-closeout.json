@@ -1,0 +1,67 @@
+{
+  "schema": "forge-orchestrator-local-closeout/1",
+  "date": "2026-09-23",
+  "scope": "local implementation and scoped change verification",
+  "admission_evidence": false,
+  "native_qualification": "not-run",
+  "production_rollout": "not-enabled",
+  "full_workflow_parity": "not-established",
+  "starting_head": "b1c4b0e50c17cd35eff8fed1115a9762000b5197",
+  "broad_run": {
+    "report": ".dev/p6-acceptance-01/report.json",
+    "sha256": "77580f0e33a1531fb45090bac4f898830dc271f63c715294e728f3c8ff2b2ad3",
+    "source_sha256": "b05176257715da070bd68b012aae389258c4f1ddb19cafc0031719f38b764f80",
+    "source_stable": true,
+    "aggregate_status": "fail",
+    "accepted_suites": [
+      "forge-orchestrator", "forge-bridge", "forge-broker",
+      "forge-fix-runner", "forge-start", "forge-recover"
+    ],
+    "exceptions": {
+      "forge-infra-lock": "149 passes; missing ignored private generated document caused one failure",
+      "adversarial-skills": "exit-zero result invalid: Bash 3.2 skipped two Python blocks"
+    }
+  },
+  "readiness_and_lock_checkpoint": "9e2f7df249294cd7727438548755161376726587e68ce3da9ed96c7ad2cd8f79",
+  "final_source_sha256": "b934f47927a4734ed982d69ad6fe7e7510e1722eae115ffd7d235fd2b44b0eef",
+  "all_suites_rerun_on_final_source": false,
+  "post_broad_changes": [
+    "Read-only readiness recognizes independently proven terminal boundaries",
+    "Readiness guide, isolated fixtures and regression tests",
+    "Infra-lock harness checks the private generated reference only when present",
+    "Skill harness avoids nested heredocs and propagates Python failures"
+  ],
+  "focused_checks": [
+    {
+      "command": "python3 -m unittest discover -s tests/forge-orchestrator -p test_host_launch.py",
+      "status": "pass", "tests": 24,
+      "log": ".dev/p6-host-final.log",
+      "sha256": "e6d8c65d8fb06215b09dc2678f10032ad34969f694d599f68acbc17afbdeab75"
+    },
+    {
+      "command": "bash tests/forge-infra-lock/run.sh",
+      "status": "pass", "checks": 149,
+      "not_checked": "optional private generated technical reference is absent",
+      "log": ".dev/p6-lock-final.log",
+      "sha256": "74a6828f0327bd4e872e805253a8a6e39138e92af6d63262df1b03127a365fc1"
+    },
+    {
+      "command": "/bin/bash tests/adversarial-skills/run.sh",
+      "status": "pass", "checks": 66,
+      "log": ".dev/p6-skills-final.log",
+      "sha256": "23d463ad14144e0a767b02541dc14037fde256fd6640ba7b235afb7830b77634"
+    },
+    {
+      "command": "bash tests/adversarial-skills/run.sh",
+      "status": "pass", "checks": 66,
+      "log": ".dev/p6-skills-bash5.log",
+      "sha256": "23d463ad14144e0a767b02541dc14037fde256fd6640ba7b235afb7830b77634"
+    },
+    {
+      "command": "python3 -m unittest discover -s tests/forge-orchestrator -p test_rollout.py",
+      "status": "pass", "tests": 8,
+      "log": ".dev/p6-rollout-final.log",
+      "sha256": "198254c3a4c90e662d2c584c50b66bc3d75050e7b00c84cbadf346bf68bc4900"
+    }
+  ]
+}

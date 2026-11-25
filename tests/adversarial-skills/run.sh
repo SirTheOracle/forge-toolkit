@@ -24,6 +24,19 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PASS=0; FAIL=0
 ok(){  PASS=$((PASS+1)); printf '  ok: %s\n' "$1"; }
 bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
+REPORT="$(mktemp)" || exit 1
+trap 'rm -f "$REPORT"' EXIT
+read_report(){
+  local rc="$1" line
+  while IFS= read -r line; do
+    case "$line" in
+      OK\|*)  ok  "${line#OK|}"  ;;
+      BAD\|*) bad "${line#BAD|}" ;;
+      *)      [ -n "$line" ] && printf '%s\n' "$line" ;;
+    esac
+  done < "$REPORT"
+  [ "$rc" = 0 ] || bad "Python checks failed (exit $rc)"
+}
 
 echo "== 1. The four watchdog rules, on all eight prose files =="
 # Every assertion runs over WHITESPACE-NORMALISED text. These are markdown paragraphs
@@ -35,14 +48,7 @@ echo "== 1. The four watchdog rules, on all eight prose files =="
 # distinct-path idea as free-floating prose while its retry rows said only "Re-spawn
 # C" — a lead reading the recovery table saw nothing about paths. Presence anywhere in
 # the file is NOT the property under test; presence in the recovery region is.
-while IFS= read -r line; do
-  case "$line" in
-    OK\|*)  ok  "${line#OK|}"  ;;
-    BAD\|*) bad "${line#BAD|}" ;;
-    *)      [ -n "$line" ] && printf '%s\n' "$line" ;;
-  esac
-done <<EOF
-$(python3 - "$ROOT" <<'PY'
+python3 - "$ROOT" > "$REPORT" <<'PY'
 import pathlib, re, sys
 
 root = pathlib.Path(sys.argv[1])
@@ -188,8 +194,7 @@ else:
 
 sys.exit(1 if failures else 0)
 PY
-)
-EOF
+read_report "$?"
 
 echo "== 2. forge-coder coding-stage runaway guards (issue #52), on both copies =="
 # WHY: a dispatched coding worker burned 1h25m on one turn — no commit, no callback,
@@ -206,14 +211,7 @@ echo "== 2. forge-coder coding-stage runaway guards (issue #52), on both copies 
 # what is complete and continue" — mechanically impossible, because the broker binds one
 # commit per delivery and a second attempt fails HEAD_MOVED, leaving the delivery open
 # and blocking every later dispatch to that pane. T7 fails against that wording.
-while IFS= read -r line; do
-  case "$line" in
-    OK\|*)  ok  "${line#OK|}"  ;;
-    BAD\|*) bad "${line#BAD|}" ;;
-    *)      [ -n "$line" ] && printf '%s\n' "$line" ;;
-  esac
-done <<EOF
-$(python3 - "$ROOT" <<'PY'
+python3 - "$ROOT" > "$REPORT" <<'PY'
 import pathlib, re, sys
 
 root = pathlib.Path(sys.argv[1])
@@ -395,19 +393,11 @@ if len(sections) == len(COPIES):
 
 sys.exit(1 if failures else 0)
 PY
-)
-EOF
+read_report "$?"
 
 echo "== 3. Operator-constraint carriage (#77b) =="
-while IFS= read -r line; do
-  case "$line" in
-    OK\|*)  ok  "${line#OK|}"  ;;
-    BAD\|*) bad "${line#BAD|}" ;;
-    *)      [ -n "$line" ] && printf '%s\n' "$line" ;;
-  esac
-done <<EOF
-$(FORGE_TEST_CLAUDE_SKILLS_DIR="${FORGE_TEST_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}" \
-  python3 - "$ROOT" <<'PY'
+FORGE_TEST_CLAUDE_SKILLS_DIR="${FORGE_TEST_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}" \
+  python3 - "$ROOT" > "$REPORT" <<'PY'
 import os, pathlib, re, subprocess, sys
 
 root = pathlib.Path(sys.argv[1])
@@ -553,13 +543,8 @@ else:
 # The EXEMPT set FAILS SAFE: a stage nobody thinks about defaults to CARRYING the ledger
 # (noise), never to omitting it (silence). Curation is only fatal when its default is
 # silence. Each entry needs a WRITTEN REASON here, and this is the only place one lives.
-EXEMPT = {
-    "proposal": "orchestrator-local and NOT dispatchable — cmd_dispatch refuses "
-                "--stage proposal outright, so this template renders no includes and an "
-                "include here would never resolve. The frame-challenge clause reaches "
-                "that stage through skills/adversarial-proposal/SKILL.md and the "
-                "orchestrator's Spec Boundary section instead.",
-}
+# P3 local-render carries the same ledger into native proposal children.
+EXEMPT = {}
 miss = []
 for p in stage_prompts:
     need = {"_operator_constraints", "_constraint_check"}
@@ -735,18 +720,26 @@ else:
     ok("T-CC7 PROMPT_NAMES and DIGEST_NAMES both agree with the repo, both ways")
 
 # ---- T-CC8 · NOT_COVERED: on every non-underscore prompt (P43) ------------------------
-nc = [p.name for p in stage_prompts if "NOT_COVERED:" not in p.read_text()]
+nc = [p.name for p in stage_prompts if p.stem != "verify" and "NOT_COVERED:" not in p.read_text()]
 if nc:
     bad("T-CC8 these stage prompts do not require a NOT_COVERED: line: " + ", ".join(sorted(nc)))
 else:
-    ok("T-CC8 all %d non-underscore prompts require a NOT_COVERED: line" % len(stage_prompts))
+    ok("T-CC8 all %d non-YAML stage prompts require a NOT_COVERED: line" % (len(stage_prompts) - 1))
 # and the contract line it rides on
-bi = [p.name for p in stage_prompts if "BLOCKING_ITEMS:" not in p.read_text()]
+bi = [p.name for p in stage_prompts if p.stem != "verify" and "BLOCKING_ITEMS:" not in p.read_text()]
 if bi:
     bad("T-CC8 these stage prompts still have no BLOCKING_ITEMS: line: " + ", ".join(sorted(bi)))
 else:
-    ok("T-CC8 all %d non-underscore prompts carry the BLOCKING_ITEMS: contract line"
-       % len(stage_prompts))
+    ok("T-CC8 all %d non-YAML stage prompts carry the BLOCKING_ITEMS: contract line"
+       % (len(stage_prompts) - 1))
+
+# Verification is structured YAML, not a free-form producer confidence claim.
+verify = (pdir / "verify.txt").read_text()
+vdigest = (root / "digests/verify.txt").read_text()
+if all(token in verify for token in ("finding_results and check_results", "unexercised required checks", "Do not append free-form confidence")) and all(token in vdigest for token in ("CONFIDENCE:", "BLOCKING_ITEMS:")):
+    ok("T-CC8-VERIFY YAML evidence feeds the digest verdict without corrupting the schema")
+else:
+    bad("T-CC8-VERIFY missing structured evidence/digest contract")
 
 # ---- T-CC9 · qa / qa-retry lockstep, SECTION-SCOPED (P44) -----------------------------
 # The two files were byte-identical, which is WHY the build lane's retry stage could not
@@ -787,7 +780,6 @@ else:
 
 sys.exit(1 if failures else 0)
 PY
-)
-EOF
+read_report "$?"
 
 printf '\nPASS: %d\nFAIL: %d\n' "$PASS" "$FAIL"; [ "$FAIL" = 0 ]

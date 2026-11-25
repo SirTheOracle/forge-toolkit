@@ -80,7 +80,7 @@ if [ "${REGEN:-0}" = 1 ]; then cp "$WORK/plain.norm" "$GOLD"; echo "  (golden RE
 [ "$prc" -eq 0 ] && ok "T-START-PLAIN-EXITS-ZERO: plain run exits 0" || bad "plain run exited $prc"
 grep 'send-keys' "$TMLOG" | grep -q 'FORGE_ROLE' && bad "plain launch strings carry FORGE_ROLE (byte drift)" || ok "plain launch strings unstamped"
 CODEX_STATUS_OVERRIDE="forge codex-launch"
-grep -q 'forge codex-launch.*--root.*--session.*--pane 3.*--effort xhigh' "$TMLOG" && ok "Codex A uses centralized attested launch" || bad "Codex A launch contract missing"
+grep -q 'forge codex-launch.*--root.*--session.*--pane 3.*--effort high' "$TMLOG" && ok "Codex A uses centralized attested launch" || bad "Codex A launch contract missing"
 grep -q 'forge codex-launch.*--pane 4.*--effort medium' "$TMLOG" && ok "Codex B uses centralized attested launch" || bad "Codex B launch contract missing"
 for _pane in 3 4; do
   _launch_line=$(grep "send-keys -t forge-1:.$_pane " "$TMLOG")

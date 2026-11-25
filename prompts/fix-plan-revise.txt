@@ -12,7 +12,7 @@ You are executing the 'fix-plan-revise' stage of a forge fix-pipeline.
 
 Slug: {slug}
 
-Follow the adversarial-fix-plan skill at ~/.claude/skills/adversarial-fix-plan/SKILL.md — REVISE MODE.
+Follow the adversarial-fix-plan skill at {worker_skill} — REVISE MODE.
 
 The skill spawns the 3 persistent teammates (Planner A surgical, Planner B robust, Synthesizer C) but in revise mode they DO NOT start from scratch. They:
   Round 1 — A and B each read the existing fix-plan.md AND fix-review.md, then produce a revised proposal that addresses every CRITICAL and MAJOR review issue assigned to their lane (A keeps the surgical bias; B keeps the robust bias). MINOR/ADVISORY items: address if cheap, defer with rationale if not.

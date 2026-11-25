@@ -52,7 +52,7 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 # Resolve the real path of this script so the plist points at the installed
 # location (works whether ~/bin/forge-watch is a symlink or a copy).
-SELF="$( cd "$(dirname "$0")" >/dev/null 2>&1 && pwd )/$(basename "$0")"
+SELF="${FORGE_WATCH_BIN:-$( cd "$(dirname "$0")" >/dev/null 2>&1 && pwd )/$(basename "$0")}"
 
 mkdir -p "$CACHE_DIR" "$CONFIG_DIR" 2>/dev/null || true
 
@@ -412,7 +412,7 @@ def tmux_sessions():
         return m
     try:
         out = subprocess.run(
-            ['tmux', 'list-sessions', '-F', '#{session_name}\t#{session_path}'],
+            ['tmux', '-u', 'list-sessions', '-F', '#{session_name}\t#{session_path}'],
             capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -458,7 +458,7 @@ def tmux_pane_snapshots():
     deadline = time.monotonic() + PANE_CAPTURE_BUDGET_S
     try:
         out = subprocess.run(
-            ['tmux', 'list-panes', '-a', '-F', '#{session_name}\t#{pane_index}'],
+            ['tmux', '-u', 'list-panes', '-a', '-F', '#{session_name}\t#{pane_index}'],
             capture_output=True, text=True, timeout=min(2, PANE_CAPTURE_BUDGET_S))
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -1659,6 +1659,7 @@ def scan_attention(root, label):
     asks = []
     spawn_states = []
     worker_prompts, worker_stops, worker_perms = {}, [], []   # namespaced per-turn files
+    finding_start = len(findings)
     for fp in sorted(glob.glob(os.path.join(adir, '*.json'))):
         rec = _load_att(fp)
         if rec is None:
@@ -1706,6 +1707,8 @@ def scan_attention(root, label):
             continue
         if not sess:
             continue
+        if ev in ('userpromptsubmit', 'stop', 'permissionrequest') and rec.get('role') == 'worker':
+            continue
         if ev == 'dispatch':
             if age_s(rec.get('dispatched_at')) is None:
                 continue
@@ -1723,7 +1726,13 @@ def scan_attention(root, label):
         elif ev == 'permissionrequest':
             perms.setdefault(sess, []).append(rec)
     sessions = set(latest_disp) | set(prompt_ev) | set(stop_ev) | set(perms)
+    host_providers = {}
     for sess in sessions:
+        host_records = [row for row in (latest_disp.get(sess), prompt_ev.get(sess), stop_ev.get(sess)) if row]
+        host_records.extend(perms.get(sess, []))
+        newest = max(host_records, key=lambda row: row.get('emitted_at') or row.get('dispatched_at') or '', default={})
+        provider = newest.get('provider')
+        host_providers[sess] = provider if provider in ('claude', 'codex') else 'unknown'
         s_stop = stop_ev.get(sess)
         stop_at = parse_iso(s_stop.get('emitted_at')) if s_stop else None
         # NEEDS-PERMISSION (hot, notifies): a later Stop supersedes it (turn moved
@@ -2063,7 +2072,9 @@ def scan_attention(root, label):
         if state == 'answered' and (age_s(disp_at) or 0) > TASK_WINDOW_S:
             continue                       # terminal + old → out of the live view
         TASKS.append({'task_id': did, 'session': d.get('session'), 'root': root, 'label': label,
-                      'agent': 'claude', 'pane': d.get('target_pane', 0), 'state': state,
+                      'agent': d.get('provider') if d.get('provider') in ('claude', 'codex') else 'unknown',
+                      'provider': d.get('provider') if d.get('provider') in ('claude', 'codex') else 'unknown',
+                      'role': 'orchestrator', 'pane': d.get('target_pane', 0), 'state': state,
                       'dispatched_at': disp_at, 'started_at': None,
                       'answered_at': (_mtime_iso(resp) if answered else None),
                       'response_path': (os.path.join('.dev', 'attention', 'payloads', f'response.{did}.txt') if answered else None),
@@ -2111,12 +2122,21 @@ def scan_attention(root, label):
     # Observational trust proxy: the register marker is present but no codex-tagged worker file
     # has appeared. Clears on the first codex emission. GC-bounded (7d) — see §7 limitations.
     if os.path.isfile(os.path.join(adir, 'codex-register.json')):
-        seen_codex = (any(ws.get('agent') == 'codex' for ws in worker_stops)
+        seen_codex = (any(row.get('provider') == 'codex' and row.get('provider_observation') == 'verified'
+                          for row in list(prompt_ev.values()) + list(stop_ev.values())
+                          + [row for rows in perms.values() for row in rows])
+                      or any(ws.get('agent') == 'codex' for ws in worker_stops)
                       or any(wp.get('agent') == 'codex' for wp in worker_prompts.values()))
         if not seen_codex:
             add_finding('CODEX-EMISSION-OFF', root, f"{label}\tcodex",
                         f"{label} — codex hooks installed but no codex emission seen; complete the "
                         f"one-time `/hooks` trust review in a codex pane at this root", policy='never')
+
+    for finding in findings[finding_start:]:
+        if finding['condition'] in ('SESSION-QUEUED', 'SESSION-WORKING', 'SESSION-DONE', 'NEEDS-REPLY', 'NEEDS-PERMISSION'):
+            finding['provider'] = host_providers.get(finding.get('session'), 'unknown')
+            finding['role'] = 'orchestrator'
+
 
 def scan_usage(root, label):
     """S8: context findings derived from the bridge-owned usage ledger.
@@ -2191,6 +2211,8 @@ def scan_usage(root, label):
 
         orch = data.get('orchestrator')
         if isinstance(orch, dict):
+            provider = orch.get('provider')
+            provider = provider if provider in ('claude', 'codex') else 'unknown'
             fresh, a = _fresh(orch)
             if _hi(orch) and orch['headroom'] <= ORCH_ALERT_HEADROOM and fresh:
                 inc = orch.get('incarnation') or ''
@@ -2199,13 +2221,13 @@ def scan_usage(root, label):
                 # does not already give; a new session re-arms it.
                 add_finding('ORCHESTRATOR-LOW-CONTEXT', root, f"{sess}\t{inc}",
                             f"{label} · {sess} — orchestrator (pane 0) at "
-                            f"{orch['headroom']}% headroom (alert <= {ORCH_ALERT_HEADROOM}); "
+                            f"{orch['headroom']}% headroom (provider={provider}, alert <= {ORCH_ALERT_HEADROOM}); "
                             f"write the handoff note and start a fresh pane-0 session. "
                             f"Pane 0 is NEVER auto-reset and holds the only un-journaled "
                             f"state in the system",
                             policy='once', session=sess)
                 CONTEXT_ROWS.append({'session': sess, 'root': root, 'label': label,
-                                     'worker': 'claude-orchestrator', 'role': 'orchestrator',
+                                     'worker': 'orchestrator', 'role': 'orchestrator', 'provider': provider,
                                      'headroom': orch['headroom'],
                                      'confidence': orch.get('confidence'),
                                      'age_s': (int(a) if a is not None else None)})
@@ -2660,7 +2682,7 @@ if BOARD:
                    'mid_turn', 'earlier',
                    'reason', 'parked_at', 'uncommitted', 'worker', 'entry_ts',
                    'duplicates', 'blocked_at', 'incarnation', 'callback_shape',
-                   'delivery', 'merge_state', 'branch'):
+                   'delivery', 'merge_state', 'branch', 'provider', 'role'):
             if kx in f:
                 v = f[kx]
                 # Board rows are JSON — coerce any datetime (unquoted YAML timestamps,

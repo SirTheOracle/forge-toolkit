@@ -10,7 +10,7 @@ You are executing the 'proposal-lite' stage of a forge pipeline.
 
 Slug: {slug}
 
-Follow the adversarial-lite skill at ~/.claude/skills/adversarial-lite/SKILL.md
+Follow the adversarial-lite skill at {worker_skill}
 
 The skill spawns 3 agents across 2 rounds:
   Round 1 — Proposer A (Sonnet) and Proposer B (Sonnet) investigate the same problem in PARALLEL with zero knowledge of each other, using complementary strategies (e.g., for bug_fix: FORWARD trace vs BACKWARD trace)

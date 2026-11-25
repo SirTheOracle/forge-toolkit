@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import datetime as dt
 import fcntl
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -28,6 +30,9 @@ SCHEMA = "forge-broker-request/1"
 DELIVERY_SCHEMA = "forge-delivery/1"
 RESULT_SCHEMA = "forge-broker-result/1"
 STOP = False
+TMUX_SOCKET = ""
+STARTUP_RUNTIME = None
+CONTROL_PROTOCOL = "forge-broker-control/1"
 
 
 class Refusal(RuntimeError):
@@ -42,6 +47,150 @@ def utc() -> str:
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def process_executable(pid: int) -> Path:
+    if sys.platform == "darwin":
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        path = ctypes.create_string_buffer(4096)
+        if lib.proc_pidpath(pid, path, len(path)) <= 0:
+            raise Refusal("PROCESS_UNAVAILABLE", "kernel executable unavailable")
+        return Path(os.fsdecode(path.value)).resolve(strict=True)
+    if sys.platform.startswith("linux"):
+        return Path(os.readlink(f"/proc/{pid}/exe")).resolve(strict=True)
+    raise Refusal("PROCESS_PLATFORM_UNSUPPORTED", sys.platform)
+
+
+def runtime_identity() -> dict:
+    """Observed startup inputs, including a copied candidate's full inventory."""
+    interpreter = process_executable(os.getpid())
+    paths = {Path(__file__).resolve(), Path(sys.executable).resolve(), interpreter}
+    for relative in ("bin/forge-orchestrator-host", "lib/forge_orchestrator.py"):
+        candidate = Path(__file__).resolve().parent.parent / relative
+        if candidate.is_file():
+            paths.add(candidate.resolve())
+    for module in tuple(sys.modules.values()):
+        filename = getattr(module, "__file__", None)
+        if filename and Path(filename).is_file():
+            paths.add(Path(filename).resolve())
+    package = Path(__file__).resolve().parent.parent / "package.json"
+    projections = {}
+    if package.exists():
+        receipt = load_json(package)
+        if receipt.get("schema") != "forge-orchestrator-package/1":
+            raise Refusal("BROKER_RUNTIME_INVALID", "invalid copied package receipt")
+        paths.add(package)
+        paths.update(Path(item["path"]) for item in receipt["files"])
+        projections = {item["path"]: item for item in receipt["files"] if item.get("kind")}
+    files = [projections.get(str(path)) or {"path": str(path), "sha256": sha(path.read_bytes())}
+             for path in sorted(paths)]
+    payload = {"schema": "forge-broker-runtime/1", "protocol": CONTROL_PROTOCOL,
+               "entry": str(Path(__file__).resolve()),
+               "interpreter": str(interpreter), "files": files,
+               "process": {"pid": os.getpid(), "started": process_stamp(os.getpid())}}
+    identity = dict(payload, sha256=sha(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()))
+    if package.exists():
+        verify_runtime_files(identity)
+    return identity
+
+
+def verify_runtime_files(identity: dict) -> None:
+    if not isinstance(identity, dict) or identity.get("schema") != "forge-broker-runtime/1":
+        raise Refusal("BROKER_RUNTIME_UNAVAILABLE", "startup runtime identity is missing")
+    payload = {key: value for key, value in identity.items() if key != "sha256"}
+    if (set(identity) != {"schema", "protocol", "entry", "interpreter", "files", "process", "sha256"}
+            or identity["protocol"] != CONTROL_PROTOCOL
+            or identity["sha256"] != sha(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+            or not isinstance(identity["files"], list) or not identity["files"]):
+        raise Refusal("BROKER_RUNTIME_INVALID", "invalid startup manifest")
+    process = identity["process"]
+    if (not isinstance(process, dict) or set(process) != {"pid", "started"}
+            or type(process["pid"]) is not int or process["pid"] <= 0
+            or not isinstance(process["started"], str) or not process["started"]):
+        raise Refusal("BROKER_RUNTIME_INVALID", "startup process identity required")
+    paths = set()
+    for item in identity["files"]:
+        if (not isinstance(item, dict) or set(item) not in ({"path", "sha256"}, {"path", "sha256", "kind"})
+                or not isinstance(item["path"], str) or not Path(item["path"]).is_absolute()
+                or not isinstance(item["sha256"], str) or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])
+                or item["path"] in paths):
+            raise Refusal("BROKER_RUNTIME_INVALID", "invalid startup file")
+        if "kind" in item:
+            path = Path(item["path"])
+            if (item["kind"] != "codex-hook-trust" or path.parts[-2:] != ("codex", "config.toml")
+                    or path.parent.parent.parent.name != "authentication-p4"
+                    or not re.fullmatch(r"[a-f0-9]{64}", path.parent.parent.name)
+                    or item["path"] in (identity["entry"], identity["interpreter"])):
+                raise Refusal("BROKER_RUNTIME_INVALID", "invalid hook trust projection")
+        paths.add(item["path"])
+    if (not isinstance(identity["entry"], str) or not isinstance(identity["interpreter"], str)
+            or identity["entry"] not in paths or identity["interpreter"] not in paths):
+        raise Refusal("BROKER_RUNTIME_INVALID", "entry and interpreter must be inventoried")
+    for item in identity["files"]:
+        path = Path(item["path"])
+        try:
+            if (path.resolve(strict=True) != path or not path.is_file()
+                    or ("kind" not in item and sha(path.read_bytes()) != item["sha256"])):
+                raise Refusal("BROKER_RUNTIME_CHANGED", str(path))
+        except (OSError, RuntimeError) as exc:
+            if isinstance(exc, Refusal):
+                raise
+            raise Refusal("BROKER_RUNTIME_CHANGED", str(path)) from exc
+    package = Path(identity["entry"]).parent.parent / "package.json"
+    if str(package) in paths:
+        control = package.parent / "bin/forge-orchestrator-package"
+        if str(control) not in paths:
+            raise Refusal("BROKER_RUNTIME_INVALID", "package verifier missing from startup inventory")
+        # Verify all executable bytes before loading the parser. Only native
+        # hook-trust data is deferred to the pinned package's schema validation.
+        spec = importlib.util.spec_from_loader("forge_broker_package", loader=None, origin=str(control))
+        module = importlib.util.module_from_spec(spec)
+        module.__file__ = str(control)
+        try:
+            receipt = json.loads(package.read_bytes())
+            expected = {item["path"]: item for item in receipt["files"]}
+            observed = {item["path"]: item for item in identity["files"]}
+            if (any(observed.get(path) != item for path, item in expected.items())
+                    or any("kind" in item and expected.get(path) != item for path, item in observed.items())):
+                raise ValueError("package dependency changed or missing from startup inventory")
+            exec(compile(control.read_bytes(), str(control), "exec"), module.__dict__)
+            receipt = module.verify(package.parent)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+            raise Refusal("BROKER_RUNTIME_CHANGED", str(exc)) from exc
+    elif any("kind" in item for item in identity["files"]):
+        raise Refusal("BROKER_RUNTIME_INVALID", "hook trust projection requires its pinned package verifier")
+
+
+def runtime_proof(token: str, nonce: bytes, identity: dict) -> str:
+    body = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(token.encode("ascii"), b"forge-runtime\0" + nonce + body, hashlib.sha256).hexdigest()
+
+
+def orchestrator_records():
+    # Never import a workspace/PYTHONPATH shadow of the protected record reader.
+    path = Path(__file__).resolve().parent.parent / "lib/forge_orchestrator.py"
+    if path.resolve() != path or not path.is_file():
+        raise Refusal("ORCHESTRATOR_LIBRARY_UNAVAILABLE", str(path))
+    spec = importlib.util.spec_from_file_location("forge_orchestrator_records", path)
+    module = importlib.util.module_from_spec(spec)
+    # Do not consult or create a timestamp-validated bytecode cache on this
+    # read-only path. Candidate closure qualification remains a separate gate.
+    exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
+    return module
+
+
+def inspect_orchestrator(protected: Path, root: Path, git_dir: Path, common: Path, root_id: str) -> dict:
+    records = orchestrator_records()
+    descriptor = {"physical_root": str(root), "git_dir": str(git_dir),
+                  "git_common_dir": str(common), "root_id": root_id}
+    try:
+        current = records.Store(protected, descriptor).current()
+    except (records.Refusal, OSError, ValueError) as exc:
+        raise Refusal(getattr(exc, "code", "ORCHESTRATOR_RECORD_UNAVAILABLE"), str(exc)) from exc
+    return {"schema": "forge-orchestrator-status/1", "root": descriptor,
+            "role": "orchestrator", "provider": current["record"]["seat"]["provider"] if current else None,
+            "state": current["record"]["state"] if current else "absent",
+            "binding": current, "admission": "unverified"}
 
 
 def process_stamp(pid: int) -> str:
@@ -411,7 +560,7 @@ def broker_lock_held(protected: Path) -> bool:
             os.close(fd)
 
 
-def control_call(protected: Path, request: dict) -> dict:
+def control_call(protected: Path, request: dict, expected_runtime: str | None = None) -> dict:
     # Control rides authenticated loopback: contained Codex panes have an
     # attested network-deny sandbox. Authenticate the server before disclosing
     # the token so a stale endpoint cannot harvest it.
@@ -432,7 +581,7 @@ def control_call(protected: Path, request: dict) -> dict:
     except OSError as exc:
         sock.close()
         denied = isinstance(exc, PermissionError) or getattr(exc, "errno", None) in {errno.EPERM, errno.EACCES}
-        if (denied and request.get("action") in LIFECYCLE_ACTIONS
+        if (denied and expected_runtime is None and request.get("action") in LIFECYCLE_ACTIONS
                 and info.get("lifecycle_queue") == 1
                 and broker_lock_held(protected)):
             return lifecycle_call(Path(info["physical_code_root"]), request)
@@ -446,6 +595,8 @@ def control_call(protected: Path, request: dict) -> dict:
             if not chunk:
                 break
             hello_raw += chunk
+            if len(hello_raw) > 1024 * 1024:
+                raise Refusal("CONTROL_HANDSHAKE_INVALID", "startup manifest exceeds limit")
         try:
             hello = json.loads(hello_raw)
             nonce = bytes.fromhex(str(hello["nonce"]))
@@ -455,6 +606,24 @@ def control_call(protected: Path, request: dict) -> dict:
         expected = hmac.new(token.encode("ascii"), b"forge-server\0" + nonce, hashlib.sha256).hexdigest()
         if not secrets.compare_digest(proof, expected):
             raise Refusal("CONTROL_SERVER_UNAUTHENTICATED", host)
+        runtime = hello.get("runtime_identity")
+        if runtime is not None:
+            signed = runtime_proof(token, nonce, runtime)
+            if not secrets.compare_digest(str(hello.get("runtime_proof", "")), signed):
+                raise Refusal("CONTROL_RUNTIME_UNAUTHENTICATED", host)
+        if expected_runtime is not None:
+            if not isinstance(runtime, dict) or runtime.get("sha256") != expected_runtime:
+                raise Refusal("BROKER_RUNTIME_MISMATCH", "live daemon does not match the required startup runtime")
+            verify_runtime_files(runtime)
+            observed = {"pid": info.get("pid"), "started": info.get("pid_started")}
+            if runtime["process"] != observed:
+                raise Refusal("BROKER_RUNTIME_MISMATCH", "daemon process differs from protected startup identity")
+            try:
+                os.kill(observed["pid"], 0)
+                if process_stamp(observed["pid"]) != observed["started"]:
+                    raise Refusal("BROKER_RUNTIME_MISMATCH", "daemon PID/start identity changed")
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise Refusal("BROKER_RUNTIME_MISMATCH", "daemon process unavailable") from exc
         request = dict(request)
         request["control_token"] = token
         sock.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
@@ -487,8 +656,26 @@ def control_call(protected: Path, request: dict) -> dict:
     return value
 
 
+def tmux_socket_from_context(context: str) -> str:
+    if not context:
+        return ""
+    parts = context.rsplit(",", 2)
+    if (len(parts) != 3 or not Path(parts[0]).is_absolute() or "\x00" in context
+            or not parts[1].isdigit() or not parts[2].isdigit()):
+        raise Refusal("TMUX_CONTEXT_INVALID", "expected an absolute socket path, server PID and session index")
+    socket_path = Path(parts[0]).resolve()
+    default = Path(f"/tmp/tmux-{os.getuid()}/default").resolve()
+    # Empty preserves the historical default-server binding for legacy records.
+    return "" if socket_path == default else str(socket_path)
+
+
+def tmux_argv(*args: str) -> list[str]:
+    # Bound at process startup, never selected by a worker's control request.
+    return ["/opt/homebrew/bin/tmux", *(["-S", TMUX_SOCKET] if TMUX_SOCKET else []), *args]
+
+
 def tmux_field(target: str, fmt: str) -> str:
-    cp = subprocess.run(["/opt/homebrew/bin/tmux", "display-message", "-p", "-t", target, fmt],
+    cp = subprocess.run(tmux_argv("display-message", "-p", "-t", target, fmt),
                         text=True, capture_output=True, env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin"})
     if cp.returncode:
         raise Refusal("TMUX_TARGET_INVALID", target)
@@ -507,8 +694,7 @@ def tmux_session_created(session: str) -> str | None:
         live = dict(item.split("=", 1) for item in fixture.split(",") if "=" in item)
         return live.get(session)
     try:
-        cp = subprocess.run(["/opt/homebrew/bin/tmux", "display-message", "-p",
-                             "-t", session, "#{session_created}"],
+        cp = subprocess.run(tmux_argv("display-message", "-p", "-t", session, "#{session_created}"),
                             text=True, capture_output=True,
                             env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin"})
     except OSError:
@@ -588,6 +774,28 @@ def register_delivery(root: Path, git_dir: Path, common: Path, root_id: str,
     if supplied - allowed:
         raise Refusal("CONTROL_FIELDS_DENIED", ",".join(sorted(supplied - allowed)))
     session, pane = str(request.get("session", "")), str(request.get("pane", ""))
+    # Validate new host admission in-process. Calling this daemon's own control
+    # socket here would deadlock its single control loop. Recovery is unchanged.
+    current_path = protected / "orchestrator/current.json"
+    launches_path = protected / "orchestrator/launches"
+    try:
+        claimed = tmux_field(session + ":.0", "#{@forge-provider}")
+    except Refusal:
+        claimed = ""
+    if os.path.lexists(current_path) or launches_path.exists() or claimed:
+        path = Path(__file__).resolve().parent / "forge-orchestrator-host"
+        if not path.is_file() or path.resolve() != path:
+            raise Refusal("ORCHESTRATOR_LIBRARY_UNAVAILABLE", str(path))
+        namespace = {"__name__": "forge_host_guard", "__file__": str(path)}
+        exec(compile(path.read_bytes(), str(path), "exec"), namespace)
+        if STARTUP_RUNTIME is None:
+            raise Refusal("BROKER_RUNTIME_UNAVAILABLE", "qualified startup identity required")
+        try:
+            active = {"process": namespace["process"](os.getpid(), CONTROL_PROTOCOL),
+                      "runtime_sha256": STARTUP_RUNTIME["sha256"], "protocol": CONTROL_PROTOCOL}
+            namespace["admission_guard"](namespace["Context"](str(root)), session, active)
+        except namespace["Refusal"] as exc:
+            raise Refusal(exc.code, exc.detail) from exc
     target = f"{session}:.{pane}"
     incarnation = tmux_field(target, "#{session_created}")
     pane_root = Path(tmux_field(target, "#{pane_current_path}")).resolve(strict=True)
@@ -872,6 +1080,11 @@ def handle_control(root: Path, git_dir: Path, common: Path, root_id: str,
     if not secrets.compare_digest(str(request.pop("control_token", "")), token):
         raise Refusal("CONTROL_AUTH_DENIED", "host control token required")
     action = request.get("action")
+    if action == "inspect-runtime":
+        if set(request) != {"action"}:
+            raise Refusal("CONTROL_FIELDS_DENIED", "inspect-runtime takes no caller identity")
+        return {"schema": "forge-broker-runtime-status/1", "pid": os.getpid(),
+                "pid_started": process_stamp(os.getpid()), "runtime_identity": STARTUP_RUNTIME}
     if action == "stop-broker":
         info = load_json(protected / "pid.json")
         info.update(state="draining", drain_requested_at=utc())
@@ -893,6 +1106,8 @@ def handle_control(root: Path, git_dir: Path, common: Path, root_id: str,
         with locked(protected / "effects.lock"):
             return process(str(root), control_request, trusted_host=True)
     if action == "register-delivery":
+        if STARTUP_RUNTIME is not None:
+            verify_runtime_files(STARTUP_RUNTIME)
         return register_delivery(root, git_dir, common, root_id, protected, request, mode)
     if action == "attest-launch":
         return inspect_live_codex(root, protected, request)
@@ -1336,7 +1551,8 @@ def lifecycle_pass(root: Path, git_dir: Path, common: Path, root_id: str, protec
 
 
 def serve(args: argparse.Namespace) -> int:
-    global STOP
+    global STOP, STARTUP_RUNTIME
+    STARTUP_RUNTIME = runtime_identity()
     root, git_dir, common, root_id = resolve_root(args.root)
     protected, transactions, requests, _ = state_paths(root, git_dir, common, root_id)
     protected.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1370,9 +1586,11 @@ def serve(args: argparse.Namespace) -> int:
     atomic_json(protected / "pid.json", {"schema": "forge-broker-pid/1", "pid": os.getpid(),
                 "pid_started": started, "git_dir": str(git_dir), "git_common_dir": str(common),
                 "session": args.session, "session_incarnation": args.incarnation,
+                "tmux_socket": TMUX_SOCKET,
                 "physical_code_root": str(root), "root_identity": root_id,
                 "control_host": control_host, "control_port": control_port,
                 "lifecycle_queue": 1, "callback_incarnation_probe": 1,
+                "runtime_identity": STARTUP_RUNTIME,
                 "mode": args.mode, "started_at": utc(), "state": "running"})
     signal.signal(signal.SIGTERM, lambda *_: globals().__setitem__("STOP", True))
     while not STOP:
@@ -1388,7 +1606,9 @@ def serve(args: argparse.Namespace) -> int:
                                             hashlib.sha256).hexdigest()
                     conn.sendall(json.dumps({"schema": "forge-broker-hello/1",
                                              "nonce": nonce.hex(),
-                                             "server_proof": server_proof},
+                                             "server_proof": server_proof,
+                                             "runtime_identity": STARTUP_RUNTIME,
+                                             "runtime_proof": runtime_proof(token, nonce, STARTUP_RUNTIME)},
                                             separators=(",", ":")).encode() + b"\n")
                     raw = b""
                     while not raw.endswith(b"\n") and len(raw) <= 131072:
@@ -1498,18 +1718,25 @@ def await_lock_release(protected: Path, timeout: float) -> bool:
 
 
 def main() -> int:
+    global TMUX_SOCKET
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("serve"); s.add_argument("--root", required=True); s.add_argument("--session", required=True); s.add_argument("--incarnation", required=True); s.add_argument("--mode", required=True)
     s = sub.add_parser("start"); s.add_argument("--root", required=True); s.add_argument("--session", required=True); s.add_argument("--incarnation", required=True); s.add_argument("--mode", required=True)
+    s.add_argument("--fresh", action="store_true", help="refuse reuse/reaping; this invocation must create the daemon")
     s = sub.add_parser("stop"); s.add_argument("--root", required=True); s.add_argument("--timeout", type=float, default=10.0)
     s = sub.add_parser("status"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true")
-    s = sub.add_parser("control"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("control"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true"); s.add_argument("--expect-runtime-sha256")
     s = sub.add_parser("paths"); s.add_argument("--root", required=True); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("orchestrator-status"); s.add_argument("--root", required=True)
     s = sub.add_parser("once"); s.add_argument("--root", required=True); s.add_argument("--request", required=True)
     args = p.parse_args()
+    TMUX_SOCKET = tmux_socket_from_context(os.environ.get("TMUX", ""))
     root, git_dir, common, root_id = resolve_root(args.root)
     protected, _, _, _ = state_paths(root, git_dir, common, root_id)
+    if args.cmd == "orchestrator-status":
+        print(json.dumps(inspect_orchestrator(protected, root, git_dir, common, root_id), sort_keys=True))
+        return 0
     if args.cmd == "serve":
         return serve(args)
     if args.cmd == "start":
@@ -1519,10 +1746,14 @@ def main() -> int:
                 os.kill(int(info.get("pid", 0)), 0)
                 actual = process_stamp(int(info["pid"]))
                 if actual == info.get("pid_started"):
+                    if args.fresh:
+                        raise Refusal("BROKER_ALREADY_RUNNING", "fresh construction cannot adopt or reap another daemon")
                     expected = {"session": args.session, "session_incarnation": args.incarnation,
                                 "mode": args.mode, "physical_code_root": str(root),
                                 "root_identity": root_id}
                     mismatches = [key for key, value in expected.items() if info.get(key) != value]
+                    if info.get("tmux_socket", "") != TMUX_SOCKET:
+                        mismatches.append("tmux_socket")
                     if mismatches == ["session_incarnation"] and not tmux_incarnation_alive(
                             str(info.get("session", "")), str(info.get("session_incarnation", ""))):
                         # The only difference is the incarnation, and tmux confirms the
@@ -1580,11 +1811,18 @@ def main() -> int:
             info["live"] = actual == info.get("pid_started")
         except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
             info["live"] = False
+        try:
+            verify_runtime_files(info.get("runtime_identity"))
+            info["runtime_state"] = "unchanged"
+        except (Refusal, OSError, ValueError, KeyError, TypeError):
+            info["runtime_state"] = "unavailable" if "runtime_identity" not in info else "changed"
         print(json.dumps(info, sort_keys=True) if args.json else f"BROKER state={info.get('state')} live={str(info['live']).lower()} mode={info.get('mode','unknown')}")
         return 0 if info["live"] else 3
     if args.cmd == "control":
+        if args.expect_runtime_sha256 is not None and not re.fullmatch(r"[a-f0-9]{64}", args.expect_runtime_sha256):
+            raise Refusal("BROKER_RUNTIME_INVALID", "expected a lowercase SHA-256 digest")
         request = json.load(sys.stdin)
-        result = control_call(protected, request)
+        result = control_call(protected, request, expected_runtime=args.expect_runtime_sha256)
         print(json.dumps(result["detail"], sort_keys=True)); return 0
     if args.cmd == "paths":
         print(json.dumps({"schema": "forge-broker-paths/1",

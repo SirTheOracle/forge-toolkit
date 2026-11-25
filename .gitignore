@@ -21,3 +21,24 @@ __pycache__/
 # Handoff notes reference private project names and local paths; keep local.
 handoffs/
 .claude/docs-refresh.yml
+
+# ── web control center: generated install/build/test trees ──────────────────
+# SCOPED to web/. `npm ci` and `pip install -e` write thousands of untracked files into
+# this checkout; bin/forge:1655-1675 records untracked_count into .dev/forge-worktree.json
+# and raises `worktree-dirty-source` on spawn, so an unignored tree breaks spawn
+# preconditions for this root. The manifests, the source and package-lock.json stay TRACKED.
+web/frontend/node_modules/
+web/frontend/dist/
+web/frontend/coverage/
+web/frontend/test-results/
+web/frontend/playwright-report/
+web/frontend/.vite/
+web/backend/*.egg-info/
+web/backend/src/*.egg-info/
+web/backend/.pytest_cache/
+web/backend/build/
+web/backend/dist/
+web/backend/.coverage
+web/backend/htmlcov/
+web/backend/.venv/
+web/.venv/

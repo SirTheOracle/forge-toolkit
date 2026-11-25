@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 for suite in \
   tests/codex-policy-smoke/run.sh \
+  tests/forge-orchestrator/run.sh \
   tests/forge-broker/run.sh \
   tests/forge-worktree/run.sh \
   tests/forge-fix-runner/run.sh \
@@ -14,6 +15,8 @@ for suite in \
   tests/forge-infra-lock/run.sh \
   tests/forge-recover/run.sh \
   tests/forge-sync-main/run.sh \
+  tests/forge-web/run.sh \
+  tests/forge-web/docs.sh \
   tests/adversarial-skills/run.sh; do
   echo "== $suite =="; bash "$ROOT/$suite"
 done

@@ -10,7 +10,7 @@ You are executing the 'implementation' stage of a forge pipeline.
 
 Slug: {slug}
 
-Follow the adversarial-implementation skill at ~/.codex/skills/adversarial-implementation/SKILL.md
+Follow the adversarial-implementation skill at {worker_skill}
 
 Inputs:
 - .dev/proposals/{slug}/final-plan.md (the source plan)

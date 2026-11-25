@@ -1,0 +1,1372 @@
+#!/usr/bin/env python3
+"""Qualified host launch backend. Project files and request stamps are not authority."""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import hashlib
+import importlib.util
+import json
+import os
+import pwd
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import time
+import uuid
+
+
+ENTRY = Path(__file__).resolve()
+TREE = ENTRY.parent.parent
+
+
+def module(name, path):
+    if path.resolve() != path or not path.is_file():
+        raise RuntimeError("required sibling module unavailable: " + str(path))
+    spec = importlib.util.spec_from_loader(name, loader=None, origin=str(path))
+    result = importlib.util.module_from_spec(spec)
+    result.__file__ = str(path)
+    exec(compile(path.read_bytes(), str(path), "exec"), result.__dict__)
+    return result
+
+
+records = module("forge_records", TREE / "lib/forge_orchestrator.py")
+broker = module("forge_broker", TREE / "bin/forge-broker")
+Refusal, require = records.Refusal, records.require
+
+
+def sealed_system_file(fd, info):
+    # macOS ships hard-link aliases (grep/egrep, rm/unlink, ...) on the sealed,
+    # read-only system volume. A link there cannot be created or redirected, so the
+    # single-link rule is unnecessary; everywhere writable it still applies.
+    return info.st_uid == 0 and bool(os.fstatvfs(fd).f_flag & os.ST_RDONLY)
+
+
+def _safe_read(path, consume, limit=None):
+    # One no-follow, single-link regular-file open shared by content reads and hashing.
+    path = Path(path)
+    require(path.is_absolute(), "UNSAFE_PATH", str(path))
+    parent = records.directory(path.parent)
+    fd = None
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and (info.st_nlink == 1 or sealed_system_file(fd, info))
+                and (limit is None or info.st_size <= limit),
+                "UNSAFE_INPUT", str(path))
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            return consume(stream)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent)
+
+
+def file_bytes(path, limit=256 * 1024 * 1024):
+    data = _safe_read(path, lambda stream: stream.read(limit + 1), limit)
+    require(len(data) <= limit, "UNSAFE_INPUT", str(path))
+    return data
+
+
+def file_sha256(path):
+    # Identity hashing streams, so large native executables (codex-cli > 256 MiB) are not capped.
+    def digest(stream):
+        h = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+        return h.hexdigest()
+    return _safe_read(path, digest)
+
+
+def read_json(path):
+    path = Path(path).absolute()
+    fd = records.directory(path.parent)
+    try:
+        return records.read_at(fd, path.name)
+    finally:
+        os.close(fd)
+
+
+def file_identity(path, kind=None):
+    if kind is None:
+        return {"path": str(path), "sha256": file_sha256(path)}
+    data = file_bytes(path)
+    if kind == "codex-hook-trust":
+        location = Path(path)
+        require(location.parts[-2:] == ("codex", "config.toml")
+                and location.parent.parent.parent.name == "authentication-p4"
+                and records.sha256(location.parent.parent.name),
+                "INVALID_INPUT", "hook trust projection is restricted to its native config")
+        try:
+            import tomllib
+        except ImportError:
+            # Apple's isolated Python 3.9 ships the same parser with pip.
+            from pip._vendor import tomli as tomllib
+        config = tomllib.loads(data.decode("utf-8"))
+        require(set(config) <= {"cli_auth_credentials_store", "hooks", "tui", "notice", "projects"}
+                and config.get("cli_auth_credentials_store") == "keyring",
+                "AUTH_CONFIG_CHANGED", str(path))
+        # Codex worker panes share this namespace and persist the operator's folder
+        # trust answer for the Forge root. Only that root, only the trust enum; the
+        # host's argv always overrides its own root to untrusted.
+        parts = location.absolute().parts
+        root = str(Path(*parts[:parts.index(".git")])) if ".git" in parts else None
+        projects = config.get("projects", {})
+        require(isinstance(projects, dict) and all(
+                    key == root and isinstance(value, dict) and set(value) == {"trust_level"}
+                    and value["trust_level"] in ("trusted", "untrusted")
+                    for key, value in projects.items()),
+                "AUTH_CONFIG_CHANGED", str(path))
+        # Codex records its own first-run UI acknowledgements here at startup (e.g.
+        # tui.screen_reader_detection_done, tui.model_availability_nux."<model>" = 1).
+        # Booleans and integers only, at any depth: no strings, so no paths or commands.
+        def ui_state(value):
+            if isinstance(value, dict):
+                return all(isinstance(k, str) and ui_state(v) for k, v in value.items())
+            return type(value) in (bool, int)
+        for table in ("tui", "notice"):
+            require(isinstance(config.get(table, {}), dict) and ui_state(config.get(table, {})),
+                    "AUTH_CONFIG_CHANGED", str(path))
+        hooks = config.get("hooks", {})
+        require(isinstance(hooks, dict) and set(hooks) <= {"state"}, "AUTH_CONFIG_CHANGED", str(path))
+        state = hooks.get("state", {})
+        require(isinstance(state, dict), "AUTH_CONFIG_CHANGED", str(path))
+        for key, value in state.items():
+            require(isinstance(key, str) and isinstance(value, dict)
+                    and set(value) <= {"enabled", "trusted_hash"}
+                    and ("enabled" not in value or type(value["enabled"]) is bool)
+                    and ("trusted_hash" not in value or (isinstance(value["trusted_hash"], str)
+                         and re.fullmatch(r"sha256:[0-9a-f]{64}", value["trusted_hash"]))),
+                    "AUTH_CONFIG_CHANGED", str(path))
+        # Native per-hook approval is mutable state, never a source of hook code.
+        data = b'cli_auth_credentials_store = "keyring"\n'
+    else:
+        require(kind is None, "INVALID_INPUT", "unknown dependency kind")
+    result = {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
+    if kind:
+        result["kind"] = kind
+    return result
+
+
+def verify_file(item):
+    require(isinstance(item, dict) and isinstance(item.get("path"), str) and records.sha256(item.get("sha256")),
+            "INVALID_INPUT", "absolute path and SHA-256 required")
+    expected = {"path": item["path"], "sha256": item["sha256"]}
+    if item.get("kind") is not None:
+        expected["kind"] = item["kind"]
+    require(file_identity(item["path"], item.get("kind")) == expected,
+            "INPUT_CHANGED", item["path"])
+
+
+class Context:
+    def __init__(self, raw):
+        self.root, self.git_dir, self.common, self.root_id = broker.resolve_root(raw)
+        self.protected, self.transactions, _, _ = broker.state_paths(self.root, self.git_dir, self.common, self.root_id)
+        self.identity = {"physical_root": str(self.root), "git_dir": str(self.git_dir),
+                         "git_common_dir": str(self.common), "root_id": self.root_id}
+        self.store = records.Store(self.protected, self.identity)
+        self.management = self.store.path / "management-v1"
+        self.management_entry = self.management / "bin/forge"
+
+
+def management_inputs(ctx):
+    manifest = read_json(ctx.management / "entry.json")
+    require(manifest.get("schema") == "forge-orchestrator-management/1" and manifest.get("root") == ctx.identity,
+            "MANAGEMENT_IDENTITY_MISMATCH", "wrong management entry root")
+    verify_file(manifest.get("interpreter"))
+    expected = {str(ctx.management / name) for name in ("bin/forge", "bin/forge-broker", "lib/forge_orchestrator.py")}
+    files = manifest.get("files", [])
+    require(isinstance(files, list) and {item.get("path") for item in files} == expected,
+            "MANAGEMENT_INPUT_CHANGED", "management inventory differs")
+    for item in files:
+        verify_file(item)
+    if manifest.get("package"):
+        item = manifest["package"]
+        verify_file(item)
+        package_root = Path(item["path"]).parent
+        require(ctx.store.path / "candidates" in package_root.parents,
+                "MANAGEMENT_INPUT_CHANGED", "management package is not protected under this root")
+        receipt = read_json(item["path"])
+        require(receipt.get("schema") == "forge-orchestrator-package/1" and receipt.get("root") == ctx.identity,
+                "MANAGEMENT_INPUT_CHANGED", "management package belongs to another root")
+        for dependency in receipt["files"]:
+            verify_file(dependency)
+        verifier = package_root / "bin/forge-orchestrator-package"
+        require(str(verifier) in {entry["path"] for entry in receipt["files"]},
+                "MANAGEMENT_INPUT_CHANGED", "management package verifier missing")
+        module("management_package", verifier).verify(package_root)
+    return manifest
+
+
+def management_admission(ctx):
+    # The generic forge router never delegates mutations here. This distinct
+    # copied entry requires its own native execution approval; contained workers
+    # still cannot write the protected store when they invoke it directly.
+    require(ENTRY == ctx.management_entry, "OPERATOR_ENTRY_REQUIRED", str(ctx.management_entry))
+    manifest = management_inputs(ctx)
+    require(manifest["interpreter"] == file_identity(Path(sys.executable).resolve()),
+            "MANAGEMENT_INPUT_CHANGED", "management interpreter changed")
+
+
+def prepare_management(ctx):
+    require(ENTRY.name == "forge-orchestrator-host", "MANAGEMENT_ENTRY_REQUIRED", "use the dedicated preparation executable")
+    parent = records.directory(ctx.store.path, create=True)
+    try:
+        os.mkdir("management-v1", 0o700, dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    files = []
+    for relative, source in (("bin/forge", ENTRY), ("bin/forge-broker", TREE / "bin/forge-broker"),
+                             ("lib/forge_orchestrator.py", TREE / "lib/forge_orchestrator.py")):
+        target = ctx.management / relative
+        data = file_bytes(source)
+        if relative == "bin/forge":
+            interpreter = str(Path(sys.executable).resolve())
+            require(" " not in interpreter and "\n" not in interpreter, "INTERPRETER_UNSUPPORTED", interpreter)
+            data = ("#!" + interpreter + " -ISB\n").encode() + data.split(b"\n", 1)[1]
+        directory = records.directory(target.parent, create=True)
+        try:
+            fd = os.open(target.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500, dir_fd=directory)
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        files.append(file_identity(target))
+    fd = records.directory(ctx.management)
+    try:
+        manifest = {"schema": "forge-orchestrator-management/1", "root": ctx.identity,
+                    "interpreter": file_identity(Path(sys.executable).resolve()), "files": files}
+        if (TREE / "package.json").exists():
+            manifest["package"] = file_identity(TREE / "package.json")
+        records.write_at(fd, "entry.json", manifest, exclusive=True)
+    finally:
+        os.close(fd)
+    return {"management_entry": str(ctx.management_entry), "admission": "requires-explicit-registration"}
+
+
+def candidate_body(candidate):
+    return {key: value for key, value in candidate.items() if key != "conformance"}
+
+
+def topology(ctx):
+    output = subprocess.check_output(["/usr/bin/git", "-C", str(ctx.root), "worktree", "list", "--porcelain", "-z"],
+                                     env={"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
+    result = []
+    for field in output.split(b"\0"):
+        if not field.startswith(b"worktree "):
+            continue
+        root, git_dir, common, _ = broker.resolve_root(os.fsdecode(field[9:]))
+        pointer = root / ".git"
+        result.append({"root": str(root), "git_dir": str(git_dir), "common": str(common),
+                       "pointer_sha256": hashlib.sha256(file_bytes(pointer)).hexdigest() if pointer.is_file() else None})
+    return sorted(result, key=lambda item: item["root"])
+
+
+def validate_candidate(ctx, candidate, *, qualification=True):
+    fields = {"schema", "root", "on_spawn", "files", "inputs", "providers", "tools", "conformance", "project_config_sha256"}
+    require(set(candidate) == fields and candidate["schema"] == "forge-orchestrator-candidate/1"
+            and candidate["root"] == ctx.identity, "INVALID_PROFILE", "candidate schema/fields/root differ")
+    records.validate_inputs(candidate["inputs"])
+    files = candidate["files"]
+    require(isinstance(files, list) and files, "INVALID_PROFILE", "explicit dependency inventory required")
+    inventory = {}
+    for item in files:
+        verify_file(item)
+        path = Path(item["path"])
+        require(path not in inventory, "INVALID_PROFILE", "duplicate dependency")
+        require(ctx.root not in path.parents or ctx.protected in path.parents,
+                "MUTABLE_PROJECT_INPUT", str(path))
+        inventory[path] = item["sha256"]
+    tools = candidate["tools"]
+    require(isinstance(tools, dict) and set(tools) == {"tmux", "forge", "forge_start", "bridge", "broker", "shell", "host", "claude_worker"},
+            "INVALID_PROFILE", "closed tool inventory required")
+    for name, path in tools.items():
+        require(isinstance(path, str) and Path(path) in inventory, "DEPENDENCY_MISSING", name)
+    require(Path("/usr/bin/env") in inventory, "DEPENDENCY_MISSING", "clean tmux child environment executable")
+    for name, item in candidate["inputs"].items():
+        require(inventory.get(Path(item["path"])) == item["sha256"], "DEPENDENCY_MISSING", name)
+    hook = candidate["on_spawn"]
+    require(isinstance(hook, dict) and set(hook) == {"kind", "argv", "supported_providers", "transport_version"},
+            "INVALID_PROFILE", "closed on_spawn contract required")
+    require(hook["kind"] in ("builtin", "custom") and hook["transport_version"] == 1,
+            "HOOK_NOT_QUALIFIED", "unsupported hook transport")
+    require(isinstance(hook["argv"], list) and hook["argv"] and all(isinstance(arg, str) and "\0" not in arg for arg in hook["argv"])
+            and Path(hook["argv"][0]) in inventory, "HOOK_NOT_QUALIFIED", "exact approved argv required")
+    if hook["kind"] == "builtin":
+        require(hook["argv"] == [tools["forge_start"], "--populate-existing"], "HOOK_NOT_QUALIFIED", "builtin argv differs")
+    providers = candidate["providers"]
+    require(isinstance(providers, dict) and providers and not set(providers) - {"claude", "codex"},
+            "INVALID_PROVIDER", "claude|codex required")
+    require(isinstance(hook["supported_providers"], list) and sorted(hook["supported_providers"]) == sorted(providers),
+            "HOOK_NOT_QUALIFIED", "provider support differs")
+    for name, provider in providers.items():
+        require(isinstance(provider, dict) and set(provider) == {"argv", "executable", "version", "evidence"},
+                "INVALID_PROVIDER", name)
+        verify_file(provider["executable"])
+        require(inventory.get(Path(provider["executable"]["path"])) == provider["executable"]["sha256"],
+                "DEPENDENCY_MISSING", name)
+        require(isinstance(provider["argv"], list) and provider["argv"]
+                and provider["argv"][0] == provider["executable"]["path"]
+                and all(isinstance(arg, str) and "\0" not in arg for arg in provider["argv"])
+                and isinstance(provider["version"], str) and provider["version"], "INVALID_PROVIDER", "exact argv/version required")
+        records.validate_evidence(provider["evidence"])
+    require(candidate["project_config_sha256"] is None or records.sha256(candidate["project_config_sha256"]),
+            "INVALID_PROFILE", "project config hash required")
+    package = candidate_package(candidate)
+    if package:
+        for item in package["files"]:
+            require(inventory.get(Path(item["path"])) == item["sha256"], "DEPENDENCY_MISSING", item["path"])
+    if qualification:
+        report_item = candidate["conformance"]
+        verify_file(report_item)
+        report_path = Path(report_item["path"])
+        require(ctx.store.path / "reports" in report_path.parents, "QUALIFICATION_UNPROTECTED", str(report_path))
+        report = read_json(report_path)
+        local_release = report.get("schema") == "forge-orchestrator-local-release/1"
+        require(report.get("schema") in {"forge-orchestrator-qualification/1", "forge-orchestrator-local-release/1"}
+                and report.get("root") == ctx.identity
+                and report.get("candidate_sha256") == records.digest(candidate_body(candidate)),
+                "QUALIFICATION_MISMATCH", "report is not for these exact inputs")
+        checks = (("package_integrity", "worker_containment", "management_worker_boundary", "hook_transport", "runtime_closure", "topology")
+                  if local_release else ("native_policy", "management_entry", "hook_transport", "runtime_closure", "topology"))
+        for check in checks:
+            require(report.get("checks", {}).get(check) == "pass", "ORCHESTRATOR_NOT_QUALIFIED", check)
+        for provider in providers.values():
+            require((provider["evidence"]["native_policy"] == "unverified") == local_release,
+                    "QUALIFICATION_MISMATCH", "provider evidence validation grade differs")
+        require(report.get("management_entry_sha256") == file_identity(ctx.management_entry)["sha256"],
+                "QUALIFICATION_MISMATCH", "operator entry changed")
+        require(report.get("management_sha256") == records.digest(management_inputs(ctx)),
+                "QUALIFICATION_MISMATCH", "management closure changed")
+        require(report.get("topology_sha256") == records.digest(topology(ctx)),
+                "TOPOLOGY_CHANGED", "Git pointer topology requires requalification")
+        require(report.get("supported_providers") == sorted(providers), "QUALIFICATION_MISMATCH", "provider coverage differs")
+        if package:
+            capability = report.get("capability")
+            verify_file(capability)
+            package_root = Path(candidate["inputs"]["package"]["path"]).parent
+            control = module("forge_package", package_root / "bin/forge-orchestrator-package")
+            try:
+                measured = control.validate_capability(package_root, package, Path(capability["path"]),
+                                                       **({"local_release": True} if local_release else {}))
+            except control.host.Refusal as exc:
+                raise Refusal(exc.code, exc.detail) from exc
+            require(measured["checks"] == report["checks"]
+                    and all(provider["evidence"]["reports"] == [capability["sha256"]] for provider in providers.values()),
+                    "QUALIFICATION_MISMATCH", "capability evidence differs from conformance")
+    return candidate
+
+
+def candidate_package(candidate):
+    item = candidate.get("inputs", {}).get("package") if candidate else None
+    if not item or Path(item["path"]).name != "package.json":
+        return None
+    verify_file(item)
+    package = Path(item["path"]).parent
+    control = module("forge_package", package / "bin/forge-orchestrator-package")
+    return control.verify(package)
+
+
+def clean_env(ctx, candidate=None):
+    package = candidate_package(candidate)
+    if package:
+        env = dict(package["environment"])
+        if os.environ.get("TMUX"):
+            env["TMUX"] = os.environ["TMUX"]
+        return env
+    env = {key: os.environ[key] for key in ("HOME", "USER", "LOGNAME", "TERM") if key in os.environ}
+    env.update(PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL="C", LANG="C")
+    if candidate:
+        env["PATH"] = str(Path(candidate["tools"]["forge"]).parent) + ":" + env["PATH"]
+    if os.environ.get("TMUX"):
+        env["TMUX"] = os.environ["TMUX"]
+    env["FORGE_WATCH_TRIGGER"] = "0"
+    return env
+
+
+def host_argv(candidate, *args):
+    package = candidate_package(candidate)
+    if package:
+        root = Path(candidate["inputs"]["package"]["path"]).parent
+        metadata = read_json(root / "runtime/runtime.json")
+        return [metadata["python"], "-I", "-S", "-B", str(root / "runtime/python_entry.py"),
+                candidate["tools"]["host"], *args]
+    return ["/usr/bin/python3", "-I", candidate["tools"]["host"], *args]
+
+
+def project_request(ctx, candidate):
+    path = ctx.root / ".claude/forge-project.yml"
+    try:
+        actual = hashlib.sha256(file_bytes(path, 1024 * 1024)).hexdigest()
+    except FileNotFoundError:
+        actual = None
+    require(actual == candidate["project_config_sha256"], "HOOK_CONFIG_CHANGED", "project config differs from registration")
+    if actual is None:
+        requested = [candidate["tools"]["forge_start"], "--populate-existing"]
+    else:
+        result = subprocess.run([candidate["tools"]["forge"], "orchestrator-hook", "--root", str(ctx.root)],
+                                cwd=ctx.root, env=clean_env(ctx, candidate), text=True, capture_output=True, timeout=10)
+        require(result.returncode == 0, "HOOK_REQUEST_INVALID", "project hook could not be parsed")
+        requested = json.loads(result.stdout)
+        if not requested:
+            requested = [candidate["tools"]["forge_start"], "--populate-existing"]
+    require(requested == candidate["on_spawn"]["argv"], "HOOK_ARGV_CHANGED", "project hook differs from registration")
+
+
+def admitted_profile(ctx, provider=None, snapshot=None):
+    if provider is None:
+        binding = ctx.store.current()
+        provider = binding["record"]["seat"]["provider"] if binding else "claude"
+    current = ctx.store.profile(provider)
+    require(current is not None, "ORCHESTRATOR_NOT_QUALIFIED", "operator profile is absent")
+    require(current["profile"]["enabled"], "PROFILE_DISABLED", "new admission is disabled")
+    if snapshot is not None:
+        require(current["sha256"] == snapshot, "PROFILE_CHANGED", "live launch retains its original profile; terminal handoff required")
+    candidate = validate_candidate(ctx, current["profile"]["candidate"])
+    if provider:
+        require(provider in candidate["providers"], "PROVIDER_NOT_SUPPORTED", provider)
+    project_request(ctx, candidate)
+    return current
+
+
+def requested_provider(ctx, provider):
+    if provider is not None:
+        return provider
+    current = ctx.store.current()
+    if current and current["record"]["state"] == "ready":
+        original = ctx.store.profile_snapshot(current["record"]["profile_hash"])
+        candidate = validate_candidate(ctx, original["candidate"], qualification=False)
+        if Runtime(ctx, candidate).at_root():
+            return current["record"]["seat"]["provider"]
+    return "claude"
+
+
+def profile_catalog_boundary(ctx, provider, candidate):
+    if provider is None:
+        return
+    previous, current = ctx.store.profile_state(), ctx.store.current()
+    # Older retained helpers cannot read the new catalog schema. Never change
+    # their registration format while they still own session resources.
+    if previous is None or previous["schema"] == "forge-orchestrator-profile/1":
+        if current:
+            original = ctx.store.profile_snapshot(current["record"]["profile_hash"])
+            candidate = original["candidate"]
+        retained = validate_candidate(ctx, candidate, qualification=False)
+        terminal_observation(ctx, Runtime(ctx, retained), current)
+
+
+def profile_command(ctx, args):
+    if args.profile_action == "inspect":
+        if args.source:
+            candidate = validate_candidate(ctx, read_json(args.source), qualification=False)
+            return {"candidate": candidate, "candidate_sha256": records.digest(candidate_body(candidate)),
+                    "management_entry": str(ctx.management_entry), "admission": "unverified"}
+        return {"profile": ctx.store.profile(args.provider), "providers": ctx.store.profiles(),
+                "management_entry": str(ctx.management_entry)}
+    management_admission(ctx)
+    if args.profile_action == "probe":
+        # Exercise the management entry and protected write boundary without
+        # creating a profile, approving a candidate, or changing a revision.
+        directory = records.directory(ctx.management)
+        name = ".probe-" + uuid.uuid4().hex
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            os.close(fd)
+            os.unlink(name, dir_fd=directory)
+        finally:
+            os.close(directory)
+        return {"management_write": True, "profile_changed": False}
+    if args.profile_action == "register":
+        require(args.source is not None, "INVALID_PROFILE", "register requires --from")
+        candidate = validate_candidate(ctx, read_json(args.source))
+        if any(value["evidence"]["native_policy"] == "unverified" for value in candidate["providers"].values()):
+            require(args.accept_local_validation, "LOCAL_VALIDATION_ACCEPTANCE_REQUIRED",
+                    "register requires --accept-local-validation; native model behavior is unverified")
+            require(args.provider is not None, "PROVIDER_REQUIRED", "local release requires --provider")
+        project_request(ctx, candidate)
+        if args.provider is not None:
+            require(args.provider in candidate["providers"], "PROVIDER_NOT_SUPPORTED", args.provider)
+        profile_catalog_boundary(ctx, args.provider, candidate)
+        return ctx.store.publish_profile(candidate, args.expect_revision, provider=args.provider)
+    current = ctx.store.profile(args.provider)
+    require(current is not None, "PROFILE_ABSENT", "no profile to disable")
+    profile_catalog_boundary(ctx, args.provider, current["profile"]["candidate"])
+    return ctx.store.publish_profile(current["profile"]["candidate"], args.expect_revision,
+                                     enabled=False, provider=args.provider)
+
+
+def rollout_status(ctx, provider):
+    """Read the actual admission gates without granting or changing authority."""
+    result = {"schema": "forge-orchestrator-rollout/1", "root": ctx.identity,
+              "provider": provider, "default_provider": "claude", "eligible": False,
+              "full_workflow_parity": "not-established", "profile": None, "binding": None,
+              "scope": "registered-prerequisites-only", "evidence": None, "boundary": None,
+              "recovery": "retained helpers and original ownership checks; no admission bypass"}
+    try:
+        profile, current = ctx.store.profile(provider), ctx.store.current()
+        if profile:
+            result["profile"] = {"sha256": profile["sha256"],
+                                 "revision": profile["profile"]["revision"],
+                                 "enabled": profile["profile"]["enabled"]}
+        if current:
+            record = current["record"]
+            result["binding"] = {"launch_id": record["launch_id"], "state": record["state"],
+                                 "provider": record["seat"]["provider"], "session": record["seat"]["session"],
+                                 "profile_sha256": record["profile_hash"]}
+        admitted = admitted_profile(ctx, provider)
+        candidate = admitted["profile"]["candidate"]
+        local_release = candidate["providers"][provider]["evidence"]["native_policy"] == "unverified"
+        result["validation"] = "local" if local_release else "native"
+        result["native_qualification"] = "not-run" if local_release else "passed-primitives-only"
+        if local_release:
+            result["scope"] = "attended-local-release"
+        rt = Runtime(ctx, candidate)
+        # Match launch's distinction between ensuring a live host and starting
+        # after a proven terminal boundary. A retained record is not a live seat.
+        if current and current["record"]["state"] == "ready" and rt.at_root():
+            live_binding(ctx, rt, current, provider)
+            boundary = "existing-session"
+        else:
+            terminal_observation(ctx, rt, current)
+            boundary = "new-session"
+        result["evidence"] = {"inputs": candidate["inputs"], "conformance": candidate["conformance"],
+                              "provider": candidate["providers"][provider]}
+        require(ctx.store.profile(provider) == profile and ctx.store.current() == current,
+                "REVISION_CONFLICT", "rollout inputs changed during inspection")
+        result.update(eligible=True, reason=None, boundary=boundary)
+    except (Refusal, broker.Refusal, OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
+        result["reason"] = {"code": getattr(exc, "code", "ORCHESTRATOR_UNAVAILABLE"), "detail": str(exc)}
+    return result
+
+
+def process(pid, version="host-launcher/1"):
+    require(type(pid) is int and pid > 0, "PROCESS_UNAVAILABLE", "positive PID required")
+    stamp = subprocess.check_output(["/bin/ps", "-p", str(pid), "-o", "lstart="],
+                                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, text=True).strip()
+    require(bool(stamp), "PROCESS_UNAVAILABLE", str(pid))
+    executable = broker.process_executable(pid)
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(1024 * 1024)
+        data = ctypes.create_string_buffer(size.value)
+        require(libc.sysctl(mib, 3, data, ctypes.byref(size), None, 0) == 0,
+                "PROCESS_UNAVAILABLE", "kernel argv unavailable")
+        raw = data.raw[:size.value]
+        argc = struct.unpack_from("i", raw)[0]
+        require(0 < argc < 4096, "PROCESS_UNAVAILABLE", "invalid argc")
+        end = raw.index(b"\0", 4) + 1
+        while end < len(raw) and raw[end] == 0:
+            end += 1
+        argv = [os.fsdecode(arg) for arg in raw[end:].split(b"\0")[:argc]]
+    elif sys.platform.startswith("linux"):
+        argv = [os.fsdecode(arg) for arg in Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")]
+    else:
+        raise Refusal("PROCESS_PLATFORM_UNSUPPORTED", sys.platform)
+    again = subprocess.check_output(["/bin/ps", "-p", str(pid), "-o", "lstart="],
+                                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, text=True).strip()
+    require(stamp == again, "PROCESS_REPLACED", str(pid))
+    return {"pid": pid, "started": stamp, "executable": str(executable),
+            "sha256": file_identity(executable)["sha256"], "version": version, "argv": argv}
+
+
+def parents():
+    result = subprocess.check_output(["/bin/ps", "-axo", "pid=,ppid="], text=True,
+                                     env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    return {int(row.split()[0]): int(row.split()[1]) for row in result.splitlines() if row.strip()}
+
+
+def same_process(expected):
+    try:
+        return process(expected["pid"], expected["version"]) == expected
+    except (OSError, ValueError, Refusal, subprocess.SubprocessError):
+        return False
+
+
+def alive(expected):
+    # A changed executable under the same PID/start is still a live owner, not
+    # permission to retire the old transaction.
+    try:
+        stamp = subprocess.check_output(["/bin/ps", "-p", str(expected["pid"]), "-o", "lstart="],
+                                        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, text=True).strip()
+        return stamp == expected["started"]
+    except (OSError, KeyError, subprocess.SubprocessError):
+        return False
+
+
+def terminal_size():
+    for fd in (1, 0, 2):
+        try:
+            cols, rows = os.get_terminal_size(fd)
+        except OSError:
+            continue
+        if cols > 0 and rows > 0:
+            return cols, rows
+    return None
+
+
+def worker_forge(forge):
+    # The packaged forge wrapper re-pins the isolated environment with env -i;
+    # worker panes run its pinned body directly so they keep the operator's own.
+    body = Path(forge).with_name("." + Path(forge).name + "-body")
+    return ["/bin/bash", str(body)] if body.is_file() else [str(forge)]
+
+
+OPERATOR_ENV_DROP = {"TMUX", "TMUX_PANE", "TMUX_SESSION", "PWD", "OLDPWD", "SHLVL", "_"}
+
+
+class Runtime:
+    def __init__(self, ctx, candidate):
+        self.ctx, self.candidate = ctx, candidate
+        self.env = clean_env(ctx, candidate)
+        self.socket = broker.tmux_socket_from_context(os.environ.get("TMUX", ""))
+        self.binary = candidate["tools"]["tmux"]
+
+    def tmux(self, *args, check=True):
+        # -u: under the pinned LC_ALL=C, tmux >= 3.6 rewrites tab separators in -F output to "_".
+        argv = [self.binary, "-u"] + (["-S", self.socket] if self.socket else []) + list(args)
+        cp = subprocess.run(argv, cwd=self.ctx.root, env=self.env, text=True, capture_output=True, timeout=10)
+        require(not check or cp.returncode == 0, "TMUX_REFUSED", cp.stderr.strip())
+        return cp
+
+    def child_argv(self, session, argv, *, pane=None, role=None, operator_profile=False):
+        # A long-lived tmux server retains its own ambient environment. Merely
+        # cleaning the tmux client environment does not clean the spawned pane.
+        if operator_profile:
+            # Worker panes run exactly like legacy forge-start workers: in the
+            # operator's own environment (PATH, UTF-8 locale, HOME, ~/.claude,
+            # ~/.codex, keychain login). Only Forge tool pins come from the
+            # package. The orchestrator seat alone uses the isolated namespace.
+            env = self.operator_env()
+            env.update({k: v for k, v in self.env.items() if k.startswith("FORGE_")})
+            env.update(TMUX_SESSION=session, FORGE_ROOT=str(self.ctx.root), FORGE_INITIATIVE=session)
+        else:
+            env = dict(self.env, TMUX_SESSION=session, FORGE_ROOT=str(self.ctx.root), FORGE_INITIATIVE=session)
+        if pane:
+            env["TMUX_PANE"] = pane
+            env["TMUX"] = self.tmux("display-message", "-p", "-t", pane, "#{socket_path},#{pid},0").stdout.strip()
+        if role:
+            env["FORGE_ROLE"] = role
+        if role == "orchestrator":
+            # Render the native TUI in UTF-8; packaged helpers re-pin LC_ALL=C themselves.
+            env.pop("LC_ALL", None)
+            env["LANG"] = env["LC_CTYPE"] = "en_US.UTF-8"
+        return ["/usr/bin/env", "-i", *[key + "=" + value for key, value in sorted(env.items())], *argv]
+
+    def operator_env(self):
+        # The tmux server's global environment is what legacy forge-start panes
+        # inherit: the operator's login environment when the server started.
+        cp = self.tmux("show-environment", "-g", check=False)
+        env = {}
+        for line in (cp.stdout.splitlines() if cp.returncode == 0 else []):
+            key, sep, value = line.partition("=")
+            if sep and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and key not in OPERATOR_ENV_DROP:
+                env[key] = value
+        account = pwd.getpwuid(os.getuid())
+        env.update(HOME=account.pw_dir, USER=account.pw_name, LOGNAME=account.pw_name)
+        env.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        env.setdefault("LANG", "en_US.UTF-8")
+        env.setdefault("TERM", "xterm-256color")
+        return env
+
+    def sessions(self):
+        cp = self.tmux("list-sessions", "-F", "#{session_name}\t#{session_path}\t#{session_created}\t#{session_id}", check=False)
+        if cp.returncode:
+            require(not cp.stdout and ("no server running" in cp.stderr or "No such file or directory" in cp.stderr),
+                    "TMUX_UNAVAILABLE", cp.stderr.strip())
+            return []
+        result = []
+        for row in cp.stdout.splitlines():
+            fields = row.split("\t")
+            require(len(fields) == 4, "TMUX_UNAVAILABLE", "malformed session descriptor")
+            result.append({"session": fields[0], "root": str(Path(fields[1]).resolve()),
+                           "incarnation": fields[2], "session_id": fields[3]})
+        return result
+
+    def at_root(self):
+        return [row for row in self.sessions() if row["root"] == str(self.ctx.root)]
+
+    def seat(self, target, provider):
+        target = target if target.startswith("%") else "=" + target + ":"
+        fields = self.tmux("display-message", "-p", "-t", target,
+                           "#{session_name}\t#{session_path}\t#{session_created}\t#{session_id}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{socket_path}").stdout.strip().split("\t")
+        require(len(fields) == 8 and str(Path(fields[1]).resolve()) == str(self.ctx.root),
+                "LIVE_ROOT_MISMATCH", "pane does not belong to the requested physical root")
+        seat = {"role": "orchestrator", "provider": provider, "session": fields[0], "incarnation": fields[2],
+                "session_id": fields[3], "pane_id": fields[4], "socket": str(Path(fields[7]).resolve())}
+        records.validate_seat(seat)
+        return seat, int(fields[5]), fields[6]
+
+    def pane_ids(self, session):
+        return self.tmux("list-panes", "-s", "-t", "=" + session, "-F", "#{pane_id}").stdout.splitlines()
+
+    def geometry(self, session, expected):
+        rows = self.tmux("list-panes", "-t", "=" + session,
+                         "-F", "#{pane_id} #{pane_index} #{pane_left} #{pane_top} #{pane_width} #{window_width}").stdout.splitlines()
+        require(len(rows) == 5, "LAYOUT_INVALID", "five panes required")
+        parsed = [row.split() for row in rows]
+        require(all(len(row) == 6 for row in parsed) and [row[0] for row in parsed] == expected,
+                "LAYOUT_INVALID", "pane objects/index order differ")
+        p = [list(map(int, row[1:])) for row in parsed]
+        require([row[0] for row in p] == list(range(5)) and p[0][1:3] == [0, 0]
+                and p[0][3] == p[0][4] and p[1][1] == p[2][1] == 0
+                and p[3][1] == p[4][1] > 0 and p[1][2] == p[3][2]
+                and p[2][2] == p[4][2] and p[0][2] < p[1][2] < p[2][2],
+                "LAYOUT_INVALID", "existing five-pane geometry differs")
+
+    def idle(self, seat, shell):
+        actual, pid, command = self.seat(seat["pane_id"], seat["provider"])
+        require(actual == seat and pid == shell["pid"], "HANDOFF_IDENTITY_MISMATCH", "pane/shell replaced")
+        require(same_process(shell) and shell["executable"] == self.candidate["tools"]["shell"]
+                and command in {Path(shell["executable"]).name, "bash"}, "PANE_NOT_IDLE", "expected invocation-owned shell")
+        require(pid not in parents().values(), "PANE_NOT_IDLE", "shell has a running child")
+
+    def new_shell(self, session, provider):
+        require(not self.at_root(), "ROOT_ALREADY_LIVE", "a session already owns this root")
+        # tmux runs here without a tty (captured pipes), so a detached session
+        # would be born at default-size 80x24 and the five-pane split would be
+        # stretched unevenly on attach. Size it from the operator's terminal,
+        # as legacy forge-start's tty-attached new-session does.
+        size = terminal_size()
+        cp = self.tmux("new-session", "-d", "-s", session, "-c", str(self.ctx.root),
+                       *(["-x", str(size[0]), "-y", str(size[1])] if size else []),
+                       "-e", "TMUX_SESSION=" + session, "-e", "FORGE_ROOT=" + str(self.ctx.root),
+                       "-e", "FORGE_INITIATIVE=" + session, "-P", "-F", "#{pane_id}",
+                       *self.child_argv(session, [self.candidate["tools"]["shell"], "--noprofile", "--norc"]), check=False)
+        require(cp.returncode == 0, "SESSION_CREATE_REFUSED", cp.stderr.strip())
+        pane = cp.stdout.strip()
+        deadline = time.monotonic() + 3
+        while True:
+            seat, pid, _ = self.seat(pane, provider)
+            shell = process(pid)
+            try:
+                self.idle(seat, shell)
+                return seat, shell
+            except Refusal:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+
+    def broker_binding(self, expected=None):
+        result = broker.control_call(self.ctx.protected, {"action": "inspect-runtime"}, expected_runtime=expected)["detail"]
+        runtime = result["runtime_identity"]
+        broker.verify_runtime_files(runtime)
+        observed = process(result["pid"], runtime["protocol"])
+        require(observed["started"] == result["pid_started"] and observed["executable"] == runtime["interpreter"]
+                and runtime["entry"] == self.candidate["tools"]["broker"],
+                "BROKER_RUNTIME_MISMATCH", "running broker executable/process differs")
+        entry = self.candidate["tools"]["broker"]
+        require(entry in observed["argv"], "BROKER_RUNTIME_MISMATCH", "running daemon argv does not contain the approved entry")
+        return {"process": observed, "runtime_sha256": runtime["sha256"], "protocol": runtime["protocol"]}
+
+
+def expanded_argv(ctx, provider, session):
+    return [arg.replace("{root}", str(ctx.root)).replace("{session}", session) for arg in provider["argv"]]
+
+
+def provider_process(rt, record):
+    actual, pid, _ = rt.seat(record["seat"]["pane_id"], record["seat"]["provider"])
+    require(actual == record["seat"], "LAUNCH_IDENTITY_MISMATCH", "live tmux descriptor differs")
+    provider = rt.candidate["providers"][record["seat"]["provider"]]
+    observed = process(pid, provider["version"])
+    require(observed["executable"] == provider["executable"]["path"]
+            and observed["sha256"] == provider["executable"]["sha256"]
+            and observed["argv"] == expanded_argv(rt.ctx, provider, record["seat"]["session"]),
+            "PROVIDER_PROCESS_MISMATCH", "observed provider executable/argv differs")
+    return observed
+
+
+def validation_grade(evidence):
+    return "local" if evidence["native_policy"] == "unverified" else "native"
+
+
+def live_binding(ctx, rt, current, provider=None, observed_broker=None):
+    require(current is not None, "ORCHESTRATOR_BINDING_UNAVAILABLE", "protected launch is absent")
+    record = current["record"]
+    if provider:
+        require(record["seat"]["provider"] == provider, "PROVIDER_MISMATCH", "existing session is unchanged")
+    require(record["state"] == "ready", "LAUNCH_NOT_READY", record["state"])
+    admitted_profile(ctx, record["seat"]["provider"], record["profile_hash"])
+    require(rt.at_root() == [{"session": record["seat"]["session"], "root": str(ctx.root),
+                             "incarnation": record["seat"]["incarnation"], "session_id": record["seat"]["session_id"]}],
+            "LAUNCH_IDENTITY_MISMATCH", "live session set differs")
+    observed = provider_process(rt, record)
+    for option, expected in (("@forge-role", "orchestrator"), ("@forge-provider", record["seat"]["provider"]),
+                             ("@forge-worker", "claude")):
+        require(rt.tmux("show-options", "-p", "-v", "-t", record["seat"]["pane_id"], option).stdout.strip() == expected,
+                "LAUNCH_IDENTITY_MISMATCH", "advisory seat metadata contradicts the protected binding")
+    active_broker = observed_broker if observed_broker is not None else rt.broker_binding(record["broker"]["runtime_sha256"])
+    records.compare_live(record, ctx.identity, record["seat"], observed, active_broker,
+                         record["profile_hash"], rt.candidate["inputs"]["package"]["sha256"])
+    require(ctx.store.current() == current, "REVISION_CONFLICT", "binding changed during live observation")
+    return {"role": "orchestrator", "provider": record["seat"]["provider"], "session": record["seat"]["session"],
+            "launch_id": record["launch_id"], "admission": "verified", "validation": validation_grade(record["evidence"])}
+
+
+def admission_guard(ctx, session, observed_broker=None):
+    current = ctx.store.current()
+    if current is None:
+        broker.TMUX_SOCKET = broker.tmux_socket_from_context(os.environ.get("TMUX", ""))
+        try:
+            claimed = broker.tmux_field(session + ":.0", "#{@forge-provider}")
+        except broker.Refusal:
+            # Unconverted legacy launchers have no new authority record. Their
+            # existing bridge identity gate remains responsible for availability.
+            require(ctx.store.profile() is None, "ORCHESTRATOR_BINDING_UNAVAILABLE", "qualified seat cannot be observed")
+            claimed = ""
+        require(not claimed, "ORCHESTRATOR_BINDING_UNAVAILABLE", "claimed provider has no protected launch")
+        require(ctx.store.profile() is None, "ORCHESTRATOR_BINDING_UNAVAILABLE", "registered root has no launch binding")
+        return {"admission": "legacy", "role": "orchestrator", "provider": "claude"}
+    require(current["record"]["seat"]["session"] == session, "LAUNCH_IDENTITY_MISMATCH", "resolved session differs")
+    profile = admitted_profile(ctx, snapshot=current["record"]["profile_hash"])
+    return live_binding(ctx, Runtime(ctx, profile["profile"]["candidate"]), current, observed_broker=observed_broker)
+
+
+def legacy_ensure(ctx, session, provider):
+    require(provider in (None, "claude") and ctx.store.current() is None and ctx.store.profile() is None,
+            "ORCHESTRATOR_BINDING_UNAVAILABLE", "legacy inference cannot override a qualified claim")
+    executable = shutil.which("claude")
+    require(executable is not None, "ORCHESTRATOR_BINDING_UNAVAILABLE", "native Claude executable unavailable")
+    executable = str(Path(executable).resolve())
+    rt = Runtime(ctx, {"tools": {"tmux": "/opt/homebrew/bin/tmux", "forge": str(TREE / "bin/forge")}})
+    rows = rt.at_root()
+    require(len(rows) == 1 and rows[0]["session"] == session,
+            "ORCHESTRATOR_BINDING_UNAVAILABLE", "legacy root/session is ambiguous")
+    panes = rt.pane_ids(session)
+    require(len(panes) == 5,
+            "ORCHESTRATOR_BINDING_UNAVAILABLE", "legacy five-pane topology unavailable")
+    before, pid, _ = rt.seat(panes[0], "claude")
+    for pane, alias in zip(panes, ("claude", "claude-opus", "claude-sonnet", "codex-a", "codex-b")):
+        require(rt.tmux("show-options", "-p", "-v", "-t", pane, "@forge-worker").stdout.strip() == alias,
+                "ORCHESTRATOR_BINDING_UNAVAILABLE", "legacy pane receipt differs")
+    claimed = rt.tmux("show-options", "-p", "-v", "-t", panes[0], "@forge-provider", check=False).stdout.strip()
+    require(not claimed, "ORCHESTRATOR_BINDING_UNAVAILABLE", "claimed provider requires protected binding")
+    observed = process(pid)
+    require(observed["executable"] == executable and observed["sha256"] == file_identity(executable)["sha256"],
+            "ORCHESTRATOR_BINDING_UNAVAILABLE", "legacy native Claude process not corroborated")
+    require(rt.seat(panes[0], "claude")[0] == before and same_process(observed) and rt.at_root() == rows,
+            "ORCHESTRATOR_BINDING_UNAVAILABLE", "legacy identity changed while observing")
+    return {"admission": "legacy-observed", "role": "orchestrator", "provider": "claude", "session": session,
+            "pane_id": before["pane_id"], "incarnation": before["incarnation"]}
+
+
+def observe_host(ctx, session, pane_id=None):
+    """Read-only attribution, never infer a provider from a seat alias or env."""
+    unknown = {"role": "orchestrator", "provider": "unknown", "session": session,
+               "observation": "unknown"}
+    try:
+        require(bool(session), "INVALID_SESSION", "resolved session required")
+        current = ctx.store.current()
+        if current is None:
+            result = legacy_ensure(ctx, session, None)
+        else:
+            result = admission_guard(ctx, session)
+            require(ctx.store.current() == current, "REVISION_CONFLICT", "binding changed during observation")
+            result.update(pane_id=current["record"]["seat"]["pane_id"],
+                          incarnation=current["record"]["seat"]["incarnation"])
+        require(not pane_id or result["pane_id"] == pane_id,
+                "LAUNCH_IDENTITY_MISMATCH", "event came from a different pane")
+        return dict(result, observation="verified")
+    except (Refusal, records.Refusal, broker.Refusal, OSError, ValueError, subprocess.SubprocessError) as exc:
+        return dict(unknown, reason=getattr(exc, "code", "OBSERVATION_UNAVAILABLE"))
+
+
+def ancestry(record, candidate):
+    creator = record["owner"]
+    require(same_process(creator), "HANDOFF_CREATOR_GONE", "creator identity changed")
+    me = process(os.getpid())
+    if me == creator:
+        return [me]
+    table = parents()
+    current = os.getpid()
+    chain = []
+    allowed = {item["path"] for item in candidate["files"]}
+    for _ in range(32):
+        if current == creator["pid"]:
+            require(chain and any(candidate["tools"]["host"] in item["argv"] for item in chain),
+                    "HANDOFF_PROVENANCE_INVALID", "expected populate executable absent")
+            return chain
+        item = process(current)
+        require(item["executable"] in allowed, "HANDOFF_PROVENANCE_INVALID", "unapproved intermediary executable")
+        # Interpreted intermediaries must name an approved script, not -c/-m
+        # source strings. Native hook executables are bound by their own hash.
+        args = item["argv"][1:]
+        require(not any(arg in {"-c", "-m", "--eval"} for arg in args),
+                "HANDOFF_PROVENANCE_INVALID", "opaque intermediary command")
+        if Path(item["executable"]).name.startswith(("python", "Python", "bash", "sh")):
+            require(any(arg in allowed for arg in args), "HANDOFF_PROVENANCE_INVALID", "unapproved intermediary script")
+        chain.append(item)
+        current = table.get(current, 0)
+        require(current > 1, "HANDOFF_PROVENANCE_INVALID", "creator is not an ancestor")
+    raise Refusal("HANDOFF_PROVENANCE_INVALID", "process chain exceeds limit")
+
+
+def terminal_observation(ctx, rt, current, *, recovering=False):
+    require(not rt.at_root(), "HANDOFF_REQUIRED", "a live session still owns this root")
+    if current:
+        record = current["record"]
+        for owner in (record.get("owner"), record.get("process"), record.get("handoff", {}).get("shell"),
+                      record.get("handoff", {}).get("claimant"), record.get("handoff", {}).get("hook_process")):
+            require(not owner or not alive(owner), "HANDOFF_REQUIRED", "prior process is still alive")
+        require(record["state"] != "preparing" or recovering, "PREPARING_RECOVERY_REQUIRED", "explicit recovery must disposition a dead preparing transaction")
+    try:
+        info = read_json(ctx.protected / "pid.json")
+    except FileNotFoundError:
+        info = None
+    require(info is None or (info.get("state") == "stopped" and not broker.broker_pid_live(info)),
+            "HANDOFF_REQUIRED", "existing broker must be resolved by its recovery/stop protocol")
+    require(not broker.broker_lock_held(ctx.protected), "HANDOFF_REQUIRED", "broker lock is held")
+    for relative in ("active",):
+        directory = ctx.protected / relative
+        if directory.exists():
+            for path in directory.iterdir():
+                if path.suffix == ".json":
+                    row = read_json(path)
+                    require(row.get("state") in {"completed", "failed", "cancelled", "superseded"},
+                            "HANDOFF_REQUIRED", "unresolved protected " + relative)
+    control = ctx.protected / "control-requests"
+    if control.exists():
+        for path in control.glob("*.json"):
+            request = read_json(path)
+            opid = request.get("operation_id")
+            require(isinstance(opid, str) and re.fullmatch(r"[A-Za-z0-9._-]{8,128}", opid),
+                    "HANDOFF_REQUIRED", "unresolved control request identity")
+            result = read_json(ctx.protected / "results" / (opid + ".json"))
+            require(result.get("schema") == broker.RESULT_SCHEMA and result.get("operation_id") == opid
+                    and result.get("status") in {"ok", "error"} and result.get("finished_at"),
+                    "HANDOFF_REQUIRED", "unresolved protected control request")
+    deliveries = ctx.protected / "deliveries"
+    if deliveries.exists():
+        for path in deliveries.glob("*.json"):
+            require(read_json(path).get("state") in {"completed", "failed", "cancelled", "superseded"},
+                    "HANDOFF_REQUIRED", "nonterminal delivery")
+    if ctx.transactions.exists():
+        for path in ctx.transactions.glob("*/journal.json"):
+            require(read_json(path).get("state") in {"committed", "restored", "committed-recovery"},
+                    "HANDOFF_REQUIRED", "unresolved effect journal")
+    require(not os.path.lexists(ctx.common / "forge-infra-lock/infra.holder"),
+            "HANDOFF_REQUIRED", "infra ownership requires disposition")
+    for relative in (".dev/forge-broker/requests", ".dev/forge-broker/lifecycle/requests"):
+        path = ctx.root / relative
+        if path.exists():
+            fd = records.directory(path)
+            try:
+                for name in os.listdir(fd):
+                    # Completed/rejected effect claims are retained by the
+                    # existing poller. Never resurrect them as pending work.
+                    terminal = re.fullmatch(r".+\.request\.json\.claimed\.\d+\.(done|error\.json)", name)
+                    require(relative.endswith("forge-broker/requests") and terminal,
+                            "HANDOFF_REQUIRED", "unresolved request queue")
+                    file_bytes(path / name, 1024 * 1024)
+            finally:
+                os.close(fd)
+    callbacks = ctx.root / ".dev/forge-tmp/callbacks"
+    if callbacks.exists():
+        for path in callbacks.iterdir():
+            require(path.name == "archive", "HANDOFF_REQUIRED", "unconsumed callback remains")
+            fd = records.directory(path)
+            os.close(fd)
+    result = subprocess.run([rt.candidate["tools"]["forge"], "orchestrator-pending", "--root", str(ctx.root)],
+                            cwd=ctx.root, env=rt.env, text=True, capture_output=True, timeout=10)
+    require(result.returncode == 0 and json.loads(result.stdout) == {"pending": False},
+            "HANDOFF_REQUIRED", "pending work is present or cannot be established")
+    return ({"reference": current["reference"], "record_sha256": records.digest(current["record"])} if current else None)
+
+
+def reserve_launch(ctx, rt, profile, session, provider):
+    current = ctx.store.current()
+    predecessor = terminal_observation(ctx, rt, current)
+    candidate = profile["profile"]["candidate"]
+    # A server may not exist yet; socket_path is filled from tmux exactly once
+    # when the invocation-owned shell is bound below.
+    socket = rt.socket or str(Path(f"/tmp/tmux-{os.getuid()}/default").resolve())
+    record = {"schema": "forge-orchestrator-launch/1", "root": ctx.identity, "launch_id": uuid.uuid4().hex,
+              "revision": 1, "state": "preparing", "construction": "reserved", "created_at": records.now(),
+              "updated_at": records.now(), "owner": process(os.getpid()), "process_epoch": 0,
+              "seat": {"role": "orchestrator", "provider": provider, "session": session, "socket": socket},
+              "profile_hash": profile["sha256"], "package_hash": candidate["inputs"]["package"]["sha256"],
+              "inputs": candidate["inputs"], "evidence": candidate["providers"][provider]["evidence"]}
+    generation = current["reference"]["generation"] if current else 0
+    return ctx.store.reserve(record, generation, predecessor)
+
+
+def claim_handoff(ctx, rt, launch_id, session, provider):
+    current = ctx.store.current()
+    require(current is not None and current["record"]["launch_id"] == launch_id, "HANDOFF_MISSING", "unknown launch locator")
+    record = current["record"]
+    require(record["seat"]["session"] == session and record["seat"]["provider"] == provider,
+            "HANDOFF_IDENTITY_MISMATCH", "request differs from protected transaction")
+    require(record["state"] == "preparing" and record.get("construction") in {"shell-created", "hook-started"},
+            "HANDOFF_ALREADY_CLAIMED", "one-use handoff unavailable")
+    admitted_profile(ctx, provider, record["profile_hash"])
+    chain = ancestry(record, rt.candidate)
+    require(rt.pane_ids(session) == [record["seat"]["pane_id"]], "PANE_NOT_IDLE", "populate requires the sole owned pane")
+    rt.idle(record["seat"], record["handoff"]["shell"])
+    handoff = dict(record["handoff"], claimant=process(os.getpid()), chain=chain, claimed_at=records.now())
+    record = ctx.store.preparing(launch_id, record["revision"], current["reference"]["generation"], "claimed", handoff=handoff)
+    return {"record": record, "reference": current["reference"]}
+
+
+def run_hook(ctx, args):
+    current = ctx.store.current()
+    require(current and current["record"]["launch_id"] == args.launch_id,
+            "HANDOFF_MISSING", "unknown launch locator")
+    record = current["record"]
+    profile = admitted_profile(ctx, record["seat"]["provider"], record["profile_hash"])
+    candidate = profile["profile"]["candidate"]
+    require(ENTRY == Path(candidate["tools"]["host"]) and os.getppid() == record["owner"]["pid"]
+            and same_process(record["owner"]), "HANDOFF_PROVENANCE_INVALID", "hook must descend directly from its creator")
+    rt = Runtime(ctx, candidate)
+    rt.idle(record["seat"], record["handoff"]["shell"])
+    # Journal the live hook PID/start before it can execute any approved hook
+    # bytes. Exec preserves this identity even if the creator subsequently dies.
+    handoff = dict(record["handoff"], hook_process=process(os.getpid()))
+    ctx.store.preparing(record["launch_id"], record["revision"], current["reference"]["generation"],
+                        "hook-started", handoff=handoff)
+    require(same_process(record["owner"]), "HANDOFF_CREATOR_GONE", "creator exited before hook execution")
+    admitted_profile(ctx, record["seat"]["provider"], record["profile_hash"])
+    argv = [*candidate["on_spawn"]["argv"], record["seat"]["session"]]
+    env = dict(rt.env, TMUX_SESSION=record["seat"]["session"], FORGE_ORCHESTRATOR_PROVIDER=record["seat"]["provider"],
+               FORGE_ORCHESTRATOR_REQUEST_VERSION="1", FORGE_ORCHESTRATOR_LAUNCH_ID=record["launch_id"])
+    os.execve(argv[0], argv, env)
+
+
+def assert_claim(ctx, rt, current, *, idle=True):
+    record = current["record"]
+    require(ctx.store.current() == current, "REVISION_CONFLICT", "transaction changed")
+    require(record.get("construction") == "claimed" and same_process(record["handoff"]["claimant"]),
+            "HANDOFF_PROVENANCE_INVALID", "claimant changed")
+    require(record["handoff"]["claimant"]["pid"] == os.getpid(), "HANDOFF_PROVENANCE_INVALID", "claim belongs to another process")
+    admitted_profile(ctx, record["seat"]["provider"], record["profile_hash"])
+    require(same_process(record["owner"]), "HANDOFF_CREATOR_GONE", "creator exited before population")
+    if idle:
+        rt.idle(record["seat"], record["handoff"]["shell"])
+
+
+def fail_launch(ctx, launch_id, diagnostic):
+    current = ctx.store.current()
+    if current and current["record"]["launch_id"] == launch_id and current["record"]["state"] == "preparing":
+        record = current["record"]
+        owners = [record["owner"].get("pid"), record.get("handoff", {}).get("claimant", {}).get("pid")]
+        require(os.getpid() in owners, "HANDOFF_PROVENANCE_INVALID", "failure writer does not own construction")
+        ctx.store.transition(launch_id, record["revision"], current["reference"]["generation"], "failed", diagnostic=diagnostic[:4096])
+
+
+def advisory_session(ctx, session):
+    directory = records.directory(ctx.root / ".dev", create=True)
+    name = ".forge-session." + uuid.uuid4().hex
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        try:
+            data = ("# advisory only; authority is the live pane and protected binding\n" + session + "\n").encode()
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(name, ".forge-session", src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        try:
+            os.unlink(name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
+
+
+def populate_launch(ctx, rt, current):
+    record = current["record"]
+    session, host = record["seat"]["session"], record["seat"]["pane_id"]
+    created, broker_owned, provider_started, ready = [], None, False, False
+    try:
+        assert_claim(ctx, rt, current)
+        provider = rt.candidate["providers"][record["seat"]["provider"]]
+        version = subprocess.run([provider["executable"]["path"], "--version"], env=rt.env,
+                                 text=True, capture_output=True, timeout=10)
+        require(version.returncode == 0 and version.stdout.strip() == provider["version"],
+                "PROVIDER_VERSION_CHANGED", "provider version differs from qualification")
+        doctor = subprocess.run([rt.candidate["tools"]["forge"], "codex-doctor", str(ctx.root)],
+                                env=rt.env, text=True, capture_output=True, timeout=30)
+        require(doctor.returncode == 0 and "launch_ready=true" in doctor.stdout.splitlines(),
+                "WORKER_PREFLIGHT_FAILED", "existing Codex worker gate failed")
+        # All effects below target captured pane objects, never an adoptable
+        # session name. Split resources are recorded immediately for cleanup.
+        for orientation, anchor, percent in (("-v", host, "60"), ("-h", None, "50"),
+                                               ("-v", None, "50"), ("-v", "right", "50")):
+            assert_claim(ctx, rt, current)
+            target = anchor or created[0]
+            if target == "right":
+                target = created[1]
+            pane = rt.tmux("split-window", orientation, "-t", target, "-c", str(ctx.root), "-p", percent,
+                           "-P", "-F", "#{pane_id}", *rt.child_argv(session,
+                           [rt.candidate["tools"]["shell"], "--noprofile", "--norc"])).stdout.strip()
+            require(pane.startswith("%"), "LAYOUT_INVALID", "split did not return a pane object")
+            created.append(pane)
+        require(len(rt.pane_ids(session)) == 5, "LAYOUT_INVALID", "construction must have five panes")
+        panes = [host, created[0], created[2], created[1], created[3]]
+        rt.geometry(session, panes)
+        assert_claim(ctx, rt, current)
+        env = dict(rt.env, TMUX_SESSION=session, FORGE_ROOT=str(ctx.root))
+        server_pid = rt.tmux("display-message", "-p", "-t", host, "#{pid}").stdout.strip()
+        env["TMUX"] = record["seat"]["socket"] + "," + server_pid + ",0"
+        started = subprocess.run([rt.candidate["tools"]["broker"], "start", "--root", str(ctx.root),
+                                  "--session", session, "--incarnation", record["seat"]["incarnation"], "--mode", "contain", "--fresh"],
+                                 cwd=ctx.root, env=env, text=True, capture_output=True, timeout=15)
+        require(started.returncode == 0, "BROKER_START_FAILED", started.stderr.strip())
+        broker_owned = json.loads(started.stdout)
+        active_broker = rt.broker_binding()
+        assert_claim(ctx, rt, current)
+        rt.tmux("respawn-pane", "-k", "-t", host, "-c", str(ctx.root),
+                *rt.child_argv(session, expanded_argv(ctx, provider, session), pane=host, role="orchestrator"))
+        provider_started = True
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                observed = provider_process(rt, record)
+                break
+            except (Refusal, subprocess.SubprocessError):
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+        # Preserve the persisted claude identity and all four worker aliases.
+        for pane, alias in zip(panes, ("claude", "claude-opus", "claude-sonnet", "codex-a", "codex-b")):
+            rt.tmux("set-option", "-p", "-t", pane, "@forge-worker", alias)
+        rt.tmux("set-option", "-p", "-t", host, "@forge-role", "orchestrator")
+        rt.tmux("set-option", "-p", "-t", host, "@forge-provider", record["seat"]["provider"])
+        rt.tmux("set-environment", "-t", "=" + session, "FORGE_LAYOUT", "2")
+        # Worker routing/eligibility is unchanged; qualified paths pin the same
+        # commands to their approved package instead of resolving mutable PATH.
+        for pane, model in ((panes[1], "claude-opus-5"), (panes[2], "claude-sonnet-5")):
+            rt.tmux("respawn-pane", "-k", "-t", pane, "-c", str(ctx.root),
+                    *rt.child_argv(session, [rt.candidate["tools"]["claude_worker"], "--model", model,
+                                           "--permission-mode", "acceptEdits"], pane=pane, role="worker",
+                                   operator_profile=True))
+        for index, effort in ((3, "high"), (4, "medium")):
+            rt.tmux("respawn-pane", "-k", "-t", panes[index], "-c", str(ctx.root),
+                    *rt.child_argv(session, [*worker_forge(rt.candidate["tools"]["forge"]),
+                                           "codex-launch", "--root", str(ctx.root),
+                                           "--session", session, "--pane", str(index), "--effort", effort], pane=panes[index],
+                                   operator_profile=True))
+        assert_claim(ctx, rt, current, idle=False)
+        require(provider_process(rt, record) == observed, "PROVIDER_PROCESS_MISMATCH", "provider changed during construction")
+        require(rt.broker_binding(active_broker["runtime_sha256"]) == active_broker,
+                "BROKER_RUNTIME_MISMATCH", "broker changed during construction")
+        advisory_session(ctx, session)
+        ctx.store.transition(record["launch_id"], record["revision"], current["reference"]["generation"],
+                             "ready", process=observed, broker=active_broker, process_epoch=1)
+        ready = True
+        rt.tmux("select-pane", "-t", host, check=False)
+        return {"role": "orchestrator", "provider": record["seat"]["provider"], "session": session,
+                "launch_id": record["launch_id"], "admission": "verified", "validation": validation_grade(record["evidence"])}
+    except BaseException as exc:
+        if ready:
+            raise
+        for pane in reversed(created):
+            rt.tmux("kill-pane", "-t", pane, check=False)
+        # Never kill an existing populate host or a launched provider. An owned
+        # broker is stopped only before any provider could have begun work.
+        if broker_owned and not provider_started:
+            try:
+                info = read_json(ctx.protected / "pid.json")
+                if info.get("pid") == broker_owned.get("pid") and info.get("pid_started") == broker_owned.get("pid_started"):
+                    broker.stop_broker(ctx.protected, info, 5)
+            except Exception:
+                pass
+        fail_launch(ctx, record["launch_id"], str(exc))
+        raise
+
+
+def launch(ctx, args):
+    profile = admitted_profile(ctx, args.provider)
+    candidate = profile["profile"]["candidate"]
+    if ENTRY != Path(candidate["tools"]["host"]):
+        env = clean_env(ctx, candidate)
+        for key in ("FORGE_ORCHESTRATOR_LAUNCH_ID", "FORGE_ORCHESTRATOR_PROVIDER", "FORGE_ORCHESTRATOR_REQUEST_VERSION"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        argv = host_argv(candidate, *sys.argv[1:])
+        os.execve(argv[0], argv, env)
+    rt = Runtime(ctx, candidate)
+    current = ctx.store.current()
+    if args.command != "populate" and current and current["record"]["state"] == "ready" and rt.at_root():
+        return live_binding(ctx, rt, current, args.provider)
+    if args.command == "populate":
+        require(args.launch_id and os.environ.get("FORGE_ORCHESTRATOR_REQUEST_VERSION") == "1"
+                and os.environ.get("FORGE_ORCHESTRATOR_PROVIDER") == args.provider,
+                "HANDOFF_MISSING", "complete spawn request and protected locator required")
+        current = claim_handoff(ctx, rt, args.launch_id, args.session, args.provider)
+        return populate_launch(ctx, rt, current)
+    if not args.session:
+        names = {item["session"] for item in rt.sessions()}
+        index = 1
+        while "forge-" + str(index) in names:
+            index += 1
+        args.session = "forge-" + str(index)
+    require(args.session and all(char.isalnum() or char in "_-" for char in args.session)
+            and args.session.isascii(), "INVALID_SESSION", "explicit ASCII session name required")
+    if args.dry_run:
+        terminal_observation(ctx, rt, current)
+        return {"plan": "create", "provider": args.provider, "session": args.session, "root": str(ctx.root),
+                "validation": validation_grade(candidate["providers"][args.provider]["evidence"])}
+    current = reserve_launch(ctx, rt, profile, args.session, args.provider)
+    launch_id = current["record"]["launch_id"]
+    try:
+        assets = subprocess.run([candidate["tools"]["forge"], "root-assets", "ensure-dev-exclusion", "--root", str(ctx.root)],
+                                cwd=ctx.root, env=rt.env, capture_output=True, text=True, timeout=15)
+        require(assets.returncode == 0, "ROOT_ASSETS_REFUSED", "could not establish the .dev exclusion")
+        admitted_profile(ctx, args.provider, profile["sha256"])
+        seat, shell = rt.new_shell(args.session, args.provider)
+        # Binding a nondefault socket discovered from an approved tmux wrapper
+        # is allowed only before any actual seat identity has been published.
+        require(current["record"]["seat"]["socket"] == seat["socket"], "SOCKET_MISMATCH", "tmux server differs from requested socket")
+        handoff = {"shell": shell, "expected_hook": candidate["on_spawn"]["argv"],
+                   "expected_populate": candidate["tools"]["host"], "created_at": records.now()}
+        record = ctx.store.preparing(launch_id, 1, current["reference"]["generation"], "shell-created", seat=seat, handoff=handoff)
+        current = {"record": record, "reference": current["reference"]}
+        if args.command == "spawn":
+            admitted_profile(ctx, args.provider, profile["sha256"])
+            rt.idle(seat, shell)
+            env = dict(rt.env, TMUX_SESSION=args.session, FORGE_ORCHESTRATOR_PROVIDER=args.provider,
+                       FORGE_ORCHESTRATOR_REQUEST_VERSION="1", FORGE_ORCHESTRATOR_LAUNCH_ID=launch_id)
+            result = subprocess.run(host_argv(candidate, "hook", "--root", str(ctx.root),
+                                     "--launch-id", launch_id), cwd=ctx.root, env=env,
+                                    text=True, capture_output=True, timeout=120)
+            require(result.returncode == 0, "POPULATE_FAILED", "approved hook failed; host session left alive: " + result.stderr[-2048:])
+            return live_binding(ctx, rt, ctx.store.current(), args.provider)
+        current = claim_handoff(ctx, rt, launch_id, args.session, args.provider)
+        result = populate_launch(ctx, rt, current)
+    except BaseException as exc:
+        fail_launch(ctx, launch_id, str(exc))
+        raise
+    # All state transitions and construction cleanup decisions precede this
+    # terminal exec. Attach/switch failure does not rewrite a ready record.
+    if not args.no_attach and (args.attach or (os.isatty(0) and os.isatty(1))):
+        verb = "switch-client" if os.environ.get("TMUX") else "attach-session"
+        print(json.dumps(result, sort_keys=True), flush=True)
+        argv = [rt.binary] + (["-S", rt.socket] if rt.socket else []) + [verb, "-t", "=" + args.session]
+        os.execve(rt.binary, argv, rt.env)
+    return result
+
+
+def recover_launch(ctx, args):
+    try:
+        current = ctx.store.current()
+    except Refusal as exc:
+        if exc.code != "UNSELECTED_LAUNCH":
+            raise
+        current = None
+    require(records.identifier(args.launch_id), "REFERENCE_CONFLICT", "exact launch id required")
+    unselected = current is None
+    if unselected:
+        record = read_json(ctx.store.path / "launches" / (args.launch_id + ".json"))
+        records.validate_launch(record, ctx.identity)
+        current = {"record": record, "reference": {"launch_id": args.launch_id, "generation": 0}}
+    require(current["record"]["launch_id"] == args.launch_id,
+            "REFERENCE_CONFLICT", "exact current launch id required")
+    record = current["record"]
+    require(record["state"] == "preparing", "INVALID_TRANSITION", "only interrupted preparation needs disposition")
+    original = ctx.store.profile_snapshot(record["profile_hash"])
+    candidate = validate_candidate(ctx, original["candidate"], qualification=False)
+    # No age-based takeover, resource killing or current-profile requirement.
+    # Existing recovery must first leave every original resource terminal.
+    terminal_observation(ctx, Runtime(ctx, candidate), current, recovering=True)
+    if unselected:
+        return ctx.store.disposition_unselected(record)
+    return ctx.store.transition(record["launch_id"], record["revision"], current["reference"]["generation"],
+                                "failed", diagnostic="explicit recovery: terminal ownership independently verified")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    prepare = commands.add_parser("prepare-management")
+    prepare.add_argument("--root", required=True)
+    for name in ("start", "spawn", "populate", "admit", "route", "guard", "recover", "legacy-ensure", "hook", "observe", "rollout"):
+        command = commands.add_parser(name)
+        command.add_argument("--root", required=True)
+        command.add_argument("--provider", choices=("claude", "codex"))
+        command.add_argument("--session")
+        if name == "observe":
+            command.add_argument("--pane-id")
+        if name == "rollout":
+            command.add_argument("--check", action="store_true")
+        command.add_argument("--launch-id")
+        command.add_argument("--dry-run", action="store_true")
+        attach = command.add_mutually_exclusive_group()
+        attach.add_argument("--no-attach", action="store_true")
+        attach.add_argument("--attach", action="store_true")
+    profile = commands.add_parser("orchestrator-profile")
+    actions = profile.add_subparsers(dest="profile_action", required=True)
+    for action in ("inspect", "register", "disable", "probe"):
+        command = actions.add_parser(action)
+        command.add_argument("--root", required=True)
+        command.add_argument("--provider", choices=("claude", "codex"))
+        if action in {"inspect", "register"}:
+            command.add_argument("--from", dest="source", required=action == "register")
+        else:
+            command.set_defaults(source=None)
+        if action in {"register", "disable"}:
+            command.add_argument("--expect-revision", type=int, required=True)
+        if action == "register":
+            command.add_argument("--accept-local-validation", action="store_true",
+                                 help="accept local gates without claiming native model qualification")
+    args = parser.parse_args()
+    ctx = Context(args.root)
+    if args.command == "prepare-management":
+        result = prepare_management(ctx)
+    elif args.command == "orchestrator-profile":
+        result = profile_command(ctx, args)
+    elif args.command == "rollout":
+        result = rollout_status(ctx, args.provider or "codex")
+        print(json.dumps(result, sort_keys=True))
+        return 3 if args.check and not result["eligible"] else 0
+    elif args.command == "route":
+        current, profile = ctx.store.current(), ctx.store.profile()
+        if args.provider == "codex" or current or profile:
+            admitted_profile(ctx, requested_provider(ctx, args.provider))
+            print("qualified")
+        else:
+            print("legacy")
+        return 0
+    elif args.command == "admit":
+        current = ctx.store.current()
+        profile = admitted_profile(ctx, args.provider, current["record"]["profile_hash"] if current else None)
+        result = live_binding(ctx, Runtime(ctx, profile["profile"]["candidate"]), current, args.provider)
+    elif args.command == "guard":
+        require(bool(args.session), "INVALID_SESSION", "resolved session required")
+        result = admission_guard(ctx, args.session)
+    elif args.command == "observe":
+        result = observe_host(ctx, args.session, args.pane_id)
+    elif args.command == "recover":
+        result = recover_launch(ctx, args)
+    elif args.command == "legacy-ensure":
+        result = legacy_ensure(ctx, args.session, args.provider)
+    elif args.command == "hook":
+        result = run_hook(ctx, args)
+    else:
+        args.provider = requested_provider(ctx, args.provider)
+        result = launch(ctx, args)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (Refusal, broker.Refusal, OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(json.dumps({"status": "error", "code": getattr(exc, "code", "ORCHESTRATOR_UNAVAILABLE"), "detail": str(exc)}), file=sys.stderr)
+        raise SystemExit(3)

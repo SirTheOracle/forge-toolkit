@@ -1,0 +1,14 @@
+# Operator session for the attended P1 experiments. Loaded only by
+# tests/forge-orchestrator/native-probe.sh session; never by a Forge worker.
+# CLI overrides take precedence over the user's approval_policy="never".
+approval_policy = "on-request"
+approvals_reviewer = "user"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = false
+writable_roots = []
+
+# Native sandbox execution, protected fixture preparation, tmux/broker access
+# and other host operations require individual approvals after restart.
+# No persistent allow rules for shell/Python/tmux or sandbox bypass are granted.

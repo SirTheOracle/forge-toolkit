@@ -102,6 +102,10 @@ if re.search(r'\{coding, ?qa, ?qa-fix, ?qa-retry, ?verify\}', br):
 # still fails — proven by injecting one.
 FIVE = re.compile(r'`coding`,\s*`qa`,\s*`qa-fix`,\s*`qa-retry`,\s*`verify`')
 for rel in ("docs/forge-technical-reference.md", "docs/forge-operator-guide.md"):
+    if rel == "docs/forge-technical-reference.md" and not (root / rel).exists():
+        # Explicitly private/generated in .gitignore, absent from a fresh checkout.
+        print("  R23-LOCKSTEP: optional generated technical reference absent; checking tracked protocol and guide")
+        continue
     text = (root / rel).read_text()
     flat = re.sub(r'\s+', ' ', text)
     for m in FIVE.finditer(flat):

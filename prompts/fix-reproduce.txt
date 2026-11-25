@@ -12,7 +12,7 @@ You are executing the 'fix-reproduce' stage of a forge fix-pipeline.
 
 Slug: {slug}
 
-Follow the fix-reproducer skill at ~/.claude/skills/fix-reproducer/SKILL.md
+Follow the fix-reproducer skill at {worker_skill}
 
 This is the OPTIONAL first stage. You verify a reported bug is reproducible and capture deterministic repro steps, environment state, and evidence. You are a single procedural executor — do NOT spawn sub-agents, do NOT diagnose root cause, do NOT propose fixes.
 

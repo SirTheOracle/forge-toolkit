@@ -6,20 +6,21 @@
 # Resolves pane/session/root STRUCTURALLY from $TMUX_PANE (the one attribution
 # key present on the live, unstamped forge-1..4 sessions) via a single
 # `tmux display-message` call, so it fires with NO FORGE_ROLE/TMUX_SESSION launch
-# stamp. FORGE_ROLE, when a future spawned session sets it, overrides the
-# structural role. Writes ONE atomic file under <root>/.dev/attention/, exits 0.
+# stamp. A role stamp cannot promote a worker pane into the host seat.
+# Writes atomic records under <root>/.dev/attention/.
 #
 # INVIOLABLE: permissionrequest exits 0 with ZERO stdout so the dialog survives
-# (fail-open). EVERY path exits 0. All four events are gated to the orchestrator
-# (pane 0) per the handoff — a worker pane finishing a turn must not mark the
-# initiative done; worker escalation is the Phase B `forge ask` path.
+# (fail-open). Host lifecycle files are restricted to the orchestrator (pane 0).
+# Worker events use separate per-turn files and never mark the initiative done.
 import sys, os, json, re, glob, hashlib, secrets, datetime, subprocess
+from pathlib import Path
 
 def done():
     sys.exit(0)
 
-# `--codex` (first arg) selects the codex adapter: SAME body, agent='codex' (Diff 7c), role
-# forced worker by pane math, task_id correlated on the native turn_id. Codex stdin keys
+# `--codex` selects the native event adapter, not the host provider or role.
+# Host attribution comes from the validated binding; worker task_id uses turn_id.
+# Codex stdin keys
 # (`prompt`, `last_assistant_message`, `transcript_path`) already match the internal shape
 # (Gate 2) — no key remap, only the flag.
 argv = sys.argv[1:]
@@ -42,7 +43,7 @@ if meta is None:
     if pane:
         try:
             meta = subprocess.run(
-                ['tmux', 'display-message', '-p', '-t', pane,
+                ['tmux', '-u', 'display-message', '-p', '-t', pane,
                  '#{pane_index}\t#{session_name}\t#{session_path}\t#{window_panes}'],
                 capture_output=True, text=True, timeout=5).stdout.strip()
         except (OSError, subprocess.SubprocessError):
@@ -74,17 +75,17 @@ else:
 # LOCKSTEP: bin/forge-bridge pane_index() 'claude'.
 # Verified by `forge-bridge alias-self-test --strict`.
 ORCH_PANE_INDEX = '0'
-# role: env override wins; otherwise the canonical orchestrator index wins.
+# Role stamps cannot promote a worker pane into the host seat.
 # Emission is now OPEN to every pane — the gate that used to DISCARD worker signal is gone.
 # Workers write NAMESPACED per-turn files (the worker branch below); the canonical
 # stop.<session>.json stays the orchestrator's alone, so a worker turn can never mark the
-# initiative done (§5). `agent` rides ONLY on worker records, so the orchestrator envelope —
-# and stop.<session>.json — stays byte-identical. Step 7 makes `agent` codex-aware.
+# initiative done (§5). `agent` remains worker-only; host provider is additive.
 # Index 0 is the first pane of every tmux session, so structural inference needs
-# corroboration. FORGE_ROLE still wins when present.
+# corroboration. An explicit worker stamp can only demote the seat.
 _multi = (window_panes or '').isdigit() and int(window_panes) > 1
-role = os.environ.get('FORGE_ROLE') or (
-    'orchestrator' if (pane_index == ORCH_PANE_INDEX and _multi) else 'worker')
+role = ('orchestrator' if pane_index == ORCH_PANE_INDEX
+        and (_multi or os.environ.get('FORGE_ROLE') == 'orchestrator')
+        and os.environ.get('FORGE_ROLE') != 'worker' else 'worker')
 agent = 'codex' if codex else 'claude'
 if not session or not os.path.isdir(os.path.join(root, '.dev')):
     done()
@@ -96,6 +97,39 @@ try:
         done()
 except Exception:
     done()
+
+for key in ('prompt', 'last_assistant_message', 'transcript_path', 'session_id', 'turn_id', 'tool_name'):
+    if data.get(key) is not None and not isinstance(data[key], str):
+        done()
+
+# A child event or an event from another adapter cannot terminate the host turn.
+if (data.get('parent_tool_use_id') or
+        str(data.get('hook_event_name') or event).lower() != event):
+    done()
+host_fields = {}
+if role == 'orchestrator':
+    host_fields = {'provider': 'unknown', 'provider_observation': 'unknown'}
+    try:
+        args = [sys.executable, '-I', str(Path(__file__).resolve().with_name('forge-orchestrator-host')),
+                'observe', '--root', root, '--session', session]
+        if os.environ.get('TMUX_PANE'):
+            args += ['--pane-id', os.environ['TMUX_PANE']]
+        observed = subprocess.run(args, text=True, capture_output=True, timeout=5)
+        binding = json.loads(observed.stdout) if observed.returncode == 0 else {}
+        if not isinstance(binding, dict):
+            binding = {}
+        if binding.get('observation') == 'verified' and binding.get('provider') == agent:
+            host_fields.update(provider=agent, provider_observation='verified')
+            for key in ('launch_id', 'incarnation'):
+                if binding.get(key):
+                    host_fields[key] = binding[key]
+        elif binding.get('observation') == 'verified':
+            done()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    for key in ('session_id', 'turn_id'):
+        if isinstance(data.get(key), str) and data[key]:
+            host_fields['native_' + key] = data[key]
 
 adir = os.path.join(root, '.dev', 'attention')
 try:
@@ -192,6 +226,7 @@ def envelope(variant, extra):
          'session': session, 'root': root, 'pane_index': pane_index,
          'role': role, 'tmux_pane': os.environ.get('TMUX_PANE', ''),
          'emitted_at': NOW}
+    d.update(host_fields)
     d.update(extra); return d
 
 def atomic(path, obj):
@@ -218,13 +253,24 @@ def tail_transcript(tp):
             obj = json.loads(ln)
         except ValueError:
             continue
+        if not isinstance(obj, dict):
+            continue
+        if codex and obj.get('type') == 'response_item':
+            obj = obj.get('payload') or {}
+            if not isinstance(obj, dict):
+                continue
+        if codex and obj.get('type') == 'event_msg':
+            payload = obj.get('payload') or {}
+            if isinstance(payload, dict) and payload.get('type') == 'agent_message':
+                return payload.get('message') if isinstance(payload.get('message'), str) else ''
         if obj.get('type') == 'assistant' or obj.get('role') == 'assistant':
             m = obj.get('message', obj)
             c = m.get('content') if isinstance(m, dict) else None
             if isinstance(c, str): return c
             if isinstance(c, list):
                 return ' '.join(b.get('text', '') for b in c
-                                if isinstance(b, dict) and b.get('type') == 'text')
+                                if isinstance(b, dict) and b.get('type') in ('text', 'output_text')
+                                and isinstance(b.get('text'), str))
     return ''
 
 def mint_ptask():
@@ -256,8 +302,8 @@ def fire_watch_check(ev):
         pass
 
 # --- worker branch: NAMESPACED per-turn emission -------------------------------------------
-# Handled here and RETURNED, so the orchestrator handlers below stay byte-identical (a worker
-# never reaches the canonical stop.<session>.json writer). Per-TURN keying
+# Handled here and RETURNED, so a worker never reaches the canonical
+# stop.<session>.json writer. Per-TURN keying
 # (wstop.<session>.p<pane>.<task_id>.json) is load-bearing: N turns in one pane render as N task
 # rows; a per-pane filename would reintroduce the LWW collapse. agent is 'claude' here; the
 # --codex adapter (Step 7) sets it to 'codex' and supplies turn_id for native correlation.
@@ -408,6 +454,15 @@ if event == 'userpromptsubmit':
                      'prompt_snippet': snip(prompt),
                      'prompt_sha256': hashlib.sha256(prompt.encode('utf-8', 'replace')).hexdigest()}))
 elif event == 'stop':
+    try:
+        with open(os.path.join(adir, f'prompt.{session}.json')) as f:
+            parent_prompt = json.load(f)
+        if isinstance(parent_prompt, dict):
+            for key in ('launch_id', 'incarnation', 'native_session_id', 'native_turn_id'):
+                if parent_prompt.get(key) and host_fields.get(key) != parent_prompt[key]:
+                    done()
+    except (OSError, ValueError):
+        pass
     lam = data.get('last_assistant_message')
     if lam:
         src, msg = 'last_assistant_message', lam

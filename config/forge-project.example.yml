@@ -32,7 +32,7 @@ services:
     working_dir: "backend"
     port: 8000
     health_check: "http://localhost:8000/docs"
-    activate_venv: "source .venv/bin/activate"
+    # direnv activates the environment; commands run directly.
   frontend:
     command: "npm run dev"
     working_dir: "frontend"
@@ -43,7 +43,7 @@ testing:
   backend:
     command: "pytest"
     working_dir: "backend"
-    activate_venv: "source .venv/bin/activate"
+    # direnv activates the environment; commands run directly.
   frontend:
     unit_command: "npm run test:run"
     e2e_command: "npm run test:e2e"

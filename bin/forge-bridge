@@ -284,6 +284,89 @@ session_incarnation_of() {   # <session>; empty when unavailable
     fi
 }
 
+# _bounded_line <cmd> [args...] — one stdout line, bounded even for shell functions.
+# Always returns 0; an allocation failure or timeout yields no line. Probe output
+# goes to a private file, so descendants cannot hold the caller's capture pipe open.
+# Bash job control is enabled only in an inner subshell to give the probe and its
+# watchdog separate process groups. On timeout the whole probe group is killed;
+# on completion cleanup signals are attempted without an unconfirmed wait. No read -t exit-code
+# assumption, perl, timeout(1), exported function, or operator job-control change.
+# Standard mktemp/sleep/rm commands are required; a failed mktemp refuses the probe.
+_bounded_line() {
+    # Marker evidence, not kill -0: EPERM does not imply a process has exited.
+    # Never wait for an unconfirmed child; private file capture bounds callers even
+    # when every signal is refused. Job-control changes are confined to this shell.
+    (
+        local _t="${FORGE_TMUX_PROBE_TIMEOUT_S:-2}" _dir _pid _timer _line="" _rc=""
+        case "$_t" in ''|*[!0-9]*) _t=2 ;; esac
+        [ "$_t" -ge 1 ] 2>/dev/null || _t=2
+        _dir="$(mktemp -d "${TMPDIR:-/tmp}/forge-probe.XXXXXX")" || exit 0
+        set -m
+        (
+            # Read-only observation children must never prolong operation locks.
+            exec 8>&- 9>&- 10>&- 11>&- 12>&- 13>&-
+            set +m
+            exec >"$_dir/output" 2>/dev/null
+            ulimit -f 128 2>/dev/null || exit 0
+            ( "$@" )
+            printf '%s\n' "$?" >"$_dir/status"
+            : >"$_dir/done"
+        ) &
+        _pid=$!
+        (
+            exec 8>&- 9>&- 10>&- 11>&- 12>&- 13>&-
+            set +m
+            sleep "$_t"
+            [ -e "$_dir/release" ] || : >"$_dir/timed-out"
+            : >"$_dir/timer-exit"
+        ) >/dev/null 2>&1 &
+        _timer=$!
+        while [ ! -e "$_dir/done" ] && [ ! -e "$_dir/timed-out" ]; do sleep 0.02; done
+        if [ -e "$_dir/done" ] && [ ! -e "$_dir/timed-out" ]; then
+            IFS= read -r _rc <"$_dir/status" || true
+            if [ "$_rc" = 0 ]; then IFS= read -r _line <"$_dir/output" || true; fi
+        fi
+        : >"$_dir/release"
+        # This also cleans descendants whose leader already exited. A failed kill
+        # grants no permission to wait; Bash reaps exited jobs automatically.
+        kill -KILL -- "-$_pid" 2>/dev/null || kill -KILL "$_pid" 2>/dev/null || true
+        kill -KILL -- "-$_timer" 2>/dev/null || kill -KILL "$_timer" 2>/dev/null || true
+        rm -rf "$_dir"
+        printf '%s' "$_line"
+    ) 2>/dev/null
+    return 0
+}
+
+# Bounded tmux read. EVERY probe added by the web-control-center work goes through here.
+# _emit_event runs while the pipeline lifecycle lock is held (:6212, lock :6146 -> unlock
+# :6223), and the builtin-append helper at :295-298 exists precisely because _emit_event may
+# spawn a child — so an unbounded probe anywhere on these paths could hold a pipeline lock
+# on a wedged tmux server.
+#
+# SCOPE, STATED HONESTLY: this bounds the probes THIS WORK ADDS (provenance resolution,
+# expectation comparison, pane pinning, infra-lock target re-read) and the identity
+# resolution Step 11 performs on the ungated path. It does NOT bound the legacy
+# _forge_identity probes reached through require_identity on paths that already ran a gate —
+# changing those is a different, unrelated behaviour change (review R5) and is not done here.
+_tmux_probe() { _bounded_line tmux "$@"; }
+
+# _target_ident_of <session> -> 'session_id<TAB>session_created'; either field may be empty.
+# ONE probe where there was one before: the call site in _forge_identity already ran a
+# display-message via session_incarnation_of, so folding #{session_id} into the same format
+# string adds a FIELD, not a round trip.
+# Seamed on FORGE_TMUX_LIST in the 4-column form the file already reads at :255
+# (_same_root_sessions destructures `_sn _sp _sid _si`), so hermetic suites can inject it.
+# Fields are emitted with awk printf, and read with `cut -f` at the call site, never with
+# `IFS=$'\t' read` — TAB is IFS whitespace and an empty field would shift the rest left.
+_target_ident_of() {   # <session>
+    local inject="${FORGE_TMUX_LIST:-}"
+    if [ -n "$inject" ]; then
+        awk -F'\t' -v s="$1" '$1==s{printf "%s\t%s\n", (NF>=3?$3:""), (NF>=4?$4:""); exit}' "$inject"
+    else
+        _tmux_probe display-message -p -t "$1" '#{session_id}	#{session_created}'
+    fi
+}
+
 _CALLBACK_INCARNATION_RESULT=""
 _CALLBACK_INCARNATION_REASON=""
 
@@ -398,24 +481,37 @@ _forge_identity() {
     ID_host_session=""; ID_host_pane=""; ID_host_root=""; ID_host_incarnation=""
     ID_target_session=""; ID_target_source="none"; ID_target_root=""; ID_target_incarnation=""
     ID_legacy_file_session=""; ID_state=""; ID_ambiguous_list=""
+    # tmux session OBJECT ids ($N). Purely additive: every existing consumer reads the four
+    # descriptor fields above and is byte-unaffected.
+    ID_host_session_id=""; ID_target_session_id=""
     local env_stamp="${TMUX_SESSION:-}"
     [ -n "$env_stamp" ] && ! _valid_session_name "$env_stamp" && env_stamp=""
 
     # --- Host probe: ONE TMUX_PANE-targeted display-message (untargeted resolves the
     #     ACTIVE pane, not the caller — tests/forge-start/run.sh:98-100). ---
-    local host_state="" hp rc pid sn spath screated
+    local host_state="" hp rc pid sn spath screated ssid
     if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
         hp="$(tmux display-message -p -t "$TMUX_PANE" \
-            '#{pane_id}	#{session_name}	#{session_path}	#{session_created}' 2>/dev/null)"; rc=$?
+            '#{pane_id}	#{session_name}	#{session_path}	#{session_created}	#{session_id}' 2>/dev/null)"; rc=$?
         if [ "$rc" -ne 0 ] || [ -z "$hp" ]; then
             host_state="tmux-unavailable"
         else
-            IFS=$'\t' read -r pid sn spath screated <<< "$hp"
+            # `cut -f`, not `IFS=$'\t' read`: TAB is an IFS *whitespace* character, so bash
+            # COLLAPSES runs of tabs and an empty field silently shifts every later field
+            # left — the trap this file documents at length beside _usage_parse_capture
+            # (:2327-2340). A four-field read survived only because #{session_path} is never
+            # empty; widening it to five without fixing the read would widen a latent hazard.
+            pid="$(printf '%s'      "$hp" | cut -f1)"
+            sn="$(printf '%s'       "$hp" | cut -f2)"
+            spath="$(printf '%s'    "$hp" | cut -f3)"
+            screated="$(printf '%s' "$hp" | cut -f4)"
+            ssid="$(printf '%s'     "$hp" | cut -f5)"
             if [ "$pid" = "$TMUX_PANE" ]; then
                 host_state="in-pane"
                 ID_host_pane="$pid"
                 _valid_session_name "$sn" && ID_host_session="$sn"
                 ID_host_root="$(ownership_root "$spath")"; ID_host_incarnation="$screated"
+                ID_host_session_id="$ssid"
             else
                 host_state="tmux-unavailable"     # probe hit the wrong pane → do not trust
             fi
@@ -486,8 +582,12 @@ _forge_identity() {
     if [ -n "$ID_target_session" ]; then
         if [ "$ID_target_session" = "$ID_host_session" ] && [ -n "$ID_host_incarnation" ]; then
             ID_target_incarnation="$ID_host_incarnation"
+            ID_target_session_id="$ID_host_session_id"
         else
-            ID_target_incarnation="$(session_incarnation_of "$ID_target_session")"
+            local target_ident
+            target_ident="$(_target_ident_of "$ID_target_session")"
+            ID_target_session_id="$(printf '%s' "$target_ident" | cut -f1)"
+            ID_target_incarnation="$(printf '%s' "$target_ident" | cut -f2)"
         fi
     fi
     return 0
@@ -569,28 +669,144 @@ _identity_refuse() {
     } >&2
 }
 
+# _explicit_target_check <cmd> -> 0 validated (channel published), 1 refuse.
+# Existence + intended-root + (optional) expectation for an EXPLICITLY ROUTED target, and the
+# SOLE writer of the _FORGE_VALID_* channel.
+#
+# Split out of require_identity for one reason: the EXPECTATION operands must be enforced
+# INDEPENDENTLY of FORGE_IDENTITY_ENFORCE. That variable is the legacy identity-rollout kill
+# switch (:598); leaving the comparison inside it means an inherited `FORGE_IDENTITY_ENFORCE=0`
+# turns an EXPLICITLY REQUESTED precondition into a no-op while the capability marker still
+# advertises the full contract. Review R3 reproduced gate_rc=0 against a target with a
+# different id, incarnation AND root.
+#
+# Explicit target-file routes always reach this helper, including rollout 0 without
+# expectations. Legacy target-scoped pane routes preserve optional enforcement: with
+# rollout 0 and no expectations they skip this helper and add no mandatory target probe.
+# Supplied identity expectations are enforced for both explicit classes.
+#
+# NO PROBE IS ADDED for the comparison: _forge_identity ran microseconds ago at the top of
+# require_identity and already resolved ID_target_session_id / ID_target_incarnation in its
+# single display-message.
+_explicit_target_check() {   # <cmd>
+    local cmd="$1" troot
+    if ! tmux has-session -t "$ID_target_session" 2>/dev/null; then
+        echo "ERROR: --cross-session target '$ID_target_session' does not exist — refusing." >&2
+        return 1
+    fi
+    troot="$(ownership_root "$(session_path_of "$ID_target_session")")"
+    if [ "$troot" != "$ID_target_root" ]; then
+        echo "ERROR: --cross-session target '$ID_target_session' is rooted at $troot, not the intended root $ID_target_root — refusing." >&2
+        return 1
+    fi
+    if [ -n "${_FORGE_EXPECT_SID:-}" ]; then
+        if [ -z "${ID_target_session_id:-}" ] || [ "$ID_target_session_id" != "$_FORGE_EXPECT_SID" ]; then
+            echo "ERROR: EXPECTATION MISMATCH target '$ID_target_session' is tmux object '${ID_target_session_id:-unknown}', not '$_FORGE_EXPECT_SID' — refusing before any write." >&2
+            return 1
+        fi
+        if [ -z "${ID_target_incarnation:-}" ] || [ "$ID_target_incarnation" != "$_FORGE_EXPECT_INC" ]; then
+            echo "ERROR: EXPECTATION MISMATCH target '$ID_target_session' was created at '${ID_target_incarnation:-unknown}', not '$_FORGE_EXPECT_INC' (session recreated) — refusing before any write." >&2
+            return 1
+        fi
+    fi
+    # Published for EVERY validated explicit target, expectation-bearing or not — plan §2
+    # scopes the infra-lock fix to a "validated explicit target" and A1 is a defect on the
+    # no-expectation path too. Legacy pane routes that skip this helper at rollout 0
+    # publish no channel; explicit file routes always validate and publish it.
+    _FORGE_VALID_SESSION="$ID_target_session"
+    _FORGE_VALID_SID="${ID_target_session_id:-}"
+    _FORGE_VALID_CREATED="${ID_target_incarnation:-}"
+    _FORGE_VALID_ROOT="$ID_target_root"
+    return 0
+}
+
+# _bind_target_root <cmd> — print the project root this command may mutate; REFUSE when it is
+# not the root the caller's explicit target was validated against.
+#
+# Review R4, reproduced: require_identity validates --target-root against tmux, while
+# cmd_callback_consume derives its file tree from cwd ancestry (:7411). Nothing joined the
+# two, so a consume invoked from root B with --target-root A passed the gate and wrote its
+# event under B.
+#
+# _require_root_cwd CANNOT CLOSE THIS, which is why this is a separate function and not a
+# twelfth call site of it: _require_root_cwd (:2944) resolves _root with
+# `_resolve_project_root ""`, i.e. from the SAME cwd it then compares against, so it is fully
+# satisfied at B and says nothing about A. The invariant here is a different one — the
+# validated target root and the mutation tree must be the same tree — so
+# tests/forge-bridge/run.sh:298 stays at eleven call sites and one definition, deliberately.
+#
+# LEGACY IS BYTE-IDENTICAL: with no validated explicit target both extra checks are skipped
+# and the cwd-derived root is returned exactly as before. ownership_root spawns git, so that
+# one extra child exists only on the explicit path.
+_bind_target_root() {   # <cmd>; prints the project root, rc 1 on refusal
+    local cmd="$1" pr cwd
+    pr="$(_resolve_project_root "" 2>/dev/null)" || return 1
+    [ -n "$pr" ] || return 1
+    if [ -n "${_FORGE_VALID_ROOT:-}" ]; then
+        cwd="$(pwd -P)"
+        if [ "$cwd" != "$pr" ]; then
+            echo "ERROR: $cmd: explicit routing requires the physical cwd to BE the project root (cwd=$cwd project_root=$pr) — refusing before any write." >&2
+            return 1
+        fi
+        if [ "$(ownership_root "$pr" 2>/dev/null)" != "$_FORGE_VALID_ROOT" ]; then
+            echo "ERROR: $cmd: the files under $pr do not belong to the validated target root $_FORGE_VALID_ROOT — the validated target and the mutation tree disagree; refusing before any write." >&2
+            return 1
+        fi
+    fi
+    printf '%s' "$pr"
+}
+
 # require_identity <cmd> <class-token> — THE one fail-closed identity gate; supersedes
 # require_tmux_session. Runs _forge_identity, sets ID_*, records an IDENTITY event, sets
 # legacy SESSION="$ID_target_session" so every "$SESSION:$WINDOW.$PANE" call site is
 # byte-unchanged. Unknown class → fail closed. Tokens: root-scoped | host-pane |
-# host-session | host-degrade | target-scoped | diagnostic.
+# host-session | host-degrade | target-scoped | target-file | diagnostic.
 require_identity() {
     local cmd="${1:-(unknown)}" class="${2:-}"
+    # Set by _explicit_target_check's caller so the unconditional expectation gate below does
+    # not repeat work the enforce block already did.
+    local _explicit_validated=0
 
-    # Dual-mode: send/callback upgrade to class-3 iff BOTH flags present.
-    if { [ "$cmd" = "send" ] || [ "$cmd" = "callback" ]; } \
-       && [ "${_FORGE_CROSS:-0}" = "1" ] && [ -n "${_FORGE_TARGET:-}" ]; then
-        class="target-scoped"
+    # Dual-mode: upgrade to an explicit class iff BOTH flags are present. TWO classes:
+    #   target-scoped  send/callback — PANE operations; keeps the five-pane precondition.
+    #   target-file    park/park-resolve/callback-consume — FILE operations; the same
+    #                  existence/root/expectation validation, NO pane-count requirement.
+    #                  A headless web child must not need five healthy panes to park.
+    # THREE command names here, TWO verbs in the router allowlist, deliberately:
+    # `park --resolve` delegates to cmd_park_resolve (:7497) BEFORE `require_identity "park"`
+    # (:7499) ever runs, and cmd_park_resolve gates under the name "park-resolve" (:7593),
+    # which is never a router verb. The two lists are DIFFERENT SETS.
+    if [ "${_FORGE_CROSS:-0}" = "1" ] && [ -n "${_FORGE_TARGET:-}" ]; then
+        case "$cmd" in
+            send|callback)                      class="target-scoped" ;;
+            park|park-resolve|callback-consume) class="target-file" ;;
+        esac
     fi
 
+    # Explicit routes must prove their target before writing even an audit event.
+    # Reset the process-local channel on every gate, including in-process delegation.
+    local _explicit_audit=0
+    if [ "${_FORGE_CROSS:-0}" = 1 ] && [ -n "${_FORGE_TARGET:-}" ]; then
+        _explicit_audit=1
+        _FORGE_VALID_SESSION=""; _FORGE_VALID_SID=""
+        _FORGE_VALID_CREATED=""; _FORGE_VALID_ROOT=""
+    fi
+    _FORGE_AUDIT_CLASS="$class"
+    _FORGE_FILE_AUDIT_PENDING=0
+    if [ "$_explicit_audit" = 1 ] && [ "$class" = target-file ]; then
+        _FORGE_FILE_AUDIT_PENDING=1
+        _FORGE_FILE_AUDIT_CMD="$cmd"
+    fi
     _forge_identity
-    _emit_event IDENTITY "-" \
-        "cmd=$cmd class=$class state=${ID_state} host=${ID_host_session:-none} target=${ID_target_session:-none} source=${ID_target_source}" 2>/dev/null || true
+    if [ "$_explicit_audit" != 1 ]; then
+        _emit_event IDENTITY "-" \
+            "cmd=$cmd class=$class state=${ID_state} host=${ID_host_session:-none} target=${ID_target_session:-none} source=${ID_target_source}" 2>/dev/null || true
+    fi
     SESSION="$ID_target_session"
 
     case "$class" in
         root-scoped|diagnostic) return 0 ;;       # diagnostics: SESSION set, body prints/handles; never refuse (R7)
-        host-pane|host-session|host-degrade|target-scoped) : ;;
+        host-pane|host-session|host-degrade|target-scoped|target-file) : ;;
         *) echo "ERROR: command '$cmd' has no identity class — refusing (fail-closed gate)." >&2; return 1 ;;
     esac
 
@@ -599,25 +815,27 @@ require_identity() {
         case "$class" in
             host-degrade)                                   # callback/log-response/context/stall-check-status
                 [ "$ID_state" = "MISMATCH" ] && { _identity_refuse "$cmd"; return 1; } ;;
-            host-pane|host-session|target-scoped)
+            host-pane|host-session|target-scoped|target-file)
                 case "$ID_state" in
                     MISMATCH|AMBIGUOUS|UNAVAILABLE) _identity_refuse "$cmd"; return 1 ;;
                 esac ;;
         esac
         # class-3 cross-session validation: target exists + rooted at the intended
         # (caller-supplied, cd-bound or --target-root) root — NOT the bridge cwd (MAJOR-1 / P4.19).
-        if [ "$class" = "target-scoped" ]; then
-            if ! tmux has-session -t "$ID_target_session" 2>/dev/null; then
-                echo "ERROR: --cross-session target '$ID_target_session' does not exist — refusing." >&2
-                return 1
-            fi
-            local troot; troot="$(ownership_root "$(session_path_of "$ID_target_session")")"
-            if [ "$troot" != "$ID_target_root" ]; then
-                echo "ERROR: --cross-session target '$ID_target_session' is rooted at $troot, not the intended root $ID_target_root — refusing." >&2
-                return 1
-            fi
-            _emit_event CROSS "-" "cmd=$cmd host=${ID_host_session:-none} target=$ID_target_session target_root=$ID_target_root source=${ID_target_source} caller_mode=explicit-arg"
+        if [ "$class" = "target-scoped" ] || [ "$class" = "target-file" ]; then
+            _explicit_target_check "$cmd" || return 1
+            _explicit_validated=1
         fi
+    fi
+
+    # Explicit file routes always validate, even at rollout 0 without expectations.
+    # Legacy pane routes keep optional enforcement: rollout 0 without expectations
+    # adds no mandatory target probe. Supplied expectations are always checked.
+    if [ "$_explicit_validated" != 1 ] \
+       && { [ "$class" = "target-file" ] || \
+            { [ "$class" = "target-scoped" ] && [ -n "${_FORGE_EXPECT_SID:-}" ]; }; }; then
+        _explicit_target_check "$cmd" || return 1
+        _explicit_validated=1
     fi
 
     # Pane precondition (BOTH phases) — pane ops need a live host session with the full
@@ -644,8 +862,39 @@ require_identity() {
             fi
             require_pane_count "$SESSION" "$FORGE_REQUIRED_PANES" || return 1
             ;;
+        # File operations always completed explicit root/identity validation above,
+        # at either rollout value and with or without expectations. They require
+        # liveness here, never the five-pane precondition used by pane operations.
+        target-file)
+            if [ -z "$SESSION" ] || ! tmux has-session -t "$SESSION" 2>/dev/null; then
+                echo "ERROR: cross-session target '$SESSION' is not a live session." >&2
+                return 1
+            fi
+            ;;
     esac
+    if [ "$class" = target-file ]; then
+        # Only root binding belongs in the gate. The command accepts its audit
+        # after all selector/expectation revalidation, immediately before mutation.
+        _bind_target_root "$cmd" >/dev/null || return 1
+    elif [ "$_explicit_audit" = 1 ] && [ "$class" = target-scoped ]; then
+        _emit_event IDENTITY "-" \
+            "cmd=$cmd class=$class state=${ID_state} host=${ID_host_session:-none} target=${ID_target_session:-none} source=${ID_target_source}" 2>/dev/null || true
+        if [ "$_explicit_validated" = 1 ]; then
+            _emit_event CROSS "-" "cmd=$cmd host=${ID_host_session:-none} target=$ID_target_session target_root=$ID_target_root source=${ID_target_source} caller_mode=explicit-arg"
+        fi
+    fi
     return 0
+}
+
+
+_file_action_accept_audit() {
+    # Called once, only after the command-specific pre-write checks have passed.
+    [ "${_FORGE_FILE_AUDIT_PENDING:-0}" = 1 ] || return 0
+    _FORGE_FILE_AUDIT_PENDING=0
+    local cmd="$_FORGE_FILE_AUDIT_CMD" class=target-file
+    _emit_event IDENTITY "-" \
+        "cmd=$cmd class=$class state=${ID_state} host=${ID_host_session:-none} target=${ID_target_session:-none} source=${ID_target_source}" 2>/dev/null || true
+    _emit_event CROSS "-" "cmd=$cmd host=${ID_host_session:-none} target=$ID_target_session target_root=$ID_target_root source=${ID_target_source} caller_mode=explicit-arg"
 }
 
 # ---- Helpers ----
@@ -929,7 +1178,7 @@ _context_alert_headroom() {   # <worker_canonical>
     printf '%s' "$shared"
 }
 
-# Effective orchestrator-pane alert headroom (S11/S13.3). No family dimension — the orchestrator (pane 0) is always Claude.
+# Effective orchestrator-pane alert headroom, shared by both host providers.
 # Deliberately NOT named *_MIN_HEADROOM: it is not gate vocabulary and never authorizes an
 # action against the orchestrator (pane 0).
 _orchestrator_alert_headroom() {
@@ -2294,22 +2543,149 @@ _sanitize_event_value() {
     printf '%s' "$clean" | awk '{ if (length($0) > 200) print substr($0, 1, 200) "…"; else print $0 }'
 }
 
+# ── event provenance (§3) ────────────────────────────────────────────────────
+# _evp_snapshot — resolve identity and print the four fields we need, TAB separated.
+# Run ONLY through _bounded_line, which executes it in a process substitution: that subshell
+# is BOTH the timeout boundary and the side-effect boundary. _forge_identity assigns thirteen
+# globals and two live consumers branch on them (_resolve_session :515-519 feeds context/usage
+# FILE NAMING; cmd_emit :9292 branches on ID_target_session), and an ungated command must not
+# acquire an identity as a side effect of logging one event. Containment is structural: it
+# cannot go stale when _forge_identity gains a field.
+_evp_snapshot() {
+    _forge_identity >/dev/null 2>&1
+    printf '%s\t%s\t%s\t%s\n' "${ID_target_session:-}" "${ID_target_session_id:-}" \
+        "${ID_target_incarnation:-}" "${ID_target_root:-}"
+}
+
+# _event_provenance <project_root> — sets _EVP_OUT to
+#   ' event_session=… event_session_id=… event_incarnation=…'   (leading space)
+# or the empty string. BARE CALL ONLY: it publishes through $_EVP_OUT, and a
+# command-substitution wrapper would discard the memo (:306-307 documents the same idiom
+# for _callback_verify_live_incarnation, and for the same reason).
+#
+# NEVER EMITS. require_identity emits IDENTITY (:587) and _identity_refuse emits (:563);
+# either on the emitter's own path is unbounded recursion. Only _forge_identity (:397) is
+# called, and only when no gate has already run.
+#
+# BOUNDED END TO END. The resolving branch goes through _bounded_line, so a wedged tmux
+# server cannot stall an emit through the HOST probe (_forge_identity :408, unbounded) or
+# through _same_root_sessions -> tmux list-sessions (:260, unbounded, and the branch a
+# headless web child with no $TMUX actually takes). Bounding _tmux_probe alone left both of
+# those open — review R5 reproduced a public `emit STAGE` still blocked at four seconds with
+# FORGE_TMUX_PROBE_TIMEOUT_S=1. Legacy identity behaviour on already-gated paths is NOT
+# altered to achieve this.
+#
+# NEVER PROBES UNDER A PIPELINE LOCK. _emit_event is called with the lifecycle lock held
+# (:6146 lock / :6212 emit / :6223 unlock), and the builtin-append helper at :295-298 exists
+# precisely because _emit_event may spawn a child. The ID_state / _FORGE_VALID_* fast paths
+# are what keep that true: every locked call site runs behind its own require_identity. The
+# bound is the BACKSTOP, not the mechanism. DO NOT RELAX THE FAST PATHS.
+#
+# A NONEMPTY ID_state IS NOT AN OWNER. host-degrade classes do not refuse on
+# MISMATCH/AMBIGUOUS/UNAVAILABLE, so ID_state can be set for a target the gate could not
+# trust. Stamping that onto the record the web feed joins on is exactly the unproven-owner
+# case the join must exclude (review R8). Only MATCH is accepted here; a validated explicit
+# target arrives through _FORGE_VALID_* above it.
+#
+# MEMOIZED per (explicit target, physical log root) for one process; a changed key
+# invalidates. NEGATIVE RESULTS ARE CACHED TOO, deliberately: :268-270 states each
+# forge-bridge process runs exactly one command, so a transient probe failure would otherwise
+# be re-paid on every event of that command. The cost is bounded — provenance absent for one
+# command — and absence is always a correct rendering (§6 treats an unproven owner as
+# omissible). There is no time-based expiry for the same reason.
+#
+# FAIL-OPEN IS ABSOLUTE. Any failure, timeout, ambiguity or unknown owner leaves provenance
+# absent and returns 0. Provenance can never fail, delay or alter an emit.
+_EVP_KEY=""; _EVP_VALUE=""; _EVP_OUT=""
+_event_provenance() {   # <project_root>; sets _EVP_OUT
+    _EVP_OUT=""
+    [ "${FORGE_EVENT_PROVENANCE:-1}" = "1" ] || return 0
+    local pr="${1:-}" key="${_FORGE_TARGET:-}|${1:-}"
+    if [ "$key" = "$_EVP_KEY" ]; then _EVP_OUT="$_EVP_VALUE"; return 0; fi
+    local sess="" sid="" inc="" oroot="" snap
+    if [ -n "${_FORGE_VALID_SESSION:-}" ]; then
+        # Validated by the identity gate this invocation — nothing to resolve.
+        sess="$_FORGE_VALID_SESSION"; sid="$_FORGE_VALID_SID"
+        inc="$_FORGE_VALID_CREATED";  oroot="$_FORGE_VALID_ROOT"
+    elif [ "${ID_state:-}" = "MATCH" ]; then
+        # A gate ran AND it resolved a trusted identity. CROSS_SESSION_DECLARED reaches the
+        # branch above through _FORGE_VALID_*; MISMATCH / AMBIGUOUS / UNAVAILABLE are NOT
+        # owners and must fall through to "absent", never be widened back to `-n "$ID_state"`.
+        sess="${ID_target_session:-}"; sid="${ID_target_session_id:-}"
+        inc="${ID_target_incarnation:-}"; oroot="${ID_target_root:-}"
+    elif [ -n "${ID_state:-}" ]; then
+        # A gate ran and did NOT establish a trusted owner. Provenance stays absent.
+        :
+    else
+        # No gate has run (e.g. public `emit`). Resolve ONCE, BOUNDED, inside a process
+        # substitution so the thirteen ID_* globals are not published to this process, and
+        # read the four fields back through a tab-separated line. `cut -f` never collapses an
+        # empty field. An empty snap (timeout/failure) means provenance absent — fail-open.
+        snap="$(_bounded_line _evp_snapshot)"
+        sess="$(printf  '%s' "$snap" | cut -f1)"
+        sid="$(printf   '%s' "$snap" | cut -f2)"
+        inc="$(printf   '%s' "$snap" | cut -f3)"
+        oroot="$(printf '%s' "$snap" | cut -f4)"
+    fi
+    _valid_session_name "$sess" || sess=""
+    # Ownership is bound to the PHYSICAL LOG ROOT: a session rooted elsewhere does not own
+    # this log and stays anonymous. Cheap string compare FIRST — ownership_root spawns git
+    # (:220) and must not become a child under the lifecycle lock; the fallback is inside the
+    # memo, so at most one git call per (target, root) per process.
+    if [ -n "$sess" ] && [ -n "$oroot" ] && [ -n "$pr" ]; then
+        if [ "$oroot" != "$pr" ] && [ "$oroot" != "$(ownership_root "$pr" 2>/dev/null)" ]; then
+            sess=""
+        fi
+    fi
+    if [ -n "$sess" ]; then
+        _EVP_OUT=" event_session=$sess"
+        [ -n "$sid" ] && _EVP_OUT="$_EVP_OUT event_session_id=$sid"
+        [ -n "$inc" ] && _EVP_OUT="$_EVP_OUT event_incarnation=$inc"
+    fi
+    _EVP_KEY="$key"; _EVP_VALUE="$_EVP_OUT"
+    return 0
+}
+
 # _emit_event <TYPE> <slug> [fields-string]
 # Best-effort line-emit to <project_root>/.dev/forge-tmp/orchestrator-events.log.
 # Never writes to stdout/stderr (bridge contract: callers may parse those).
 # Silently skips on unresolvable project root or fs write failure.
 # Structured key=value tokens are NOT re-sanitized here — callers sanitize
 # freeform values via _sanitize_event_value before assembling the fields arg.
+#
+# ADDITIVE TRAILING PROVENANCE. event_at is always present; the three identity fields appear
+# only when the owner is established FOR THIS PHYSICAL LOG ROOT. Every existing token keeps
+# its position, so the watcher's anchored `\bkey=value(\s|$)` parsers and its
+# `startswith("COMPLETE:")` checks are byte-unaffected. NOTE: the third writer to this log,
+# _callback_incarnation_event_locked (:299), is deliberately NOT changed — it must create no
+# child under a callback lock — so some lines carry no event_at at all. Readers must treat an
+# absent event_at as legacy, never as a parse error.
+#
+# THE FOUR PROVENANCE NAMES ARE BRIDGE-AUTHORED, ALWAYS. Public `emit` refuses them as field
+# names (Step 13); every internal caller builds its fields string from literals, pinned by
+# the T17 source scan. They are appended, never interleaved, so each appears EXACTLY ONCE.
 _emit_event() {
     local type="$1"; shift
     local slug="$1"; shift
     local project_root
-    project_root=$(_resolve_project_root "" 2>/dev/null) || return 0
+    if [ "${_FORGE_CROSS:-0}" = 1 ] && [ -n "${_FORGE_TARGET:-}" ]; then
+        [ "${_FORGE_FILE_AUDIT_PENDING:-0}" != 1 ] || return 0
+        project_root="${_FORGE_VALID_ROOT:-}"
+        if [ -z "$project_root" ] && [ "${_FORGE_AUDIT_CLASS:-}" = target-scoped ] \
+           && [ "${FORGE_IDENTITY_ENFORCE:-1}" = 0 ] && [ -z "${_FORGE_EXPECT_SID:-}" ]; then
+            # Preserve the old successful pane route's audit without adding probes.
+            project_root=$(_resolve_project_root "" 2>/dev/null) || return 0
+        fi
+    else
+        project_root=$(_resolve_project_root "" 2>/dev/null) || return 0
+    fi
     [ -z "$project_root" ] && return 0
     local log_dir="$project_root/.dev/forge-tmp"
     local log_file="$log_dir/orchestrator-events.log"
     mkdir -p "$log_dir" 2>/dev/null || return 0
-    printf '%s: pipeline=%s %s\n' "$type" "$slug" "$*" >> "$log_file" 2>/dev/null || true
+    _event_provenance "$project_root"          # bare call: the memo must survive
+    printf '%s: pipeline=%s %s event_at=%s%s\n' \
+        "$type" "$slug" "$*" "$(timestamp)" "$_EVP_OUT" >> "$log_file" 2>/dev/null || true
     # Step 6: BLOCKED/COMPLETE/stage events land at ~1s instead of the 30s floor. Detached,
     # fail-open, gated (FORGE_WATCH_TRIGGER=0 disables in tests). Never touches stdout/stderr or
     # the return code.
@@ -2447,6 +2823,8 @@ rec = {"family": os.environ.get("FORGE_U_FAMILY", ""),
        "stage": n(os.environ.get("FORGE_U_STAGE", "null")),
        "measured_at": os.environ.get("FORGE_U_AT", ""),
        "observed_by": os.environ.get("FORGE_U_OBSBY", "callback")}
+if slot == "orchestrator":
+    rec["provider"] = rec["family"] if rec["family"] in ("claude", "codex") else "unknown"
 _g = os.environ.get("FORGE_U_GEN", "")
 if _g:
     rec["generation"] = _g
@@ -2495,8 +2873,12 @@ try:
             prior = data.get("orchestrator") if slot == "orchestrator" else workers.get(wk)
             if not isinstance(prior, dict):
                 prior = None
-            crossed = 1 if (_low(rec) and not _low(prior)) else 0
-            if not (mode == "sample" and rec.get("confidence") != "high" and prior is not None):
+            same_host = (slot != "orchestrator" or (prior is not None
+                         and prior.get("family") == rec["family"]
+                         and prior.get("session") == rec.get("session")
+                         and prior.get("incarnation") == rec.get("incarnation")))
+            crossed = 1 if (_low(rec) and not (same_host and _low(prior))) else 0
+            if not (mode == "sample" and rec.get("confidence") != "high" and prior is not None and same_host):
                 if slot == "orchestrator":
                     data["orchestrator"] = rec
                 else:
@@ -2561,6 +2943,7 @@ _observe_pane1() {   # <project_root> [slug]
     local pr="$1" slug="${2:-orchestrator}"
     [ -n "$pr" ] || { printf 'unknown none\n'; return 0; }
     local sess="${ID_target_session:-}"
+    local provider; provider="$(_orchestrator_provider "$pr" "$sess")"
     local cap="" fixture=""
     if [ -n "${FORGE_PANE1_FIXTURE:-}" ] && [ -f "${FORGE_PANE1_FIXTURE}" ]; then
         cap="$FORGE_PANE1_FIXTURE"; fixture=1
@@ -2574,12 +2957,12 @@ _observe_pane1() {   # <project_root> [slug]
         tmux capture-pane -p -t "$sess:$WINDOW.$ORCH_IDX" -S -12 > "$cap" 2>/dev/null || true
     fi
     local _pct _tok _hr _cf _rs _raw
-    IFS=$'\t' read -r _pct _tok _hr _cf _rs _raw <<< "$(_usage_parse_capture "$cap" claude)"
+    IFS=$'\t' read -r _pct _tok _hr _cf _rs _raw <<< "$(_usage_parse_capture "$cap" "$provider")"
     [ -z "$fixture" ] && rm -f "$cap" 2>/dev/null
     local _oal; _oal="$(_orchestrator_alert_headroom 2>/dev/null)" || _oal=-1
     case "$_oal" in ''|*[!0-9]*) _oal=-1 ;; esac
     local _ctl
-    _ctl="$(FORGE_U_FAMILY=claude FORGE_U_STAGE=orchestrator FORGE_U_AT="$(timestamp)" \
+    _ctl="$(FORGE_U_FAMILY="$provider" FORGE_U_STAGE=orchestrator FORGE_U_AT="$(timestamp)" \
             FORGE_U_OBSBY=pane1 FORGE_U_SESSION="${sess:-}" FORGE_U_INCARNATION="${ID_target_incarnation:-}" \
             _usage_upsert "$pr/$(_usage_file)" orchestrator sample "$_oal" \
               "$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$_pct" "$_tok" "$_hr" "$_cf" "$_rs" "$_raw")")"
@@ -2588,7 +2971,7 @@ _observe_pane1() {   # <project_root> [slug]
     if [ "${_r_cross:-0}" = 1 ]; then
         # S13.3: one event per crossing. The BOARD row is state-derived from the ledger, so
         # this event is telemetry only — it is never what makes the row appear or disappear.
-        _emit_event ORCHESTRATOR_LOW_CONTEXT "$slug" "worker=claude-orchestrator headroom=${_r_hr:-unknown} threshold=$_oal confidence=${_r_conf:-none} session=${sess:-} incarnation=${ID_target_incarnation:-}"
+        _emit_event ORCHESTRATOR_LOW_CONTEXT "$slug" "worker=orchestrator provider=$provider headroom=${_r_hr:-unknown} threshold=$_oal confidence=${_r_conf:-none} session=${sess:-} incarnation=${ID_target_incarnation:-}"
     fi
     printf '%s %s\n' "${_r_hr:-unknown}" "${_r_conf:-none}"
     return 0
@@ -3091,6 +3474,7 @@ _cancel_copy_mode() {
 cmd_send() {
     require_identity "send" host-pane || return 1
     _require_root_cwd send || return 1
+    _orchestrator_admission || return 1
 
     local FORCE=false ALLOW_BLOCKED="" SKIP_BLOCK_GUARD=0
     while :; do
@@ -3197,6 +3581,7 @@ cmd_send() {
         codex-a|codex-b|claude-opus|claude-sonnet)
             if [ "$SKIP_BLOCK_GUARD" = 1 ]; then
                 # dispatch's internal delivery — caller owns the lock + generation.
+                _orchestrator_admission || return 1
                 _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"
                 return $?
             fi
@@ -3254,6 +3639,7 @@ cmd_send() {
             # BEFORE typing; any write failure aborts with NO keystroke. send --force is the
             # no-reset continuation but STILL advances the generation so prior observation/
             # reset cannot authorize the next stage.
+            _orchestrator_admission || { _worker_unlock "$TARGET"; return 1; }
             local _g; _g="$(_hygiene_write "$_pr2" next-gen "")" || { _worker_unlock "$TARGET"; echo "HOOK BLOCKED: send refused — generation write failed for $TARGET." >&2; return 1; }
             _hygiene_write "$_pr2" delivery "$TARGET" \
                 "id=send-$(date -u +%Y%m%dT%H%M%SZ)-$$" "generation=${_g:-0}" \
@@ -3264,6 +3650,7 @@ cmd_send() {
             # ACM S1: same one-line visibility as the dispatch boundaries.
             echo "HYGIENE $TARGET: SEND_CONTINUATION — headroom=${_shr:-unknown} confidence=$_sconf (no reset, gen ${_g:-0})" >&2
             _hygiene_crash_at activity
+            _orchestrator_admission || { _worker_unlock "$TARGET"; return 1; }
             _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"; local _rc=$?
             _hygiene_crash_at send-enter
             [ "$_rc" -eq 0 ] && _hygiene_write "$_pr2" delivered "$TARGET" 2>/dev/null || true   # advisory
@@ -3273,7 +3660,38 @@ cmd_send() {
             ;;
     esac
     # Non-worker target (orchestrator pane / relay) — unchanged path.
+    _orchestrator_admission || return 1
     _worker_send_locked "$SESSION:$WINDOW.$PANE" "$MSG"
+}
+
+# Resolve a "session:window.pane" target STRING to a concrete tmux pane OBJECT (%N) and
+# prove it belongs to the expected session object / creation / root. A name is re-resolved
+# by tmux on every command, so a session that dies and is recreated mid-send can have the
+# Enter keystroke land in a different pane than the text; a pane object id cannot follow a
+# name reuse.
+#
+# Gated on _FORGE_EXPECT_SID, NOT on _FORGE_VALID_SESSION: every existing cross-session
+# caller (bin/forge:534 dispatch, forge ask's BLOCKED callback) routes explicitly but
+# supplies no expectations, and §2 requires worker send/lock behaviour to stay unchanged.
+# Without expectations this returns its input and the send path is byte-identical to today.
+_pin_pane_object() {   # <full-target> -> echoes %N (or the input unchanged); rc 1 on mismatch
+    local _tgt="$1" meta pane sid spath screated
+    if [ -z "${_FORGE_EXPECT_SID:-}" ]; then printf '%s' "$_tgt"; return 0; fi
+    meta="$(_tmux_probe display-message -p -t "$_tgt" \
+        '#{pane_id}	#{session_id}	#{session_path}	#{session_created}')"
+    [ -n "$meta" ] || { echo "SEND_FAILED pane-identity-unavailable $_tgt" >&2; return 1; }
+    pane="$(printf '%s'     "$meta" | cut -f1)"
+    sid="$(printf '%s'      "$meta" | cut -f2)"
+    spath="$(printf '%s'    "$meta" | cut -f3)"
+    screated="$(printf '%s' "$meta" | cut -f4)"
+    if [ "$sid" != "$_FORGE_EXPECT_SID" ] || [ "$screated" != "$_FORGE_EXPECT_INC" ]; then
+        echo "SEND_FAILED identity-changed $_tgt (pane $pane is session $sid created $screated) — nothing was typed" >&2
+        return 1
+    fi
+    if [ -n "${_FORGE_VALID_ROOT:-}" ] && [ "$(ownership_root "$spath")" != "$_FORGE_VALID_ROOT" ]; then
+        echo "SEND_FAILED pane-root-changed $_tgt — nothing was typed" >&2; return 1
+    fi
+    printf '%s' "$pane"
 }
 
 # Lock-owned key-send primitive. Assumes the caller owns the target worker lock (or the
@@ -3282,6 +3700,8 @@ cmd_send() {
 # delivery stays `attempting` (rc!=0) so the caller does NOT mark it delivered.
 _worker_send_locked() {   # <full-target> <msg>
     local _tgt="$1" MSG="$2"
+    # One resolution, then the SAME object id for select, copy-mode cancel, text and Enter.
+    _tgt="$(_pin_pane_object "$_tgt")" || return 1
     tmux select-pane -t "$_tgt" || { echo "SEND_FAILED select-pane $_tgt" >&2; return 1; }
     sleep 0.3
     _cancel_copy_mode "$_tgt"
@@ -3432,6 +3852,20 @@ cmd_log() {
     session="$(_resolve_session)"
     [ -z "$session" ] && session="unknown"
 
+    _orchestrator_admission || return 1
+    if [ "${FORGE_ASSETS_REQUIRED:-0}" = 1 ] && [ "$(canonical_pane_name "$to")" = claude ]; then
+        case "$stage" in
+            qa|qa-retry)
+                _infra_lock_owned_by_me "$slug" "$stage" "$(_resolve_project_root "")" >/dev/null || {
+                    echo "INFRA_LOCK_REQUIRED: local $stage requires this session's slug/stage lock" >&2
+                    return 5
+                }
+                ;;
+        esac
+        case "$stage" in
+            proposal|qa|qa-retry) prompt=$(cmd_local_render --slug "$slug" --stage "$stage") || return 2 ;;
+        esac
+    fi
     ensure_pipeline_log "$slug"
     ensure_summary_log
 
@@ -4250,8 +4684,23 @@ _callback_selection_unchanged() {   # [--selector <fn>] <before tuple> plus sele
     if [ "$1" = "--selector" ]; then selector="$2"; shift 2; fi
     local before="$1"; shift
     local cb_dir="$1" slug="$2" stage="$3" actor_s="$4" actor_i="$5"
+    # Expected web actions revalidate the tmux object under the caller's lifecycle lock.
+    # Creation seconds alone cannot detect same-second replacement of a session name.
     local live_i
-    live_i="$(session_incarnation_of "$actor_s")"
+    if [ -n "${_FORGE_EXPECT_SID:-}" ]; then
+        local actor_ident actor_sid
+        actor_ident="$(_target_ident_of "$actor_s")"
+        actor_sid="$(printf '%s' "$actor_ident" | cut -f1)"
+        live_i="$(printf '%s' "$actor_ident" | cut -f2)"
+        if [ "$actor_s" != "$_FORGE_VALID_SESSION" ] || \
+           [ "$actor_sid" != "$_FORGE_VALID_SID" ] || \
+           [ "$live_i" != "$_FORGE_VALID_CREATED" ]; then
+            echo "CALLBACK_IDENTITY_CHANGED" >&2
+            return 1
+        fi
+    else
+        live_i="$(session_incarnation_of "$actor_s")"
+    fi
     if { [ -n "$actor_i" ] && [ "$live_i" != "$actor_i" ]; } || \
        { [ -z "$actor_i" ] && [ -n "$live_i" ]; }; then
         echo "CALLBACK_IDENTITY_CHANGED" >&2
@@ -5056,7 +5505,8 @@ if usage_file and os.path.exists(usage_file):
             ctx_rows.append(
                 f"  {'pane-0 (orch)':<15} headroom={str(_o.get('headroom')):<8} "
                 f"confidence={str(_o.get('confidence')):<5} age={_u_hage(_a):<5} "
-                f"by={str(_o.get('observed_by') or '?'):<9}{_tag}  OBSERVE-ONLY")
+                f"by={str(_o.get('observed_by') or '?'):<9}{_tag} "
+                f"provider={_o.get('provider') or 'unknown'}  OBSERVE-ONLY")
 L.append("## Worker context")
 L.append("")
 L.extend(ctx_rows or ["  (no usage recorded yet)"])
@@ -5176,12 +5626,7 @@ backend = services.get('backend') or {}
 frontend = services.get('frontend') or {}
 lines = ["Environment setup (run before any other commands):"]
 lines.append(f"  Working directory: {project_root}")
-venv = backend.get('activate_venv')
-if venv:
-    bw = backend.get('working_dir')
-    if bw and venv.startswith('source ') and not venv.startswith(f'source {bw}/'):
-        venv = f"source {bw}/" + venv[len('source '):]
-    lines.append(f"  Python venv: {venv}")
+lines.append("  Environment: direnv is already active; run commands directly, never source activation files.")
 app_env = (data.get('forge') or {}).get('app_env') or data.get('app_env')
 if app_env:
     lines.append(f"  APP_ENV: {app_env}")
@@ -5369,20 +5814,48 @@ _render_template() {
     # it is surfaced only if a template actually asks for the include.
     local oc_text oc_rc
     oc_text=$(_render_operator_constraints "$project_root" "$slug" 2>&1); oc_rc=$?
+    local worker_skill=""
+    if grep -q '{worker_skill}' "$tmpl_path"; then
+        worker_skill=$(_stage_assets "$stage" "$worker") || return 2
+    fi
     python3 - "$tmpl_path" "$FORGE_PROMPTS_DIR" "$slug" "$stage" "$worker" \
-        "$worker_pane" "$project_root" "$preamble" "$oc_rc" "$oc_text" <<'PYEOF'
+        "$worker_pane" "$project_root" "$preamble" "$oc_rc" "$oc_text" "$worker_skill" <<'PYEOF'
 import sys, os, re
 (tmpl_path, prompts_dir, slug, stage, worker, worker_pane, project_root, preamble,
  oc_rc, oc_text) = sys.argv[1:11]
 
+if os.path.realpath(tmpl_path) != os.path.abspath(tmpl_path):
+    raise SystemExit('ERROR: symlinked template: ' + tmpl_path)
 with open(tmpl_path) as f:
     text = f.read()
 
 INCLUDE_RE = re.compile(r'<<<INCLUDE\s+(\S+)\s*>>>')
 
 def resolve_include(name):
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', name):
+        raise SystemExit('ERROR: unsafe include name: ' + name)
+    if name in ('_preamble', '_operator_constraints', '_qa_completion') and os.path.lexists(os.path.join(prompts_dir, name + '.txt')):
+        raise SystemExit('ERROR: shadowed synthetic include: ' + name)
     if name == '_preamble':
         return preamble
+    if name == '_ask_escalation' and worker_pane == '0':
+        return ('If blocked, return the specific question to the host. Keep the local pending '
+                'and infra lock while the host obtains the answer; do not emit a worker callback.')
+    if name == '_qa_completion':
+        if stage not in ('qa', 'qa-retry'):
+            raise SystemExit('ERROR: QA completion include on a non-QA stage')
+        if worker_pane == '0':
+            return '''When complete, return the artifact paths to the host. The host closes its
+existing local pending with forge-bridge log-response --slug {slug} --to claude
+--stage {stage} --response "FORGE_DONE: {stage} - see .dev/qa/{slug}/issues.md".
+On terminal failure, close with FORGE_ERROR instead. Never emit a worker callback.
+Keep the lock through asks and running children. After all children terminate
+and no unsafe process remains, release the lock before the path-only digest.'''
+        return '''When complete:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status DONE --quiet --message "see .dev/qa/{slug}/issues.md"
+
+If blocked:
+  ~/bin/forge-bridge callback --slug {slug} --stage {stage} --worker {worker} --status BLOCKED --quiet --message "{issue}"'''
     # Second synthetic (#77b). NOT _preamble's empty-on-miss contract: an absent,
     # unparseable, schema-invalid or oversized ledger EXITS 2, the same way an ordinary
     # missing include does below. A stage that runs without the operator's words is the
@@ -5395,11 +5868,14 @@ def resolve_include(name):
             sys.exit(2)
         return oc_text
     path = os.path.join(prompts_dir, f"{name}.txt")
-    if not os.path.exists(path):
+    if not os.path.isfile(path) or os.path.realpath(path) != os.path.abspath(path):
         sys.stderr.write(f"ERROR: include not found: {name}\n")
         sys.exit(2)
     with open(path) as f:
-        return f.read().rstrip('\n')
+        included = f.read().rstrip('\n')
+    if INCLUDE_RE.search(included):
+        raise SystemExit('ERROR: nested include unsupported: ' + name)
+    return included
 
 # Resolve includes (single pass; nested includes are not supported by design).
 def expand(m):
@@ -5412,10 +5888,63 @@ text = (text
         .replace('{stage}', stage)
         .replace('{worker}', worker)
         .replace('{worker_pane}', str(worker_pane))
+        .replace('{worker_skill}', sys.argv[11])
         .replace('{project_root}', project_root))
 
 sys.stdout.write(text)
 PYEOF
+}
+
+_stage_assets() {
+    local sibling="$(_forge_sibling_bin)"
+    FORGE_PROMPTS_DIR="$FORGE_PROMPTS_DIR" FORGE_DIGESTS_DIR="$FORGE_DIGESTS_DIR" \
+        python3 "$(dirname "$sibling")/../lib/forge_assets.py" route --stage "$1" --worker "$2"
+}
+
+_snapshot_qa_findings() {
+    case "$1" in qa-retry|fix-qa-retry) ;; *) return 0 ;; esac
+    # Legacy/custom templates without the snapshot contract retain their behavior.
+    grep -q 'prior-.*issues.md' "$FORGE_PROMPTS_DIR/$1.txt" || return 0
+    local sibling="$(_forge_sibling_bin)"
+    python3 "$(dirname "$sibling")/../lib/forge_assets.py" snapshot-findings \
+        --stage "$1" --slug "$2" --root "$3" >/dev/null
+}
+
+# Publish complete renders only; failed retries never truncate the prior file.
+_publish_render() {
+    local template="$1" slug="$2" stage="$3" worker="$4" pane="$5" root="$6" kind="$7"
+    case "$slug:$stage:$kind" in *[!A-Za-z0-9._:-]*) echo "ERROR: invalid render token" >&2; return 2 ;; esac
+    local rendered tmp out="$root/.dev/forge-tmp/$kind-$stage-$slug.txt"
+    rendered=$(_render_template "$template" "$slug" "$stage" "$worker" "$pane" "$root") || return 2
+    mkdir -p "$root/.dev/forge-tmp" || return 2
+    tmp=$(mktemp "$root/.dev/forge-tmp/.$kind.XXXXXX") || return 2
+    if ! printf '%s\n' "$rendered" > "$tmp" || ! mv -f "$tmp" "$out"; then
+        rm -f "$tmp"
+        return 2
+    fi
+    printf '%s\n' "$out"
+}
+
+cmd_local_render() {
+    local slug="" stage="proposal" provider="${FORGE_ORCHESTRATOR_PROVIDER:-claude}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slug) slug="$2"; shift 2 ;;
+            --provider) provider="$2"; shift 2 ;;
+            --stage) stage="$2"; shift 2 ;;
+            *) echo "ERROR: unknown local-render argument: $1" >&2; return 2 ;;
+        esac
+    done
+    [ -n "$slug" ] || return 2
+    case "$stage" in proposal|qa|qa-retry) ;; *) return 2 ;; esac
+    case "$provider" in claude|codex) ;; *) return 2 ;; esac
+    local root out
+    root=$(_resolve_project_root "")
+    [ -n "$root" ] || return 2
+    _stage_assets "$stage" "$provider" >/dev/null || return 2
+    _snapshot_qa_findings "$stage" "$slug" "$root" || return 2
+    out=$(_publish_render "$FORGE_PROMPTS_DIR/$stage.txt" "$slug" "$stage" "$provider" 0 "$root" local) || return 2
+    printf 'LOCAL_PROMPT: %s\n' "$out"
 }
 
 # _constraint_carrier_stage <stage> — 0 if this stage carries the operator ledger.
@@ -5486,6 +6015,7 @@ cmd_dispatch() {
     # a forked log and goes blind — the same n_pending=0 failure as #27 residual A.
     # The refusal converts silent-blind into loud.
     _require_root_cwd dispatch || return 1
+    _orchestrator_admission || return 1
 
     local worker_canonical worker_pane
     worker_canonical=$(canonical_pane_name "$worker")
@@ -5507,9 +6037,8 @@ cmd_dispatch() {
     # build-pipeline stages AND the fix-pipeline stages are constrained; commit-review,
     # pr-review and ad-hoc names stay deliberately unconstrained through an EXPLICIT
     # no-op `default` arm, so the vocabulary is closed by intent rather than by
-    # omission. The verify "!= latest QA
-    # worker" exclusion stays in orchestrator prose — the bridge enforces tier,
-    # not pipeline history.
+    # omission. Protected-package route preflight below also checks the latest
+    # QA worker; legacy dispatch retains this tier-only guard.
     case "$stage" in
         review|incorporate|implementation|impl-review|verify)
             case "$worker_canonical" in
@@ -5697,6 +6226,15 @@ cmd_dispatch() {
         fi
     fi
 
+    # Candidate routes are checked before reset, supersede, pending or send.
+    if [ "${FORGE_ASSETS_REQUIRED:-0}" = 1 ]; then
+        _stage_assets "$stage" "$worker_canonical" >/dev/null || return 2
+        local route_check
+        route_check="$("$FORGE_FORGE_BIN" route --root "$project_root" --slug "$slug" --stage "$stage" --worker "$worker_canonical")" || {
+            printf '%s\n' "$route_check" >&2
+            return 2
+        }
+    fi
     local tmpl_path="$FORGE_PROMPTS_DIR/$stage.txt"
     local rendered
     if [ -n "$source_prompt" ]; then
@@ -5800,6 +6338,19 @@ PY
             fi
             ;;
     esac
+
+    # Lane refusal must precede reset, supersede and pending writes. Rendering a
+    # legacy dry run remains side-effect-free and does not admit a delivery.
+    local lane_info capability_class lane rollout
+    lane_info="$("${FORGE_FORGE_BIN:-forge}" codex-lane --root "$project_root" --stage "$stage" --worker "$worker_canonical")" || return 1
+    capability_class="$(printf '%s\n' "$lane_info" | sed -n 's/^capability_class=//p')"
+    lane="$(printf '%s\n' "$lane_info" | sed -n 's/^lane=//p')"
+    rollout="$(printf '%s\n' "$lane_info" | sed -n 's/^rollout=//p')"
+    if [[ "$worker_canonical" == codex-* ]] && [ "$lane" = reviewed-host ]; then
+        _emit_event LANE_REQUIRED "$slug" "stage=$stage worker=$worker_canonical capability=$capability_class rollout=$rollout"
+        echo "LANE_REQUIRED lane=reviewed-host stage=$stage capability=$capability_class rollout=$rollout" >&2
+        return 4
+    fi
 
     # --- Operator-constraint report-side set equality (#77b Step 6 check 3) ---
     # Evaluated at the SUCCESSOR stage's dispatch, using _evidence_stage_record's SELECTOR
@@ -5926,6 +6477,7 @@ PYEOF
     # (and lifecycle) lock via the RETURN trap, so no fd 10-13 can leak on an error path.
     trap _hygiene_release_all RETURN
     _worker_lock "$worker_canonical" || { _emit_event ERROR "$slug" "stage=$stage reason=worker-lock-busy worker=$worker_canonical"; return 1; }
+    _snapshot_qa_findings "$stage" "$slug" "$project_root" || { _worker_unlock "$worker_canonical"; return 2; }
     if [ "$_dmode" = enforce ]; then
         # P0-2: awaiting-verify-decision is a send-blocking terminal state (new work would
         # invalidate the exact verify callback binding finalization relies on).
@@ -6228,17 +6780,6 @@ PYEOF
 
     # P0-4: supersede's replacement prompt is written only now, after its reset+close.
     [ "$supersede" = true ] && printf '%s' "$rendered" > "$prompt_file"
-    local lane_info capability_class lane rollout
-    lane_info="$("${FORGE_FORGE_BIN:-forge}" codex-lane --root "$project_root" --stage "$stage" --worker "$worker_canonical")" || return 1
-    capability_class="$(printf '%s\n' "$lane_info" | sed -n 's/^capability_class=//p')"
-    lane="$(printf '%s\n' "$lane_info" | sed -n 's/^lane=//p')"
-    rollout="$(printf '%s\n' "$lane_info" | sed -n 's/^rollout=//p')"
-    if [[ "$worker_canonical" == codex-* ]] && [ "$lane" = reviewed-host ]; then
-        _emit_event LANE_REQUIRED "$slug" "stage=$stage worker=$worker_canonical capability=$capability_class rollout=$rollout"
-        echo "LANE_REQUIRED lane=reviewed-host stage=$stage capability=$capability_class rollout=$rollout" >&2
-        _worker_unlock "$worker_canonical"
-        return 4
-    fi
     local delivery_id delivery_inc physical_code_root root_id prompt_sha
     physical_code_root="$(ownership_root "$project_root")"; root_id="$(root_identity "$project_root")"
     prompt_sha="$(printf '%s' "$rendered" | shasum -a 256 | awk '{print $1}')"
@@ -7244,8 +7785,9 @@ PY
                 fi
                 _wait_emit_callback "$cb_file" "$slug" "$stage" "$worker_canonical" \
                     "$digest_template" "$project_root"
+                local digest_rc=$?
                 _render_status_file
-                return 0
+                return "$digest_rc"
             fi
         fi
 
@@ -7347,19 +7889,22 @@ print(d.get('message', '') or '')
         "$status" "$stage" "$slug" "$worker_canonical" "$message" "$_cbid" "$_selpt"
 
     if [ -n "$digest_template" ] && [ "$status" = "DONE" ]; then
+        case "$digest_template" in *[!A-Za-z0-9_-]*)
+            printf 'DIGEST_PROMPT_ERROR: invalid template name\n'; return 2 ;; esac
         local digest_tmpl="$FORGE_DIGESTS_DIR/$digest_template.txt"
         if [ ! -f "$digest_tmpl" ]; then
             _emit_event ERROR "$slug" "stage=$stage reason=digest-template-not-found template=$digest_template"
             printf 'DIGEST_PROMPT_ERROR: template not found: %s\n' "$digest_tmpl"
-            return 0
+            return 2
         fi
-        local digest_out_dir="$project_root/.dev/forge-tmp"
-        mkdir -p "$digest_out_dir"
-        local digest_out="$digest_out_dir/digest-${stage}-${slug}.txt"
+        local digest_out
         local worker_pane
         worker_pane=$(pane_index "$worker_canonical")
-        _render_template "$digest_tmpl" "$slug" "$stage" "$worker_canonical" \
-            "$worker_pane" "$project_root" > "$digest_out" || return 0
+        digest_out=$(_publish_render "$digest_tmpl" "$slug" "$stage" "$worker_canonical" \
+            "$worker_pane" "$project_root" digest) || {
+            printf 'DIGEST_PROMPT_ERROR: render failed: %s\n' "$digest_tmpl"
+            return 2
+        }
         _emit_event DIGEST "$slug" "stage=$stage template=$digest_template event=prompt-rendered out_file=$digest_out"
         printf 'DIGEST_PROMPT: %s\n' "$digest_out"
     fi
@@ -7387,14 +7932,26 @@ print(d.get('message', '') or '')
 #     terminal callback is REFUSED with CALLBACK_TERMINAL_NOT_SUPERSEDED and no bytes change.
 cmd_callback_consume() {
     local slug="" stage="" status="BLOCKED" _no_lock=0 _closed_selection=""
+    # FAIL CLOSED, for the same reason as cmd_park: `*) shift ;;` made any future expectation
+    # flag a silent no-op on a bridge that predates it. Arity first, then assign — explicit
+    # `return 2`, NEVER `${2?msg}`, because that terminates the shell and BOTH callers of
+    # this function are in-process subshells (:6214 --supersede, :7625 park --resolve) that
+    # run AFTER a durable write; aborting one there leaves the PARK-INCONSISTENT state the
+    # lifecycle lock exists to prevent.
     while [ $# -gt 0 ]; do
         case "$1" in
-            --slug)               slug="$2"; shift 2 ;;
-            --stage)              stage="$2"; shift 2 ;;
-            --status)             status="$2"; shift 2 ;;
-            --_no_lock)           _no_lock=1; shift ;;
-            --_closed-selection)  _closed_selection="$2"; shift 2 ;;
-            *)                    shift ;;
+            --_no_lock) _no_lock=1; shift ;;
+            --slug|--stage|--status|--_closed-selection)
+                [ $# -ge 2 ] || { echo "ERROR: callback-consume: $1 requires a value" >&2; return 2; }
+                case "$1" in
+                    --slug)              slug="$2" ;;
+                    --stage)             stage="$2" ;;
+                    --status)            status="$2" ;;
+                    --_closed-selection) _closed_selection="$2" ;;
+                esac
+                shift 2 ;;
+            --*) echo "ERROR: callback-consume: unknown option '$1'" >&2; return 2 ;;
+            *)   echo "ERROR: callback-consume: unexpected operand '$1'" >&2; return 2 ;;
         esac
     done
     if [ -z "$slug" ] || [ -z "$stage" ]; then
@@ -7407,8 +7964,15 @@ cmd_callback_consume() {
         DONE|ERROR) consume_selector=_callback_terminal_superseded_select ;;
         *) echo "ERROR: callback-consume only consumes BLOCKED|PARKED (open) or DONE|ERROR (superseded stale residue); got '$status'" >&2; return 1 ;;
     esac
-    require_identity "callback-consume" host-degrade || return 1
-    local project_root; project_root=$(_resolve_project_root "")
+    if [ "$_no_lock" != 1 ]; then
+        require_identity "callback-consume" host-degrade || return 1
+    fi
+    # R4: the gate validated --target-root against tmux; this line chose the file tree from
+    # cwd ancestry. Nothing joined them, so a consume invoked from root B with --target-root A
+    # passed the gate and archived/emitted under B (reproduced by review: rc 0,
+    # `CALLBACK_CONSUME NOOP`, event written under B). _bind_target_root refuses that
+    # disagreement BEFORE any file is selected, and is a no-op for every legacy caller.
+    local project_root; project_root="$(_bind_target_root callback-consume)" || return 1
     [ -n "$project_root" ] || { echo "ERROR: callback-consume requires forge-project.yml in cwd ancestry" >&2; return 1; }
     local cb_dir="$project_root/.dev/forge-tmp/callbacks"
     local pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
@@ -7419,11 +7983,13 @@ cmd_callback_consume() {
     else
         selection="$("$consume_selector" "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" "$status" "$pipeline_log")" || select_rc=$?
         if [ "$select_rc" -eq 1 ]; then
+            _file_action_accept_audit
             _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=noop reason=no-canonical-callback status=$status"
             echo "CALLBACK_CONSUME NOOP stage=$stage slug=$slug reason=no-canonical-callback (nothing to archive)"
             return 0
         fi
         if [ "$select_rc" -eq 5 ]; then
+            _file_action_accept_audit
             _emit_event CALLBACK_CONSUME "$slug" "stage=$stage action=noop reason=status-mismatch status=$status"
             echo "CALLBACK_CONSUME NOOP stage=$stage slug=$slug reason=status-mismatch (nothing to archive)"
             return 0
@@ -7456,6 +8022,7 @@ cmd_callback_consume() {
             return 1
         fi
     fi
+    _file_action_accept_audit
     local archive_dir="$cb_dir/archive" archive_file
     mkdir -p "$archive_dir"
     archive_file="$archive_dir/${slug}-${stage}.${file_cb_id}.callback"
@@ -7471,20 +8038,124 @@ cmd_callback_consume() {
     echo "CALLBACK_CONSUME ARCHIVED stage=$stage slug=$slug status=$status → $archive_file"
 }
 
+# _park_expect_ok <want_ts> <got_ts> <want_cbid> <got_cbid> <want_sha> <got_sha> <phase>
+# ONE comparator, called TWICE — at selection and again under the lifecycle lock — so a
+# replacement between selection and write is a refusal, not a silent retarget. It binds
+# IDENTITY and STATUS of the object the operator was looking at; it never compares
+# arbitrary UI text.
+#
+#   empty want  -> no expectation, always passes.
+#   `none`      -> "expect NO callback"; satisfied only by an empty got. A DIFFERENT
+#                  assertion from "no expectation": a callback that appeared since the
+#                  operator looked is a conflict, not a convenience. Accepted only on the
+#                  --resolve path (cmd_park refuses it at parse — park selects a BLOCKED
+#                  callback by construction, so `none` there can never hold).
+# Every refusal names the phase so an operator can tell a stale render (pre-lock) from a
+# live race (under-lock).
+_park_expect_ok() {   # -> 0 ok, 1 conflict
+    local wts="$1" gts="$2" wid="$3" gid="$4" wsha="$5" gsha="$6" phase="$7"
+    if [ -n "$wts" ] && [ "$wts" != "$gts" ]; then
+        echo "REFUSED: EXPECTATION MISMATCH ($phase) selected pending timestamp is '${gts:-<none>}', expected '$wts' — no bytes changed." >&2
+        return 1
+    fi
+    if [ -n "$wid" ]; then
+        if [ "$wid" = none ]; then
+            if [ -n "$gid" ]; then
+                echo "REFUSED: EXPECTATION MISMATCH ($phase) a callback ('$gid') is present but 'none' was expected — no bytes changed." >&2
+                return 1
+            fi
+        elif [ -z "$gid" ]; then
+            echo "REFUSED: EXPECTATION MISMATCH ($phase) expected callback '$wid' but none is present — no bytes changed." >&2
+            return 1
+        elif [ "$wid" != "$gid" ]; then
+            echo "REFUSED: EXPECTATION MISMATCH ($phase) selected callback id is '$gid', expected '$wid' — the callback was replaced; no bytes changed." >&2
+            return 1
+        fi
+    fi
+    if [ -n "$wsha" ]; then
+        if [ "$wsha" = none ]; then
+            if [ -n "$gsha" ]; then
+                echo "REFUSED: EXPECTATION MISMATCH ($phase) a callback is present but 'none' was expected — no bytes changed." >&2
+                return 1
+            fi
+        elif [ "$wsha" != "$gsha" ]; then
+            echo "REFUSED: EXPECTATION MISMATCH ($phase) callback content changed since it was displayed (sha256 is '${gsha:-<none>}', expected '$wsha') — no bytes changed." >&2
+            return 1
+        fi
+    fi
+    return 0
+}
+
 cmd_park() {
     # forge-bridge park --slug <s> --stage <s> --reason <text> [--worker <w>] [--uncommitted]
     #  (and: park --resolve --slug <s> --stage <s> [--note …])
     local resolve=false slug="" stage="" reason="" worker="" uncommitted=false note=""
+    local x_pts="" x_cbid="" x_cbsha="" x_seen=0
+    # FAIL CLOSED. The old `*) shift ;;` discarded any unrecognised token silently, so a
+    # bridge that predates this work accepts `--expected-callback-sha256 …` and proceeds
+    # WITH NO CHECK AT ALL while reporting success (plan-review B4). Rejecting unknown flags
+    # is half the fix; `web-contract-version` is the other half, because strict parsing here
+    # cannot repair an already-installed old copy.
+    #
+    # Known option VALUES stay OPAQUE: `--reason --target-session` is a literal reason.
+    # ARITY IS CHECKED FIRST, then the value is assigned. `${2?msg}` is NOT used: it
+    # TERMINATES the shell rather than returning, and in cmd_callback_consume (Step 9, same
+    # shape) that exit lands in a subshell that runs AFTER _patch_response_by_ts has closed
+    # the pending, manufacturing PARK-INCONSISTENT from a parser fault.
     while [ $# -gt 0 ]; do case "$1" in
         --resolve)     resolve=true; shift ;;
-        --slug)        slug="$2";   shift 2 ;;
-        --stage)       stage="$2";  shift 2 ;;
-        --reason)      reason="$2"; shift 2 ;;
-        --worker)      worker="$2"; shift 2 ;;
         --uncommitted) uncommitted=true; shift ;;
-        --note)        note="$2";   shift 2 ;;
-        *) shift ;;
+        --slug|--stage|--reason|--worker|--note|\
+        --expected-pending-ts|--expected-callback-id|--expected-callback-sha256)
+            [ $# -ge 2 ] || { echo "ERROR: park: $1 requires a value" >&2; return 2; }
+            case "$1" in
+                --slug)   slug="$2" ;;   --stage)  stage="$2" ;;
+                --reason) reason="$2" ;; --worker) worker="$2" ;;
+                --note)   note="$2" ;;
+                # An EXPLICITLY SUPPLIED EMPTY expectation is a caller bug, never an
+                # assertion: _park_expect_ok reads an empty want as "no expectation", so
+                # accepting one converts a requested precondition into a silent no-op
+                # (review R15). x_seen counts the operands, not the values, so a `none`
+                # and an ordinary value are treated alike by the completeness rule below.
+                --expected-pending-ts)
+                    [ -n "$2" ] || { echo "ERROR: park: --expected-pending-ts was given an empty value; omit the flag to assert nothing" >&2; return 2; }
+                    x_pts="$2"; x_seen=$((x_seen+1)) ;;
+                --expected-callback-id)
+                    [ -n "$2" ] || { echo "ERROR: park: --expected-callback-id was given an empty value; omit the flag to assert nothing" >&2; return 2; }
+                    x_cbid="$2"; x_seen=$((x_seen+1)) ;;
+                --expected-callback-sha256)
+                    [ -n "$2" ] || { echo "ERROR: park: --expected-callback-sha256 was given an empty value; omit the flag to assert nothing" >&2; return 2; }
+                    x_cbsha="$2"; x_seen=$((x_seen+1)) ;;
+            esac
+            shift 2 ;;
+        --*) echo "ERROR: park: unknown option '$1' — refusing (an expectation operand must never be silently discarded; put flag-shaped free text after --reason/--note)." >&2; return 2 ;;
+        *)   echo "ERROR: park: unexpected operand '$1' (park takes no positional arguments)" >&2; return 2 ;;
     esac; done
+    # COMPLETE-OR-ABSENT. Step 6's contract says the callback id and its sha are ONE
+    # assertion stated twice, and that `none` asserts absence for BOTH. A half-specified
+    # tuple (`--expected-callback-id <id>` with no sha, or a `none` paired with a real hash)
+    # is therefore a usage error and is refused at PARSE, where it costs no probe — the
+    # reviewed draft claimed this was "enforced at parse time" in Step 6 and never
+    # implemented it (review R15).
+    if [ -n "$x_cbid" ] || [ -n "$x_cbsha" ]; then
+        if [ -z "$x_cbid" ] || [ -z "$x_cbsha" ]; then
+            echo "ERROR: park: --expected-callback-id and --expected-callback-sha256 must be given together (a half-specified callback expectation silently downgrades the precondition)" >&2; return 2
+        fi
+        if { [ "$x_cbid" = none ] && [ "$x_cbsha" != none ]; } \
+           || { [ "$x_cbsha" = none ] && [ "$x_cbid" != none ]; }; then
+            echo "ERROR: park: the 'none' sentinel asserts that NO callback exists and must be given for BOTH --expected-callback-id and --expected-callback-sha256" >&2; return 2
+        fi
+    fi
+    # `none` asserts ABSENCE and is meaningful only for --resolve (see _park_expect_ok).
+    if { [ "$x_cbid" = none ] || [ "$x_cbsha" = none ]; } && [ "$resolve" != true ]; then
+        echo "ERROR: park: the 'none' sentinel is only valid with --resolve" >&2; return 2
+    fi
+    if [ -n "$x_cbsha" ] && [ "$x_cbsha" != none ]; then
+        case "$x_cbsha" in
+            *[!0-9a-f]*) echo "ERROR: park: --expected-callback-sha256 must be 64 lowercase hex characters or 'none'" >&2; return 2 ;;
+        esac
+        [ "${#x_cbsha}" -eq 64 ] || { echo "ERROR: park: --expected-callback-sha256 must be 64 lowercase hex characters or 'none'" >&2; return 2; }
+    fi
     [ -n "$slug" ] && [ -n "$stage" ] || { echo "Usage: forge-bridge park --slug <s> --stage <s> --reason <text> [--worker <w>] [--uncommitted]" >&2; return 1; }
 
     local project_root; project_root=$(_resolve_project_root "")
@@ -7493,25 +8164,43 @@ cmd_park() {
     local sess; sess="$(_resolve_session)"
     local pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
 
-    if [ "$resolve" = true ]; then cmd_park_resolve "$slug" "$stage" "$note"; return $?; fi
+    if [ "$resolve" = true ]; then
+        cmd_park_resolve "$slug" "$stage" "$note" "$x_pts" "$x_cbid" "$x_cbsha"; return $?
+    fi
     [ -n "$reason" ] || { echo "ERROR: park requires --reason" >&2; return 1; }
 
     require_identity "park" host-degrade || return 1
     _require_root_cwd park || return 1
+    # R4: project_root/cb_dir/pipeline_log above were resolved BEFORE the identity gate ran,
+    # so _FORGE_VALID_ROOT did not exist yet. Re-bind now and re-derive the two paths built
+    # from it, so an explicit --target-root can never name one root while the park writes
+    # under another. _require_root_cwd above cannot see this: it compares cwd to the root it
+    # ALSO derived from cwd. Legacy (no explicit target) returns the identical value.
+    project_root="$(_bind_target_root park)" || return 1
+    cb_dir="$project_root/.dev/forge-tmp/callbacks"
+    pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
     local selection select_rc=0
     selection="$(_callback_mutation_select "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" BLOCKED,PARKED "$pipeline_log")" || select_rc=$?
-    if [ "$select_rc" -eq 1 ]; then echo "PARK NOOP slug=$slug stage=$stage reason=no-blocked-callback"; return 0; fi
+    if [ "$select_rc" -eq 1 ]; then
+        # An expected callback disappearing is a conflict, not the legacy no-op case.
+        _park_expect_ok "$x_pts" "" "$x_cbid" "" "$x_cbsha" "" pre-lock || return 1
+        _file_action_accept_audit
+        echo "PARK NOOP slug=$slug stage=$stage reason=no-blocked-callback"; return 0
+    fi
     [ "$select_rc" -eq 0 ] || return 1
     local cb_file cb_status cb_id park_ts cb_session cb_incarnation cb_origin cb_hash
     IFS='|' read -r cb_file cb_status cb_id park_ts cb_session cb_incarnation cb_origin cb_hash <<< "$selection"
+
+    # Expected-selection gate #1 — BEFORE any write.
+    _park_expect_ok "$x_pts" "$park_ts" "$x_cbid" "$cb_id" "$x_cbsha" "$cb_hash" pre-lock || return 1
 
     if [ "$(_callback_ask_origin "$project_root" "$slug" "$stage" "$cb_origin")" = "ask" ]; then
         echo "REFUSED: '$slug/$stage' is an operator ask — answer via 'forge dispatch @<session> --answers', not park." >&2
         return 1
     fi
-    if [ "$cb_status" = "PARKED" ]; then echo "PARK NOOP slug=$slug stage=$stage (already parked)"; return 0; fi
-    if [ -z "$cb_file" ] || [ -z "$cb_status" ]; then echo "PARK NOOP slug=$slug stage=$stage reason=no-blocked-callback"; return 0; fi
-    if [ "$cb_status" != "BLOCKED" ]; then echo "PARK NOOP slug=$slug stage=$stage reason=callback-status=$cb_status (not BLOCKED)"; return 0; fi
+    if [ "$cb_status" = "PARKED" ]; then _file_action_accept_audit; echo "PARK NOOP slug=$slug stage=$stage (already parked)"; return 0; fi
+    if [ -z "$cb_file" ] || [ -z "$cb_status" ]; then _file_action_accept_audit; echo "PARK NOOP slug=$slug stage=$stage reason=no-blocked-callback"; return 0; fi
+    if [ "$cb_status" != "BLOCKED" ]; then _file_action_accept_audit; echo "PARK NOOP slug=$slug stage=$stage reason=callback-status=$cb_status (not BLOCKED)"; return 0; fi
 
     _callback_prelock_barrier
     _lifecycle_lock "$slug" "$stage" || return 1
@@ -7520,6 +8209,14 @@ cmd_park() {
         echo "REFUSED: park revalidation failed (CALLBACK_IDENTITY_CHANGED) — no write performed." >&2
         return 1
     fi
+    # Expected-selection gate #2 — under the lifecycle lock. Gate #1 alone leaves a
+    # replacement window between selection and lock acquisition; the bridge's own
+    # revalidation above catches a CHANGED callback, this catches "changed into something
+    # other than what the operator was shown".
+    if ! _park_expect_ok "$x_pts" "$park_ts" "$x_cbid" "$cb_id" "$x_cbsha" "$cb_hash" under-lock; then
+        _lifecycle_unlock; return 1
+    fi
+    _file_action_accept_audit
     local parked_at; parked_at=$(timestamp)
     local unc_bool; unc_bool=$([ "$uncommitted" = true ] && echo true || echo false)
     if ! _insert_parked_fields_by_ts "$slug" "$park_ts" "$parked_at" "$reason" "$unc_bool"; then
@@ -7588,11 +8285,20 @@ PY
     return $park_rc
 }
 
-cmd_park_resolve() {   # <slug> <stage> <note>   (acquires the lifecycle lock)
+cmd_park_resolve() {   # <slug> <stage> <note> [exp-pending-ts] [exp-cb-id] [exp-cb-sha]
     local slug="$1" stage="$2" note="$3"
+    local x_pts="${4:-}" x_cbid="${5:-}" x_cbsha="${6:-}"
+    # The class token stays "park-resolve": cmd_park delegates here (:7497) BEFORE running
+    # its own gate (:7499), so this is the only place the resolve path is classified. With
+    # explicit routing the dual-mode upgrade (Step 4b) promotes it to target-file; without,
+    # host-degrade is byte-unchanged. cmd_park is the only caller, and passing "" for all
+    # three trailing positionals reproduces today's behaviour exactly — which is what every
+    # existing `park --resolve` invocation does, including bin/forge:2983,2985.
     require_identity "park-resolve" host-degrade || return 1
     _require_root_cwd park-resolve || return 1
-    local project_root; project_root=$(_resolve_project_root "")
+    # R4: _require_root_cwd proves cwd == the root it derived FROM cwd; it says nothing about
+    # the root --target-root was validated against. _bind_target_root joins the two.
+    local project_root; project_root="$(_bind_target_root park-resolve)" || return 1
     [ -n "$project_root" ] || { echo "ERROR: park --resolve requires forge-project.yml" >&2; return 1; }
     local cb_dir="$project_root/.dev/forge-tmp/callbacks"
     local pipeline_log="$project_root/.dev/proposals/$slug/forge-log.yml"
@@ -7603,7 +8309,16 @@ cmd_park_resolve() {   # <slug> <stage> <note>   (acquires the lifecycle lock)
     IFS=$'\t' read -r ts parked_worker <<< "$parked"
     local selection="" select_rc=0
     selection="$(_callback_mutation_select "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" PARKED "$pipeline_log")" || select_rc=$?
+    # rc 1 is ABSENCE — the NO-CALLBACK case `--expected-callback-id none` exists to assert.
+    # rc >= 2 is a SELECTOR ERROR (ambiguity, invalid header, missing dependency) and is
+    # returned, never read as "no callback": that conflation is how an unreadable callback
+    # would become a silent close.
     [ "$select_rc" -eq 0 ] || [ "$select_rc" -eq 1 ] || return "$select_rc"
+    local r_cbfile="" r_cbstatus="" r_cbid="" r_cbts="" r_cbsess="" r_cbinc="" r_cborigin="" r_cbhash=""
+    if [ -n "$selection" ]; then
+        IFS='|' read -r r_cbfile r_cbstatus r_cbid r_cbts r_cbsess r_cbinc r_cborigin r_cbhash <<< "$selection"
+    fi
+    _park_expect_ok "$x_pts" "$ts" "$x_cbid" "$r_cbid" "$x_cbsha" "$r_cbhash" pre-lock || return 1
     _callback_prelock_barrier
     _lifecycle_lock "$slug" "$stage" || return 1
     local live_i parked_now
@@ -7612,13 +8327,72 @@ cmd_park_resolve() {   # <slug> <stage> <note>   (acquires the lifecycle lock)
        { [ -z "$ID_target_incarnation" ] && [ -n "$live_i" ]; }; then
         _lifecycle_unlock; echo "REFUSED: park --resolve actor identity changed" >&2; return 1
     fi
+    # session_created ALONE cannot distinguish same-second name reuse (review R2): a session
+    # that dies and is recreated inside the same second keeps the stamp and changes the tmux
+    # OBJECT. When the gate validated an object id, re-read BOTH fields here and compare.
+    # Bounded via _target_ident_of -> _tmux_probe: this runs with the lifecycle lock HELD.
+    if [ -n "${_FORGE_VALID_SID:-}" ]; then
+        local _li _lsid _lcreated
+        _li="$(_target_ident_of "$ID_target_session")"
+        _lsid="$(printf '%s' "$_li" | cut -f1)"
+        _lcreated="$(printf '%s' "$_li" | cut -f2)"
+        if [ "$_lsid" != "$_FORGE_VALID_SID" ] \
+           || { [ -n "$_FORGE_VALID_CREATED" ] && [ "$_lcreated" != "$_FORGE_VALID_CREATED" ]; }; then
+            _lifecycle_unlock
+            echo "REFUSED: park --resolve actor identity changed (under-lock) — target '$ID_target_session' is now tmux object '${_lsid:-unknown}' created '${_lcreated:-unknown}', validated as '$_FORGE_VALID_SID'/'$_FORGE_VALID_CREATED'; no bytes changed." >&2
+            return 1
+        fi
+    fi
     parked_now="$(_parked_pending_select "$pipeline_log" "$stage" "$ID_target_session" "$ID_target_incarnation")" || parked_now=""
     if [ "$parked_now" != "$parked" ]; then
         _lifecycle_unlock; echo "REFUSED: park --resolve pending changed" >&2; return 1
     fi
+    # RE-SELECT UNDER THE LOCK — PRESENT **AND** ABSENT (review R2).
+    #
+    # The old revalidation was conditional on a nonempty PRE-LOCK selection, and the
+    # comparator then reused the PRE-LOCK r_cbid/r_cbhash. A callback that APPEARED between
+    # selection and lock acquisition was therefore seen by NEITHER check: the pending closed,
+    # the new callback was stranded, and `--expected-callback-id none` reported PARK RESOLVED
+    # with rc 0. Reproduced by review with a deterministic barrier. The selector ran once.
+    local l_sel="" l_rc=0
+    l_sel="$(_callback_mutation_select "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" PARKED "$pipeline_log")" || l_rc=$?
+    if [ "$l_rc" -ge 2 ]; then
+        _lifecycle_unlock
+        echo "REFUSED: park --resolve callback selection failed under the lifecycle lock (rc=$l_rc) — an unreadable or ambiguous callback is NOT an absent one; no bytes changed." >&2
+        return 1
+    fi
+    local l_cbid="" l_cbhash="" l_dir="vanished"
+    if [ -n "$l_sel" ]; then
+        local _lf _ls _lid _lts _lse _lin _lo _lh
+        IFS='|' read -r _lf _ls _lid _lts _lse _lin _lo _lh <<< "$l_sel"
+        l_cbid="$_lid"; l_cbhash="$_lh"; l_dir="appeared"
+    fi
+    # A change of PRESENCE is a refusal for EVERY caller, expectation-bearing or not. The
+    # write below closes the pending; a callback that arrived under the lock is a worker
+    # result that the close would strand. This is a deliberate behaviour change on the
+    # legacy path too: the refusal is non-terminal and changes no bytes, so the correct
+    # response is to re-render and retry, which is strictly better than silently discarding
+    # a result. No existing case in tests/forge-bridge/run.sh exercises this race (the
+    # barrier seam is unused by them), so nothing regresses.
+    if { [ -n "$selection" ] && [ -z "$l_sel" ]; } || { [ -z "$selection" ] && [ -n "$l_sel" ]; }; then
+        _lifecycle_unlock
+        echo "REFUSED: park --resolve callback changed (under-lock) — a callback $l_dir between selection and the lifecycle lock; no bytes changed." >&2
+        return 1
+    fi
+    if [ -n "$l_sel" ] && [ "$l_sel" != "$selection" ]; then
+        _lifecycle_unlock; echo "REFUSED: park --resolve callback changed" >&2; return 1
+    fi
     if [ -n "$selection" ] && ! _callback_selection_unchanged "$selection" "$cb_dir" "$slug" "$stage" "$ID_target_session" "$ID_target_incarnation" PARKED "$pipeline_log"; then
         _lifecycle_unlock; echo "REFUSED: park --resolve callback changed" >&2; return 1
     fi
+    # Expected-selection gate #2 — on the FRESHLY READ tuple, under the lock, before the
+    # FIRST write. Comparing the pre-lock tuple here (as the reviewed draft did) only
+    # re-asserts what gate #1 already checked and proves nothing about the state being
+    # written.
+    if ! _park_expect_ok "$x_pts" "$ts" "$x_cbid" "$l_cbid" "$x_cbsha" "$l_cbhash" under-lock; then
+        _lifecycle_unlock; return 1
+    fi
+    _file_action_accept_audit
     if ! _patch_response_by_ts "$slug" "$ts" "FORGE_PARK_RESOLVED: ${note:-resolved}"; then
         _lifecycle_unlock; echo "ERROR: park --resolve: failed to close pending" >&2; return 1
     fi
@@ -8223,8 +8997,15 @@ _append_complete_event() {   # <project_root> <slug> <completion_id> <extra_fiel
     local pr="$1" slug="$2" cid="$3" extra="$4"
     local log_dir="$pr/.dev/forge-tmp" log_file="$pr/.dev/forge-tmp/orchestrator-events.log"
     mkdir -p "$log_dir" 2>/dev/null || return 1
+    # Dedup FIRST and UNCHANGED. _event_has_completion (:8207-8219) matches
+    # `\bpipeline=<slug>(\s|$)` AND `\bcompletion_id=<cid>(\s|$)` as whole tokens, so an
+    # existing record still matches whether or not it carries provenance and a re-run is
+    # still a no-op. Provenance is APPENDED after $extra — never inserted between
+    # pipeline= and completion_id= — so both anchors and every byte-prefix comparison hold.
     _event_has_completion "$log_file" "$slug" "$cid" && return 0
-    FORGE_AE_FILE="$log_file" FORGE_AE_LINE="COMPLETE: pipeline=$slug completion_id=$cid$extra" python3 - <<'PY'
+    _event_provenance "$pr"
+    FORGE_AE_FILE="$log_file" \
+    FORGE_AE_LINE="COMPLETE: pipeline=$slug completion_id=$cid$extra event_at=$(timestamp)$_EVP_OUT" python3 - <<'PY'
 import os,sys
 f=os.environ["FORGE_AE_FILE"]; line=os.environ["FORGE_AE_LINE"].rstrip("\n")+"\n"
 try:
@@ -8561,7 +9342,7 @@ live={}
 seam=os.environ.get('FORGE_BLOCKED_AUDIT_TMUX_LIST','')
 try:
     lines=(open(seam).read().splitlines() if seam else
-           subprocess.check_output(['tmux','list-sessions','-F',
+           subprocess.check_output(['tmux','-u','list-sessions','-F',
              '#{session_name}\t#{session_path}\t#{session_id}\t#{session_created}'],
              text=True,stderr=subprocess.DEVNULL,timeout=5).splitlines())
 except Exception: lines=[]
@@ -8764,6 +9545,32 @@ _infra_lock_identity() {
         sid="$FORGE_LOCK_SELF_SESSION_ID"
         screated="${FORGE_LOCK_SELF_SESSION_CREATED:-0}"
         tpid="${FORGE_LOCK_SELF_TMUX_PID:-0}"
+    elif [ -n "${_FORGE_VALID_SESSION:-}" ]; then
+        # Validated explicit target (A1). The UNTARGETED display-message below resolves the
+        # tmux server's ACTIVE session, which in a headless web child is some other
+        # operator's pane — so park's delegated release and the rendered status were
+        # attributed to the wrong owner and the release reported IDENTITY_FAILURE /
+        # RELEASE_NOOP_NOT_OWNER. The gate already proved this session exists, is rooted
+        # where the caller intended and matches any supplied expectations; re-probe it BY
+        # NAME for the server pid and re-confirm name/id/creation/root, so a death+recreate
+        # between the gate and here cannot be mistaken for the same session. Any
+        # disagreement falls back to rc 1 — the caller's existing "cannot resolve identity"
+        # refusal — never to a guessed owner. Reads a process-local variable written only by
+        # require_identity; a web caller cannot supply an owner field.
+        local vinfo vname vsid vcreated vpath
+        vinfo=$(_tmux_probe display-message -p -t "=$_FORGE_VALID_SESSION:" \
+            '#{session_name}|#{session_id}|#{session_created}|#{pid}|#{session_path}')
+        [ -n "$vinfo" ] || return 1
+        vname="${vinfo%%|*}";    vinfo="${vinfo#*|}"
+        vsid="${vinfo%%|*}";     vinfo="${vinfo#*|}"
+        vcreated="${vinfo%%|*}"; vinfo="${vinfo#*|}"
+        tpid="${vinfo%%|*}";     vinfo="${vinfo#*|}"
+        vpath="${vinfo%%|*}"
+        [ "$vname" = "$_FORGE_VALID_SESSION" ] || return 1
+        [ -z "$_FORGE_VALID_SID" ]     || [ "$vsid" = "$_FORGE_VALID_SID" ]         || return 1
+        [ -z "$_FORGE_VALID_CREATED" ] || [ "$vcreated" = "$_FORGE_VALID_CREATED" ] || return 1
+        [ -z "$_FORGE_VALID_ROOT" ]    || [ "$(ownership_root "$vpath")" = "$_FORGE_VALID_ROOT" ] || return 1
+        session="$vname"; sid="$vsid"; screated="$vcreated"
     else
         local idinfo
         idinfo=$(tmux display-message -p '#{session_name}|#{session_id}|#{session_created}|#{pid}' 2>/dev/null)
@@ -9189,6 +9996,7 @@ cmd_digest() {
         echo "Usage: forge-bridge digest --slug <s> --stage <s> --template <name> [--worker <w>]" >&2
         return 1
     fi
+    case "$template" in *[!A-Za-z0-9_-]*) echo 'DIGEST_PROMPT_ERROR: invalid template name'; return 2 ;; esac
 
     local project_root
     project_root=$(_resolve_project_root "")
@@ -9203,14 +10011,12 @@ cmd_digest() {
     worker_pane=$(pane_index "$worker")
 
     local tmpl_path="$FORGE_DIGESTS_DIR/$template.txt"
-    local out_dir="$project_root/.dev/forge-tmp"
-    mkdir -p "$out_dir"
-    local out_file="$out_dir/digest-${stage}-${slug}.txt"
-
-    _render_template "$tmpl_path" "$slug" "$stage" "$worker_canonical" \
-        "$worker_pane" "$project_root" > "$out_file" || {
+    local out_file
+    out_file=$(_publish_render "$tmpl_path" "$slug" "$stage" "$worker_canonical" \
+        "$worker_pane" "$project_root" digest) || {
         _emit_event ERROR "$slug" "stage=$stage reason=template-render-failed template=$template"
-        return 1
+        echo "DIGEST_PROMPT_ERROR: render failed: $tmpl_path"
+        return 2
     }
 
     _emit_event DIGEST "$slug" "stage=$stage template=$template event=prompt-rendered out_file=$out_file"
@@ -9245,17 +10051,65 @@ cmd_emit() {
     esac
     local slug="" stage=""
     local -a passthrough=()
+    # _emit_token_ok <what> <value> — a STRUCTURED operand that is written into the event line
+    # unquoted must be ONE token: no whitespace (space, TAB, CR, LF), no `=`, and nothing
+    # outside [A-Za-z0-9._-]. `--stage` and `--slug` are interpolated directly into the
+    # fields string, so without this a caller supplies a complete ownership tuple through
+    # either of them (review R8, reproduced with --stage). Both are already constrained to
+    # this charset in practice: every stage in config/codex-forge-runtime.json is [a-z-] and
+    # a slug is a `.dev/proposals/<slug>` directory name.
+    _emit_token_ok() {
+        case "$2" in
+            '') echo "ERROR: emit: $1 may not be empty" >&2; return 1 ;;
+            *[!A-Za-z0-9._-]*)
+                echo "ERROR: emit: $1 must be a single [A-Za-z0-9._-] token — '$2' contains a separator, whitespace or control character and could forge event fields." >&2
+                return 1 ;;
+        esac
+        return 0
+    }
     while [ $# -gt 0 ]; do
         case "$1" in
-            --slug)  slug="$2";  shift 2 ;;
-            --stage) stage="$2"; shift 2 ;;
+            --slug)
+                [ $# -ge 2 ] || { echo "ERROR: emit: --slug requires a value" >&2; return 1; }
+                _emit_token_ok --slug "$2" || return 1
+                slug="$2";  shift 2 ;;
+            --stage)
+                [ $# -ge 2 ] || { echo "ERROR: emit: --stage requires a value" >&2; return 1; }
+                _emit_token_ok --stage "$2" || return 1
+                stage="$2"; shift 2 ;;
             *)
                 if [[ "$1" == *=* ]]; then
                     local k="${1%%=*}" v="${1#*=}"
+                    # THE KEY IS VALIDATED AS A TOKEN, not merely checked against a deny-list.
+                    # A key containing a space or a newline splits into extra fields when the
+                    # line is written, which is how a deny-list on the key alone is bypassed.
+                    _emit_token_ok "field name" "$k" || return 1
+                    # RESERVED provenance names are bridge-authored, from validated identity.
+                    # The web feed treats these four as proof of ownership for its session
+                    # join, so the CLI must be the only writer: a caller-supplied
+                    # event_session would produce a record with two conflicting owners and is
+                    # exactly the forgery the join must be able to exclude. Refuse loudly —
+                    # never drop, never rename. Placed inside the *=* branch so a bare
+                    # `event_at` token without `=` is not caught by accident; the bare-token
+                    # arm below rejects it on its own terms.
+                    case "$k" in
+                        event_at|event_session|event_session_id|event_incarnation)
+                            echo "ERROR: emit: '$k' is a reserved provenance field written by the bridge; callers may not supply it." >&2
+                            return 1 ;;
+                    esac
                     local v_clean
                     v_clean=$(_sanitize_event_value "$v")
                     passthrough+=("$k=$v_clean")
                 else
+                    # A BARE token is also written into the line verbatim. Validate it the
+                    # same way and refuse a reserved name, so `emit … event_session` cannot
+                    # be used to smuggle a name that a later reader tokenizes loosely.
+                    _emit_token_ok "field" "$1" || return 1
+                    case "$1" in
+                        event_at|event_session|event_session_id|event_incarnation)
+                            echo "ERROR: emit: '$1' is a reserved provenance field written by the bridge; callers may not supply it." >&2
+                            return 1 ;;
+                    esac
                     passthrough+=("$1")
                 fi
                 shift
@@ -9919,6 +10773,16 @@ cmd_stall_check() {
     canonical=$(canonical_pane_name "$target")
     idx=$(pane_index "$target")
 
+    local classifier="$canonical" host_provider=""
+    if [ "$idx" = "$ORCH_IDX" ]; then
+        host_provider="$(_orchestrator_provider "$project_root" "$SESSION")"
+        case "$host_provider" in
+            claude) classifier=claude-opus ;;
+            codex) classifier=codex-a ;;
+            *) echo "UNKNOWN pane=$canonical provider=unknown reason=host_binding_unavailable"; return 0 ;;
+        esac
+    fi
+
     # Pane existence check → DEAD signal.
     if ! tmux list-panes -t "$SESSION:$WINDOW" -F '#{pane_index}' 2>/dev/null | grep -qx "$idx"; then
         cmd_signal "stall-check" "DEAD pane=$canonical session=$SESSION" >/dev/null
@@ -9937,6 +10801,22 @@ cmd_stall_check() {
     if [ ! -s "$raw_file" ]; then
         rm -f "$raw_file"
         echo "UNKNOWN capture_failed pane=$canonical"
+        return 0
+    fi
+
+    # The operator seat has no worker callback boundary. Report its UI state,
+    # never a worker completion/recovery action inferred from pending logs.
+    if [ -n "$host_provider" ]; then
+        local host_state
+        host_state="$(FORGE_HEALTH_FIXTURE="$raw_file" _worker_health "$SESSION" "$idx" "$classifier")"
+        rm -f "$raw_file"
+        case "$host_state" in
+            busy) host_state=ACTIVE ;;
+            idle) host_state=IDLE ;;
+            prompting) host_state=PROMPTING ;;
+            *) host_state=UNKNOWN ;;
+        esac
+        echo "$host_state pane=$canonical provider=$host_provider"
         return 0
     fi
 
@@ -10657,7 +11537,7 @@ cmd_health() {
     # Expected (canonical_name, idx, kind) tuples.
     # kind is 'claude' or 'codex' — matched against idle-prompts.yml regex tables.
     local specs=(
-        "claude:0:claude-opus"
+        "claude:0:$(_orchestrator_provider "$ID_target_root" "$SESSION")"
         "claude-opus:1:claude-opus"
         "claude-sonnet:2:claude-sonnet"
         "codex-a:3:codex-a"
@@ -10675,6 +11555,15 @@ cmd_health() {
         idx="${rest%%:*}"
         kind="${rest##*:}"
 
+        if [ "$idx" = "$ORCH_IDX" ]; then
+            case "$kind" in
+                claude) kind=claude-opus ;;
+                codex) kind=codex-a ;;
+                *) echo "UNKNOWN pane=$name idx=$idx provider=unknown reason=host_binding_unavailable"
+                   unknown=$((unknown+1)); continue ;;
+            esac
+        fi
+
         if ! echo " $existing_idxs " | grep -q " $idx "; then
             echo "DEAD pane=$name idx=$idx"
             dead=$((dead+1))
@@ -10686,6 +11575,19 @@ cmd_health() {
         if [ ! -s "$raw_file" ]; then
             echo "UNKNOWN pane=$name idx=$idx reason=capture_failed"
             unknown=$((unknown+1))
+            continue
+        fi
+
+        if [ "$idx" = "$ORCH_IDX" ]; then
+            local host_state
+            host_state="$(FORGE_HEALTH_FIXTURE="$raw_file" _worker_health "$SESSION" "$idx" "$kind")"
+            case "$host_state" in
+                idle|busy|prompting)
+                    echo "OK pane=$name idx=$idx kind=${kind%%-*} provider=${kind%%-*} state=$host_state"
+                    ok=$((ok+1)) ;;
+                *) echo "UNKNOWN pane=$name idx=$idx provider=${kind%%-*} reason=no_marker_match"
+                   unknown=$((unknown+1)) ;;
+            esac
             continue
         fi
 
@@ -10821,6 +11723,42 @@ cmd_identity() {
     esac
 }
 
+cmd_orchestrator_status() {
+    [ "$#" = 0 ] || { echo "orchestrator-status takes no arguments" >&2; return 2; }
+    # Use the shared resolver without require_identity's audit write.
+    _forge_identity
+    case "${ID_state:-}" in
+        MATCH) ;;
+        *) _print_identity_block >&2; return 3 ;;
+    esac
+    # Resolve the live bridge root first. The record cannot redirect this read,
+    # and a stored ready state is not sufficient for admission.
+    "$(_forge_sibling_bin)" orchestrator-status --root "$ID_target_root"
+}
+
+_orchestrator_admission() {
+    # This guard is intentionally absent from callback, consume, stop and
+    # recovery paths: original delivery ownership survives new-input drift.
+    local sibling="$(_forge_sibling_bin)"
+    /usr/bin/python3 -I "$(dirname "$sibling")/forge-orchestrator-host" guard \
+        --root "$ID_target_root" --session "$ID_target_session" >/dev/null
+}
+
+_orchestrator_provider() {   # <resolved root> <resolved session>
+    local sibling observation
+    sibling="$(_forge_sibling_bin)"
+    observation="$(/usr/bin/python3 -I "$(dirname "$sibling")/forge-orchestrator-host" observe \
+        --root "$1" --session "$2" 2>/dev/null)" || observation='{}'
+    printf '%s' "$observation" | python3 -c '
+import json,sys
+try:
+    value=json.load(sys.stdin)
+    provider=value.get("provider") if value.get("observation") == "verified" else None
+except (ValueError, AttributeError):
+    provider=None
+print(provider if provider in ("claude", "codex") else "unknown")'
+}
+
 # ---- Global cross-session flags (session-pin hardening P1.6) ----
 # PROCESS-LOCAL, NEVER exported → authorization cannot be inherited by a nested bridge
 # call, and an in-pane orchestrator cannot acquire the bypass from its session env.
@@ -10849,12 +11787,55 @@ _FORGE_P_CONSTRAINTS_SHA=""
 # refuse LEGITIMATE dispatches; set-ness cannot substitute either, because the six
 # above are initialised empty right here. A dedicated marker decouples the two.
 _FORGE_LOG_INPROC=""
+# Side-effect-free capability marker for the local web control center (§4). FIRST — before
+# the routing parse and before any identity or state work: a probe must never create a log
+# dir, take a lock, resolve a session or emit an event. Matched on argv[1] only, so the
+# probe has exactly ONE spelling. Probers MUST compare the exact string: a bridge that
+# predates this verb falls through to `help|*`, prints help and exits 0, so rc proves nothing.
+if [ "${1:-}" = "web-contract-version" ]; then
+    printf 'forge-web-contract/1\n'
+    exit 0
+fi
+
+# Expectation operands (§2). Initialised HERE, unconditionally, for the same reason the
+# _FORGE_P_* block above is: an exported same-named variable must be inert. Authorization
+# must never be inheritable from the environment. The *_SEEN flags are separate from the
+# values so that an explicitly supplied EMPTY value is an error rather than a silent
+# downgrade to "no expectation" (review R15).
+_FORGE_EXPECT_SID=""; _FORGE_EXPECT_INC=""
+_FORGE_EXPECT_SID_SEEN=0; _FORGE_EXPECT_INC_SEEN=0
+# Validated-target channel. Written ONLY by _explicit_target_check, after existence + root +
+# (optional) expectation all held. Read by _infra_lock_identity, _pin_pane_object,
+# _bind_target_root and the event provenance helper. Process-local, never exported: a child
+# must not inherit an identity assertion it did not earn, and a web caller cannot supply an
+# owner.
+_FORGE_VALID_SESSION=""; _FORGE_VALID_SID=""; _FORGE_VALID_CREATED=""; _FORGE_VALID_ROOT=""
 _fb_argv=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --target-session) _FORGE_TARGET="$2"; shift 2 ;;
+        # ARITY GUARDED. `shift 2` with one argument left FAILS AND DOES NOT SHIFT, so the
+        # loop spins forever on a trailing `--target-session` — reproduced. Every value-taking
+        # routing flag checks $# first and exits 2 with a named diagnostic (review R15).
+        --target-session)
+            [ $# -ge 2 ] || { echo "ERROR: --target-session requires a value." >&2; exit 2; }
+            _FORGE_TARGET="$2"; shift 2 ;;
         --cross-session)  _FORGE_CROSS=1; shift ;;
-        --target-root)    _FORGE_TARGET_ROOT="$2"; shift 2 ;;
+        --target-root)
+            [ $# -ge 2 ] || { echo "ERROR: --target-root requires a value." >&2; exit 2; }
+            _FORGE_TARGET_ROOT="$2"; shift 2 ;;
+        --expected-session-id)
+            [ $# -ge 2 ] || { echo "ERROR: --expected-session-id requires a value." >&2; exit 2; }
+            _FORGE_EXPECT_SID_SEEN=1; _FORGE_EXPECT_SID="$2"; shift 2 ;;
+        --expected-incarnation)
+            [ $# -ge 2 ] || { echo "ERROR: --expected-incarnation requires a value." >&2; exit 2; }
+            _FORGE_EXPECT_INC_SEEN=1; _FORGE_EXPECT_INC="$2"; shift 2 ;;
+        # `--` ENDS routing extraction. Everything after it is forwarded to the subcommand
+        # BYTE-UNCHANGED, so a --reason/--note/message whose text IS a reserved routing flag
+        # can no longer be eaten by this loop at any argv position. The boundary itself is
+        # removed. The VERB stays before it (the router's `case` runs on the post-loop argv),
+        # as do all routing/expectation flags:
+        #     park <routing> -- --slug S --stage T --reason TEXT
+        --) shift; _fb_argv+=(${@+"$@"}); break ;;
         *) _fb_argv+=("$1"); shift ;;
     esac
 done
@@ -10863,10 +11844,56 @@ if [ -n "$_FORGE_TARGET" ] && [ "$_FORGE_CROSS" != "1" ]; then
     echo "ERROR: --target-session requires --cross-session (cross-session routing must be explicitly declared)." >&2
     exit 2
 fi
+# An explicitly supplied EMPTY value is a mistake, never an assertion. Without this, a web
+# caller that renders an empty session id into its argv silently downgrades the precondition
+# to "no expectation" — the exact fail-open class these operands exist to close.
+if [ "$_FORGE_EXPECT_SID_SEEN" = 1 ] && [ -z "$_FORGE_EXPECT_SID" ]; then
+    echo "ERROR: --expected-session-id was given an empty value; omit the flag to assert nothing." >&2; exit 2
+fi
+if [ "$_FORGE_EXPECT_INC_SEEN" = 1 ] && [ -z "$_FORGE_EXPECT_INC" ]; then
+    echo "ERROR: --expected-incarnation was given an empty value; omit the flag to assert nothing." >&2; exit 2
+fi
+# An incomplete expectation tuple SILENTLY DOWNGRADES the precondition (plan-review B4).
+if [ "$_FORGE_EXPECT_SID_SEEN" != "$_FORGE_EXPECT_INC_SEEN" ]; then
+    echo "ERROR: --expected-session-id and --expected-incarnation must be given together (an incomplete expectation tuple silently downgrades the precondition)." >&2
+    exit 2
+fi
+if [ -n "$_FORGE_EXPECT_SID" ] && { [ "$_FORGE_CROSS" != "1" ] || [ -z "$_FORGE_TARGET" ]; }; then
+    echo "ERROR: expectation operands require --target-session with --cross-session." >&2
+    exit 2
+fi
+# Shape validation BEFORE any probe, so a forged or typo'd tuple fails at parse and the
+# negative tests need no tmux. A tmux SESSION id is `$N` — `%N` is a PANE id and `@N` is a
+# window id (verified: `tmux list-sessions -F '#{session_id}'` -> $0, $4, $1650).
+#
+# THE COMPLETE SUFFIX IS VALIDATED, NOT A PREFIX GLOB. `case "$v" in '$'[0-9]*)` is a glob,
+# not a regex: it means "$", one digit, then ANYTHING, and it accepts `$1garbage`
+# (reproduced by review, R15). Strip the leading `$` with a parameter expansion — no
+# subprocess, no glob — and then reject any non-digit anywhere in the remainder. Never
+# `eval` these: tests/forge-infra-lock/run.sh:762 documents that `$811` re-expands as `$8`
+# then `11`.
+if [ -n "$_FORGE_EXPECT_SID" ]; then
+    _FORGE_EXPECT_SID_N="${_FORGE_EXPECT_SID#\$}"
+    if [ "$_FORGE_EXPECT_SID_N" = "$_FORGE_EXPECT_SID" ] || [ -z "$_FORGE_EXPECT_SID_N" ]; then
+        echo "ERROR: --expected-session-id must be a tmux session id of the form \$N (got '$_FORGE_EXPECT_SID')." >&2; exit 2
+    fi
+    case "$_FORGE_EXPECT_SID_N" in
+        *[!0-9]*) echo "ERROR: --expected-session-id must be a tmux session id of the form \$N — '$_FORGE_EXPECT_SID' has a non-numeric suffix." >&2; exit 2 ;;
+    esac
+fi
+if [ -n "$_FORGE_EXPECT_INC" ]; then
+    case "$_FORGE_EXPECT_INC" in
+        *[!0-9]*) echo "ERROR: --expected-incarnation must be the numeric session_created stamp (got '$_FORGE_EXPECT_INC')." >&2; exit 2 ;;
+    esac
+fi
 if [ "$_FORGE_CROSS" = "1" ]; then
     case "${1:-}" in
-        send|callback) ;;
-        *) echo "ERROR: --cross-session is only valid for 'send' and 'callback' (got '${1:-}')." >&2; exit 2 ;;
+        # send|callback stay target-scoped (pane operations, five-pane precondition).
+        # park|callback-consume are FILE operations: the new target-file class gives them the
+        # same existence/root/expectation validation without five healthy panes. Extending
+        # only this list is INSUFFICIENT — see require_identity (Step 4).
+        send|callback|park|callback-consume) ;;
+        *) echo "ERROR: --cross-session is only valid for 'send', 'callback', 'park' and 'callback-consume' (got '${1:-}')." >&2; exit 2 ;;
     esac
 fi
 
@@ -10912,11 +11939,13 @@ case "${1:-help}" in
     infra-lock)      shift; cmd_infra_lock "$@" ;;
     wait)            shift; cmd_wait "$@" ;;
     digest)          shift; cmd_digest "$@" ;;
+    local-render)    shift; cmd_local_render "$@" ;;
     emit)            shift; cmd_emit "$@" ;;
     stall-check)         shift; cmd_stall_check "$@" ;;
     stall-check-status)  shift; require_identity "stall-check-status" host-degrade || true; cmd_stall_check_status "$@" ;;
     alias-self-test)     shift; cmd_alias_self_test "$@" ;;
     identity)            cmd_identity ;;
+    orchestrator-status) shift; cmd_orchestrator_status "$@" ;;
     health)              cmd_health ;;
     constraint-check)    shift; cmd_constraint_check "$@" ;;
     constraints)         shift; cmd_constraints "$@" ;;
@@ -10965,6 +11994,7 @@ case "${1:-help}" in
         echo "                                dispatch-time safety precondition; refuses on an open pending, non-idle health,"
         echo "                                a terminal state, in observe mode, and on the orchestrator (pane 0)"
         echo "  identity                      Print host/target identity descriptor; exit 0 (MATCH/CROSS) or 3 (MISMATCH/AMBIGUOUS/UNAVAILABLE)"
+        echo "  orchestrator-status           Read protected binding at the live bridge root; does not admit work"
         echo "  stall-check-status [--project-root <p>]"
         echo "                                List panes with pending dispatch and stale stall-check coverage"
         echo "  alias-self-test [--strict]    Verify pane alias maps stay in lockstep"
@@ -10978,6 +12008,8 @@ case "${1:-help}" in
         echo "                                DONE|ERROR is stale-residue cleanup ONLY: it archives a terminal callback only when a NEWER delivery-bound dispatch superseded it, and refuses a fresh one (CALLBACK_TERMINAL_NOT_SUPERSEDED)."
         echo "  park --slug <s> --stage <s> --reason <text> [--worker <w>] [--uncommitted]"
         echo "                                Park an open BLOCKED item: keeps the pending open, writes a durable parked record, flips the callback to PARKED. Use 'park --resolve --slug <s> --stage <s> [--note <text>]' to close a parked item."
+        echo "                                Expected selection (optional; refuses instead of retargeting): --expected-pending-ts <ts> --expected-callback-id <id|none> --expected-callback-sha256 <hex|none>. The id and the sha are ONE assertion: give both or neither, and 'none' must be given for both. 'none' is --resolve only. Checked at selection and again under the lifecycle lock."
+        echo "                                Unknown options, stray operands and missing values are REFUSED (exit 2), so an expectation operand can never be silently dropped."
         echo "  blocked-audit [--root <path>] [--json]"
         echo "                                Read-only audit of BLOCKED/PARKED callbacks, half-parked records, duplicate open pendings, and stale state keys. MUTATES NOTHING."
         echo "  infra-lock <acquire|release|status> --slug <s> --stage <t> [--timeout N] [--interval I] [--force]"
@@ -11008,6 +12040,14 @@ case "${1:-help}" in
         echo "  hygiene-status                Print mode, per-family reset capability, thresholds, residue, terminal state, activation preflight, journal"
         echo "  hygiene-gc [--days N] [--dry-run]  Reap dead-incarnation terminal journals + locks (conservative)"
         echo "  hygiene-abandon --slug <s> --reason <text>  Audited cleanup non-completion escape from a stuck terminal state"
+        echo "  web-contract-version          Print 'forge-web-contract/1' (capability marker read by bin/forge-web); no identity, routing or state work"
+        echo ""
+        echo "Global routing (FLAGS ONLY; all of these go BEFORE the subcommand):"
+        echo "  --target-session <s> --cross-session   explicit target; valid for send, callback, park, callback-consume"
+        echo "  --target-root <p>                      the intended physical root of that target"
+        echo "  --expected-session-id \$<n>             refuse unless the target's tmux session id matches (\$N, not %N)"
+        echo "  --expected-incarnation <n>             refuse unless the target's session_created matches"
+        echo "  --                                     end routing parsing; every later argument reaches the subcommand byte-unchanged"
         echo ""
         echo "Panes: claude/orchestrator/claude-orchestrator (0), claude-opus/opus/inline/general (1), claude-sonnet/sonnet (2), codex/codex-a (3), codex-b (4)"
         echo ""

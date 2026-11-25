@@ -1,0 +1,35 @@
+{
+  "schema": "forge-orchestrator-assets/1",
+  "providers": {
+    "claude": ["forge-orchestrator", "forge-coder", "forge-fix-runner", "fix-coder", "adversarial-proposal", "adversarial-lite", "adversarial-implementation", "adversarial-qa", "adversarial-verify", "docs-refresh", "command-center", "fix-reproducer", "adversarial-investigate", "adversarial-fix-plan", "fix-plan-reviewer", "adversarial-fix-qa"],
+    "codex": ["forge-orchestrator", "forge-coder", "fix-coder", "adversarial-proposal", "adversarial-lite", "adversarial-implementation", "adversarial-qa", "adversarial-verify", "docs-refresh", "proposal-reviewer"]
+  },
+  "required": ["skills/forge-orchestrator/SKILL.md", "skills/forge-orchestrator/references/claude.md", "skills/forge-orchestrator/references/codex.md", "codex-skills/forge-orchestrator/SKILL.md", "agents/forge-orchestrator.md", "commands/forge.md", "commands/forge-orchestrator.md", "commands/forge-status.md", "lib/forge_orchestrator.py", "lib/forge_assets.py"],
+  "synthetic": ["_preamble", "_operator_constraints", "_qa_completion"],
+  "quarantined": ["env-fix", "qa-live-retry"],
+  "stages": {
+    "proposal": {"skill": "adversarial-proposal", "providers": ["claude", "codex"], "local": true, "artifacts": ["proposals/{slug}/final-plan.md"]},
+    "proposal-lite": {"skill": "adversarial-lite", "providers": ["claude", "codex"], "artifacts": ["proposals/{slug}/final-plan.md"]},
+    "review": {"skill": "proposal-reviewer", "providers": ["codex"], "artifacts": ["proposals/{slug}/review-feedback.md"]},
+    "incorporate": {"skill": null, "providers": ["claude", "codex"], "artifacts": ["proposals/{slug}/incorporate-report.md", "proposals/{slug}/final-plan.md"]},
+    "implementation": {"skill": "adversarial-implementation", "providers": ["claude", "codex"], "artifacts": ["proposals/{slug}/implementation.md"]},
+    "impl-review": {"skill": null, "providers": ["claude", "codex"], "artifacts": ["proposals/{slug}/impl-review.md"]},
+    "coding": {"skill": "forge-coder", "providers": ["claude", "codex"], "artifacts": ["proposals/{slug}/coder-report.md"]},
+    "coding-fix": {"skill": "forge-coder", "providers": ["claude", "codex"], "artifacts": ["proposals/{slug}/coding-fix-report.md"]},
+    "qa": {"skill": "adversarial-qa", "providers": ["claude", "codex"], "artifacts": ["qa/{slug}/issues.md", "qa/{slug}/manifest.yaml"]},
+    "qa-retry": {"skill": "adversarial-qa", "providers": ["claude", "codex"], "artifacts": ["qa/{slug}/issues.md", "qa/{slug}/manifest.yaml"]},
+    "qa-fix": {"skill": null, "providers": ["claude", "codex"], "artifacts": ["qa/{slug}/qa-fix-report.md"]},
+    "verify": {"skill": "adversarial-verify", "providers": ["claude", "codex"], "artifacts": ["qa/{slug}/verification-report.yaml"]},
+    "fix-reproduce": {"skill": "fix-reproducer", "providers": ["claude"], "artifacts": ["proposals/{slug}/repro.md"]},
+    "fix-investigate": {"skill": "adversarial-investigate", "providers": ["claude"], "artifacts": ["proposals/{slug}/diagnosis.md"]},
+    "fix-investigate-solo": {"skill": null, "providers": ["claude", "codex"], "artifacts": ["proposals/{slug}/diagnosis.md"]},
+    "fix-plan": {"skill": "adversarial-fix-plan", "providers": ["claude"], "artifacts": ["proposals/{slug}/fix-plan.md"]},
+    "fix-plan-solo": {"skill": null, "providers": ["claude", "codex"], "artifacts": ["proposals/{slug}/fix-plan.md"]},
+    "fix-plan-review": {"skill": "fix-plan-reviewer", "providers": ["claude"], "artifacts": ["proposals/{slug}/fix-review.md"]},
+    "fix-plan-revise": {"skill": "adversarial-fix-plan", "providers": ["claude"], "artifacts": ["proposals/{slug}/fix-plan.md"]},
+    "fix-code": {"skill": "fix-coder", "providers": ["claude", "codex"], "artifacts": ["proposals/{slug}/fix-coder-report.md", "proposals/{slug}/fix-diffs.md"]},
+    "fix-qa": {"skill": "adversarial-fix-qa", "providers": ["claude"], "artifacts": ["qa/{slug}/fix-issues.md", "qa/{slug}/fix-manifest.yaml"]},
+    "fix-qa-retry": {"skill": "adversarial-fix-qa", "providers": ["claude"], "artifacts": ["qa/{slug}/fix-issues.md", "qa/{slug}/fix-manifest.yaml"]},
+    "fix-scout": {"skill": null, "providers": ["claude", "codex"], "artifacts": ["proposals/{slug}/routing-plan.md"]}
+  }
+}

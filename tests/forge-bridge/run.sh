@@ -18,6 +18,10 @@ bad(){ FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$1"; }
 not_run(){ NOT_RUN=$((NOT_RUN+1)); printf '  NOT RUN: %s\n' "$1"; }
 
 export FORGE_WATCH_TRIGGER=0
+# Execute the C1 contract family before any native pane setup can fail or time out.
+python3 "$ROOT/tests/forge-bridge/p0-tests.py" WebBridgeContractTests WebInventoryContractTests WebNativeBridgeTests \
+  && ok "C1 web routing/lifecycle/provenance/inventory contract" \
+  || bad "C1 web routing/lifecycle/provenance/inventory contract"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fbid.XXXXXX")"; WORK="$(cd "$WORK" && pwd -P)"
 P0_HELPER="$ROOT/tests/forge-bridge/p0-harness.py"
 P0_EVIDENCE="${FORGE_BRIDGE_EVIDENCE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/forge-bridge-evidence.XXXXXX")}"
@@ -542,13 +546,14 @@ _dp_declared="$(printf '%s' "$_dp_out" | grep -c 'prompts/.*— not installed' |
 # a stale floor still passes — which is exactly why it must be raised with the inventory
 # rather than left behind it.
 [ "$_dp_declared" -ge 28 ] || _dp_err="$_dp_err declared-but-absent-reported-only-$_dp_declared"
-# The two synthetics must never be reported as live-undeclared: they are excluded BY NAME,
-# and a regression there would produce a drift report that names them on every run forever.
+# Files shadowing synthetic includes must be reported, never loaded.
 printf 'x\n' > "$_dp/.config/forge/prompts/_preamble.txt"
 printf 'x\n' > "$_dp/.config/forge/prompts/_operator_constraints.txt"
 _dp_out="$(cd "$ROOT" && _dp_env || true)"
-printf '%s' "$_dp_out" | grep -qE 'prompts/(_preamble|_operator_constraints)\.txt' \
-  && _dp_err="$_dp_err synthetic-reported-as-undeclared"
+for _synthetic in _preamble _operator_constraints; do
+  printf '%s' "$_dp_out" | grep -q "prompts/$_synthetic.txt .*shadows a synthetic include" \
+    || _dp_err="$_dp_err synthetic-shadow-silent:$_synthetic"
+done
 rm -f "$_dp/.config/forge/prompts/_preamble.txt" "$_dp/.config/forge/prompts/_operator_constraints.txt"
 # Reverse · present-but-undeclared: an untracked live .txt MUST be reported.
 printf 'probe\n' > "$_dp/.config/forge/prompts/driftprobe-tmp.txt"
@@ -596,10 +601,14 @@ PFNS="$WORK/prompt-fns.sh"
 # extraction that omits it yields rc 127 and a `render-failed:` for every carrier prompt
 # with a diagnostic that points nowhere near the cause. That function deliberately uses a
 # literal '.dev' rather than $DEV_DIR precisely so it survives this isolation.
-sed -n '/^_render_preamble()/,/^}$/p; /^_render_operator_constraints()/,/^}$/p; /^_render_template()/,/^}$/p' "$BRIDGE" > "$PFNS"
+sed -n '/^_render_preamble()/,/^}$/p; /^_render_operator_constraints()/,/^}$/p; /^_render_template()/,/^}$/p; /^_stage_assets()/,/^}$/p' "$BRIDGE" > "$PFNS"
 bash -n "$PFNS" && ok "T-PROMPT-EXTRACT renderer extraction parses" || bad "T-PROMPT-EXTRACT renderer extraction does not parse"
 # shellcheck disable=SC1090
 . "$PFNS"
+_forge_sibling_bin() { printf '%s/bin/forge\n' "$ROOT"; }
+export FORGE_CLAUDE_SKILLS_DIR="$ROOT/skills"
+export FORGE_CODEX_SKILLS_DIR="$ROOT/codex-skills"
+export FORGE_DIGESTS_DIR="$ROOT/digests"
 _pr_root="$WORK/prompt-root"; mkdir -p "$_pr_root/.claude"
 cat > "$_pr_root/.claude/forge-project.yml" <<'YML'
 project:
@@ -648,7 +657,7 @@ _pp_out="$(_render_template "$_pp_tmpl" pp-slug coding claude-opus 1 "$_pr_root"
 [ "$_pp_rc" -eq 0 ] || _pp_err="$_pp_err preamble-render-rc=$_pp_rc"
 # The preamble is GENERATED from forge-project.yml, so its content proves the synthetic
 # path ran — no _preamble.txt exists anywhere for it to have been read from.
-printf '%s' "$_pp_out" | grep -q 'Environment setup (run before any other commands)' \
+printf '%s' "$_pp_out" | grep -q 'Environment: direnv is already active; run commands directly' \
   || _pp_err="$_pp_err preamble-text-missing"
 printf '%s' "$_pp_out" | grep -q "Working directory: $_pr_root" || _pp_err="$_pp_err preamble-not-project-specific"
 printf '%s' "$_pp_out" | grep -q 'Backend port: 8123' || _pp_err="$_pp_err preamble-not-from-yml"
@@ -664,36 +673,24 @@ printf '%s' "$_pp_mout" | grep -q 'ERROR: include not found: _no_such_include' \
   && ok "T-PROMPT-PREAMBLE _preamble still resolves synthetically from forge-project.yml, and an ordinary missing include still exits 2" \
   || bad "T-PROMPT-PREAMBLE:$_pp_err"
 
-# T-PROMPT-RENDER · vendoring is self-contained and changed no rendered byte.
+# T-PROMPT-RENDER · all declared provider routes render deterministically.
 _prr_err=""; _prr_n=0
 for _t in "$ROOT"/prompts/*.txt; do
   [ -f "$_t" ] || continue
   _prr_n=$((_prr_n+1))
   FORGE_PROMPTS_DIR="$ROOT/prompts"
-  _prr_a="$(_render_template "$_t" rslug coding claude-opus 1 "$_pr_root" 2>/dev/null)" \
-    || { _prr_err="$_prr_err render-failed:$(basename "$_t")"; continue; }
-  # Deterministic: same inputs, same bytes.
-  _prr_b="$(_render_template "$_t" rslug coding claude-opus 1 "$_pr_root" 2>/dev/null)"
-  [ "$_prr_a" = "$_prr_b" ] || _prr_err="$_prr_err nondeterministic:$(basename "$_t")"
-  # Byte-identical BEFORE vs AFTER vendoring: render the same stage from the live
-  # directory the prompts were vendored out of. Skipped on a machine that has none
-  # (fresh clone), which is why the self-containment half above carries no such guard.
-  # The live comparison is scoped to prompts whose live copy still MATCHES the repo
-  # source. install.sh Step 3.8 PRESERVES an operator-modified live prompt rather than
-  # overwriting it, so an edited prompt stays divergent until the operator deletes the
-  # live copy and re-installs — and asserting byte-identity across that window would make
-  # the suite red for a reason that is not a defect. Where live and repo DO match, the
-  # render must still match: that is the #77a guarantee and it is retained in full.
-  _prr_live="$HOME/.config/forge/prompts/$(basename "$_t")"
-  if [ -f "$_prr_live" ] && cmp -s "$_t" "$_prr_live"; then
-    FORGE_PROMPTS_DIR="$HOME/.config/forge/prompts"
-    _prr_c="$(_render_template "$_prr_live" rslug coding claude-opus 1 "$_pr_root" 2>/dev/null)"
-    [ "$_prr_a" = "$_prr_c" ] || _prr_err="$_prr_err live-differs:$(basename "$_t")"
-  fi
+  _prr_stage="$(basename "$_t" .txt)"
+  _prr_providers="$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["stages"].get(sys.argv[2], {}).get("providers", ["claude"])))' "$ROOT/config/orchestrator-assets.json" "$_prr_stage")"
+  for _prr_provider in $_prr_providers; do
+    _prr_a="$(_render_template "$_t" rslug "$_prr_stage" "$_prr_provider" 1 "$_pr_root" 2>/dev/null)" \
+      || { _prr_err="$_prr_err render-failed:$_prr_stage:$_prr_provider"; continue; }
+    _prr_b="$(_render_template "$_t" rslug "$_prr_stage" "$_prr_provider" 1 "$_pr_root" 2>/dev/null)"
+    [ "$_prr_a" = "$_prr_b" ] || _prr_err="$_prr_err nondeterministic:$_prr_stage:$_prr_provider"
+  done
 done
 [ "$_prr_n" -ge 27 ] || _prr_err="$_prr_err rendered-only-$_prr_n-prompts"
 [ -z "$_prr_err" ] \
-  && ok "T-PROMPT-RENDER all $_prr_n vendored prompts render from prompts/ alone, deterministically and byte-identically to the live originals" \
+  && ok "T-PROMPT-RENDER all $_prr_n vendored prompts render deterministically for every declared provider" \
   || bad "T-PROMPT-RENDER:$_prr_err"
 
 # ---- #77b · the _operator_constraints synthetic (T-OC-SYNTHETIC) ----
@@ -4401,6 +4398,8 @@ echo "── ACM §1: pane-1 observation ──"
 AP="$WORK/acmPane1"; mkdir -p "$AP/.dev"
 _resolve_project_root(){ printf '%s' "$AP"; }
 _session_or_sentinel(){ printf 'acmP'; }
+# Local footer fixture; P4 descriptor validation has separate host-binding tests.
+_orchestrator_provider(){ printf 'claude'; }
 FORGE_PANE1_FIXTURE="$AFIX/claude-81.txt" _observe_pane1 "$AP" p1slug >/dev/null
 python3 - "$AP/$(_usage_file)" <<'PY' && ok "T-ACM-PANE1 record lands under top-level orchestrator:, never under workers:" || bad "T-ACM-PANE1 placement wrong"
 import sys,yaml
@@ -5837,27 +5836,25 @@ if command -v tmux >/dev/null 2>&1; then
   rm -f "$UNKR/.dev/forge-log.yml"
 
   # ── T-UNK-PRODUCER ─────────────────────────────────────────────────────────────
-  # The producer half, at the SHIPPED DEFAULT FORGE_IDENTITY_ENFORCE=1: a session whose
-  # NAME fails _valid_session_name (:251) still reaches cmd_log, because _forge_identity
-  # fixes ID_state in the case at :427-448 and only AFTERWARDS nulls ID_target_session
-  # at :458, while `require_identity … host-session` gates on the state alone and
-  # carries no pane precondition (:604). So `log` succeeds and stamps the literal
-  # `unknown` at :3173. This is what makes T-UNK-HOOK's trigger REAL, not hypothetical.
+  # P2 admission requires a resolved session before any new pending row. Legacy
+  # unknown-session rows above still need their recovery behavior, but this
+  # producer must no longer create one even while the H9 identity gap remains.
   UNKBAD="fbunk+bad-$$"
   tmux new-session -d -s "$UNKBAD" -x 200 -y 50 -c "$UNKR" -e FORGE_LAYOUT=2 2>/dev/null
   if tmux has-session -t "$UNKBAD" 2>/dev/null; then
     run_in_pane "$UNKBAD:0.0" unkprod "( cd $UNKR && $UNKENV $BRIDGE log --slug unkprod --stage adhoc --from claude --to codex-a --prompt p )"
-    { [ "$(rc_of unkprod)" = 0 ] \
-      && grep -q '^    session: unknown$' "$UNKR/.dev/proposals/unkprod/forge-log.yml"; } \
-      && ok "T-UNK-PRODUCER an invalid-named session still logs, stamping session: unknown (enforce default)" \
+    { [ "$(rc_of unkprod)" != 0 ] \
+      && out_of unkprod | grep -q INVALID_SESSION \
+      && [ ! -e "$UNKR/.dev/proposals/unkprod/forge-log.yml" ]; } \
+      && ok "T-UNK-PRODUCER P2 admission rejects unresolved session before pending creation" \
       || bad "T-UNK-PRODUCER rc=$(rc_of unkprod) $(out_of unkprod | tr '\n' ' ')"
 
     # ── T-UNK-SIG ────────────────────────────────────────────────────────────────
     # Named SEPARATELY so it cannot be trimmed away with the case above. It pins the H9
     # state/value gap as an OBSERVED FACT even though H9 is deliberately NOT fixed here
     # (it is a class fix touching every host-session/host-degrade command; the diagnosis
-    # records it as the deeper cause and explicitly NOT the fix site). If this ever
-    # stops holding, T-UNK-HOOK's trigger has silently become vacuous.
+    # records it as the deeper cause and explicitly NOT the fix site). Admission
+    # prevents new rows; the earlier tests retain historical-row coverage.
     run_in_pane "$UNKBAD:0.0" unksig "( cd $UNKR && $UNKENV $BRIDGE identity )"
     { out_of unksig | grep -q 'identity_state=MATCH' \
       && out_of unksig | grep -q 'target_session=none'; } \

@@ -1,0 +1,237 @@
+{
+  "schema": "forge-orchestrator-p1-measurements/1",
+  "date": "2026-09-14",
+  "p1_status": "INCOMPLETE",
+  "provider_admitted": false,
+  "production_fix": "Local stage asks use existing exact-pending self-callback identity adoption. Explicit --root relays retain target-session and cross-session validation.",
+  "package_files": 126,
+  "native_host": {
+    "version": "Codex 0.153.4",
+    "model": "gpt-6-astra",
+    "policy": "workspace-write; network restricted; on-request; hooks/plugins disabled; reviewed host, not worker-contained",
+    "approvals": "Individual one-time approvals reviewed by P1 test controller; no persistent rules; not a human usability study",
+    "identity": "MATCH",
+    "broker": "Native start and stop; real worker attestation and completed deliveries",
+    "shared_lock": "Native acquire/status/normal release; linked-root contender timed out against live holder",
+    "completed_deliveries": 2,
+    "redispatch_for_digest_or_answer": false,
+    "missing_digest": "DONE plus DIGEST_PROMPT_ERROR; host stopped and retained the lock",
+    "digest_retry": "Selected existing immutable digest template; same callback and delivery; no template-byte replacement proved",
+    "digest_child": "Native fork_turns:none; tool-traced reads of rendered prompt and artifact; opaque input message is hashed, not decrypted or plaintext-attested",
+    "recovery": "Host process exited/resumed; original BLOCKED callback ID, pending timestamp and live lock recovered",
+    "answer": "Public linked-root answer archived/injected once; duplicate answer refused",
+    "answer_cleanup": "Cross-root callback-consume warned. Owning host used public send/consume; newer DONE correctly survived BLOCKED status-mismatch no-op"
+  },
+  "native_forge_worker": {
+    "model": "gpt-5.5",
+    "launcher": "Copied forge codex-launch",
+    "policy": "strict-config; workspace-write; network disabled; approvals never; no extra writable roots",
+    "contained_ready": true,
+    "unattended_ready": false,
+    "private_codex_home": false,
+    "policy_file_loaded": false,
+    "ask_fix_package_audit": {
+      "status": "PASS",
+      "files": 126,
+      "exact_command_traced": true,
+      "all_write_opens_denied": true,
+      "all_unchanged": true
+    },
+    "callbacks": [
+      "DONE",
+      "BLOCKED",
+      "DONE"
+    ]
+  },
+  "standalone_native_worker": {
+    "model": "gpt-6-astra",
+    "policy": "workspace-write; approvals never",
+    "files": 2096,
+    "status": "PASS",
+    "exact_command_traced": true,
+    "scope": "Separate package/runtime write-open probe, not the Forge gpt-5.5 launch"
+  },
+  "claude_child": {
+    "version": "2.1.271",
+    "model": "claude-opus-5[1m]",
+    "permission_mode": "default",
+    "tools": "Read and Agent allowlist; hooks disabled",
+    "child_dummy_read_traced": true,
+    "scope": "Parent protected-entry Read and child outside-workspace dummy-token Read. Shared readability, not full child OS-policy attestation. No real credential copied."
+  },
+  "fixture_findings": [
+    "TMUX session field must be numeric N, not displayed $N; helper validates observed socket/session/pane.",
+    "Contained worker needs observed TMUX_SESSION routing hint; it does not replace bridge identity validation.",
+    "Default unproven reset profile refused dispatch. Disposable banner-transition qualification passed on a used conversation; installed configuration unchanged.",
+    "Short tiled pane lost visible reset banner and refused dispatch; real proof passed at a 100x53 worker viewport. Percentage-only pristine proof not enabled.",
+    "Continuation exceeding 2048-byte send ceiling was refused; file-pointer send used without changing guard.",
+    "Earlier unroutable and callback-failed asks remain negative fixture evidence; two actual worker deliveries are terminal."
+  ],
+  "remaining": [
+    "Genuine provider-aware hook/attention events under the selected policy",
+    "Remaining global discovery and Claude loading transitions",
+    "Full child-policy, identity/token inheritance and opaque disjoint-input reconciliation",
+    "Profile-management authority and remaining runtime/alias closure",
+    "Nested-parent pointer write-open protection still fails; bytes were never changed",
+    "Cross-root answer-side callback cleanup warning"
+  ],
+  "tests": {
+    "orchestrator_harness": {
+      "passed": 45,
+      "failed": 0
+    },
+    "shell_syntax": "PASS",
+    "codex_policy_smoke": "Hermetic PASS; live gates skipped",
+    "command_center": {
+      "patched": {
+        "passed": 238,
+        "failed": 39
+      },
+      "baseline": {
+        "passed": 238,
+        "failed": 39
+      },
+      "same_failures": true,
+      "baseline_matches_prechange_HEAD": true,
+      "baseline_commit": "86188ec",
+      "failure_disposition": "38 repository/installed prose synchronization assertions and one existing real-bridge relay case",
+      "dedicated_tmux_socket": true
+    },
+    "full_aggregate": "NOT_RUN"
+  },
+  "cleanup": {
+    "native_clients_exited": true,
+    "deliveries_completed": 2,
+    "broker": "stopped",
+    "shared_lock": "FREE",
+    "invocation_owned_server_stopped": true,
+    "command_center_test_server_stopped": true,
+    "production_sessions_touched": false
+  },
+  "evidence": [
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/package.json",
+      "sha256": "47c4bf746a3d9444e43adf723740d56ce541684f55763ac08a89a1422a248112"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/run-f935a7cdaf6d040e/report.json",
+      "sha256": "92b312f22df9c647fd5fd9652ce2765ceee3986a3b404a4cf4e020566c44dfb1"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/package-access-0d959d7b34d64423/report.json",
+      "sha256": "19389f5c708a27705111d04286da668310bb469cbb47fb8c600a30a53dc18d7a"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/runtime-audit-fcb73e093acd33a9/report.json",
+      "sha256": "938e9e17224c453cb940b64bb0c1d268b9a02091d9e9bc99acd82636ffedc740"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/runtime-audit-fcb73e093acd33a9/dependencies.json",
+      "sha256": "0cbdfccafee052cf2a1696b8c5010eca00a60466cbc5bccd44052b47ffcaab6c"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/native-worker-73cfb1458ec7b83d/report.json",
+      "sha256": "d5c7cd7b9eeb7ee605606f427b0b4187bbbf3257b9e6ede971780973b07e959c"
+    },
+    {
+      "path": ".dev/forge-p1/ask-fix-20260914-01/package.json",
+      "sha256": "2a392848bd7847c8a88229fb58ed8a6350b954c0dd757e4d343f85efd15feb46"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/native-reviewed.json",
+      "sha256": "c26b536b3f8ddc10e9d93dcd1712db5aca2592941e96740700f36845512efb47"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/ask-fix-native-audit-reviewed.json",
+      "sha256": "c5d17d7c58ecd396415182e3c77afa5b2b138468794b86404e16c207103b9785"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/claude-child-reviewed.json",
+      "sha256": "e7222bd053534c413f2c8c28e6a61ae205a4ae3fdfd5ee2ebc6aefaa242a6d64"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/native-host-wait-missing-result.json",
+      "sha256": "fce3f7a03b354312252364d4f8d44377d662996b931ff1d676d5367b9b1b5077"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/native-host-digest-child-result.json",
+      "sha256": "2705fdc299a992e1e11d20c4cfa73693760aa6c700355286742fa410ec1bb357"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/native-host-recovered-blocked-lock.json",
+      "sha256": "4b728cde9cfb45377601b1feb919431d9f51d0f93981251ab8518286d439ee1f"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/operator-answer.json",
+      "sha256": "e21e6505de6ee118c8eb456f3e74a1040f1975adc357617f1ed2dd8b65bb1db2"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/operator-answer-duplicate.json",
+      "sha256": "18d8bc686708efd6b677e98845677b871480571d48d6c01271a7f0dbaf8f4065"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/native-host-answer-consume-result.json",
+      "sha256": "43e2ae0e71dd0a2be7c074898650fc21eca9a60594abe10e43a4b145a327ad43"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/native-host-terminal-result.json",
+      "sha256": "7563422a7e8a34ba5be89e132aa73c8336962d29b287d44e61e08ab95ad620d1"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/protected-terminal-state.json",
+      "sha256": "90b166f4ef47173385e2db0dab2176e148888c5e7c650154788661fbf0840012"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/terminal-lock-check.json",
+      "sha256": "57f850eedf1d5e87c08d47bd226402fa27b7b8a9c53fc7379f3927c5a1db70d4"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/cleanup.json",
+      "sha256": "3121bdec657973c0bd864a8ffd65c037ded2543c41cb8c137832e0123b0f7d07"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/reset-qualified-input.json",
+      "sha256": "ebc187855b7a2dce27f514b2a67cf10a503b7bc6217fef9b136da71b5891142a"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/reset-qualified-audit.json",
+      "sha256": "e5834ff6c4f94cfc744fda2cd8a884fdd9d4ec14fe6e24387bc1bbb4e0c02a0e"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/reset-used-baseline.json",
+      "sha256": "6fd13120657b2f58eb8a34234b6961b381459697840d62ad15339eff2adf1332"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/reset-used-after.json",
+      "sha256": "5eebb7b9bf8e7a2c620e6fc0ec3af67391a5fa4b1e0e734f71360cd62f4fbd39"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/worker-large-dispatch-baseline.json",
+      "sha256": "33c756585ddfa5d1159af75d0f82fb0a4457c958f5742e8f21e68e44ee1cbb1e"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/native-host-dispatch-success.json",
+      "sha256": "031128495c90f1b4bd3439c53f4aa585232fc85806776da1e36fdecf0f9fa003"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/native-host-lock-contender.json",
+      "sha256": "c16782c051a1d544efb5fd7e464bef8ab6ce9705420ecbb7501c9f9eb3619bc0"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/host-7dedc422/native-worker-launch.json",
+      "sha256": "a143b682cf2ef60a68698ecedf2b5e229a4480cf90bbbf6fa73a467ad83525b1"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/forge-cc-suite-comparison.json",
+      "sha256": "0a384dd032890945de57fe7a207e41fce5cd8ab08660af71eb49ca205d185240"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/forge-cc-suite-baseline.json",
+      "sha256": "afec24e93ad965d311e3492c7494ae709185f12846a77543ad6afb86635ec9d9"
+    },
+    {
+      "path": ".dev/forge-p1/workflow-20260914-01/forge-cc-suite.json",
+      "sha256": "8cad9e1d78042185686fcf7227ab5e19af2e3e2c3188738bf6871d72d9020999"
+    }
+  ]
+}

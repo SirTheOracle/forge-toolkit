@@ -1,0 +1,43 @@
+# forge-web — backend for the local Forge control center.
+#
+# src layout, hatchling, matching the neighbouring goparent-ai backend manifest.
+# NO [project.scripts]: bin/forge-web is the only launcher. A console script on $PATH
+# would be a second, unpinned entry point — exactly the "stale copy" hazard the contract
+# marker exists to stop.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forge-web"
+version = "0.1.0"
+description = "Local browser control center for Forge — a read/act layer over .dev/ and the existing CLIs"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "pydantic>=2.9.0",
+    "pyyaml>=6.0.1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/forge_web"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src"]
+# `live` drives the real bin/forge-watch and is deselected by default; DoD 10.7 runs
+# tests/forge-web/sampler-live.sh instead, which is where the real numbers come from.
+addopts = "-m 'not live'"
+markers = [
+    "live: touches the real forge-watch binary (isolated cache/roots); deselected by default",
+]

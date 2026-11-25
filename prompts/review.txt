@@ -10,7 +10,7 @@ You are executing the 'review' stage of a forge pipeline.
 
 Slug: {slug}
 
-Follow the proposal-reviewer skill at ~/.codex/skills/proposal-reviewer/SKILL.md
+Follow the proposal-reviewer skill at {worker_skill}
 
 Inputs (read all):
 - .dev/proposals/{slug}/problem-statement.md
