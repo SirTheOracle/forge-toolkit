@@ -607,6 +607,17 @@ def alive(expected):
         return False
 
 
+def terminal_size():
+    for fd in (1, 0, 2):
+        try:
+            cols, rows = os.get_terminal_size(fd)
+        except OSError:
+            continue
+        if cols > 0 and rows > 0:
+            return cols, rows
+    return None
+
+
 def worker_forge(forge):
     # The packaged forge wrapper re-pins the isolated environment with env -i;
     # worker panes run its pinned body directly so they keep the operator's own.
@@ -725,7 +736,13 @@ class Runtime:
 
     def new_shell(self, session, provider):
         require(not self.at_root(), "ROOT_ALREADY_LIVE", "a session already owns this root")
+        # tmux runs here without a tty (captured pipes), so a detached session
+        # would be born at default-size 80x24 and the five-pane split would be
+        # stretched unevenly on attach. Size it from the operator's terminal,
+        # as legacy forge-start's tty-attached new-session does.
+        size = terminal_size()
         cp = self.tmux("new-session", "-d", "-s", session, "-c", str(self.ctx.root),
+                       *(["-x", str(size[0]), "-y", str(size[1])] if size else []),
                        "-e", "TMUX_SESSION=" + session, "-e", "FORGE_ROOT=" + str(self.ctx.root),
                        "-e", "FORGE_INITIATIVE=" + session, "-P", "-F", "#{pane_id}",
                        *self.child_argv(session, [self.candidate["tools"]["shell"], "--noprofile", "--norc"]), check=False)

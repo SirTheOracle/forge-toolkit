@@ -88,5 +88,38 @@ class WorkerProfile(unittest.TestCase):
             self.assertEqual(host.worker_forge(str(forge)), ["/bin/bash", str(Path(tmp) / ".forge-body")])
 
 
+class SessionSize(unittest.TestCase):
+    """The host's tmux has no tty; the session must be born at the terminal size."""
+
+    def test_terminal_size_reads_first_terminal_fd(self):
+        from unittest import mock
+        def fake(fd):
+            if fd == 1:
+                raise OSError("not a tty")
+            return os.terminal_size((203, 61))
+        with mock.patch.object(host.os, "get_terminal_size", fake):
+            self.assertEqual(host.terminal_size(), (203, 61))
+        with mock.patch.object(host.os, "get_terminal_size", side_effect=OSError):
+            self.assertIsNone(host.terminal_size())
+
+    def test_new_session_is_created_at_terminal_size(self):
+        from unittest import mock
+        seen = []
+        class Stop(Exception):
+            pass
+        def tmux(*args, check=True):
+            seen.append(args)
+            raise Stop()
+        rt = SimpleNamespace(at_root=lambda: False, ctx=SimpleNamespace(root=Path("/root")), tmux=tmux,
+                             candidate={"tools": {"shell": "/bin/bash"}},
+                             child_argv=lambda session, argv: ["/usr/bin/env", "-i", *argv])
+        with mock.patch.object(host, "terminal_size", return_value=(203, 61)), self.assertRaises(Stop):
+            host.Runtime.new_shell(rt, "forge-1", "codex")
+        args = list(seen[0])
+        self.assertEqual(args[0], "new-session")
+        self.assertEqual(args[args.index("-x") + 1], "203")
+        self.assertEqual(args[args.index("-y") + 1], "61")
+
+
 if __name__ == "__main__":
     unittest.main()
