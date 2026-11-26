@@ -121,5 +121,21 @@ class SessionSize(unittest.TestCase):
         self.assertEqual(args[args.index("-y") + 1], "61")
 
 
+class AttachClient(unittest.TestCase):
+    def test_attach_client_is_utf8(self):
+        rt = SimpleNamespace(binary="/pkg/tmux", socket="/sock", env=dict(ISOLATED))
+        argv, env = host.attach_command(rt, "attach-session", "forge-1")
+        self.assertEqual(argv, ["/pkg/tmux", "-u", "-S", "/sock", "attach-session", "-t", "=forge-1"])
+        self.assertNotIn("LC_ALL", env)
+        self.assertEqual(env["LANG"], "en_US.UTF-8")
+        self.assertEqual(env["LC_CTYPE"], "en_US.UTF-8")
+        self.assertEqual(env["HOME"], ISOLATED["HOME"])
+
+    def test_launch_attach_uses_attach_command(self):
+        source = (TREE / "bin/forge-orchestrator-host").read_text()
+        self.assertIn("argv, env = attach_command(rt, verb, args.session)", source)
+        self.assertIn("os.execve(rt.binary, argv, env)", source)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -607,6 +607,17 @@ def alive(expected):
         return False
 
 
+def attach_command(rt, verb, session):
+    # The attaching client renders the operator's terminal. Under the pinned
+    # LC_ALL=C it would be a non-UTF-8 client and tmux would draw every
+    # non-ASCII glyph as "_"; legacy forge-start attaches in the operator's
+    # UTF-8 locale. -u forces UTF-8 output regardless.
+    env = {k: v for k, v in rt.env.items() if k != "LC_ALL"}
+    env["LANG"] = env["LC_CTYPE"] = "en_US.UTF-8"
+    argv = [rt.binary, "-u"] + (["-S", rt.socket] if rt.socket else []) + [verb, "-t", "=" + session]
+    return argv, env
+
+
 def terminal_size():
     for fd in (1, 0, 2):
         try:
@@ -1257,8 +1268,8 @@ def launch(ctx, args):
     if not args.no_attach and (args.attach or (os.isatty(0) and os.isatty(1))):
         verb = "switch-client" if os.environ.get("TMUX") else "attach-session"
         print(json.dumps(result, sort_keys=True), flush=True)
-        argv = [rt.binary] + (["-S", rt.socket] if rt.socket else []) + [verb, "-t", "=" + args.session]
-        os.execve(rt.binary, argv, rt.env)
+        argv, env = attach_command(rt, verb, args.session)
+        os.execve(rt.binary, argv, env)
     return result
 
 
